@@ -3,4 +3,5 @@
 //! through [`runtime::Ctx`] and never reads ground truth.
 
 pub mod proto;
+pub mod raft;
 pub mod runtime;

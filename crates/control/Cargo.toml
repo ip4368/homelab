@@ -5,4 +5,5 @@ version.workspace = true
 
 [dependencies]
 model = { path = "../model" }
+rand_chacha.workspace = true
 serde.workspace = true

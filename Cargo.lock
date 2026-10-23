@@ -13,6 +13,7 @@ name = "control"
 version = "0.1.0"
 dependencies = [
  "model",
+ "rand_chacha",
  "serde",
 ]
 
