@@ -1,0 +1,119 @@
+# Homelab cluster manager — implementation decisions
+
+Decisions taken while building the prototype that the design doc and plan leave open or got wrong. R-numbers were settled before or during tasks; the ledger rulings came from reviews. Read alongside the design doc when building this for real.
+
+## Rulings R1–R30
+
+- R1: The git repo already exists (branch `prototype`) and `.gitignore` already has target/, ui/node_modules/, ui/dist/, .superpowers/. Task 1 skips `git init` and keeps the existing .gitignore.
+- R2: Put `SwitchPortCfg` (with `PortMode::Access(u16) | Trunk{native: Option<u16>, allowed: BTreeSet<u16>}`) in `model::network` starting in Task 3. sim::topology re-exports it. Task 12 then has nothing to move.
+- R3: Task 5 defines `model::Inventory { profile: ProfileId, variant: u8, nics: Vec<NicState{name, speed_mbps, link_up: bool}>, disks: Vec<DiskState{name, kind, size_gb, failed: bool}> }`. Task 7's `HostOs::inventory()` returns it.
+- R4: Task 6 defines `MetricSample` in model (or control::proto) with its final fields: `at, cpu_pct, ram_pct, temp_c, disk_pct: BTreeMap<String,f32>, port_rx_bps, port_tx_bps: BTreeMap<String,f64>, instances: u32`. Task 25 adds only the store.
+- R5: The Task 8 preset seeds hosts and rules only. Networks and templates are seeded once Task 12 adds those commands; Task 12 extends the preset.
+- R6: Initial CP voters are 3 for Preset::Default (60 hosts) and 5 for Preset::Scale500. Growth from 3 to 5 on the default fleet is Task 24's job, so before Task 24 the default fleet stays at 3.
+- R7: Task 12 defines `LldpNeighbor { local_port: PortName, switch: SwitchId, switch_port: PortName }` in model::network. Task 13 uses it.
+- R8: `controllers/alerts.rs` is created by whichever task first needs it (Task 16). The HostDown alert stays in health.rs.
+- R9: The wire format uses serde defaults throughout. Enum variants are PascalCase (e.g. "ControlPlane"). Do not add renames; the UI consumes the ts-rs types as generated. ts-rs export goes through `.cargo/config.toml` (TS_RS_EXPORT_DIR=ui/src/gen), which Task 1 created; regenerated files in ui/src/gen are committed with each task that changes exported types.
+- R10: Partition semantics. A partition group lists switches and/or hosts. Cables between two listed nodes, or between two unlisted nodes, stay connected. A host, client or router that is NOT listed stays on the side of the switch it is cabled to. Listing a host puts all of its ports inside the group, so its cables to unlisted switches are cut. "Partition access-2 with all its hosts" therefore means listing access-2 and every host cabled to it, which also cuts those MS-01s' legs to the core switches.
+- R11 (amended after the Task 3 review): `World.networks: BTreeMap<NetworkId, LogicalNetwork>` exists (Task 3), so the fabric can map attachments to VLAN and MTU. The Fabric owns the World and is installed as the engine's Deliver; reach it with `engine.deliver_mut::<Fabric>()`. Any code that mutates topology must bump `topology.version`, which invalidates the reachability cache.
+- R12: Raft includes pre-vote (Task 4). For the CP replica (Task 6): `propose` can't return outputs, so call `tick(now)` right after proposing to flush the persist and send outputs. A restarted replica rebuilds ClusterState by re-applying committed entries from index 1, since there are no snapshots.
+- R13: The `Object` enum's serde tag is `"type"`, not `"kind"`. `"kind"` collided with `Alert.kind`. `ObjectRef { kind, id }` keeps its `kind` field, since that is a separate struct.
+- R14: Host lifecycle. `NotReady` may be entered from Ready, Cordoned, Draining or Drained. `HostObj.before_not_ready: Option<Lifecycle>` records the prior state, and recovery (SetLifecycle back from NotReady) restores that state, defaulting to Ready.
+- R15: Raft entries carry `control::proto::LogCmd { at: SimTime, cmd: Command }`. The leader stamps `at` when it proposes. Raft is `RaftNode<LogCmd>`, `Msg::Raft(RaftMsg<LogCmd>)` and `Durable<LogCmd>`, and replicas call `apply(entry.at, entry.cmd)`. Task 8's seeded Durable uses LogCmd.
+- R16 (Task 6 decisions, accepted):
+  - `RaftNode::has_quorum(now)` gates controllers and API writes.
+  - API requests not committed within 2000 ms, or pending when the leader steps down, get `Unavailable`.
+  - `Actor: Any + Send`, and the engine downcasts to ClientActor. `Engine::api(op) -> u64`, `Engine::take_api_results()` and `Engine::client_view()`.
+  - `ApiOp::CreateJoinToken` has no fields. The leader generates the token with a 24 sim-hour TTL and returns `Ok("<token>")`.
+  - `Cordon` maps to SetLifecycle Cordoned, and `Uncordon` to Ready.
+  - `ApiOp`, `ApiResult` and `MetricSample` get ts-rs exports (with `Value` as `unknown`).
+  - serde_json becomes a normal dependency of control.
+- R17 (Task 7 decisions, accepted):
+  - `HostOs::store_cp(Durable)` exists.
+  - EngineCtx implements HostOs itself, and `Ctx::host()` returns it. Each new HostOs method needs a one-line hookup in engine.rs; the world-side logic lives on World/HostHw.
+  - `HostHw::new(ProfileId, variant)`.
+  - Hosts that join get location "unknown". Presets (Task 8) set the real rack.
+- R18 (Task 8 decisions, accepted):
+  - `build_fleet(spec, cp_voters)`.
+  - `PartitionMember`, not NodeGroupKey.
+  - `Fabric::world_mut()` clears the reachability cache.
+  - The CP replica's Raft tick starts at a random 1–100 ms offset, so replicas don't tick in lockstep and split votes.
+  - `RestoreHost` on a powered host does nothing.
+- R19:
+  - The server listens on the `PORT` env var, defaulting to 8080. Something else on this Mac already uses 8080, so run.sh should honour `PORT`.
+  - `/api/ops` returns the ApiResult JSON with 200 (e.g. `{"Ok":"<token>"}`). Errors return `{"error":...}`.
+  - Faults are allowed while paused. Scenarios and ops return 409 while paused.
+  - The UI caps its own event list, because events dropped from the ring leave no tombstones.
+- R20 (Task 12 decisions, accepted):
+  - Issue variants carry `network`/`networks`, so `broken_networks` can work from issues alone.
+  - `unavailable_networks(issues)` is broken plus missing, and it is what feeds `effective_roles`. Task 14 uses it.
+  - A missing vm network is reported as `MissingRequiredNetwork{Vm, "vm-*"}`.
+  - `NetworkTemplate.profile` is a single profile. `sbc-transcode` is stored as Pi5, and the Rk3588 rule references it explicitly, because a rule's template wins over profile matching.
+  - Unobserved switch ports are skipped.
+  - `ips_in_use` excludes the host itself.
+  - The UI store does not yet handle Network or Template objects; Task 17/18 must add them.
+- R21 (Task 13 decisions, accepted):
+  - Every heartbeat carries `observed_at`. If the leader lacks that observation, it replies `ReportRequest` and the agent resends the full lldp and inventory. The log is written only on change.
+  - A host's mgmt port is `eth0` (MGMT_NIC).
+  - Hosts whose location is "unknown" learn rack-N from LLDP (MS-01s get rack-0).
+  - SwitchObj is written on change, or at most once per 60 s.
+- R22: Partitions affect only the delivery of messages and traffic flows. They do not change link state, LLDP or inventory `link_up`. Physical link changes come only from Unplug, KillSwitch and KillHost.
+- R23 (Task 14 decisions, accepted):
+  - Msg::Approved is removed. Agents learn their desired config from ApplyNetwork, and a restarted agent reports generation 0, so the leader pushes again.
+  - `HostObj.net` has `desired`, `error` and `issues_since`.
+  - Hosts with no template run bootstrap with a static mgmt IP.
+  - DeleteTemplate is refused while any host uses the template.
+  - `ApiOp::SetHostOverride` exists.
+- R24 (Task 15 decisions, accepted):
+  - In a template rollout with `include_overridden`, a host's override is dropped and the host takes the template when its batch starts.
+  - A network rollout re-pushes each host's same rendered config under a new generation.
+  - Rollout is an Object variant. The UI store must handle it (Task 18).
+- R25 (Task 16 decisions, accepted):
+  - `Traffic::tick(&mut self, fabric: &Fabric)`. The result carries paths per flow.
+  - `Flow.until` sets a flow's lifetime, and `carried_bytes(id)` reports bytes carried so far (for rebuild and migration progress in phase 3).
+  - Iperf `mbps` is per stream, and `streams` defaults to 1.
+  - `NicState.speed_mbps` is the negotiated speed, min(NIC, peer switch port).
+  - PortDown applies to ports used by the host's applied (else desired) links. Unplugging one bond member raises both PortDown and BondDegraded.
+- R26 (Task 19 decisions, accepted):
+  - `Lifecycle` lives in `model::lifecycle` and is re-exported from control::state.
+  - `place_replicas` returns `Vec<(HostId, disk)>`, where `n` is the number of new replicas and `existing` hosts are excluded.
+  - `ApplyError::MissingDependency` exists.
+  - New pods and VMs start `Pending("unscheduled")`. New volumes start `Faulted` with no replicas.
+  - ViewSnapshot lacks the workload maps; Task 20 adds them.
+- R27 (Task 20 decisions, accepted):
+  - `HostOs::create_replica` returns `Option<String>`, and the host picks the disk.
+  - Deleting a workload leaves instances and replicas on hosts until Task 21's stale cleanup removes them.
+  - A VM's replica-write targets are fixed at start, and StartInstance with a new spec replaces the instance.
+  - Traffic from general pods goes to the Router on mgmt.
+  - SeedWorkloads at 500 hosts over-asks VMs, so Task 26 should cap seeded VMs at roughly VM-capable capacity.
+- R28 (Task 20 fix):
+  - `ReplicaState::Seeding` marks the first replicas of a volume that never held data. Only these may be created empty.
+  - `ReplicaReport{volume, disk, pct, copying}`. A replica that isn't copying gets CreateReplica re-sent with a healthy source, and resumes from its pct.
+  - A volume with an empty replica list counts as never having held data, so Task 21 must keep Stale entries rather than empty the list.
+  - Finished flow bytes stay readable for 10 s or until `take_finished(id)`.
+- R29 (Task 24 decisions, accepted):
+  - A voter host that is Cordoned, Draining or Drained counts as live.
+  - Voters with no host object are not auto-replaced.
+  - CpQuorumAtRisk fires only when at least one voter is down.
+  - `Alert.action` and a `SuggestCpReplacement` command exist.
+  - `HostOs::spawn_cp_replica` exists.
+  - Growth waits 60 s after start.
+- R30 (Task 25 decisions, accepted):
+  - `RaiseAlert` has no `severity` field. Severity comes from the kind, and `Alert.subject: Option<String>` gives structured identity (kind, entity, subject).
+  - `SetAlertMessage` rewords an open alert.
+  - SwitchUnreachable is Warning.
+  - NetworkApplyFailed (Warning) and VmSplitBrain (Critical) are in the defined set.
+  - A switch's port-bps rollup sums traffic on the host ports cabled to it (by LLDP). Other switch metrics cover hosts whose mgmt port is on that switch.
+
+## Review rulings
+
+- Task 3: Ruling: amended R11 so World.networks is a BTreeMap, matching the code. Keyed lookup is better; my Vec wording was loose. Cost: none.
+- Task 6: Ruling: fold reviewer minors #2 (dedup test), #3 (term in HostDown id), #4 (gate controllers on current-term entry applied) into fix round 1 — #4 is load-bearing for T21/T24 controllers, others are cheap — cost: small.
+- Task 17: Ruling: switch↔switch links must come from CP-observed switch LLDP (ObservedSwitchPort gains link_up, speed_mbps, neighbor) not name inference or ground truth — keeps the topology view honest to the control plane — cost: one more fix round.
+- Task 24: review Approved; Ruling: fold minors #1 (promote requires recent ack + strict reconfig live-quorum check) and #5 (refuse RemoveHost for a voter) before merge — #1 is the only path for the controller to cause quorum loss — cost: small.
+- Task 21: Ruling: accept 20 GB volumes in criterion-4 test (80 GB at 2000 Mbit/s exceeds plan's 300 s; spec has no bound) and adding an MS-01 to access-2 for criterion 6 — cost: none.
+- Task 21: Ruling: pods on a host NotReady >60s are rescheduled (K3s-like eviction; §1 intent "stay up when hosts fail") — added to fix round — cost: small.
+- Task 25: Ruling: fold minors #1 (compact metric rows; T26 scale), #2 (metrics while paused), #3 (reword stale NetworkMismatch) into fix round 1.
+- Ruling: reverted the two v.instances/v.replicas retain lines from 2f54eb7 myself (commit after 4744d8a) and replaced their test with one pinning that a removed host still gets StopInstance, instead of a second fix wave — the reviewer had shown by probe that the revert restores single-run, and it returns to reviewed pre-wave behaviour — cost if wrong: the original M3 minor (removed hosts linger in volatile maps; StopInstance resent to them every RESEND_MS forever) is back.
+- Ruling: parked — a removed host is never sent DeleteReplica (storage controller skips non-members; pre-existing) and volatile entries for removed hosts are never pruned; proper fix is to let on_heartbeat keep tracking removed hosts until they report empty — cost if wrong: leftover replica data on a removed machine and a slow trickle of resends; no correctness impact on the cluster.
+- Ruling: parked — last_seen falls back to elected_at, so for 15 s after a leader change a dead-but-not-yet-NotReady host counts as heard in I1's usable gate — cost if wrong: in that window a salvageable copy could still be deleted (the I1 bug, narrowed to a 15 s post-election window).
+- Ruling: parked — criterion-3 integration window check remains near-tautological; caught_up gates guarded by unit tests — cost if wrong: an integration regression in gating would be caught only at unit level.
