@@ -40,6 +40,10 @@ pub enum Command {
     Event { entity: ObjectRef, message: String },
     /// Replaces control-plane membership and replacement mode.
     SetCp { voters: BTreeSet<HostId>, mode: CpMode },
+    SetCpMode { mode: CpMode },
+    /// Raises a `CpReplacementSuggested` alert on `dead` whose button
+    /// replaces it with `with`.
+    SuggestCpReplacement { id: String, dead: HostId, with: HostId },
     /// Creates or replaces a network. Changing the VLAN or MTU of one in use
     /// is allowed; the network controller rolls the change out.
     UpsertNetwork { network: LogicalNetwork },
@@ -128,6 +132,8 @@ pub enum ApplyError {
     InvalidBatchPct(u8),
     /// The object refers to this one, which does not exist.
     MissingDependency(ObjectRef),
+    /// A control-plane voter's host cannot be removed; replace the member first.
+    CpVoter,
 }
 
 impl fmt::Display for ApplyError {
@@ -148,6 +154,7 @@ impl fmt::Display for ApplyError {
             Self::MissingDependency(r) => {
                 write!(f, "needs {} {}, which does not exist", format!("{:?}", r.kind).to_lowercase(), r.id)
             }
+            Self::CpVoter => f.write_str("host is a control-plane voter; replace it first"),
         }
     }
 }

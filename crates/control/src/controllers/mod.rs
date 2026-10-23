@@ -12,6 +12,7 @@ pub mod alerts;
 pub mod failover;
 pub mod health;
 pub mod join;
+pub mod membership;
 pub mod network;
 pub mod observe;
 pub mod rollout;

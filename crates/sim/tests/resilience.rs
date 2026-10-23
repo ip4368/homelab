@@ -8,7 +8,7 @@ use control::agent::HostAgent;
 use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::{EntryPayload, RaftRole};
 use control::replica::CpReplica;
-use control::state::{Lifecycle, ObjectRef};
+use control::state::{CpMode, Lifecycle, ObjectRef};
 use model::{HostId, ProfileId, Role};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
@@ -423,4 +423,98 @@ fn add_hosts_fails_without_a_control_plane() {
     assert!(err.contains("join token"), "{err}");
     assert!(e.now() <= start + 5000, "waited past 5 s");
     assert!(!e.fabric().world().hosts.contains_key(&hid("pi5-13")), "no host is added without a token");
+}
+
+// ---- control-plane membership ----
+
+/// Runs up to `ms` until the client sees exactly `n` CP voters.
+fn voters_reach(e: &mut Engine, n: usize, ms: u64) -> bool {
+    let deadline = e.now() + ms;
+    e.run_until(deadline, |e| e.client_view().state.cp.voters.len() == n)
+}
+
+/// The Raft voters as the true leader holds them.
+fn raft_voters(e: &Engine) -> BTreeSet<HostId> {
+    let l = e.true_leader().expect("a leader");
+    replica(e, &l).voters().clone()
+}
+
+/// Kills a voter that is not the leader; returns it and when it died.
+fn kill_follower_voter(e: &mut Engine) -> (HostId, u64) {
+    let leader = settle(e);
+    let dead = e.client_view().state.cp.voters.iter().find(|v| **v != leader).unwrap().clone();
+    e.fault(Fault::KillHost { host: dead.clone() }).unwrap();
+    (dead, e.now())
+}
+
+#[test]
+fn default_fleet_grows_to_5() {
+    let mut e = default_fleet(21);
+    e.run_for(55_000);
+    assert_eq!(raft_voters(&e).len(), 3, "R6: no growth while the fleet settles");
+    assert!(voters_reach(&mut e, 5, 65_000), "voters after 120 s: {:?}", e.client_view().state.cp.voters);
+    let voters = e.client_view().state.cp.voters.clone();
+    assert_eq!(raft_voters(&e), voters, "the view shows the Raft membership");
+    assert!(replica(&e, &e.true_leader().unwrap()).learners().is_empty());
+    for v in &voters {
+        assert!(v.as_str().starts_with("ms01-"), "MS-01s are preferred: {voters:?}");
+        assert!(replica(&e, v).voters().contains(v), "{v} runs a replica that knows it votes");
+    }
+    let has_role = |e: &Engine| {
+        let hosts = &e.client_view().state.hosts;
+        hosts.values().filter(|h| h.roles.contains(&Role::ControlPlane)).map(|h| h.id.clone()).collect::<BTreeSet<_>>()
+    };
+    assert!(e.run_until(e.now() + 5000, |e| has_role(e) == voters), "control-plane role on {:?}", has_role(&e));
+}
+
+#[test]
+fn auto_replace_dead_member() {
+    let mut e = default_fleet(22);
+    settle(&mut e);
+    let req = e.api(ApiOp::SetCpMode { mode: CpMode::Auto });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    assert_eq!(e.client_view().state.cp.mode, CpMode::Auto);
+    let (dead, killed_at) = kill_follower_voter(&mut e);
+
+    e.run_until(killed_at + 10 * 60_000 + 60_000, |_| false);
+    let voters = e.client_view().state.cp.voters.clone();
+    assert_eq!(voters.len(), 5, "{voters:?}");
+    assert!(!voters.contains(&dead), "the dead member was replaced: {voters:?}");
+    assert_eq!(raft_voters(&e), voters);
+    assert!(!e.client_view().state.hosts[&dead].roles.contains(&Role::ControlPlane), "the dead host lost the role");
+}
+
+#[test]
+fn suggest_mode_only_alerts() {
+    let mut e = default_fleet(23);
+    let (dead, killed_at) = kill_follower_voter(&mut e);
+    let suggestion = |e: &Engine| {
+        let alerts = &e.client_view().state.alerts;
+        alerts.values().find(|a| a.kind == "CpReplacementSuggested" && a.resolved_at.is_none()).cloned()
+    };
+    e.run_until(killed_at + 10 * 60_000 - 5000, |_| false);
+    assert!(suggestion(&e).is_none(), "suggested before 10 min");
+    e.run_until(killed_at + 10 * 60_000 + 60_000, |_| false);
+    let voters = e.client_view().state.cp.voters.clone();
+    assert!(voters.contains(&dead), "suggest mode replaced the member on its own: {voters:?}");
+    let alert = suggestion(&e).expect("a CpReplacementSuggested alert");
+    assert_eq!(alert.entity, ObjectRef::host(&dead));
+    let Some(ApiOp::ReplaceCpMember { dead: d, with }) = alert.action.clone() else {
+        panic!("the alert offers the replacement: {alert:?}")
+    };
+    assert_eq!(d, dead);
+    assert!(!voters.contains(&with));
+
+    // Taking the suggestion carries the replacement out.
+    let req = e.api(ApiOp::ReplaceCpMember { dead: dead.clone(), with: with.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let replaced = |e: &Engine| {
+        let v = &e.client_view().state.cp.voters;
+        v.contains(&with) && !v.contains(&dead)
+    };
+    assert!(e.run_until(e.now() + 30_000, replaced), "voters: {:?}", e.client_view().state.cp.voters);
+    assert_eq!(e.client_view().state.cp.voters.len(), voters.len());
+    assert!(e.run_until(e.now() + 5000, |e| suggestion(e).is_none()), "the suggestion resolves once taken");
 }

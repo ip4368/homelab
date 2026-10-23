@@ -241,6 +241,11 @@ impl Actor for HostAgent {
                     os.delete_replica(&volume);
                 }
             }
+            Msg::StartCpReplica { voters } if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.spawn_cp_replica(voters);
+                }
+            }
             _ => {}
         }
     }
@@ -274,6 +279,7 @@ mod tests {
     use crate::state::NetworkResult;
     use model::network::{HostNetworkConfig, LinkKind, LldpNeighbor};
     use model::{HostId, Inventory, NetworkId, PortName, ProfileId, SwitchId};
+    use std::collections::BTreeSet;
 
     struct FakeOs {
         net: HostNetworkConfig,
@@ -284,6 +290,8 @@ mod tests {
         inventory: Inventory,
         instances: Vec<InstanceSpec>,
         replicas: Vec<ReplicaReport>,
+        /// The voters of every CP replica started.
+        cp_spawned: Vec<BTreeSet<HostId>>,
     }
 
     impl HostOs for FakeOs {
@@ -342,6 +350,9 @@ mod tests {
         fn delete_replica(&mut self, volume: &str) {
             self.replicas.retain(|r| r.volume != volume);
         }
+        fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
+            self.cp_spawned.push(voters);
+        }
     }
 
     /// Records what the agent sends; timers fire when the test advances time.
@@ -362,6 +373,7 @@ mod tests {
                 inventory: Inventory::from_profile(ProfileId::Pi5, 1),
                 instances: vec![],
                 replicas: vec![],
+                cp_spawned: vec![],
             };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
@@ -708,6 +720,21 @@ mod tests {
         a.on_message(&mut ctx, VIP, Msg::StartInstance(spec("vm/vm1")));
         a.on_message(&mut ctx, VIP, Msg::CreateReplica { volume: "disk1".into(), size_gb: 40, source: None });
         assert!(ctx.os.instances.is_empty() && ctx.os.replicas.is_empty());
+    }
+
+    #[test]
+    fn start_cp_replica_reaches_the_host_of_a_member_only() {
+        let voters: BTreeSet<HostId> = [HostId::from("h1"), HostId::from("h2")].into();
+        let mut ctx = FakeCtx::new(HostNetworkConfig::default());
+        let mut a = HostAgent::new(Some("tok".into()));
+        a.on_start(&mut ctx);
+        a.on_message(&mut ctx, VIP, Msg::StartCpReplica { voters: voters.clone() });
+        assert!(ctx.os.cp_spawned.is_empty(), "an unjoined host runs no replica");
+
+        let (mut a, mut ctx) = member();
+        a.on_message(&mut ctx, VIP, Msg::StartCpReplica { voters: voters.clone() });
+        assert_eq!(ctx.os.cp_spawned, [voters]);
+        assert!(ctx.take().is_empty());
     }
 
     #[test]

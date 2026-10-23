@@ -11,6 +11,7 @@ pub use command::{ApplyError, Command};
 pub use objects::*;
 
 use crate::controllers::join::UNKNOWN_LOCATION;
+use crate::controllers::membership::CP_REPLACEMENT_SUGGESTED;
 use crate::runtime::SimTime;
 use model::network::LldpNeighbor;
 use model::{eligible, HardwareProfile, HostId, NetworkId, ProfileId, Role, SwitchId};
@@ -199,6 +200,9 @@ impl ClusterState {
                 host.version = v;
             }
             Command::RemoveHost { id } => {
+                if self.cp.voters.contains(&id) {
+                    return Err(ApplyError::CpVoter);
+                }
                 if self.hosts.remove(&id).is_none() {
                     return Err(ApplyError::NotFound);
                 }
@@ -217,6 +221,25 @@ impl ClusterState {
                     raised_at: at,
                     resolved_at: None,
                     ground_truth,
+                    action: None,
+                    version: v,
+                };
+                self.alerts.insert(id, alert);
+            }
+            Command::SuggestCpReplacement { id, dead, with } => {
+                if self.alerts.contains_key(&id) {
+                    return Err(ApplyError::AlreadyExists);
+                }
+                let alert = Alert {
+                    id: id.clone(),
+                    severity: Severity::Warning,
+                    kind: CP_REPLACEMENT_SUGGESTED.into(),
+                    entity: ObjectRef::host(&dead),
+                    message: format!("control-plane member {dead} has been down for over 10 min; replace it with {with}"),
+                    raised_at: at,
+                    resolved_at: None,
+                    ground_truth: false,
+                    action: Some(crate::proto::ApiOp::ReplaceCpMember { dead, with }),
                     version: v,
                 };
                 self.alerts.insert(id, alert);
@@ -239,6 +262,10 @@ impl ClusterState {
             }
             Command::SetCp { voters, mode } => {
                 self.cp = CpInfo { voters, mode, version: v };
+            }
+            Command::SetCpMode { mode } => {
+                self.cp.mode = mode;
+                self.cp.version = v;
             }
             Command::UpsertNetwork { network } => self.upsert_network(v, network),
             Command::DeleteNetwork { id } => {
@@ -350,6 +377,17 @@ impl ClusterState {
         }
         self.version = v;
         Ok(())
+    }
+
+    /// Applies a committed Raft config entry: the CP voters become `voters`.
+    /// Every replica applies the same config entries in log order, so this
+    /// is as deterministic as [`ClusterState::apply`].
+    pub fn apply_membership(&mut self, voters: BTreeSet<HostId>) {
+        if self.cp.voters != voters {
+            self.version += 1;
+            self.cp.voters = voters;
+            self.cp.version = self.version;
+        }
     }
 
     /// Everything that changed after version `v`: current objects and tombstones.
@@ -699,6 +737,20 @@ mod tests {
         // clients that already saw the removal are not told again
         assert!(s.changes_since(s.version).removed.is_empty());
         assert_eq!(s.apply(3, Command::RemoveHost { id: hid("h1") }), Err(ApplyError::NotFound));
+    }
+
+    #[test]
+    fn a_control_plane_voter_cannot_be_removed() {
+        let mut s = ClusterState::new();
+        s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        s.apply_membership([hid("h1")].into());
+        let v = s.version;
+        let err = s.apply(2, Command::RemoveHost { id: hid("h1") }).unwrap_err();
+        assert_eq!(err, ApplyError::CpVoter);
+        assert_eq!(err.to_string(), "host is a control-plane voter; replace it first");
+        assert!(s.hosts.contains_key(&hid("h1")) && s.version == v, "nothing changed");
+        s.apply_membership(BTreeSet::new());
+        s.apply(3, Command::RemoveHost { id: hid("h1") }).unwrap();
     }
 
     #[test]

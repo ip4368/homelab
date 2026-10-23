@@ -4,6 +4,7 @@
 
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::rollout;
+use crate::controllers::membership::{self, RaftMembers};
 use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
@@ -59,6 +60,16 @@ impl CpReplica {
         self.durable().log.len()
     }
 
+    /// The CP voters as this replica's log has them.
+    pub fn voters(&self) -> &BTreeSet<HostId> {
+        self.raft.as_ref().map_or(&self.durable().voters, RaftNode::voters)
+    }
+
+    /// The CP learners as this replica's log has them.
+    pub fn learners(&self) -> BTreeSet<HostId> {
+        self.raft.as_ref().map(|r| r.learners().clone()).unwrap_or_default()
+    }
+
     /// The Raft state this replica has persisted.
     pub fn durable(&self) -> &Durable<LogCmd> {
         match &self.raft {
@@ -103,7 +114,11 @@ impl CpReplica {
         for e in self.raft().take_committed() {
             let result = match e.payload {
                 EntryPayload::Normal(LogCmd { at, cmd }) => Some(self.state.apply(at, cmd)),
-                EntryPayload::Noop | EntryPayload::Config(_) => None,
+                EntryPayload::Config { voters, .. } => {
+                    self.state.apply_membership(voters);
+                    Some(Ok(()))
+                }
+                EntryPayload::Noop => None,
             };
             let Some(v) = &mut self.volatile else { continue };
             v.caught_up |= e.term == v.term;
@@ -142,7 +157,14 @@ impl CpReplica {
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
-        for action in controllers::run_all(&self.state, v, now) {
+        let mut actions = controllers::run_all(&self.state, v, now);
+        let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
+        actions.extend(plan.actions);
+        if let Some(change) = plan.change {
+            // Refused only if the leader cannot change membership now; the next run asks again.
+            let _ = change.apply(raft);
+        }
+        for action in actions {
             match action {
                 Action::Propose(cmd) => {
                     if !v.may_propose(&cmd, now) {
@@ -173,11 +195,23 @@ impl CpReplica {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Unavailable });
         }
         let term = raft.term();
-        let (cmd, ok) = match handle_op(ctx, &self.state, term, op) {
+        let (index, ok) = match handle_op(ctx, &self.state, term, op) {
             Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
-            Handling::Propose(cmd, ok) => (cmd, ok),
+            Handling::Propose(cmd, ok) => (raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
+            Handling::ReplaceCpMember { dead, with } => {
+                let members = RaftMembers::of(raft);
+                let added = membership::check_replace(&self.state, &members, &dead, &with)
+                    .and_then(|()| raft.add_learner(with.clone()).map_err(|e| e.to_string()));
+                match added {
+                    Err(e) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Err(e) }),
+                    Ok(index) => {
+                        let agent = Endpoint::new(Addr::Host(with), Svc::Agent);
+                        ctx.send(agent, mgmt(), Msg::StartCpReplica { voters: members.voters });
+                        (index, serde_json::Value::Null)
+                    }
+                }
+            }
         };
-        let index = raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above");
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
         let outs = self.raft().tick(now);
@@ -280,6 +314,8 @@ enum Handling {
     Answer(ApiResult),
     /// Propose the command; answer with the value once it applies.
     Propose(Command, serde_json::Value),
+    /// Add `with` as a CP learner, to replace `dead`; answer once that commits.
+    ReplaceCpMember { dead: HostId, with: HostId },
 }
 
 /// How the leader of `term` handles `op`, given its state.
@@ -326,6 +362,8 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> H
             Err(e) => return Handling::Answer(ApiResult::Err(e)),
         },
         ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
+        ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
+        ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
     };
     Handling::Propose(cmd, serde_json::Value::Null)
 }
@@ -400,7 +438,8 @@ impl Actor for CpReplica {
             | Msg::StartInstance(_)
             | Msg::StopInstance(_)
             | Msg::CreateReplica { .. }
-            | Msg::DeleteReplica { .. } => {}
+            | Msg::DeleteReplica { .. }
+            | Msg::StartCpReplica { .. } => {}
         }
     }
 

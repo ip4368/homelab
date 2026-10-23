@@ -7,7 +7,7 @@ use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Simulated time in milliseconds since the start of the run.
 pub type SimTime = u64;
@@ -98,6 +98,10 @@ pub trait HostOs {
     /// Every replica the host holds, with how much of it is copied.
     fn replicas(&self) -> Vec<ReplicaReport>;
     fn delete_replica(&mut self, volume: &str);
+    /// Starts a CP replica on this host with empty Raft state that knows
+    /// `voters`, unless the host already holds CP state (its replica runs, or
+    /// resumes from disk on boot).
+    fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>);
 }
 
 /// A switch's own configuration, as its management interface reports it.
