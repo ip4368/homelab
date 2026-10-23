@@ -1,7 +1,7 @@
 //! Scale: the 500-host preset comes up, runs well faster than real time with
 //! its workloads, and keeps the UI's sync traffic small. The timings only mean
 //! something in an optimized build (`cargo test -p sim --release --test scale`);
-//! a debug build skips them, so the workspace suite stays fast.
+//! a debug build ignores them, so the workspace suite stays fast.
 
 use control::client::{ClientActor, CLIENT};
 use control::state::Lifecycle;
@@ -10,14 +10,6 @@ use sim::engine::Engine;
 use sim::presets::Preset;
 use sim::scenario::Scenario;
 use std::time::Instant;
-
-/// Whether this build is too slow for the timings to mean anything; says so if it is.
-fn skip_unoptimized(test: &str) -> bool {
-    if cfg!(debug_assertions) {
-        eprintln!("{test}: skipped, run `cargo test -p sim --release --test scale`");
-    }
-    cfg!(debug_assertions)
-}
 
 fn scale500(seed: u64) -> Engine {
     let mut e = Engine::new(seed);
@@ -41,10 +33,8 @@ fn seeded(seed: u64) -> Engine {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_preset_ready() {
-    if skip_unoptimized("scale500_preset_ready") {
-        return;
-    }
     let mut e = scale500(26);
     let started = Instant::now();
     assert!(e.run_until(60_000, |e| ready_hosts(e) == 500), "only {} of 500 hosts Ready by 60 sim-s", ready_hosts(&e));
@@ -55,10 +45,8 @@ fn scale500_preset_ready() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_seed_workloads_fit() {
-    if skip_unoptimized("scale500_seed_workloads_fit") {
-        return;
-    }
     let e = seeded(27);
     let s = &e.client_view().state;
     let pending: Vec<_> = s.vm_status.iter().filter(|(_, v)| matches!(v.status.phase, VmPhase::Pending(_))).collect();
@@ -69,24 +57,22 @@ fn scale500_seed_workloads_fit() {
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_runs_faster_than_realtime() {
-    if skip_unoptimized("scale500_runs_faster_than_realtime") {
-        return;
-    }
     let mut e = seeded(28);
     let started = Instant::now();
     e.run_for(120_000);
     let wall = started.elapsed().as_secs_f64();
     eprintln!("120 sim-s with workloads took {wall:.2} wall-s");
     assert!(wall < 40.0, "120 sim-s took {wall:.1} wall-s (budget 40)");
+    // 60x playback asks for 120 sim-s in 2 wall-s; keep well clear of losing it.
+    assert!(wall < 10.0, "120 sim-s took {wall:.1} wall-s: too slow to keep 60x playback comfortable (budget 10)");
     assert_eq!(ready_hosts(&e), 500);
 }
 
 #[test]
+#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_sync_payload_bounded() {
-    if skip_unoptimized("scale500_sync_payload_bounded") {
-        return;
-    }
     let mut e = seeded(29);
     let client = |e: &Engine| e.actor::<ClientActor>(&CLIENT).expect("client").sync_stats();
     let before = client(&e);

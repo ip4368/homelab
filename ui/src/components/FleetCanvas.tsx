@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { hitTest, tileLayout, type TileLayout } from '../canvasLayout'
+import { hitIndex, tileLayout, type TileLayout } from '../canvasLayout'
 import type { HostObj } from '../gen/HostObj'
 import type { Lifecycle } from '../gen/Lifecycle'
 import type { MetricSample } from '../gen/MetricSample'
@@ -62,7 +62,8 @@ interface Paint {
   hosts: Map<string, HostObj>
   metrics: Record<string, MetricSample>
   selected: string | null
-  hovered: string | null
+  /** The index of the hovered tile in `layout.rects`. */
+  hovered: number | null
   mismatches: Map<string, string>
 }
 
@@ -79,9 +80,9 @@ function draw(ctx: CanvasRenderingContext2D, width: number, p: Paint) {
     ctx.fillText(` (${h.count})`, h.x + ctx.measureText(label).width + 2, h.y + 14)
   }
   const pattern = p.mismatches.size > 0 ? hatch(ctx) : null
-  for (const r of p.layout.rects) {
+  p.layout.rects.forEach((r, i) => {
     const host = p.hosts.get(r.hostId)
-    if (!host) continue
+    if (!host) return
     const m = p.metrics[r.hostId]
     ctx.globalAlpha = host.lifecycle === 'Removed' ? 0.6 : 1
     ctx.fillStyle = host.lifecycle === 'NotReady' ? C.notReady : C.panel
@@ -121,12 +122,12 @@ function draw(ctx: CanvasRenderingContext2D, width: number, p: Paint) {
       ctx.strokeStyle = C.accent
       ctx.lineWidth = 2
       ctx.strokeRect(r.x - 1, r.y - 1, r.w + 2, r.h + 2)
-    } else if (r.hostId === p.hovered) {
+    } else if (i === p.hovered) {
       ctx.strokeStyle = C.text
       ctx.lineWidth = 1
       ctx.strokeRect(r.x - 0.5, r.y - 0.5, r.w + 1, r.h + 1)
     }
-  }
+  })
 }
 
 function Tooltip({ host, metric, mismatch, x, y }: { host: HostObj; metric: MetricSample | undefined; mismatch: string | undefined; x: number; y: number }) {
@@ -157,7 +158,8 @@ export function FleetCanvas({ groups, metrics, selected, mismatches, onSelect }:
   const wrap = useRef<HTMLDivElement>(null)
   const canvas = useRef<HTMLCanvasElement>(null)
   const [width, setWidth] = useState(0)
-  const [hovered, setHovered] = useState<string | null>(null)
+  // The hovered tile, by index: a host grouped by role has a tile in each of its role groups.
+  const [hovered, setHovered] = useState<number | null>(null)
   useLayoutEffect(() => {
     const el = wrap.current
     if (!el) return
@@ -167,6 +169,8 @@ export function FleetCanvas({ groups, metrics, selected, mismatches, onSelect }:
     return () => resize.disconnect()
   }, [])
   const layout = useMemo(() => tileLayout(groups, width), [groups, width])
+  // A new layout moves the tiles: the pointer is over a different one, if any.
+  useEffect(() => setHovered(null), [layout])
   const hosts = useMemo(() => new Map(groups.flatMap((g) => g.hosts.map((h) => [h.id, h] as const))), [groups])
 
   useEffect(() => {
@@ -185,10 +189,10 @@ export function FleetCanvas({ groups, metrics, selected, mismatches, onSelect }:
 
   const at = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const box = e.currentTarget.getBoundingClientRect()
-    return hitTest(layout.rects, e.clientX - box.left, e.clientY - box.top)
+    return hitIndex(layout.rects, e.clientX - box.left, e.clientY - box.top)
   }
-  const tip = hovered === null ? null : layout.rects.find((r) => r.hostId === hovered)
-  const tipHost = hovered === null ? undefined : hosts.get(hovered)
+  const tip = hovered === null ? undefined : layout.rects[hovered]
+  const tipHost = tip && hosts.get(tip.hostId)
 
   return (
     <div className="fleet-canvas" ref={wrap}>
@@ -204,15 +208,15 @@ export function FleetCanvas({ groups, metrics, selected, mismatches, onSelect }:
           ref={canvas}
           role="img"
           aria-label={`${hosts.size} hosts; hover a tile for details, click to open it`}
-          style={{ width, height: layout.height, cursor: hovered ? 'pointer' : 'default' }}
+          style={{ width, height: layout.height, cursor: hovered === null ? 'default' : 'pointer' }}
           onMouseMove={(e) => {
-            const id = at(e)
-            if (id !== hovered) setHovered(id)
+            const i = at(e)
+            if (i !== hovered) setHovered(i)
           }}
           onMouseLeave={() => setHovered(null)}
           onClick={(e) => {
-            const id = at(e)
-            if (id) onSelect(id)
+            const i = at(e)
+            if (i !== null) onSelect(layout.rects[i].hostId)
           }}
         />
         {tip && tipHost && (

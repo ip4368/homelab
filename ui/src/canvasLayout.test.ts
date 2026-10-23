@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { GROUP_GAP, HEADER_H, hitTest, tileLayout } from './canvasLayout'
+import { GROUP_GAP, HEADER_H, hitIndex, hitTest, tileLayout } from './canvasLayout'
 
 /** `n` hosts split into groups of `per` (like 46 hosts per rack). */
 function groups(n: number, per: number) {
@@ -62,5 +62,22 @@ describe('hitTest', () => {
     expect(hitTest(rects, r.x + r.w + 1, r.y + 9), 'the gap between tiles').toBeNull()
     expect(hitTest(rects, 5, 5), 'a group header').toBeNull()
     expect(hitTest(rects, 5000, 5000)).toBeNull()
+  })
+
+  it('tells apart the tiles of a host that is in several groups', () => {
+    // Grouped by role: h1 is in both groups, so it has two tiles.
+    const { rects } = tileLayout(
+      [
+        { key: 'Compute', hosts: [{ id: 'h1' }, { id: 'h2' }] },
+        { key: 'Storage', hosts: [{ id: 'h1' }] },
+      ],
+      800,
+    )
+    expect(rects.map((r) => r.hostId)).toEqual(['h1', 'h2', 'h1'])
+    const second = rects[2]
+    expect(hitIndex(rects, second.x + 9, second.y + 9), 'the Storage tile, not the first h1 tile').toBe(2)
+    expect(hitIndex(rects, rects[0].x + 9, rects[0].y + 9)).toBe(0)
+    expect(hitTest(rects, second.x + 9, second.y + 9)).toBe('h1')
+    expect(hitIndex(rects, 5, 5)).toBeNull()
   })
 })

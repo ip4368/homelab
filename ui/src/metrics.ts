@@ -36,6 +36,30 @@ export async function fetchMetrics(entity: string, metrics: string[]): Promise<M
   }
 }
 
+/**
+ * Runs `fetchOnce` now and every `everyMs`, handing each outcome to `apply`.
+ * A tick is skipped while the previous fetch is still out, so outcomes are
+ * applied in order; none is applied after the returned stop function runs.
+ */
+export function startPolling(fetchOnce: () => Promise<MetricsOutcome>, apply: (o: MetricsOutcome) => void, everyMs: number): () => void {
+  let live = true
+  let inFlight = false
+  const poll = () => {
+    if (inFlight) return
+    inFlight = true
+    fetchOnce().then((outcome) => {
+      inFlight = false
+      if (live) apply(outcome)
+    })
+  }
+  poll()
+  const timer = setInterval(poll, everyMs)
+  return () => {
+    live = false
+    clearInterval(timer)
+  }
+}
+
 /** Folds a fetch's outcome in: a reply replaces the series, anything else keeps them and says why. */
 export function foldOutcome(prev: MetricsView, outcome: MetricsOutcome): MetricsView {
   if ('ok' in outcome) return { reply: outcome.ok, note: null }

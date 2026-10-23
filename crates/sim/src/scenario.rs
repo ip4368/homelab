@@ -84,7 +84,8 @@ pub enum Scenario {
     /// deployment with a pod per two SBCs. The VMs stop short of asking for
     /// more than [`SEED_VM_FILL`] of the CPU or RAM of the `Ready` hosts the
     /// client sees with the VM role active (waiting up to [`SEED_WAIT_MS`]
-    /// for it to see one), so the fleet can run them all.
+    /// for it to see one), so the fleet can run them all. With no such host
+    /// it creates the deployments only and fails saying why there are no VMs.
     /// Volumes are created first, then the VMs on them, then the deployments.
     SeedWorkloads,
 }
@@ -118,6 +119,7 @@ impl Engine {
         let deadline = self.now() + SEED_WAIT_MS;
         self.run_until(deadline, |e| e.vm_room() != (0, 0));
         let (mut cpu_left, mut ram_left) = self.vm_room();
+        let no_vm_hosts = (cpu_left, ram_left) == (0, 0);
         let (mut volumes, mut vms) = (vec![], vec![]);
         for n in 1..=per_60(30) {
             let id = format!("vm-{n:02}");
@@ -170,6 +172,12 @@ impl Engine {
         }
         for batch in [volumes, vms, deployments] {
             self.api_batch(batch)?;
+        }
+        if no_vm_hosts {
+            return Err(format!(
+                "created the deployments but no VMs: the control plane shows no Ready host with the VM role active (waited {} s)",
+                SEED_WAIT_MS / 1000
+            ));
         }
         Ok(())
     }

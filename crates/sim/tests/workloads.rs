@@ -10,7 +10,7 @@ use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, Svc};
 use control::state::{Command, Lifecycle, ObjectKind, ObjectRef};
 use model::{
-    Deployment, HostId, NetworkId, PodPhase, PodStatus, PortName, ProfileId, ReplicaState, Role, Selector, SwitchId, Vm, VmPhase, Volume,
+    allocatable, profile, Deployment, HostId, NetworkId, PodPhase, PodStatus, PortName, ProfileId, ReplicaState, Role, Selector, SwitchId, Vm, VmPhase, Volume,
     VolumeHealth, TRANSCODE_CAPABILITY_PREFIX,
 };
 use sim::engine::Engine;
@@ -99,8 +99,22 @@ fn seed_vms_fit_the_vm_hosts() {
     let s = &e.client_view().state;
     let vcpus: u32 = s.vms.values().map(|o| o.vm.vcpu).sum();
     assert!(s.vms.len() < 30, "{} VMs", s.vms.len());
-    assert!(f64::from(vcpus * 1000) <= SEED_VM_FILL * 19_500.0, "{vcpus} vCPUs asked of one MS-01");
+    let (ms01_cpu_m, _) = allocatable(&profile(ProfileId::Ms01, 0));
+    assert!(f64::from(vcpus * 1000) <= SEED_VM_FILL * f64::from(ms01_cpu_m), "{vcpus} vCPUs asked of one MS-01");
     assert_eq!(s.volumes.len(), s.vms.len(), "a volume per VM");
+}
+
+#[test]
+fn seed_workloads_says_why_there_are_no_vms() {
+    // Mini PCs do not get the VM role from their seed rule.
+    let mut e = Engine::new(44);
+    e.load_fleet(&FleetSpec { ms01: 0, minipc: 6, pi5: 0, rk3588: 0 }, 3);
+    let err = e.scenario(Scenario::SeedWorkloads).unwrap_err();
+    assert!(err.contains("no VMs") && err.contains("VM role"), "{err}");
+    e.run_for(2000);
+    let s = &e.client_view().state;
+    assert!(s.vms.is_empty() && s.volumes.is_empty());
+    assert!(!s.deployments.is_empty(), "the deployments are still created");
 }
 
 #[test]

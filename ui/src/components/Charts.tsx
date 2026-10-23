@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { alignSeries, type Aligned, fetchMetrics, foldOutcome, formatBps, metricsSince, type MetricsView } from '../metrics'
+import { alignSeries, type Aligned, fetchMetrics, foldOutcome, formatBps, metricsSince, startPolling, type MetricsView } from '../metrics'
 import { formatClock } from '../clock'
 
 /** How often a visible chart asks for fresh series. */
@@ -46,18 +46,12 @@ const format = (unit: Unit, v: number | null | undefined) =>
 function useMetrics(entity: string): MetricsView {
   const [view, setView] = useState<MetricsView>({ reply: null, note: null })
   useEffect(() => {
-    let live = true
     setView({ reply: null, note: null })
-    const poll = () =>
-      fetchMetrics(entity, METRIC_NAMES).then((outcome) => {
-        if (live) setView((prev) => foldOutcome(prev, outcome))
-      })
-    poll()
-    const timer = setInterval(poll, POLL_MS)
-    return () => {
-      live = false
-      clearInterval(timer)
-    }
+    return startPolling(
+      () => fetchMetrics(entity, METRIC_NAMES),
+      (outcome) => setView((prev) => foldOutcome(prev, outcome)),
+      POLL_MS,
+    )
   }, [entity])
   return view
 }

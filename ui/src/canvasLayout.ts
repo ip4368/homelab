@@ -50,10 +50,14 @@ export function tileLayout(groups: { key: string; hosts: { id: string }[] }[], w
   return { rects, headers, height: y }
 }
 
-/** The host whose tile contains the point, or null (gaps and headings hold none). */
+/** The index of the tile containing the point, or null (gaps and headings hold none). A host in several groups has a tile in each. */
+export function hitIndex(rects: TileRect[], x: number, y: number): number | null {
+  const i = rects.findIndex((r) => x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h)
+  return i < 0 ? null : i
+}
+
+/** The host whose tile contains the point, or null. */
 export function hitTest(rects: TileRect[], x: number, y: number): string | null {
-  for (const r of rects) {
-    if (x >= r.x && x < r.x + r.w && y >= r.y && y < r.y + r.h) return r.hostId
-  }
-  return null
+  const i = hitIndex(rects, x, y)
+  return i === null ? null : rects[i].hostId
 }

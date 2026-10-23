@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { alignSeries, fetchMetrics, formatBps, foldOutcome, metricsSince, type MetricsReply, type MetricsView } from './metrics'
+import { alignSeries, fetchMetrics, formatBps, foldOutcome, metricsSince, startPolling, type MetricsOutcome, type MetricsReply, type MetricsView } from './metrics'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -21,6 +21,29 @@ describe('fetchMetrics', () => {
     await expect(fetchMetrics('fleet', ['cpu_pct'])).resolves.toEqual({ error: 'control plane unavailable' })
     vi.stubGlobal('fetch', vi.fn(async () => Promise.reject(new TypeError('network down'))))
     await expect(fetchMetrics('fleet', ['cpu_pct'])).resolves.toEqual({ error: 'TypeError: network down' })
+  })
+})
+
+describe('startPolling', () => {
+  it('skips ticks while a fetch is out, so a slow answer never lands after a newer one', async () => {
+    vi.useFakeTimers()
+    const answers: ((o: MetricsOutcome) => void)[] = []
+    const fetchOnce = vi.fn(() => new Promise<MetricsOutcome>((resolve) => answers.push(resolve)))
+    const applied: MetricsOutcome[] = []
+    const stop = startPolling(fetchOnce, (o) => applied.push(o), 5000)
+    expect(fetchOnce).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(fetchOnce, 'the first fetch is still out').toHaveBeenCalledTimes(1)
+    answers[0]({ paused: true })
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(fetchOnce).toHaveBeenCalledTimes(2)
+    expect(applied).toEqual([{ paused: true }])
+    stop()
+    answers[1]({ error: 'late' })
+    await vi.advanceTimersByTimeAsync(10_000)
+    expect(applied, 'nothing is applied once stopped').toEqual([{ paused: true }])
+    expect(fetchOnce).toHaveBeenCalledTimes(2)
+    vi.useRealTimers()
   })
 })
 
