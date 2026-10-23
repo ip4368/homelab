@@ -37,21 +37,26 @@ pub struct ClusterView {
 
 impl ClusterView {
     /// Folds in a leader's changes: upserts replace objects by ref, removals
-    /// delete them, and `version` becomes the leader's.
+    /// delete them (leaving tombstones, so `state.changes_since` reports them
+    /// to readers of the view), and `version` becomes the leader's.
     pub fn merge(&mut self, changes: Changes) {
         let s = &mut self.state;
         for obj in changes.upserts {
             match obj {
                 Object::Host(o) => {
+                    s.revive(ObjectKind::Host, o.id.as_str());
                     s.hosts.insert(o.id.clone(), o);
                 }
                 Object::Token(o) => {
+                    s.revive(ObjectKind::Token, &o.token);
                     s.tokens.insert(o.token.clone(), o);
                 }
                 Object::Rule(o) => {
+                    s.revive(ObjectKind::Rule, &o.id);
                     s.rules.insert(o.id.clone(), o);
                 }
                 Object::Alert(o) => {
+                    s.revive(ObjectKind::Alert, &o.id);
                     s.alerts.insert(o.id.clone(), o);
                 }
                 Object::Event(o) => {
@@ -61,6 +66,8 @@ impl ClusterView {
             }
         }
         for ObjectRef { kind, id } in changes.removed {
+            // Kept so that `changes_since` on the view can tell its own readers what went.
+            s.tombstone(changes.version, kind, id.clone());
             match kind {
                 ObjectKind::Host => {
                     s.hosts.remove(&HostId::new(id));
@@ -316,6 +323,10 @@ mod tests {
         assert_eq!(view.state.tokens, leader.tokens);
         assert_eq!(view.state.events, leader.events);
         assert_eq!(view.state.hosts[&HostId::from("h1")].lifecycle, Lifecycle::Pending);
+
+        let gone = view.state.changes_since(since);
+        assert_eq!(gone.removed, [ObjectRef::host(&HostId::from("h2"))], "removals are reported to readers of the view");
+        assert_eq!(view.state.changes_since(view.version).removed, []);
 
         // Re-merging an overlapping batch is harmless.
         view.merge(leader.changes_since(0));

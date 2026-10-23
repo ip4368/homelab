@@ -1,0 +1,21 @@
+[package]
+name = "server"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+control = { path = "../control" }
+model = { path = "../model" }
+sim = { path = "../sim" }
+axum = { version = "0.8", features = ["ws"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["fs"] }
+serde.workspace = true
+serde_json.workspace = true
+ts-rs.workspace = true
+
+[dev-dependencies]
+futures-util = "0.3"
+tokio-tungstenite = "0.29"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

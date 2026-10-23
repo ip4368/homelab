@@ -197,13 +197,13 @@ impl ClusterState {
         Changes { version: self.version, upserts, removed }
     }
 
-    fn tombstone(&mut self, v: u64, kind: ObjectKind, id: String) {
+    pub(crate) fn tombstone(&mut self, v: u64, kind: ObjectKind, id: String) {
         self.tombstones.push((v, ObjectRef { kind, id }));
     }
 
     /// An object is (re)created: a tombstone for the same ref would contradict
     /// the upsert, so drop it.
-    fn revive(&mut self, kind: ObjectKind, id: &str) {
+    pub(crate) fn revive(&mut self, kind: ObjectKind, id: &str) {
         self.tombstones.retain(|(_, r)| !(r.kind == kind && r.id == id));
     }
 }
