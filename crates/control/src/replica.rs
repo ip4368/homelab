@@ -165,10 +165,6 @@ impl CpReplica {
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
-        // What a removed host last ran and held is no business of the controllers any more.
-        let hosts = &self.state.hosts;
-        v.instances.retain(|h, _| hosts.contains_key(h));
-        v.replicas.retain(|h, _| hosts.contains_key(h));
         let mut actions = controllers::run_all(&self.state, v, now);
         let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
         actions.extend(plan.actions);
@@ -704,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn a_removed_hosts_instances_and_replicas_are_forgotten() {
+    fn a_removed_host_is_still_told_to_stop_what_it_runs() {
         let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
         rig.elect();
         rig.ack();
@@ -714,16 +710,14 @@ mod tests {
         let stops = |rig: &mut Rig| {
             rig.controllers();
             let sent = std::mem::take(&mut rig.ctx.sent);
-            sent.into_iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && matches!(m, Msg::StopInstance(_) | Msg::DeleteReplica { .. })).count()
+            let to_h9 = |want: fn(&Msg) -> bool| sent.iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && want(m)).count();
+            (to_h9(|m| matches!(m, Msg::StopInstance(_))), to_h9(|m| matches!(m, Msg::DeleteReplica { .. })))
         };
-        assert_eq!(stops(&mut rig), 2, "h9 runs an instance and holds a replica nothing wants");
+        assert_eq!(stops(&mut rig), (1, 1), "h9 runs an instance and holds a replica nothing wants");
         rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
-        for _ in 0..3 {
-            rig.advance(crate::controllers::scheduler::RESEND_MS);
-            assert_eq!(stops(&mut rig), 0, "h9 is no member: nothing is sent to it");
-        }
-        let v = rig.r.volatile.as_ref().unwrap();
-        assert!(!v.instances.contains_key(&hid("h9")) && !v.replicas.contains_key(&hid("h9")));
+        rig.advance(crate::controllers::scheduler::RESEND_MS);
+        // Forgetting what h9 runs would leave its VMs running beside their restarted copies.
+        assert_eq!(stops(&mut rig).0, 1, "a removed host still runs what it ran until told to stop");
     }
 
     #[test]
