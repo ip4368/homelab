@@ -5,6 +5,7 @@
 mod command;
 mod objects;
 mod rollout;
+mod workload;
 
 pub use command::{ApplyError, Command};
 pub use objects::*;
@@ -33,6 +34,15 @@ pub struct ClusterState {
     pub switches: BTreeMap<SwitchId, SwitchObj>,
     /// Every rollout, done ones included; at most one is not done.
     pub rollouts: BTreeMap<String, Rollout>,
+    pub deployments: BTreeMap<String, DeploymentObj>,
+    /// Keyed by `(deployment, idx)`.
+    pub pods: BTreeMap<(String, u32), PodObj>,
+    pub vms: BTreeMap<String, VmObj>,
+    /// Keyed by VM id.
+    pub vm_status: BTreeMap<String, VmStatusObj>,
+    pub volumes: BTreeMap<String, VolumeObj>,
+    /// Keyed by volume id.
+    pub volume_status: BTreeMap<String, VolumeStatusObj>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -60,6 +70,12 @@ impl ClusterState {
             templates: BTreeMap::new(),
             switches: BTreeMap::new(),
             rollouts: BTreeMap::new(),
+            deployments: BTreeMap::new(),
+            pods: BTreeMap::new(),
+            vms: BTreeMap::new(),
+            vm_status: BTreeMap::new(),
+            volumes: BTreeMap::new(),
+            volume_status: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
@@ -322,6 +338,15 @@ impl ClusterState {
             Command::PauseRollout { id, reason, failed } => self.pause_rollout(v, &id, reason, failed)?,
             Command::ResumeRollout { id } => self.resume_rollout(v, &id)?,
             Command::AbortRollout { id } => self.abort_rollout(v, &id)?,
+            Command::CreateDeployment { deployment } => self.create_deployment(v, deployment)?,
+            Command::DeleteDeployment { id } => self.delete_deployment(v, &id)?,
+            Command::CreateVm { vm } => self.create_vm(at, v, vm)?,
+            Command::DeleteVm { id } => self.delete_vm(v, &id)?,
+            Command::CreateVolume { volume } => self.create_volume(v, volume)?,
+            Command::DeleteVolume { id } => self.delete_volume(v, &id)?,
+            Command::SetPodStatus { deployment, idx, host, phase } => self.set_pod_status(v, deployment, idx, host, phase)?,
+            Command::SetVmStatus { id, host, phase } => self.set_vm_status(at, v, &id, host, phase)?,
+            Command::SetVolumeStatus { id, replicas, health } => self.set_volume_status(v, &id, replicas, health)?,
         }
         self.version = v;
         Ok(())
@@ -337,6 +362,12 @@ impl ClusterState {
         upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
         upserts.extend(self.switches.values().filter(|o| o.version > v).cloned().map(Object::Switch));
         upserts.extend(self.rollouts.values().filter(|o| o.version > v).cloned().map(Object::Rollout));
+        upserts.extend(self.deployments.values().filter(|o| o.version > v).cloned().map(Object::Deployment));
+        upserts.extend(self.pods.values().filter(|o| o.version > v).cloned().map(Object::Pod));
+        upserts.extend(self.vms.values().filter(|o| o.version > v).cloned().map(Object::Vm));
+        upserts.extend(self.vm_status.values().filter(|o| o.version > v).cloned().map(Object::VmStatus));
+        upserts.extend(self.volumes.values().filter(|o| o.version > v).cloned().map(Object::Volume));
+        upserts.extend(self.volume_status.values().filter(|o| o.version > v).cloned().map(Object::VolumeStatus));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
