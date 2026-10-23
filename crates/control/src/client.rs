@@ -5,7 +5,7 @@
 use crate::proto::{mgmt, ApiOp, ApiResult, MetricSample, Msg};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{Changes, ClusterState, Object, ObjectKind, ObjectRef, EVENT_RING};
-use model::HostId;
+use model::{HostId, NetworkId};
 use std::collections::BTreeMap;
 
 /// Where the simulator runs the client.
@@ -63,6 +63,14 @@ impl ClusterView {
                     s.events.insert(o.seq, o);
                 }
                 Object::Cp(o) => s.cp = o,
+                Object::Network(o) => {
+                    s.revive(ObjectKind::Network, o.network.id.as_str());
+                    s.networks.insert(o.network.id.clone(), o);
+                }
+                Object::Template(o) => {
+                    s.revive(ObjectKind::Template, &o.template.id);
+                    s.templates.insert(o.template.id.clone(), o);
+                }
             }
         }
         for ObjectRef { kind, id } in changes.removed {
@@ -87,6 +95,12 @@ impl ClusterView {
                     }
                 }
                 ObjectKind::Cp => {}
+                ObjectKind::Network => {
+                    s.networks.remove(&NetworkId::new(id));
+                }
+                ObjectKind::Template => {
+                    s.templates.remove(&id);
+                }
             }
         }
         // The leader's ring drops old events without tombstones; mirror it.
@@ -331,5 +345,28 @@ mod tests {
         // Re-merging an overlapping batch is harmless.
         view.merge(leader.changes_since(0));
         assert_eq!(view.state.hosts, leader.hosts);
+    }
+
+    #[test]
+    fn merge_carries_networks_and_templates() {
+        let mut leader = ClusterState::new();
+        let mut view = ClusterView::default();
+        for n in model::seed_networks() {
+            leader.apply(1, Command::UpsertNetwork { network: n }).unwrap();
+        }
+        for t in model::seed_templates() {
+            leader.apply(1, Command::UpsertTemplate { template: t }).unwrap();
+        }
+        view.merge(leader.changes_since(0));
+        assert_eq!((view.state.networks.len(), view.state.templates.len()), (5, 3));
+        assert_eq!(view.state.networks, leader.networks);
+        assert_eq!(view.state.templates, leader.templates);
+
+        let since = view.version;
+        leader.apply(2, Command::DeleteTemplate { id: "ms01-standard".into() }).unwrap();
+        leader.apply(2, Command::DeleteNetwork { id: model::NetworkId::from("vm-iot") }).unwrap();
+        view.merge(leader.changes_since(since));
+        assert_eq!(view.state.networks, leader.networks);
+        assert_eq!(view.state.templates, leader.templates);
     }
 }

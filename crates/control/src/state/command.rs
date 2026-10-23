@@ -1,7 +1,7 @@
 //! Commands replicated through the Raft log, and the errors `apply` can return.
 
 use super::objects::{CpMode, Lifecycle, ObjectRef, Severity};
-use model::{HardwareProfile, HostId, Inventory, ProfileId, Role};
+use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -31,6 +31,16 @@ pub enum Command {
     Event { entity: ObjectRef, message: String },
     /// Replaces control-plane membership and replacement mode.
     SetCp { voters: BTreeSet<HostId>, mode: CpMode },
+    /// Creates or replaces a network. Changing the VLAN or MTU of one in use
+    /// is allowed; the network controller rolls the change out.
+    UpsertNetwork { network: LogicalNetwork },
+    /// Fails with `InUse` while a template or a host override attaches the network.
+    DeleteNetwork { id: NetworkId },
+    UpsertTemplate { template: NetworkTemplate },
+    /// Fails with `InUse` while an auto-approve rule names the template.
+    DeleteTemplate { id: String },
+    /// Sets (or with `None` clears) a host's hand-written network configuration.
+    SetHostOverride { host: HostId, config: Option<HostNetworkConfig> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +50,8 @@ pub enum ApplyError {
     NotFound,
     AlreadyExists,
     IneligibleRole { role: Role, reason: String },
+    /// The object is still referenced by these objects.
+    InUse(Vec<ObjectRef>),
 }
 
 impl fmt::Display for ApplyError {
@@ -49,6 +61,10 @@ impl fmt::Display for ApplyError {
             Self::NotFound => f.write_str("not found"),
             Self::AlreadyExists => f.write_str("already exists"),
             Self::IneligibleRole { role, reason } => write!(f, "ineligible for role {role:?}: {reason}"),
+            Self::InUse(by) => {
+                let by: Vec<String> = by.iter().map(|r| format!("{} {}", format!("{:?}", r.kind).to_lowercase(), r.id)).collect();
+                write!(f, "in use by {}", by.join(", "))
+            }
         }
     }
 }

@@ -4,7 +4,7 @@
 //! simulated time and versions stay far below 2^53.
 
 use crate::runtime::SimTime;
-use model::{HardwareProfile, HostId, Inventory, ProfileId, Role};
+use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkTemplate, ProfileId, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -63,6 +63,8 @@ pub struct HostObj {
     /// The lifecycle the host was in when it went `NotReady`; `SetLifecycle`
     /// back to `Ready` restores it. `None` unless the host is `NotReady`.
     pub before_not_ready: Option<Lifecycle>,
+    /// A hand-written network configuration that replaces the template's.
+    pub override_: Option<HostNetworkConfig>,
     #[ts(type = "number")]
     pub last_transition: SimTime,
     #[ts(type = "number")]
@@ -86,6 +88,28 @@ pub struct AutoApproveRule {
     pub profile: ProfileId,
     pub roles: BTreeSet<Role>,
     pub template: Option<String>,
+    #[ts(type = "number")]
+    pub version: u64,
+}
+
+/// A logical network with the state version at which it last changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct NetworkObj {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub network: LogicalNetwork,
+    #[ts(type = "number")]
+    pub version: u64,
+}
+
+/// A network template with the state version at which it last changed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct TemplateObj {
+    #[serde(flatten)]
+    #[ts(flatten)]
+    pub template: NetworkTemplate,
     #[ts(type = "number")]
     pub version: u64,
 }
@@ -155,6 +179,8 @@ pub enum ObjectKind {
     Alert,
     Event,
     Cp,
+    Network,
+    Template,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -167,6 +193,12 @@ pub struct ObjectRef {
 impl ObjectRef {
     pub fn host(id: &HostId) -> Self {
         Self { kind: ObjectKind::Host, id: id.to_string() }
+    }
+    pub fn template(id: &str) -> Self {
+        Self { kind: ObjectKind::Template, id: id.into() }
+    }
+    pub fn rule(id: &str) -> Self {
+        Self { kind: ObjectKind::Rule, id: id.into() }
     }
     pub fn cp() -> Self {
         Self { kind: ObjectKind::Cp, id: "cp".into() }
@@ -183,6 +215,8 @@ pub enum Object {
     Alert(Alert),
     Event(Event),
     Cp(CpInfo),
+    Network(NetworkObj),
+    Template(TemplateObj),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

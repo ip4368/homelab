@@ -9,7 +9,7 @@ pub use command::{ApplyError, Command};
 pub use objects::*;
 
 use crate::runtime::SimTime;
-use model::{eligible, HardwareProfile, HostId, Role};
+use model::{eligible, HardwareProfile, HostId, NetworkId, Role};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Events kept in the ring; older ones are dropped.
@@ -21,6 +21,8 @@ pub struct ClusterState {
     pub hosts: BTreeMap<HostId, HostObj>,
     pub tokens: BTreeMap<String, JoinToken>,
     pub rules: BTreeMap<String, AutoApproveRule>,
+    pub networks: BTreeMap<NetworkId, NetworkObj>,
+    pub templates: BTreeMap<String, TemplateObj>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -44,6 +46,8 @@ impl ClusterState {
             hosts: BTreeMap::new(),
             tokens: BTreeMap::new(),
             rules: BTreeMap::new(),
+            networks: BTreeMap::new(),
+            templates: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
@@ -89,6 +93,7 @@ impl ClusterState {
                     roles: Default::default(),
                     labels: Default::default(),
                     before_not_ready: None,
+                    override_: None,
                     last_transition: at,
                     version: v,
                 };
@@ -177,6 +182,42 @@ impl ClusterState {
             Command::SetCp { voters, mode } => {
                 self.cp = CpInfo { voters, mode, version: v };
             }
+            Command::UpsertNetwork { network } => {
+                self.revive(ObjectKind::Network, network.id.as_str());
+                self.networks.insert(network.id.clone(), NetworkObj { network, version: v });
+            }
+            Command::DeleteNetwork { id } => {
+                if !self.networks.contains_key(&id) {
+                    return Err(ApplyError::NotFound);
+                }
+                let users = self.network_users(&id);
+                if !users.is_empty() {
+                    return Err(ApplyError::InUse(users));
+                }
+                self.networks.remove(&id);
+                self.tombstone(v, ObjectKind::Network, id.to_string());
+            }
+            Command::UpsertTemplate { template } => {
+                self.revive(ObjectKind::Template, &template.id);
+                self.templates.insert(template.id.clone(), TemplateObj { template, version: v });
+            }
+            Command::DeleteTemplate { id } => {
+                if !self.templates.contains_key(&id) {
+                    return Err(ApplyError::NotFound);
+                }
+                let users: Vec<_> =
+                    self.rules.values().filter(|r| r.template.as_deref() == Some(id.as_str())).map(|r| ObjectRef::rule(&r.id)).collect();
+                if !users.is_empty() {
+                    return Err(ApplyError::InUse(users));
+                }
+                self.templates.remove(&id);
+                self.tombstone(v, ObjectKind::Template, id);
+            }
+            Command::SetHostOverride { host, config } => {
+                let host = self.hosts.get_mut(&host).ok_or(ApplyError::NotFound)?;
+                host.override_ = config;
+                host.version = v;
+            }
         }
         self.version = v;
         Ok(())
@@ -188,6 +229,8 @@ impl ClusterState {
         upserts.extend(self.hosts.values().filter(|o| o.version > v).cloned().map(Object::Host));
         upserts.extend(self.tokens.values().filter(|o| o.version > v).cloned().map(Object::Token));
         upserts.extend(self.rules.values().filter(|o| o.version > v).cloned().map(Object::Rule));
+        upserts.extend(self.networks.values().filter(|o| o.version > v).cloned().map(Object::Network));
+        upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
@@ -195,6 +238,16 @@ impl ClusterState {
         }
         let removed = self.tombstones.iter().filter(|(at, _)| *at > v).map(|(_, r)| r.clone()).collect();
         Changes { version: self.version, upserts, removed }
+    }
+
+    /// The templates and hosts (through their override) that attach `network`.
+    fn network_users(&self, network: &NetworkId) -> Vec<ObjectRef> {
+        let attaches = |cfg: &model::HostNetworkConfig| cfg.attachments.iter().any(|a| a.network == *network);
+        let templates = self.templates.values().filter(|t| attaches(&t.template.config)).map(|t| ObjectRef::template(&t.template.id));
+        let hosts = self.hosts.values().filter(|h| h.override_.as_ref().is_some_and(attaches)).map(|h| ObjectRef::host(&h.id));
+        let mut users: Vec<_> = templates.chain(hosts).collect();
+        users.sort();
+        users
     }
 
     pub(crate) fn tombstone(&mut self, v: u64, kind: ObjectKind, id: String) {
@@ -218,7 +271,7 @@ fn check_eligible(profile: &HardwareProfile, roles: &BTreeSet<Role>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::{profile, Inventory, ProfileId, Role};
+    use model::{profile, Inventory, NetworkId, NetworkTemplate, ProfileId, Role};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn hid(s: &str) -> HostId {
@@ -410,6 +463,9 @@ mod tests {
             template: Some("x".into()),
         })
         .unwrap();
+        s.apply(5, Command::UpsertNetwork { network: model::seed_networks().remove(1) }).unwrap();
+        s.apply(5, Command::UpsertTemplate { template: model::seed_templates().remove(0) }).unwrap();
+        s.apply(5, Command::SetHostOverride { host: hid("h1"), config: Some(model::seed_templates().remove(2).config) }).unwrap();
         s.apply(5, Command::RaiseAlert {
             id: "a".into(),
             severity: Severity::Warning,
@@ -423,12 +479,19 @@ mod tests {
         s.apply(5, Command::SetCp { voters: [hid("h1")].into(), mode: CpMode::Auto }).unwrap();
         let upserts = s.changes_since(0).upserts;
         let kinds: Vec<_> = upserts.iter().map(|o| serde_json::to_value(o).unwrap()["type"].clone()).collect();
-        assert_eq!(kinds, ["Host", "Token", "Rule", "Alert", "Event", "Cp"]);
+        assert_eq!(kinds, ["Host", "Token", "Rule", "Network", "Template", "Alert", "Event", "Cp"]);
         for o in upserts {
             let json = serde_json::to_string(&o).unwrap();
             let back: Object = serde_json::from_str(&json).unwrap();
             assert_eq!(back, o, "{json}");
         }
+        // networks and templates are flat: the wire shape is the model type plus `version`
+        let net = serde_json::to_value(Object::Network(s.networks[&NetworkId::from("storage")].clone())).unwrap();
+        assert_eq!((net["type"].as_str(), net["id"].as_str(), net["vlan"].as_u64()), (Some("Network"), Some("storage"), Some(20)));
+        assert_eq!(net["subnet"], "10.20.0.0/22");
+        assert!(net["version"].is_u64());
+        let tpl = serde_json::to_value(Object::Template(s.templates["ms01-standard"].clone())).unwrap();
+        assert_eq!((tpl["type"].as_str(), tpl["id"].as_str(), tpl["profile"].as_str()), (Some("Template"), Some("ms01-standard"), Some("Ms01")));
         // Alert keeps its own `kind` field next to the `type` tag
         let alert = serde_json::to_value(Object::Alert(s.alerts["a"].clone())).unwrap();
         assert_eq!((alert["type"].as_str(), alert["kind"].as_str()), (Some("Alert"), Some("HostDown")));
@@ -575,6 +638,146 @@ mod tests {
         s.apply(1, Command::SetCp { voters: voters.clone(), mode: CpMode::Auto }).unwrap();
         assert_eq!((s.cp.voters.clone(), s.cp.mode, s.cp.version), (voters, CpMode::Auto, 1));
         assert!(s.changes_since(0).upserts.iter().any(|o| matches!(o, Object::Cp(_))));
+    }
+
+    fn seeded_networks() -> ClusterState {
+        let mut s = ClusterState::new();
+        for n in model::seed_networks() {
+            s.apply(1, Command::UpsertNetwork { network: n }).unwrap();
+        }
+        s
+    }
+
+    fn template(id: &str) -> NetworkTemplate {
+        model::seed_templates().into_iter().find(|t| t.id == id).unwrap()
+    }
+
+    fn nid(s: &str) -> NetworkId {
+        NetworkId::from(s)
+    }
+
+    fn net_ref(id: &str) -> ObjectRef {
+        ObjectRef { kind: ObjectKind::Network, id: id.into() }
+    }
+
+    #[test]
+    fn networks_upsert_replace_and_delete_with_tombstone() {
+        let mut s = seeded_networks();
+        assert_eq!(s.networks.len(), 5);
+        assert_eq!(s.networks[&nid("storage")].network.vlan, 20);
+        let v = s.version;
+        let mut changed = s.networks[&nid("storage")].network.clone();
+        (changed.vlan, changed.mtu) = (21, 8000);
+        s.apply(2, Command::UpsertNetwork { network: changed }).unwrap();
+        assert_eq!((s.networks[&nid("storage")].network.vlan, s.networks[&nid("storage")].version), (21, v + 1));
+        s.apply(3, Command::DeleteNetwork { id: nid("vm-iot") }).unwrap();
+        assert!(!s.networks.contains_key(&nid("vm-iot")));
+        assert_eq!(s.changes_since(v + 1).removed, vec![net_ref("vm-iot")]);
+        assert_eq!(s.apply(4, Command::DeleteNetwork { id: nid("vm-iot") }), Err(ApplyError::NotFound));
+        // recreating drops the tombstone
+        s.apply(5, Command::UpsertNetwork { network: model::seed_networks().pop().unwrap() }).unwrap();
+        assert!(s.changes_since(0).removed.is_empty());
+    }
+
+    #[test]
+    fn delete_in_use_network_rejected() {
+        let mut s = seeded_networks();
+        s.apply(2, Command::UpsertTemplate { template: template("ms01-standard") }).unwrap();
+        let v = s.version;
+        let err = s.apply(3, Command::DeleteNetwork { id: nid("storage") }).unwrap_err();
+        assert_eq!(err, ApplyError::InUse(vec![ObjectRef::template("ms01-standard")]));
+        assert_eq!(err.to_string(), "in use by template ms01-standard");
+        assert_eq!(s.version, v, "a rejected delete changes nothing");
+        assert!(s.networks.contains_key(&nid("storage")));
+        // a network no template carries can go
+        s.apply(4, Command::UpsertTemplate { template: template("sbc-transcode") }).unwrap();
+        s.apply(5, Command::DeleteTemplate { id: "ms01-standard".into() }).unwrap();
+        s.apply(6, Command::DeleteNetwork { id: nid("storage") }).unwrap();
+    }
+
+    #[test]
+    fn delete_network_lists_every_template_and_host_override_using_it() {
+        let mut s = seeded_networks();
+        ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+        ready_host(&mut s, "h2", ProfileId::MiniPc, 0);
+        for t in ["ms01-standard", "minipc-standard", "sbc-transcode"] {
+            s.apply(5, Command::UpsertTemplate { template: template(t) }).unwrap();
+        }
+        s.apply(6, Command::SetHostOverride { host: hid("h2"), config: Some(template("minipc-standard").config) }).unwrap();
+        let err = s.apply(7, Command::DeleteNetwork { id: nid("storage") }).unwrap_err();
+        let want = [ObjectRef::host(&hid("h2")), ObjectRef::template("minipc-standard"), ObjectRef::template("ms01-standard")];
+        let ApplyError::InUse(mut got) = err else { panic!("{err:?}") };
+        got.sort();
+        let mut want = want.to_vec();
+        want.sort();
+        assert_eq!(got, want);
+        // h1 has no override: clearing h2's frees storage only from the host side
+        s.apply(8, Command::SetHostOverride { host: hid("h2"), config: None }).unwrap();
+        let ApplyError::InUse(got) = s.apply(9, Command::DeleteNetwork { id: nid("storage") }).unwrap_err() else { panic!() };
+        assert_eq!(got, [ObjectRef::template("minipc-standard"), ObjectRef::template("ms01-standard")]);
+        // vm-iot is carried by ms01-standard only
+        let ApplyError::InUse(got) = s.apply(9, Command::DeleteNetwork { id: nid("vm-iot") }).unwrap_err() else { panic!() };
+        assert_eq!(got, [ObjectRef::template("ms01-standard")]);
+    }
+
+    #[test]
+    fn upsert_network_with_changed_vlan_or_mtu_is_allowed_while_in_use() {
+        let mut s = seeded_networks();
+        s.apply(2, Command::UpsertTemplate { template: template("minipc-standard") }).unwrap();
+        let mut storage = s.networks[&nid("storage")].network.clone();
+        storage.vlan = 25;
+        storage.mtu = 9216;
+        s.apply(3, Command::UpsertNetwork { network: storage.clone() }).unwrap();
+        assert_eq!(s.networks[&nid("storage")].network, storage);
+    }
+
+    #[test]
+    fn templates_upsert_replace_and_delete_with_tombstone() {
+        let mut s = ClusterState::new();
+        s.apply(1, Command::UpsertTemplate { template: template("sbc-transcode") }).unwrap();
+        let mut t = template("sbc-transcode");
+        t.config.links[0].mtu = 1400;
+        s.apply(2, Command::UpsertTemplate { template: t }).unwrap();
+        assert_eq!((s.templates.len(), s.templates["sbc-transcode"].template.config.links[0].mtu, s.templates["sbc-transcode"].version), (1, 1400, 2));
+        s.apply(3, Command::DeleteTemplate { id: "sbc-transcode".into() }).unwrap();
+        assert_eq!(s.changes_since(2).removed, vec![ObjectRef::template("sbc-transcode")]);
+        assert_eq!(s.apply(4, Command::DeleteTemplate { id: "sbc-transcode".into() }), Err(ApplyError::NotFound));
+    }
+
+    #[test]
+    fn delete_template_in_use_by_rules_rejected() {
+        let mut s = ClusterState::new();
+        s.apply(1, Command::UpsertTemplate { template: template("sbc-transcode") }).unwrap();
+        for (id, p) in [("pi5", ProfileId::Pi5), ("rk3588", ProfileId::Rk3588)] {
+            s.apply(2, Command::UpsertRule { id: id.into(), profile: p, roles: roles(&[Role::Compute]), template: Some("sbc-transcode".into()) })
+                .unwrap();
+        }
+        s.apply(2, Command::UpsertRule { id: "other".into(), profile: ProfileId::Ms01, roles: roles(&[]), template: None }).unwrap();
+        let v = s.version;
+        let err = s.apply(3, Command::DeleteTemplate { id: "sbc-transcode".into() }).unwrap_err();
+        assert_eq!(err, ApplyError::InUse(vec![ObjectRef::rule("pi5"), ObjectRef::rule("rk3588")]));
+        assert_eq!(err.to_string(), "in use by rule pi5, rule rk3588");
+        assert_eq!(s.version, v);
+        s.apply(4, Command::DeleteRule { id: "pi5".into() }).unwrap();
+        s.apply(4, Command::UpsertRule { id: "rk3588".into(), profile: ProfileId::Rk3588, roles: roles(&[]), template: None }).unwrap();
+        s.apply(5, Command::DeleteTemplate { id: "sbc-transcode".into() }).unwrap();
+    }
+
+    #[test]
+    fn set_host_override_sets_and_clears() {
+        let mut s = ClusterState::new();
+        assert_eq!(
+            s.apply(1, Command::SetHostOverride { host: hid("h1"), config: None }),
+            Err(ApplyError::NotFound)
+        );
+        s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].override_, None);
+        let cfg = template("sbc-transcode").config;
+        s.apply(2, Command::SetHostOverride { host: hid("h1"), config: Some(cfg.clone()) }).unwrap();
+        assert_eq!((s.hosts[&hid("h1")].override_.clone(), s.hosts[&hid("h1")].version), (Some(cfg), 2));
+        assert!(s.changes_since(1).upserts.iter().any(|o| matches!(o, Object::Host(h) if h.override_.is_some())));
+        s.apply(3, Command::SetHostOverride { host: hid("h1"), config: None }).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].override_, None);
     }
 
     #[test]

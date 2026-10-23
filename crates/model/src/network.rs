@@ -3,7 +3,7 @@
 //! from its NICs and which networks ride on them, tagged or untagged.
 
 use crate::hardware::HardwareProfile;
-use crate::ids::{NetworkId, PortName};
+use crate::ids::{NetworkId, PortName, SwitchId};
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -155,6 +155,29 @@ impl SwitchPortCfg {
             (PortMode::Trunk { allowed, .. }, true) => allowed.contains(&vlan),
         }
     }
+}
+
+/// What a host's LLDP daemon reports for one of its ports: the switch port
+/// on the other end of the cable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LldpNeighbor {
+    pub local_port: PortName,
+    pub switch: SwitchId,
+    pub switch_port: PortName,
+}
+
+/// A switch port's configuration as the controller observed it by polling.
+pub type SwitchPortCfgView = SwitchPortCfg;
+
+/// One polled switch port, with the MLAG peer of the switch it sits on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct ObservedSwitchPort {
+    pub switch: SwitchId,
+    pub port: PortName,
+    pub cfg: SwitchPortCfgView,
+    pub mlag_peer: Option<SwitchId>,
 }
 
 #[cfg(test)]

@@ -18,7 +18,7 @@ use control::raft::{Durable, Entry, EntryPayload};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Endpoint, Svc};
 use control::state::{Command, CpMode, Lifecycle};
-use model::{eligible, HostId, PortName, ProfileId, Role, SwitchId};
+use model::{eligible, seed_networks, seed_templates, HostId, PortName, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use ts_rs::TS;
@@ -163,13 +163,21 @@ pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors)
 
 /// The Raft state of a freshly installed cluster: one term-1 log entry per
 /// command, all uncommitted until the first leader's no-op commits them.
-/// The log sets the CP voters, adds the seed auto-approve rules, and adds
+/// The log sets the CP voters, adds the seed networks and templates and the
+/// seed auto-approve rules (each naming its template), and adds
 /// every host at `location`, approved with its rule's roles (plus
 /// `ControlPlane` for voters) and walked to `Ready`.
 pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<HostId>) -> Durable<LogCmd> {
     let mut cmds = vec![Command::SetCp { voters: voters.clone(), mode: CpMode::Suggest }];
+    cmds.extend(seed_networks().into_iter().map(|network| Command::UpsertNetwork { network }));
+    cmds.extend(seed_templates().into_iter().map(|template| Command::UpsertTemplate { template }));
     for p in [ProfileId::Ms01, ProfileId::MiniPc, ProfileId::Pi5, ProfileId::Rk3588] {
-        cmds.push(Command::UpsertRule { id: profile_prefix(p).into(), profile: p, roles: seed_rule_roles(p), template: None });
+        cmds.push(Command::UpsertRule {
+            id: profile_prefix(p).into(),
+            profile: p,
+            roles: seed_rule_roles(p),
+            template: Some(seed_rule_template(p).into()),
+        });
     }
     for (id, location) in hosts {
         let hw = &w.hosts[id];
@@ -206,6 +214,15 @@ pub fn seed_rule_roles(p: ProfileId) -> BTreeSet<Role> {
         ProfileId::Ms01 => [Role::Storage, Role::Vm, Role::Compute].into(),
         ProfileId::MiniPc => [Role::Compute, Role::Transcode, Role::Storage].into(),
         ProfileId::Pi5 | ProfileId::Rk3588 => [Role::Transcode, Role::Compute].into(),
+    }
+}
+
+/// The network template a profile's seed auto-approve rule applies.
+pub fn seed_rule_template(p: ProfileId) -> &'static str {
+    match p {
+        ProfileId::Ms01 => "ms01-standard",
+        ProfileId::MiniPc => "minipc-standard",
+        ProfileId::Pi5 | ProfileId::Rk3588 => "sbc-transcode",
     }
 }
 
@@ -465,7 +482,14 @@ mod tests {
         assert_eq!(host("rk3588-01").location, "rack-2");
         let eth1 = host("ms01-01").inventory.nics.iter().find(|n| n.name == "eth1").unwrap();
         assert!(!eth1.link_up, "the inventory is what the host sees: eth1 is uncabled");
-        assert!(s.rules.values().all(|r| r.template.is_none()), "templates arrive with Task 12");
+        let rule_template = |id: &str| s.rules[id].template.as_deref();
+        assert_eq!(
+            ["ms01", "minipc", "pi5", "rk3588"].map(rule_template),
+            [Some("ms01-standard"), Some("minipc-standard"), Some("sbc-transcode"), Some("sbc-transcode")]
+        );
+        assert!(s.rules.values().all(|r| s.templates.contains_key(r.template.as_deref().unwrap())));
+        assert_eq!(s.networks.keys().map(|n| n.as_str()).collect::<Vec<_>>(), ["mgmt", "migration", "storage", "vm-iot", "vm-lan"]);
+        assert_eq!(s.templates.keys().map(String::as_str).collect::<Vec<_>>(), ["minipc-standard", "ms01-standard", "sbc-transcode"]);
     }
 
     #[test]
