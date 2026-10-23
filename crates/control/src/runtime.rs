@@ -4,6 +4,7 @@
 use crate::proto::Msg;
 use model::{HostId, NetworkId};
 use serde::{Deserialize, Serialize};
+use std::any::Any;
 
 /// Simulated time in milliseconds since the start of the run.
 pub type SimTime = u64;
@@ -54,8 +55,9 @@ pub trait Ctx {
     fn host(&mut self) -> Option<&mut dyn HostOs>;
 }
 
-/// `Send` so a whole simulation can be moved onto a server thread.
-pub trait Actor: Send {
+/// `Send` so a whole simulation can be moved onto a server thread; `Any` so
+/// the simulator can reach a concrete actor (e.g. the UI client) by type.
+pub trait Actor: Any + Send {
     fn on_start(&mut self, ctx: &mut dyn Ctx);
     fn on_message(&mut self, ctx: &mut dyn Ctx, from: Endpoint, msg: Msg);
     fn on_timer(&mut self, ctx: &mut dyn Ctx, token: u64);

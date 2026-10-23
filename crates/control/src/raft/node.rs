@@ -149,6 +149,16 @@ impl<T: Clone> RaftNode<T> {
         self.leader.clone()
     }
 
+    /// Whether this node is leader and a quorum (counting itself) has
+    /// answered within the check-quorum window. A leader for which this turns
+    /// false steps down on its next `tick`.
+    pub fn has_quorum(&self, now: SimTime) -> bool {
+        let Role::Leader(p) = &self.role else { return false };
+        let window = self.cfg.election_min_ms;
+        let fresh = 1 + p.last_ack.values().filter(|&&t| now.saturating_sub(t) <= window).count();
+        fresh >= self.quorum()
+    }
+
     pub fn term(&self) -> u64 {
         self.durable.term
     }
@@ -262,13 +272,11 @@ impl<T: Clone> RaftNode<T> {
     }
 
     fn leader_tick(&mut self, now: SimTime) {
-        let (window, quorum) = (self.cfg.election_min_ms, self.quorum());
-        let Role::Leader(p) = &mut self.role else { unreachable!() };
-        let fresh = 1 + p.last_ack.values().filter(|&&t| now.saturating_sub(t) <= window).count();
-        if fresh < quorum {
+        if !self.has_quorum(now) {
             self.become_follower(now, self.durable.term, None);
             return;
         }
+        let Role::Leader(p) = &mut self.role else { unreachable!() };
         if now >= p.next_heartbeat {
             p.next_heartbeat = now + self.cfg.heartbeat_ms;
             self.broadcast_append();
@@ -701,6 +709,19 @@ mod tests {
         assert!(c.run_until(1500 + 300, stepped_down), "no SteppedDown within 1800 ms");
         assert!(!c.nodes[l].is_leader());
         assert_eq!(c.nodes[l].propose(c.now, 9), Err(NotLeader { leader_hint: None }));
+    }
+
+    #[test]
+    fn has_quorum_follows_acks_within_the_window() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(1000);
+        assert!(c.nodes[l].has_quorum(c.now));
+        assert!((0..3).filter(|&i| i != l).all(|i| !c.nodes[i].has_quorum(c.now)), "followers never have quorum");
+        c.isolate(&[l]);
+        let t0 = c.now;
+        assert!(c.nodes[l].has_quorum(t0 + 1000), "acks from just before the cut are still fresh");
+        assert!(!c.nodes[l].has_quorum(t0 + 1500 + STEP_MS + 1), "no acks for a whole window");
     }
 
     #[test]

@@ -2,8 +2,11 @@
 //! timers, dispatched to actors one at a time. Events at equal time are
 //! delivered in insertion order, so runs are fully deterministic per seed.
 
-use control::proto::Msg;
-use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, SimTime};
+use crate::fabric::Fabric;
+use control::client::{ClientActor, ClusterView, CLIENT};
+use control::proto::{ApiOp, ApiResult, Msg};
+use control::replica::CpReplica;
+use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, Svc, SimTime};
 use model::{HostId, NetworkId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -198,6 +201,45 @@ impl Engine {
         self.core.now
     }
 
+    /// The actor at `at`, if there is one and it is a `T`. Ground truth: for
+    /// tests and the simulator's own helpers, never for control logic.
+    pub fn actor<T: Actor>(&self, at: &Endpoint) -> Option<&T> {
+        let actor: &dyn Any = self.actors.get(at)?.actor.as_ref();
+        actor.downcast_ref()
+    }
+
+    /// The installed fabric. Panics if a different [`Deliver`] is installed.
+    pub fn fabric(&self) -> &Fabric {
+        self.deliver().expect("the fabric is installed")
+    }
+
+    /// What the UI client currently knows. Panics if no client is spawned.
+    pub fn client_view(&self) -> &ClusterView {
+        self.actor::<ClientActor>(&CLIENT).expect("client actor spawned").view()
+    }
+
+    /// Length of `host`'s CP replica log, if it runs one.
+    pub fn replica_log_len(&self, host: &HostId) -> Option<usize> {
+        self.actor::<CpReplica>(&Endpoint::new(Addr::Host(host.clone()), Svc::Cp)).map(CpReplica::log_len)
+    }
+
+    /// Submits `op` through the UI client now and returns its request id;
+    /// the answer arrives in [`Engine::take_api_results`].
+    pub fn api(&mut self, op: ApiOp) -> u64 {
+        self.with_actor(&CLIENT, |actor, ctx| {
+            let client: &mut dyn Any = actor;
+            client.downcast_mut::<ClientActor>().expect("client endpoint runs a ClientActor").submit(ctx, op)
+        })
+        .expect("client actor spawned")
+    }
+
+    /// Final API answers since the last call, as `(request id, result)`.
+    pub fn take_api_results(&mut self) -> Vec<(u64, ApiResult)> {
+        let Some(slot) = self.actors.get_mut(&CLIENT) else { return vec![] };
+        let client: &mut dyn Any = slot.actor.as_mut();
+        client.downcast_mut::<ClientActor>().map(ClientActor::take_results).unwrap_or_default()
+    }
+
     pub fn run_for(&mut self, ms: u64) {
         let deadline = self.core.now.saturating_add(ms);
         self.run_until(deadline, |_| false);
@@ -241,11 +283,12 @@ impl Engine {
 
     /// Runs `f` on the actor at `at` (if any) with a context. The actor is taken
     /// out of the map for the call so the context can borrow the core mutably.
-    fn with_actor(&mut self, at: &Endpoint, f: impl FnOnce(&mut dyn Actor, &mut dyn Ctx)) {
-        let Some(mut slot) = self.actors.remove(at) else { return };
+    fn with_actor<R>(&mut self, at: &Endpoint, f: impl FnOnce(&mut dyn Actor, &mut dyn Ctx) -> R) -> Option<R> {
+        let mut slot = self.actors.remove(at)?;
         let mut ctx = EngineCtx { core: &mut self.core, me: at.clone(), actor: slot.id };
-        f(slot.actor.as_mut(), &mut ctx);
+        let r = f(slot.actor.as_mut(), &mut ctx);
         self.actors.insert(at.clone(), slot);
+        Some(r)
     }
 }
 
