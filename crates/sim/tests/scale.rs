@@ -1,7 +1,8 @@
 //! Scale: the 500-host preset comes up, runs well faster than real time with
-//! its workloads, and keeps the UI's sync traffic small. The timings only mean
-//! something in an optimized build (`cargo test -p sim --release --test scale`);
-//! a debug build ignores them, so the workspace suite stays fast.
+//! its workloads, and keeps the UI's sync traffic small. Every test runs in
+//! the workspace suite (about 12 s in a debug build); the wall-clock budgets
+//! only mean something in an optimized build, so only that checks them
+//! (`cargo test -p sim --release --test scale`).
 
 use control::client::{ClientActor, CLIENT};
 use control::state::Lifecycle;
@@ -33,7 +34,6 @@ fn seeded(seed: u64) -> Engine {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_preset_ready() {
     let mut e = scale500(26);
     let started = Instant::now();
@@ -45,7 +45,6 @@ fn scale500_preset_ready() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_seed_workloads_fit() {
     let e = seeded(27);
     let s = &e.client_view().state;
@@ -57,21 +56,21 @@ fn scale500_seed_workloads_fit() {
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_runs_faster_than_realtime() {
     let mut e = seeded(28);
     let started = Instant::now();
     e.run_for(120_000);
     let wall = started.elapsed().as_secs_f64();
     eprintln!("120 sim-s with workloads took {wall:.2} wall-s");
-    assert!(wall < 40.0, "120 sim-s took {wall:.1} wall-s (budget 40)");
-    // 60x playback asks for 120 sim-s in 2 wall-s; keep well clear of losing it.
-    assert!(wall < 10.0, "120 sim-s took {wall:.1} wall-s: too slow to keep 60x playback comfortable (budget 10)");
+    if !cfg!(debug_assertions) {
+        assert!(wall < 40.0, "120 sim-s took {wall:.1} wall-s (budget 40)");
+        // 60x playback asks for 120 sim-s in 2 wall-s; keep well clear of losing it.
+        assert!(wall < 10.0, "120 sim-s took {wall:.1} wall-s: too slow to keep 60x playback comfortable (budget 10)");
+    }
     assert_eq!(ready_hosts(&e), 500);
 }
 
 #[test]
-#[cfg_attr(debug_assertions, ignore = "run with --release")]
 fn scale500_sync_payload_bounded() {
     let mut e = seeded(29);
     let client = |e: &Engine| e.actor::<ClientActor>(&CLIENT).expect("client").sync_stats();

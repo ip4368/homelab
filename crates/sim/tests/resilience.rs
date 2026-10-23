@@ -288,6 +288,9 @@ fn leader_failover_criterion_3() {
 
     assert!(e.run_until(kill_at + 6000, |e| e.true_leader().is_some_and(|n| n != l)), "no new leader within 6 s");
     let new = e.true_leader().unwrap();
+    // The moment the new leader's no-op applied: before it, neither its controllers nor the API may write.
+    assert!(e.run_until(kill_at + 6000, |e| replica(e, &new).caught_up()), "the new leader never caught up");
+    let caught_up_at = e.now();
     let deadline = e.now() + 2000;
     assert!(
         e.run_until(deadline, |e| e.client_view().leader.as_ref() == Some(&new)),
@@ -302,12 +305,16 @@ fn leader_failover_criterion_3() {
     let (new_log, commit) = (&r.durable().log, r.commit_index() as usize);
     assert!(commit >= commit_at_kill as usize);
     assert_eq!(new_log[..commit_at_kill as usize], log_at_kill[..commit_at_kill as usize], "a committed entry was lost");
-    let old_term = log_at_kill.last().unwrap().term;
-    for entry in new_log[..commit].iter().filter(|en| en.term == old_term) {
-        if let EntryPayload::Normal(LogCmd { at, .. }) = entry.payload {
-            assert!(at <= kill_at, "entry {} of the dead leader's term was stamped after the kill", entry.index);
+    // No entry was proposed in the gap: between the kill and the new leader catching up, no
+    // controller acted (the unit tests `controllers_wait_for_the_leaders_noop_to_apply`,
+    // `api_and_syncs_wait_for_the_leaders_noop_to_apply` and `minority_leader_stops_controllers`
+    // pin down the gates themselves).
+    for entry in &new_log[..commit] {
+        if let EntryPayload::Normal(LogCmd { at, ref cmd }) = entry.payload {
+            assert!(at <= kill_at || at >= caught_up_at, "entry {} ({cmd:?}) was proposed at {at}, between the kill at {kill_at} and the new leader catching up at {caught_up_at}", entry.index);
         }
     }
+    assert!(new_log[..commit].iter().any(|en| en.term == r.durable().term && matches!(en.payload, EntryPayload::Noop)), "the new leader's no-op committed");
 }
 
 #[test]

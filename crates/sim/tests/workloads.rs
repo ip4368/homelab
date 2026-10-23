@@ -431,7 +431,18 @@ fn criterion_4_host_failure() {
     let killed = e.now();
     e.fault(Fault::KillHost { host: h.clone() }).unwrap();
     let moved = |e: &Engine| vms.iter().all(|vm| running_elsewhere(e, vm, &h));
-    assert!(e.run_until(killed + 60_000 + 40_000 + 15_000, moved), "VMs of {h} not running elsewhere: {:?}", e.client_view().state.vm_status);
+    // Not before the grace period: NotReady after 40 s of silence (the last heartbeat may
+    // have been up to 5 s before the kill), then 60 s of grace.
+    let mut early = None;
+    let each = |e: &Engine| {
+        let off = vms.iter().any(|vm| vm_host(e, vm).as_ref() != Some(&h));
+        if off && early.is_none() && e.now() < killed + 35_000 + 60_000 {
+            early = Some(e.now() - killed);
+        }
+    };
+    let ok = run_checking(&mut e, killed + 60_000 + 40_000 + 15_000, each, moved);
+    assert_eq!(early, None, "a VM of {h} moved before the failover grace period");
+    assert!(ok, "VMs of {h} not running elsewhere: {:?}", e.client_view().state.vm_status);
 
     let mut rebuild_seen = false;
     let healed = run_checking(&mut e, killed + 300_000, |e| rebuild_seen |= rebuild_traffic_on_storage(e), |e| healthy_without(e, &volumes, &h));
