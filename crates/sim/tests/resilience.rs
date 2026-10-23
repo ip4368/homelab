@@ -8,15 +8,15 @@ use control::agent::HostAgent;
 use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::{EntryPayload, RaftRole};
 use control::replica::CpReplica;
-use control::state::{CpMode, Lifecycle, ObjectRef};
-use model::{HostId, ProfileId, Role};
+use control::state::{Alert, CpMode, Lifecycle, ObjectRef, Severity};
+use model::{HostId, ProfileId, Role, SwitchId, Volume};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
 use sim::faults::Fault;
 use sim::presets::Preset;
 use sim::scenario::Scenario;
 use sim::topology::PartitionMember;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
 fn three_replicas_elect_and_claim_vip() {
@@ -517,4 +517,84 @@ fn suggest_mode_only_alerts() {
     assert!(e.run_until(e.now() + 30_000, replaced), "voters: {:?}", e.client_view().state.cp.voters);
     assert_eq!(e.client_view().state.cp.voters.len(), voters.len());
     assert!(e.run_until(e.now() + 5000, |e| suggestion(e).is_none()), "the suggestion resolves once taken");
+}
+
+// ---- alerts ----
+
+fn open_alerts(e: &Engine, kind: &str) -> Vec<Alert> {
+    e.client_view().state.alerts.values().filter(|a| a.kind == kind && a.resolved_at.is_none()).cloned().collect()
+}
+
+#[test]
+fn disk_usage_alert_over_85() {
+    let mut e = default_fleet(24);
+    settle(&mut e);
+    assert!(open_alerts(&e, "DiskUsageHigh").is_empty());
+    // 1800 GB on a 2000 GB disk: 90%, plus the OS's share. Only MS-01 disks fit it.
+    api_ok(&mut e, ApiOp::CreateVolume { volume: Volume { id: "big".into(), size_gb: 1800, replicas: 2 } });
+    let placed = |e: &Engine| -> BTreeSet<(String, String)> {
+        let status = e.client_view().state.volume_status.get("big").map(|s| s.status.replicas.clone()).unwrap_or_default();
+        status.into_iter().map(|r| (r.host.to_string(), r.disk)).collect()
+    };
+    let alerted = |e: &Engine| -> BTreeSet<(String, String)> {
+        open_alerts(e, "DiskUsageHigh").into_iter().map(|a| (a.entity.id, a.subject.unwrap_or_default())).collect()
+    };
+    let deadline = e.now() + 60_000;
+    let full = |e: &Engine| placed(e).len() == 2 && alerted(e) == placed(e);
+    assert!(e.run_until(deadline, full), "placed {:?}, alerted {:?}", placed(&e), alerted(&e));
+    assert!(open_alerts(&e, "DiskUsageHigh").iter().all(|a| a.severity == Severity::Warning));
+    e.run_for(30_000);
+    assert_eq!(open_alerts(&e, "DiskUsageHigh").len(), 2, "one alert per full disk, however many samples");
+
+    api_ok(&mut e, ApiOp::DeleteVolume { id: "big".into() });
+    let deadline = e.now() + 60_000;
+    assert!(e.run_until(deadline, |e| alerted(e).is_empty()), "still alerted: {:?}", alerted(&e));
+}
+
+/// The open alerts by identity; panics if two share one.
+fn open_by_identity(e: &Engine) -> BTreeMap<(String, ObjectRef, Option<String>), String> {
+    let mut by_identity = BTreeMap::new();
+    for a in e.client_view().state.alerts.values().filter(|a| a.resolved_at.is_none()) {
+        let key = (a.kind.clone(), a.entity.clone(), a.subject.clone());
+        if let Some(other) = by_identity.insert(key.clone(), a.id.clone()) {
+            panic!("{key:?} is open twice: {other} and {}", a.id);
+        }
+    }
+    by_identity
+}
+
+#[test]
+fn alerts_deduplicated() {
+    let mut e = default_fleet(25);
+    settle(&mut e);
+    let core2 = SwitchId::from("core-2");
+    let deadline = e.now() + 35_000;
+    assert!(e.run_until(deadline, |e| e.client_view().state.switches.contains_key(&core2)), "core-2 never polled");
+    e.fault(Fault::KillSwitch { switch: core2 }).unwrap();
+    let ms01s = e.client_view().state.hosts.keys().filter(|h| h.as_str().starts_with("ms01-")).count();
+    // Polls go unanswered for 90 s before core-2 counts as unreachable.
+    let noted = |e: &Engine| {
+        let noted = |kind| open_alerts(e, kind).iter().filter(|a| a.message.ends_with("(peer switch core-2 unreachable)")).count();
+        noted("PortDown") == ms01s && noted("BondDegraded") == ms01s
+    };
+    let deadline = e.now() + 150_000;
+    assert!(e.run_until(deadline, noted), "t={} switch {:?} bonds {:?}", e.now(), open_alerts(&e, "SwitchUnreachable"), open_alerts(&e, "BondDegraded").first());
+    assert_eq!(open_alerts(&e, "SwitchUnreachable").len(), 1);
+    let before = open_by_identity(&e);
+    let mismatches = open_alerts(&e, "NetworkMismatch");
+    assert!(mismatches.iter().all(|a| !a.message.contains("not cabled")), "the cable is fine, the switch is dead: {mismatches:?}");
+
+    // A new leader judges the same conditions afresh, under a new term.
+    let old = e.true_leader().unwrap();
+    e.fault(Fault::KillHost { host: old.clone() }).unwrap();
+    let deadline = e.now() + 10_000;
+    let moved = |e: &Engine| e.true_leader().is_some_and(|l| l != old) && e.client_view().leader != Some(old.clone());
+    assert!(e.run_until(deadline, moved), "no new leader");
+    e.run_for(60_000);
+    let after = open_by_identity(&e);
+    for (key, id) in &before {
+        assert_eq!(after.get(key), Some(id), "{key:?} was raised again or resolved");
+    }
+    let still_noted = open_alerts(&e, "PortDown").iter().filter(|a| a.message.ends_with("(peer switch core-2 unreachable)")).count();
+    assert_eq!(still_noted, ms01s, "the new leader never heard where sfp1 goes, but keeps the note");
 }

@@ -2,11 +2,12 @@
 
 use crate::driver::{DriverGone, DriverHandle, OpOutcome, SPEEDS, ScenarioError};
 use crate::ws::ws_handler;
-use axum::extract::{Json, State};
+use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
 use axum::Router;
+use control::metrics::{MetricEntity, METRICS};
 use control::proto::{ApiOp, ApiResult};
 use serde::Deserialize;
 use serde_json::json;
@@ -22,6 +23,7 @@ const WALL_TIMEOUT: Duration = Duration::from_secs(10);
 pub fn app(driver: DriverHandle) -> Router {
     Router::new()
         .route("/api/ops", post(submit_op))
+        .route("/api/metrics", get(get_metrics))
         .route("/api/sim/speed", post(set_speed))
         .route("/api/sim/fault", post(inject_fault))
         .route("/api/sim/scenario", post(run_scenario))
@@ -58,17 +60,76 @@ fn ok() -> Response {
     Json(json!({ "ok": true })).into_response()
 }
 
+/// Why an operation has no `Ok` value.
+enum OpFailed {
+    /// The control plane rejected it: 400.
+    Rejected(String),
+    /// 409.
+    Paused,
+    /// The control plane could not answer: 503.
+    Unavailable,
+    Gone(DriverGone),
+}
+
+impl IntoResponse for OpFailed {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Rejected(message) => error(StatusCode::BAD_REQUEST, &message),
+            Self::Paused => paused(),
+            Self::Unavailable => unavailable(),
+            Self::Gone(gone) => gone.into_response(),
+        }
+    }
+}
+
+/// Runs `op` through the control plane: its `Ok` value, or why not.
+async fn run_op(driver: &DriverHandle, op: ApiOp) -> Result<serde_json::Value, OpFailed> {
+    match tokio::time::timeout(WALL_TIMEOUT, driver.op(op)).await {
+        Err(_) => Err(OpFailed::Unavailable),
+        Ok(Err(gone)) => Err(OpFailed::Gone(gone)),
+        Ok(Ok(OpOutcome::Paused)) => Err(OpFailed::Paused),
+        Ok(Ok(OpOutcome::Done(result))) => match result {
+            ApiResult::Ok(value) => Ok(value),
+            ApiResult::Err(message) => Err(OpFailed::Rejected(message)),
+            ApiResult::NotLeader | ApiResult::Unavailable => Err(OpFailed::Unavailable),
+        },
+    }
+}
+
 /// 200 with the [`ApiResult`] for `Ok`, 400 for a rejected operation, 503 when the control plane could not answer.
 async fn submit_op(State(driver): State<DriverHandle>, Json(op): Json<ApiOp>) -> Response {
-    match tokio::time::timeout(WALL_TIMEOUT, driver.op(op)).await {
-        Err(_) => unavailable(),
-        Ok(Err(gone)) => gone.into_response(),
-        Ok(Ok(OpOutcome::Paused)) => paused(),
-        Ok(Ok(OpOutcome::Done(result))) => match result {
-            ApiResult::Ok(_) => Json(result).into_response(),
-            ApiResult::Err(message) => error(StatusCode::BAD_REQUEST, &message),
-            ApiResult::NotLeader | ApiResult::Unavailable => unavailable(),
-        },
+    match run_op(&driver, op).await {
+        Ok(value) => Json(ApiResult::Ok(value)).into_response(),
+        Err(failed) => failed.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct MetricsQuery {
+    entity: Option<String>,
+    /// Comma-separated metric names.
+    m: Option<String>,
+}
+
+/// `?entity=host:<id>|fleet|role:<Role>|switch:<id>&m=cpu_pct,ram_pct`:
+/// 200 with `{since, series: {metric: [[t, v], ...]}}` from the leader's
+/// memory; 400 for an unknown entity or metric; otherwise as [`OpFailed`].
+async fn get_metrics(State(driver): State<DriverHandle>, Query(q): Query<MetricsQuery>) -> Response {
+    let entity = match q.entity.as_deref().map(str::parse::<MetricEntity>) {
+        Some(Ok(entity)) => entity,
+        Some(Err(message)) => return error(StatusCode::BAD_REQUEST, &message),
+        None => return error(StatusCode::BAD_REQUEST, "entity is required"),
+    };
+    let metrics: Vec<String> = q.m.unwrap_or_default().split(',').filter(|m| !m.is_empty()).map(String::from).collect();
+    if metrics.is_empty() {
+        return error(StatusCode::BAD_REQUEST, &format!("m is required: some of {}", METRICS.join(", ")));
+    }
+    if let Some(bad) = metrics.iter().find(|m| !METRICS.contains(&m.as_str())) {
+        return error(StatusCode::BAD_REQUEST, &format!("unknown metric {bad:?}: expected some of {}", METRICS.join(", ")));
+    }
+    match run_op(&driver, ApiOp::GetSeries { entity, metrics }).await {
+        Ok(value) => Json(value).into_response(),
+        Err(failed) => failed.into_response(),
     }
 }
 
@@ -176,6 +237,55 @@ mod tests {
         serde_json::to_value(op).unwrap()
     }
 
+    async fn get_json(app: &Router, path: &str) -> (StatusCode, Value) {
+        let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+        let status = res.status();
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn metrics_are_served_from_the_leaders_history() {
+        let driver = start();
+        wait_for_leader(&driver).await;
+        let app = app(driver);
+        // Hosts sample every 10 sim seconds: half a wall second at 20x.
+        let body = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (status, body) = get_json(&app, "/api/metrics?entity=fleet&m=cpu_pct,port_rx_bps").await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                if body["series"]["cpu_pct"].as_array().is_some_and(|s| s.len() >= 2) {
+                    return body;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the fleet's cpu series grows");
+        assert!(body["since"].as_u64().is_some(), "{body}");
+        let [t, v] = body["series"]["cpu_pct"][0].as_array().unwrap().as_slice() else { panic!("{body}") };
+        assert!(t.as_u64().is_some() && v.as_f64().is_some_and(|v| (0.0..=100.0).contains(&v)), "{body}");
+        assert!(body["series"]["port_rx_bps"].is_array());
+
+        let (status, body) = get_json(&app, "/api/metrics?entity=host:ms01-01&m=ram_pct").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body["series"]["ram_pct"].as_array().is_some_and(|s| !s.is_empty()), "{body}");
+
+        for bad in [
+            "/api/metrics?entity=rack:1&m=cpu_pct",
+            "/api/metrics?entity=role:Nope&m=cpu_pct",
+            "/api/metrics?entity=fleet&m=cpu_pct,bogus",
+            "/api/metrics?entity=fleet",
+            "/api/metrics?m=cpu_pct",
+            "/api/metrics?entity=host:no-such-host&m=cpu_pct",
+            "/api/metrics?entity=switch:no-such-switch&m=port_rx_bps",
+        ] {
+            let (status, body) = get_json(&app, bad).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {body}");
+            assert!(body["error"].is_string(), "{bad}: {body}");
+        }
+    }
+
     #[tokio::test]
     async fn approve_op_roundtrip() {
         let driver = start();
@@ -213,6 +323,9 @@ mod tests {
         let (status, body) = reply.await.expect("the client gives up after 5 sim seconds");
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(body, json!({"error": "control plane unavailable"}));
+        let reply = tokio::time::timeout(Duration::from_secs(6), get_json(&app, "/api/metrics?entity=fleet&m=cpu_pct"));
+        let (status, body) = reply.await.expect("reads give up too");
+        assert_eq!((status, body), (StatusCode::SERVICE_UNAVAILABLE, json!({"error": "control plane unavailable"})));
     }
 
     #[tokio::test]

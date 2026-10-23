@@ -172,6 +172,7 @@ impl TruthAlerts {
                 severity: Severity::Critical,
                 kind: SPLIT_BRAIN.into(),
                 entity: ObjectRef::vm(vm),
+                subject: None,
                 message: format!("vm {vm} runs on {} at once", hosts.join(" and ")),
                 raised_at: now,
                 resolved_at: None,

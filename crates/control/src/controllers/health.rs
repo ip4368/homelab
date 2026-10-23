@@ -5,7 +5,7 @@
 
 use super::{Action, Volatile};
 use crate::runtime::SimTime;
-use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, ObjectKind, ObjectRef, Severity};
+use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, ObjectKind, ObjectRef};
 use model::HostId;
 
 pub const NOT_READY_AFTER_MS: u64 = 40_000;
@@ -34,9 +34,9 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
                     // Stable across runs and unique per incident: an incident is
                     // the last time this leader (term) saw the host.
                     id: format!("hostdown-{id}-{}-{last_seen}", v.term),
-                    severity: Severity::Critical,
                     kind: HOST_DOWN.into(),
                     entity: ObjectRef::host(id),
+                    subject: None,
                     message: format!("{id} sent no heartbeat for {} s", NOT_READY_AFTER_MS / 1000),
                     ground_truth: false,
                 }));
@@ -140,9 +140,9 @@ mod tests {
                 Command::SetLifecycle { id: hid("h1"), lifecycle: Lifecycle::NotReady },
                 Command::RaiseAlert {
                     id: "hostdown-h1-1-5000".into(),
-                    severity: Severity::Critical,
                     kind: HOST_DOWN.into(),
                     entity: ObjectRef::host(&hid("h1")),
+                    subject: None,
                     message: "h1 sent no heartbeat for 40 s".into(),
                     ground_truth: false,
                 },

@@ -1,6 +1,7 @@
 //! Messages exchanged between actors, and the API the UI client speaks.
 //! Everything travels on the `mgmt` network ([`mgmt`]).
 
+use crate::metrics::MetricEntity;
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
 use crate::controllers::rollout::{DEFAULT_BATCH_PCT, DEFAULT_SOAK_S};
@@ -179,6 +180,10 @@ pub enum ApiOp {
     /// as a learner, is promoted once caught up, then `dead` is removed.
     /// Answered once `with` is a learner.
     ReplaceCpMember { dead: HostId, with: HostId },
+    /// Reads the leader's metrics history (nothing is written). The result
+    /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
+    /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.
+    GetSeries { entity: MetricEntity, metrics: Vec<String> },
 }
 
 fn default_batch_pct() -> u8 {

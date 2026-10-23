@@ -19,11 +19,12 @@ pub mod rollout;
 pub mod scheduler;
 pub mod storage;
 
+use crate::metrics::MetricsStore;
 use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
-use model::{HostId, NetworkId, SwitchId};
+use model::{HostId, NetworkId, PortName, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A controller command that applied with an error is not proposed again for this long.
@@ -86,8 +87,14 @@ pub struct Volatile {
     /// state includes everything committed before this leader.
     pub caught_up: bool,
     pub last_heartbeat: BTreeMap<HostId, SimTime>,
+    /// Each host's latest sample.
     pub metrics: BTreeMap<HostId, MetricSample>,
+    /// Every host's samples since this leader was elected.
+    pub history: MetricsStore,
     pub host_reports: BTreeMap<HostId, HostReport>,
+    /// The switch each host port last heard over LLDP, kept after the link
+    /// drops: where a port that is down was cabled.
+    pub lldp_seen: BTreeMap<HostId, BTreeMap<PortName, SwitchId>>,
     pub switch_reports: BTreeMap<SwitchId, SwitchReading>,
     /// When each switch was last sent a poll.
     pub switch_polled_at: BTreeMap<SwitchId, SimTime>,
@@ -133,7 +140,9 @@ impl Volatile {
             caught_up: false,
             last_heartbeat: BTreeMap::new(),
             metrics: BTreeMap::new(),
+            history: MetricsStore::new(elected_at),
             host_reports: BTreeMap::new(),
+            lldp_seen: BTreeMap::new(),
             switch_reports: BTreeMap::new(),
             switch_polled_at: BTreeMap::new(),
             net_generation: BTreeMap::new(),
@@ -173,6 +182,22 @@ impl Volatile {
     /// not heard from since the election counts as seen at the election.
     pub fn switch_last_seen(&self, id: &SwitchId) -> SimTime {
         self.switch_reports.get(id).map_or(self.elected_at, |r| r.at)
+    }
+
+    /// Files the observation `host`'s agent sent, noting the switch on the
+    /// far end of each port it hears ([`Volatile::lldp_seen`]).
+    pub fn note_report(&mut self, host: HostId, report: HostReport) {
+        let seen = self.lldp_seen.entry(host.clone()).or_default();
+        for n in &report.observed.lldp {
+            seen.insert(n.local_port.clone(), n.switch.clone());
+        }
+        self.host_reports.insert(host, report);
+    }
+
+    /// Files a metrics sample from `host`'s agent.
+    pub fn note_sample(&mut self, host: HostId, sample: MetricSample) {
+        self.history.record(host.clone(), sample.clone());
+        self.metrics.insert(host, sample);
     }
 
     /// Files the replicas `host`'s heartbeat lists, noting when each copy's

@@ -40,7 +40,7 @@ use super::scheduler::{access_switch, active_roles, agent, in_flight, RESEND_MS}
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg, ReplicaReport};
 use crate::runtime::SimTime;
-use crate::state::{Alert, ClusterState, Command, Lifecycle, ObjectKind, ObjectRef, Severity};
+use crate::state::{Alert, ClusterState, Command, Lifecycle, ObjectKind, ObjectRef};
 use model::{place_replicas, DiskView, HostId, ReplicaRef, ReplicaState, StorageHostView, VolumeHealth};
 use std::collections::BTreeMap;
 
@@ -52,11 +52,11 @@ pub const PROGRESS_STEP_PCT: u8 = 10;
 /// A copy whose reported progress has not moved for this long is abandoned.
 pub const REBUILD_STALL_MS: u64 = 60_000;
 
-/// Each volume alert's kind, the start of its ids, and its severity.
-const ALERTS: [(&str, &str, Severity); 3] = [
-    (INSUFFICIENT_STORAGE_HOSTS, "insufficientstorage", Severity::Warning),
-    (VOLUME_DEGRADED, "volumedegraded", Severity::Warning),
-    (VOLUME_FAULTED, "volumefaulted", Severity::Critical),
+/// Each volume alert's kind and the start of its ids.
+const ALERTS: [(&str, &str); 3] = [
+    (INSUFFICIENT_STORAGE_HOSTS, "insufficientstorage"),
+    (VOLUME_DEGRADED, "volumedegraded"),
+    (VOLUME_FAULTED, "volumefaulted"),
 ];
 
 pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
@@ -122,8 +122,8 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         }
         out.extend(create_replicas(state, v, now, id, size_gb, &st.replicas));
         let wanted = wanted_alerts(id, &replicas, want, short, alerts[0].is_some());
-        for (((kind, slug, severity), open), message) in ALERTS.into_iter().zip(alerts).zip(wanted) {
-            out.extend(alert(state, v, (kind, slug, severity), id, message, open));
+        for (((kind, slug), open), message) in ALERTS.into_iter().zip(alerts).zip(wanted) {
+            out.extend(alert(state, v, (kind, slug), id, message, open));
         }
     }
     // Alerts of volumes that are gone.
@@ -339,7 +339,7 @@ fn wanted_alerts(volume: &str, replicas: &[ReplicaRef], want: usize, short: bool
 fn alert(
     state: &ClusterState,
     v: &Volatile,
-    (kind, slug, severity): (&str, &str, Severity),
+    (kind, slug): (&str, &str),
     volume: &str,
     message: Option<String>,
     open: Option<&Alert>,
@@ -347,20 +347,20 @@ fn alert(
     match (open, message) {
         (Some(a), None) => Some(Action::Propose(Command::ResolveAlert { id: a.id.clone() })),
         (None, Some(message)) => {
-            let prefix = format!("{slug}-{volume}-");
-            if in_flight(v, |c| matches!(c, Command::RaiseAlert { id, .. } if id.starts_with(&prefix))) {
+            let entity = ObjectRef::volume(volume);
+            if in_flight(v, |c| matches!(c, Command::RaiseAlert { kind: k, entity: e, .. } if k == kind && *e == entity)) {
                 return None;
             }
-            let base = format!("{prefix}{}", v.term);
+            let base = format!("{slug}-{volume}-{}", v.term);
             let id = (1..)
                 .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
                 .find(|id| !state.alerts.contains_key(id))
                 .expect("some id is free");
             Some(Action::Propose(Command::RaiseAlert {
                 id,
-                severity,
                 kind: kind.into(),
-                entity: ObjectRef::volume(volume),
+                entity,
+                subject: None,
                 message,
                 ground_truth: false,
             }))
@@ -456,9 +456,9 @@ mod tests {
         apply(&mut s, proposals(&out));
         let degraded = || Command::RaiseAlert {
             id: "volumedegraded-d-1".into(),
-            severity: Severity::Warning,
             kind: VOLUME_DEGRADED.into(),
             entity: ObjectRef::volume("d"),
+            subject: None,
             message: "volume d has 2 of 3 replicas healthy".into(),
             ground_truth: false,
         };

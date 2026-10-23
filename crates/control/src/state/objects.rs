@@ -332,6 +332,12 @@ pub struct Alert {
     pub severity: Severity,
     pub kind: String,
     pub entity: ObjectRef,
+    /// What on the entity the alert is about (a port, a link, a disk), when
+    /// the entity can have several alerts of the kind. An alert's identity
+    /// is `(kind, entity, subject)`: at most one such is open at a time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub subject: Option<String>,
     pub message: String,
     #[ts(type = "number")]
     pub raised_at: SimTime,

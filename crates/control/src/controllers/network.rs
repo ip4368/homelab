@@ -18,13 +18,14 @@
 //!    would fix them, held roles and drift are written when they change. A
 //!    host whose cabling was never observed is not judged.
 //! 5. **Alert**: one `NetworkMismatch` per host while it has issues, listing
-//!    the fixes (replaced when the issues or fixes change), and a
+//!    the fixes (replaced when the issues or fixes change; a port not cabled
+//!    whose link is down is left to its `PortDown` alert), and a
 //!    `NetworkApplyFailed` for a failed or reverted generation.
 
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
-use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, NetState, NetworkResult, ObjectKind, ObjectRef, Severity};
+use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, NetState, NetworkResult, ObjectKind, ObjectRef};
 use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, ObservedSwitchPort, PortMode};
 use model::{effective_roles, render, unavailable_networks, validate_host, HostId, Issue, NetworkTemplate};
 use std::collections::{BTreeMap, BTreeSet};
@@ -221,9 +222,9 @@ fn open_alerts(state: &ClusterState) -> BTreeMap<HostId, Vec<&Alert>> {
 fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> {
     let net = &host.net;
     let id = &host.id;
-    let mismatch = (!net.issues.is_empty()).then(|| {
-        (format!("netmismatch-{id}-{}", net.issues_since), NETWORK_MISMATCH, format!("{id}: {}", net.fixes.join("; ")))
-    });
+    let fixes = alerted_fixes(state, host);
+    let mismatch = (!fixes.is_empty())
+        .then(|| (format!("netmismatch-{id}-{}", net.issues_since), NETWORK_MISMATCH, format!("{id}: {}", fixes.join("; "))));
     let failure = matches!(net.state, NetState::Failed | NetState::Reverted).then(|| {
         let why = net.error.as_deref().unwrap_or("unknown");
         let message = format!("{id}: network config generation {} not applied: {why}", net.desired_generation);
@@ -239,15 +240,34 @@ fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> 
         if !state.alerts.contains_key(&alert_id) {
             out.push(Action::Propose(Command::RaiseAlert {
                 id: alert_id,
-                severity: Severity::Warning,
                 kind: kind.into(),
                 entity: ObjectRef::host(id),
+                subject: None,
                 message,
                 ground_truth: false,
             }));
         }
     }
     out
+}
+
+/// The fixes a `NetworkMismatch` alert lists: those of the host's issues,
+/// less a port not cabled whose link is down. That port has a `PortDown`
+/// alert, and its cable is likelier fine than its far end (a dead switch).
+/// The issue stays in the host's issues for the editor.
+fn alerted_fixes(state: &ClusterState, host: &HostObj) -> Vec<String> {
+    let link_down = |port: &str| host.inventory.nics.iter().any(|n| n.name == port && !n.link_up);
+    let alerted = host.net.issues.iter().filter(|i| !matches!(i, Issue::PortNotCabled { port, .. } if link_down(port.as_str())));
+    if alerted.clone().count() == host.net.issues.len() {
+        return host.net.fixes.clone();
+    }
+    let mut fixes: Vec<String> = vec![];
+    for fix in alerted.map(|i| suggestion(state, &host.id, i)) {
+        if !fixes.contains(&fix) {
+            fixes.push(fix);
+        }
+    }
+    fixes
 }
 
 /// The change that would fix `issue` on `host`, switch-side where it can be:
@@ -287,7 +307,7 @@ mod tests {
     use super::*;
     use crate::proto::{mgmt, Msg};
     use crate::runtime::{Addr, Endpoint, Svc};
-    use crate::state::{Command, Lifecycle, NetState, NetworkResult, ObjectRef, Severity};
+    use crate::state::{Command, Lifecycle, NetState, NetworkResult, ObjectRef};
     use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort, PortMode, SwitchPortCfg};
     use model::{profile, seed_networks, seed_templates, HostId, Inventory, NetworkId, PortName, ProfileId, Role, SwitchId};
     use std::collections::BTreeMap;
@@ -493,8 +513,8 @@ mod tests {
             assert!(pushes(&out).is_empty(), "not even before it is recorded");
             let out = step(&mut s, &mut v, 32_000);
             let cmds = proposals(&out);
-            let [Command::RaiseAlert { id, severity, kind, entity, message, .. }] = cmds.as_slice() else { panic!("{out:?}") };
-            assert_eq!((id.as_str(), *severity, kind.as_str(), entity), ("netapply-m-1", Severity::Warning, NETWORK_APPLY_FAILED, &ObjectRef::host(&hid("m"))));
+            let [Command::RaiseAlert { id, kind, entity, subject: None, message, .. }] = cmds.as_slice() else { panic!("{out:?}") };
+            assert_eq!((id.as_str(), kind.as_str(), entity), ("netapply-m-1", NETWORK_APPLY_FAILED, &ObjectRef::host(&hid("m"))));
             assert!(message.contains("generation 1") && message.contains(error), "{message}");
             assert!(step(&mut s, &mut v, 32_000 + 10 * PUSH_RETRY_MS).is_empty(), "the failed generation is not pushed again");
 
@@ -536,9 +556,9 @@ mod tests {
         let out = step(&mut s, &mut v, 11_000);
         let raise = |id: &str, message: &str| Command::RaiseAlert {
             id: id.into(),
-            severity: Severity::Warning,
             kind: NETWORK_MISMATCH.into(),
             entity: ObjectRef::host(&hid("m")),
+            subject: None,
             message: message.into(),
             ground_truth: false,
         };
@@ -690,6 +710,34 @@ mod tests {
         assert_eq!(pushes(&step(&mut s, &mut v, 1000 + PUSH_RETRY_MS)), [(hid("m"), 1)]);
         v.net_results.insert(hid("m"), (1, NetworkResult::Applied));
         assert!(pushes(&step(&mut s, &mut v, 1000 + 2 * PUSH_RETRY_MS)).is_empty(), "heard back");
+    }
+
+    #[test]
+    fn a_port_not_cabled_because_its_link_is_down_is_no_mismatch() {
+        let mut s = state();
+        add_host(&mut s, "x", ProfileId::Ms01, Some("ms01-standard"), &[("mgmt", "10.0.0.3")]);
+        // The switch on sfp1's far end died: no link, so no LLDP either.
+        let observe = |s: &mut ClusterState, sfp1_up: bool| {
+            let mut inventory = Inventory::from_profile(ProfileId::Ms01, 1);
+            inventory.nics.iter_mut().find(|n| n.name == "sfp1").unwrap().link_up = sfp1_up;
+            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port) };
+            let lldp = vec![n("sfp0", "core-1", "p1"), n("eth0", "access-1", "p7")];
+            s.apply(0, Command::ObserveHost { id: hid("x"), lldp, inventory }).unwrap();
+        };
+        observe(&mut s, false);
+        let mut v = Volatile::new(0, 1);
+        for now in [0, 1000, 2000] {
+            step(&mut s, &mut v, now);
+        }
+        let not_cabled = Issue::PortNotCabled { port: PortName::from("sfp1"), networks: Default::default() };
+        assert_eq!(s.hosts[&hid("x")].net.issues, [not_cabled], "kept for the editor");
+        let mismatches = |s: &ClusterState| s.alerts.values().filter(|a| a.kind == NETWORK_MISMATCH && a.entity == ObjectRef::host(&hid("x"))).count();
+        assert_eq!(mismatches(&s), 0, "PortDown covers a port without link");
+
+        // Link without an LLDP neighbour is a cabling question after all.
+        observe(&mut s, true);
+        step(&mut s, &mut v, 3000);
+        assert_eq!(mismatches(&s), 1);
     }
 
     #[test]
