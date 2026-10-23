@@ -133,8 +133,14 @@ pub fn run(state: &ClusterState, v: &Volatile) -> Vec<Action> {
         .collect();
     let mut out = vec![];
     for host in state.hosts.values() {
-        let wanted = if managed(host.lifecycle) { conditions(host, v, &unreachable) } else { vec![] };
-        let open = open.remove(&host.id).unwrap_or_default();
+        let managed = managed(host.lifecycle);
+        let wanted = if managed { conditions(host, v, &unreachable) } else { vec![] };
+        let mut open = open.remove(&host.id).unwrap_or_default();
+        // Without a sample from the host (e.g. a leader elected since), how
+        // full its disks are is unknown: their alerts stay as they are.
+        if managed && !v.metrics.contains_key(&host.id) {
+            open.retain(|a| a.kind != DISK_USAGE_HIGH);
+        }
         out.extend(reconcile(state, host, v, &wanted, &open));
     }
     // Alerts of hosts that are gone altogether.
@@ -471,8 +477,15 @@ mod tests {
         assert_eq!(s.alerts["diskusagehigh-m-nvme0-1-20000"].severity, Severity::Warning);
         v.note_sample(hid("m"), sample(30_000, &[("nvme0", 90.0), ("nvme1", 99.0)]));
         assert!(run(&s, &v).is_empty(), "the same incidents, however full");
-        v.note_sample(hid("m"), sample(40_000, &[("nvme0", 40.0), ("nvme1", 99.0)]));
-        assert_eq!(proposals(run(&s, &v)), [Command::ResolveAlert { id: "diskusagehigh-m-nvme0-1-20000".into() }]);
+        // A new leader has no sample yet: the alerts stay, under their ids, until one comes.
+        let mut fresh = Volatile::new(35_000, 2);
+        assert!(run(&s, &fresh).is_empty(), "{:?}", run(&s, &fresh));
+        fresh.note_sample(hid("m"), sample(40_000, &[("nvme0", 40.0), ("nvme1", 99.0)]));
+        assert_eq!(proposals(run(&s, &fresh)), [Command::ResolveAlert { id: "diskusagehigh-m-nvme0-1-20000".into() }]);
+        // A host that is removed takes its alerts with it, sample or not.
+        s.apply(41_000, Command::RemoveHost { id: hid("m") }).unwrap();
+        let resolved = proposals(run(&s, &Volatile::new(41_000, 3)));
+        assert!(resolved.contains(&Command::ResolveAlert { id: "diskusagehigh-m-nvme1-1-20000".into() }), "{resolved:?}");
     }
 
     #[test]

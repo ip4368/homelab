@@ -1,4 +1,10 @@
 //! The HTTP API: user operations, simulation controls and the WebSocket.
+//!
+//! Everything that asks the control plane (`POST /api/ops`, `GET /api/metrics`)
+//! travels through the simulated fabric, which stands still while the
+//! simulation is paused: such requests are answered 409 `{"error":
+//! "simulation paused"}` at once, reads included. The UI keeps the series it
+//! last fetched while paused rather than refetching.
 
 use crate::driver::{DriverGone, DriverHandle, OpOutcome, SPEEDS, ScenarioError};
 use crate::ws::ws_handler;
@@ -113,7 +119,8 @@ struct MetricsQuery {
 
 /// `?entity=host:<id>|fleet|role:<Role>|switch:<id>&m=cpu_pct,ram_pct`:
 /// 200 with `{since, series: {metric: [[t, v], ...]}}` from the leader's
-/// memory; 400 for an unknown entity or metric; otherwise as [`OpFailed`].
+/// memory; 400 for an unknown entity or metric; otherwise as [`OpFailed`]
+/// (409 while paused: see the module docs).
 async fn get_metrics(State(driver): State<DriverHandle>, Query(q): Query<MetricsQuery>) -> Response {
     let entity = match q.entity.as_deref().map(str::parse::<MetricEntity>) {
         Some(Ok(entity)) => entity,
@@ -306,6 +313,9 @@ mod tests {
         let (status, body) = reply.await.expect("answered at once, not after a sim timeout");
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(body, json!({"error": "simulation paused"}));
+        let reply = tokio::time::timeout(Duration::from_secs(1), get_json(&app, "/api/metrics?entity=fleet&m=cpu_pct"));
+        let (status, body) = reply.await.expect("reads too are answered at once");
+        assert_eq!((status, body), (StatusCode::CONFLICT, json!({"error": "simulation paused"})));
     }
 
     #[tokio::test]

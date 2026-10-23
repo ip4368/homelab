@@ -546,6 +546,17 @@ fn disk_usage_alert_over_85() {
     e.run_for(30_000);
     assert_eq!(open_alerts(&e, "DiskUsageHigh").len(), 2, "one alert per full disk, however many samples");
 
+    // A new leader starts without samples: the alerts stay open under their ids.
+    let ids = |e: &Engine| open_alerts(e, "DiskUsageHigh").into_iter().map(|a| a.id).collect::<BTreeSet<_>>();
+    let before = ids(&e);
+    let old = e.true_leader().unwrap();
+    e.fault(Fault::KillHost { host: old.clone() }).unwrap();
+    let deadline = e.now() + 10_000;
+    let moved = |e: &Engine| e.true_leader().is_some_and(|l| l != old) && e.client_view().leader != Some(old.clone());
+    assert!(e.run_until(deadline, moved), "no new leader");
+    e.run_for(30_000);
+    assert_eq!(ids(&e), before, "resolved or raised again across the failover");
+
     api_ok(&mut e, ApiOp::DeleteVolume { id: "big".into() });
     let deadline = e.now() + 60_000;
     assert!(e.run_until(deadline, |e| alerted(e).is_empty()), "still alerted: {:?}", alerted(&e));

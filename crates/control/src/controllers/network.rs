@@ -19,7 +19,8 @@
 //!    host whose cabling was never observed is not judged.
 //! 5. **Alert**: one `NetworkMismatch` per host while it has issues, listing
 //!    the fixes (replaced when the issues or fixes change; a port not cabled
-//!    whose link is down is left to its `PortDown` alert), and a
+//!    whose link is down is left to its `PortDown` alert, and the alert is
+//!    reworded when a link coming or going changes that), and a
 //!    `NetworkApplyFailed` for a failed or reverted generation.
 
 use super::{Action, Volatile};
@@ -237,7 +238,12 @@ fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> 
         .map(|a| Action::Propose(Command::ResolveAlert { id: a.id.clone() }))
         .collect();
     for (alert_id, kind, message) in [mismatch, failure].into_iter().flatten() {
-        if !state.alerts.contains_key(&alert_id) {
+        if let Some(a) = open.iter().find(|a| a.id == alert_id) {
+            // The same incident, listing other fixes (a port's link came or went).
+            if a.message != message {
+                out.push(Action::Propose(Command::SetAlertMessage { id: alert_id, message }));
+            }
+        } else if !state.alerts.contains_key(&alert_id) {
             out.push(Action::Propose(Command::RaiseAlert {
                 id: alert_id,
                 kind: kind.into(),
@@ -738,6 +744,41 @@ mod tests {
         observe(&mut s, true);
         step(&mut s, &mut v, 3000);
         assert_eq!(mismatches(&s), 1);
+    }
+
+    #[test]
+    fn a_mismatch_is_reworded_when_a_link_changes_what_it_lists() {
+        let mut s = state();
+        add_host(&mut s, "x", ProfileId::Ms01, Some("ms01-standard"), &[("mgmt", "10.0.0.3")]);
+        // access-1 p7 sends mgmt tagged: a native VLAN mismatch, besides sfp1 not cabled.
+        let native = SwitchPortCfg { mode: PortMode::Trunk { native: Some(5), allowed: [1, 20].into() }, mtu: 9216, lacp_group: None, admin_up: true };
+        s.apply(0, observe_switch(native)).unwrap();
+        let observe = |s: &mut ClusterState, at: u64, sfp1_up: bool| {
+            let mut inventory = Inventory::from_profile(ProfileId::Ms01, 1);
+            inventory.nics.iter_mut().find(|n| n.name == "sfp1").unwrap().link_up = sfp1_up;
+            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port) };
+            let lldp = vec![n("sfp0", "core-1", "p1"), n("eth0", "access-1", "p7")];
+            s.apply(at, Command::ObserveHost { id: hid("x"), lldp, inventory }).unwrap();
+        };
+        observe(&mut s, 0, false);
+        let mut v = Volatile::new(0, 1);
+        for now in [0, 1000, 2000] {
+            step(&mut s, &mut v, now);
+        }
+        let open = |s: &ClusterState| -> Vec<(String, String)> {
+            let x = ObjectRef::host(&hid("x"));
+            s.alerts.values().filter(|a| a.kind == NETWORK_MISMATCH && a.entity == x && a.resolved_at.is_none()).map(|a| (a.id.clone(), a.message.clone())).collect()
+        };
+        let [(id, message)] = open(&s).try_into().unwrap();
+        assert_eq!(message, "x: access-1 p7: set untagged VLAN to 1 (is 5)");
+        // sfp1 gets link (but still no LLDP): the issues are the same, the alert lists one more fix.
+        observe(&mut s, 3000, true);
+        assert_eq!(proposals(&step(&mut s, &mut v, 3000)), [Command::SetAlertMessage {
+            id: id.clone(),
+            message: "x: access-1 p7: set untagged VLAN to 1 (is 5); x sfp1: not cabled".into()
+        }]);
+        assert_eq!(open(&s).len(), 1, "the same incident");
+        assert!(proposals(&step(&mut s, &mut v, 4000)).is_empty());
     }
 
     #[test]
