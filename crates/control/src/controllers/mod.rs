@@ -23,7 +23,7 @@ use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
-use model::{HostId, NetworkId, SwitchId};
+use model::{HostId, NetworkId, ReplicaState, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A controller command that applied with an error is not proposed again for this long.
@@ -115,10 +115,11 @@ pub struct Volatile {
     pub instance_stopped: BTreeMap<(HostId, String), SimTime>,
     /// When each (volume, host) was last sent `DeleteReplica`.
     pub replica_deleted: BTreeMap<(String, HostId), SimTime>,
-    /// For each copy onto a host, by (volume, host): the percentage its host
-    /// last reported, and since when it has stood there. Starts at 0 when the
-    /// first `CreateReplica` with a source is sent; dropped once complete.
-    pub copy_progress: BTreeMap<(String, HostId), (u8, SimTime)>,
+    /// For each copy onto a host, by (volume, host): the bytes its host last
+    /// reported copied, and since when that has stood. Starts at 0 when the
+    /// first `CreateReplica` with a source is sent; dropped once complete,
+    /// and when a status placing that target afresh or marking it stale is proposed.
+    pub copy_progress: BTreeMap<(String, HostId), (u64, SimTime)>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -176,17 +177,34 @@ impl Volatile {
     }
 
     /// Files the replicas `host`'s heartbeat lists, noting when each copy's
-    /// reported percentage last moved ([`Volatile::copy_progress`]).
+    /// reported bytes last moved ([`Volatile::copy_progress`]).
     pub fn note_replicas(&mut self, host: HostId, replicas: Vec<ReplicaReport>, now: SimTime) {
         for r in &replicas {
             let key = (r.volume.clone(), host.clone());
             if r.pct >= 100 {
                 self.copy_progress.remove(&key);
-            } else if self.copy_progress.get(&key).is_none_or(|(pct, _)| *pct != r.pct) {
-                self.copy_progress.insert(key, (r.pct, now));
+            } else if self.copy_progress.get(&key).is_none_or(|(bytes, _)| *bytes != r.copied_bytes) {
+                self.copy_progress.insert(key, (r.copied_bytes, now));
             }
         }
         self.replicas.insert(host, replicas);
+    }
+
+    /// Notes a controller proposal about to be made on `state`: a volume
+    /// status that places a copy on a host afresh, or marks a replica stale,
+    /// forgets that copy's progress, so an earlier copy's clock never makes
+    /// a new one look stalled.
+    pub fn note_proposed(&mut self, state: &ClusterState, cmd: &Command) {
+        let Command::SetVolumeStatus { id, replicas, .. } = cmd else { return };
+        let before = state.volume_status.get(id).map_or(&[][..], |s| &s.status.replicas[..]);
+        for r in replicas {
+            let was_live = before.iter().any(|b| b.host == r.host && b.state != ReplicaState::Stale);
+            let placed = matches!(r.state, ReplicaState::Seeding | ReplicaState::Rebuilding { .. }) && !was_live;
+            let staled = r.state == ReplicaState::Stale && was_live;
+            if placed || staled {
+                self.copy_progress.remove(&(id.clone(), r.host.clone()));
+            }
+        }
     }
 
     /// Records that the replica sent `msg` to `to`, for controllers that pace

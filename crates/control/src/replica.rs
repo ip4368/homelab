@@ -170,6 +170,7 @@ impl CpReplica {
                     if !v.may_propose(&cmd, now) {
                         continue;
                     }
+                    v.note_proposed(&self.state, &cmd);
                     if let Ok(index) = raft.propose(now, LogCmd { at: now, cmd: cmd.clone() }) {
                         v.in_flight.insert(index, cmd);
                     }
@@ -826,13 +827,13 @@ mod tests {
             observed: None,
             net_generation: 7,
             instances: vec!["vm/vm1".into(), "pod/web/0".into()],
-            replicas: vec![ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copying: true }],
+            replicas: vec![ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copied_bytes: 400, copying: true }],
         };
         rig.r.on_message(&mut rig.ctx, agent, hb);
         let v = rig.r.volatile.as_ref().unwrap();
         assert_eq!(v.net_generation[&hid("m1")], 7, "heartbeats carry the running generation");
         assert_eq!(v.instances[&hid("m1")], ["pod/web/0".to_string(), "vm/vm1".to_string()].into(), "and what the host runs");
-        let held = ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copying: true };
+        let held = ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copied_bytes: 400, copying: true };
         assert_eq!(v.replicas[&hid("m1")], [held], "and holds");
     }
 }

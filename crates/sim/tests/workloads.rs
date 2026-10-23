@@ -10,7 +10,7 @@ use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, Svc};
 use control::state::{Command, Lifecycle, ObjectKind, ObjectRef};
 use model::{
-    Deployment, HostId, NetworkId, PodPhase, PortName, ProfileId, ReplicaState, Role, Selector, SwitchId, Vm, VmPhase, Volume,
+    Deployment, HostId, NetworkId, PodPhase, PodStatus, PortName, ProfileId, ReplicaState, Role, Selector, SwitchId, Vm, VmPhase, Volume,
     VolumeHealth, TRANSCODE_CAPABILITY_PREFIX,
 };
 use sim::engine::Engine;
@@ -623,4 +623,117 @@ fn instances_lost_in_a_quick_reboot_start_again() {
     };
     assert!(e.run_until(restored + 30_000, running), "instances on {h} not started again");
     assert_eq!(e.client_view().state.hosts[&h].lifecycle, Lifecycle::Ready);
+}
+
+/// Where the copy onto `host` of `volume` comes from, if one runs.
+fn copy_source(e: &Engine, host: &HostId, volume: &str) -> Option<FlowEnd> {
+    let w = e.fabric().world();
+    let flow = w.hosts.get(host)?.replicas.get(volume)?.flow?;
+    w.traffic.flow(flow).map(|f| f.src.clone())
+}
+
+/// A small fleet with volume `data` (`size_gb`, three replicas) healthy on its MS-01s.
+fn fleet_with_volume(seed: u64, spec: FleetSpec, size_gb: u32) -> Engine {
+    let mut e = Engine::new(seed);
+    e.load_fleet(&spec, 3);
+    assert!(e.run_until(15_000, |e| e.client_view().leader.is_some()), "no leader");
+    api_all(&mut e, vec![ApiOp::CreateVolume { volume: Volume::new("data", size_gb) }]);
+    let deadline = e.now() + 30_000;
+    let healthy = |e: &Engine| e.client_view().state.volume_status.get("data").is_some_and(|v| v.status.health == VolumeHealth::Healthy);
+    assert!(e.run_until(deadline, healthy), "volume never healthy");
+    e
+}
+
+#[test]
+fn a_copy_whose_source_disk_fails_waits_for_a_real_source() {
+    let mut e = fleet_with_volume(58, FleetSpec { ms01: 3, minipc: 2, pi5: 0, rk3588: 0 }, 20);
+    let r = e.client_view().state.volume_status["data"].status.replicas[0].clone();
+    e.fault(Fault::FailDisk { host: r.host.clone(), disk: r.disk.clone() }).unwrap();
+    let deadline = e.now() + 30_000;
+    assert!(e.run_until(deadline, |e| rebuild_target(e, "data").is_some_and(|t| copy_source(e, &t, "data").is_some())), "no copy started");
+    let t = rebuild_target(&e, "data").unwrap();
+    let Some(FlowEnd::Host(source)) = copy_source(&e, &t, "data") else { panic!("copy from no host") };
+    e.run_for(2000);
+    let disk = e.fabric().world().hosts[&source].replicas["data"].disk.clone();
+    e.fault(Fault::FailDisk { host: source.clone(), disk }).unwrap();
+    let (kept, copying) = copy(&e, &t, "data").unwrap();
+    assert!(!copying && kept < 100, "the copy from the failed disk ends at {kept} %");
+    // The control plane still lists the source healthy for a heartbeat or so, and may ask
+    // again to copy from it (here such a request arrives at once): nothing may come of that.
+    e.fabric_mut().world_mut().create_replica(&t, "data", 20, Some(source.clone()));
+    assert_eq!(copy(&e, &t, "data"), Some((kept, false)), "no copy from a replica that is gone");
+    let mut progress_from_failed = false;
+    let done = |e: &Engine| e.client_view().state.volume_status["data"].status.replicas.iter().any(|x| x.host == t && x.state == ReplicaState::Healthy);
+    let deadline = e.now() + 200_000;
+    let healed = run_checking(
+        &mut e,
+        deadline,
+        |e| {
+            let src = copy_source(e, &t, "data");
+            progress_from_failed |= src == Some(FlowEnd::Host(source.clone()));
+        },
+        done,
+    );
+    assert!(healed, "{:?}", e.client_view().state.volume_status["data"]);
+    assert!(!progress_from_failed, "a copy ran from the host whose disk failed");
+    assert_eq!(copy(&e, &t, "data"), Some((100, false)));
+}
+
+#[test]
+fn a_slow_rebuild_is_not_abandoned_while_bytes_move() {
+    // Three MS-01s hold an 80 GB volume; the only other storage host is a mini PC whose
+    // link runs at 100 Mbps: its copy moves well under 1 % a minute.
+    let mut e = fleet_with_volume(59, FleetSpec { ms01: 3, minipc: 1, pi5: 0, rk3588: 0 }, 80);
+    let mini = HostId::from("minipc-01");
+    e.fault(Fault::DegradePort { host: mini.clone(), port: PortName::from("eth0"), mbps: 100 }).unwrap();
+    let r = e.client_view().state.volume_status["data"].status.replicas[0].clone();
+    assert_ne!(r.host, mini);
+    e.fault(Fault::FailDisk { host: r.host.clone(), disk: r.disk.clone() }).unwrap();
+    let deadline = e.now() + 30_000;
+    assert!(e.run_until(deadline, |e| rebuild_target(e, "data").is_some()), "no rebuild placed");
+    assert_eq!(rebuild_target(&e, "data"), Some(mini.clone()));
+    let mut abandoned = false;
+    let done = |e: &Engine| e.client_view().state.volume_status["data"].status.health == VolumeHealth::Healthy;
+    // 80 GB at 100 Mbit/s is 6400 s.
+    let deadline = e.now() + 8_000_000;
+    let healed = run_checking(
+        &mut e,
+        deadline,
+        |e| {
+            let st = &e.client_view().state.volume_status["data"].status;
+            abandoned |= st.replicas.iter().any(|x| x.host == mini && x.state == ReplicaState::Stale);
+        },
+        done,
+    );
+    assert!(!abandoned, "the slow copy was abandoned");
+    assert!(healed, "{:?}", e.client_view().state.volume_status["data"]);
+    assert!(e.client_view().state.volume_status["data"].status.replicas.iter().any(|x| x.host == mini && x.state == ReplicaState::Healthy));
+}
+
+#[test]
+fn pods_on_a_lost_host_run_elsewhere() {
+    let mut e = default_fleet(60);
+    let dep = Deployment { id: "web".into(), image: "nginx".into(), replicas: 12, cpu_m: 500, ram_mb: 512, selector: Selector::default() };
+    api_all(&mut e, vec![ApiOp::CreateDeployment { deployment: dep }]);
+    let pods_running = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.pods.len() == 12 && s.pods.values().all(|p| p.status.phase == PodPhase::Running)
+    };
+    let deadline = e.now() + 60_000;
+    assert!(e.run_until(deadline, pods_running), "pods not running");
+    let s = e.client_view().state.clone();
+    let h = s.pods.values().filter_map(|p| p.status.host.clone()).find(|h| !s.cp.voters.contains(h)).expect("a pod host that is not a CP host");
+    let on_h: Vec<String> = s.pods.values().filter(|p| p.status.host.as_ref() == Some(&h)).map(|p| PodStatus::key(&p.status.deployment, p.status.idx)).collect();
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    let elsewhere = |e: &Engine| {
+        let w = e.fabric().world();
+        pods_running(e)
+            && e.client_view().state.pods.values().all(|p| {
+                let host = p.status.host.clone().unwrap();
+                host != h && w.hosts[&host].instances.contains_key(&format!("pod/{}/{}", p.status.deployment, p.status.idx))
+            })
+    };
+    assert!(e.run_until(killed + 60_000 + 40_000 + 15_000, elsewhere), "pods {on_h:?} of {h} not running elsewhere: {:?}", e.client_view().state.pods);
+    assert!(e.now() >= killed + 60_000 + 35_000, "rescheduled before the grace period");
 }

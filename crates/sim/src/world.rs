@@ -58,6 +58,12 @@ impl Replica {
         self.base_bytes + self.flow.map_or(0.0, |f| traffic.carried_bytes(f))
     }
 
+    /// Bytes held, as the OS reports them: all of them once complete.
+    fn copied_bytes(&self, traffic: &Traffic) -> u64 {
+        let total = f64::from(self.size_gb) * 1e9;
+        if self.pct >= 100 { total as u64 } else { self.copied(traffic).min(total) as u64 }
+    }
+
     /// Ends the running copy, keeping what it got across.
     fn interrupt(&mut self, traffic: &mut Traffic) {
         if let Some((_, bytes)) = self.flow.take().and_then(|f| traffic.stop(f)) {
@@ -308,14 +314,16 @@ impl World {
     /// `source` by a [`REBUILD_MBPS`] rebuild flow on `storage`. A volume the
     /// host holds keeps its replica; if that is incomplete with no copy
     /// running (interrupted), the copy resumes from `source`. A copy only
-    /// runs while its source is powered. The replica's disk, or `None` if no
-    /// disk has room.
+    /// starts from a powered source that holds a complete replica of the
+    /// volume; with any other source the replica waits, not copying, for a
+    /// better one. The replica's disk, or `None` if no disk has room.
     pub fn create_replica(&mut self, host: &HostId, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
         if !self.hosts.get(host).is_some_and(|hw| hw.powered) {
             return None;
         }
         let source = source.filter(|s| s != host);
-        let copy_from = source.clone().filter(|s| self.hosts.get(s).is_some_and(|hw| hw.powered));
+        let complete = |hw: &HostHw| hw.replicas.get(volume).is_some_and(|r| r.pct >= 100 && !hw.failed_disks.contains(&r.disk));
+        let copy_from = source.clone().filter(|s| self.hosts.get(s).is_some_and(|hw| hw.powered && complete(hw)));
         let start = |traffic: &mut Traffic| {
             copy_from.clone().map(|s| {
                 let storage = NetworkId::from("storage");
@@ -349,7 +357,13 @@ impl World {
         let Some(hw) = self.hosts.get(host) else { return vec![] };
         hw.replicas
             .iter()
-            .map(|(v, r)| ReplicaReport { volume: v.clone(), disk: r.disk.clone(), pct: r.pct, copying: r.flow.is_some() })
+            .map(|(v, r)| ReplicaReport {
+                volume: v.clone(),
+                disk: r.disk.clone(),
+                pct: r.pct,
+                copied_bytes: r.copied_bytes(&self.traffic),
+                copying: r.flow.is_some(),
+            })
             .collect()
     }
 
@@ -689,7 +703,7 @@ mod tests {
         assert_eq!(w.create_replica(&h, "b", 100, None), Some("nvme1".into()), "nvme1 has more room now");
         assert_eq!(w.create_replica(&h, "a", 1500, None), Some("nvme0".into()), "a held volume keeps its replica");
         assert_eq!(w.create_replica(&h, "c", 1950, None), None, "no disk has room");
-        assert_eq!(w.replicas(&h), [held("a", "nvme0", 100, false), held("b", "nvme1", 100, false)]);
+        assert_eq!(w.replicas(&h), [held("a", "nvme0", 100, false, 1500), held("b", "nvme1", 100, false, 100)]);
         let u = w.usage(&h, 0).unwrap();
         assert_eq!(u.disk_pct["nvme0"], IDLE_DISK_PCT + 75.0);
         w.delete_replica(&h, "a");
@@ -699,7 +713,8 @@ mod tests {
         assert_eq!(pi.create_replica(&hid("pi"), "a", 1, None), None, "never on an SD card");
     }
 
-    /// Two MS-01s whose sfp0 (storage tagged, MTU 9000) is cabled to a jumbo trunk on `sw`.
+    /// Two MS-01s whose sfp0 (storage tagged, MTU 9000) is cabled to a jumbo
+    /// trunk on `sw`; `a` holds complete 1 GB replicas of volumes v and w.
     fn storage_pair() -> World {
         use model::network::{Attachment, Link, LinkKind};
         let mut w = World::new();
@@ -713,6 +728,9 @@ mod tests {
             };
             w.hosts.insert(hid(h), HostHw::running(ProfileId::Ms01, 0, net));
             w.topology.connect(Node::HostPort(hid(h), PortName::from("sfp0")), sp(p));
+        }
+        for v in ["v", "w"] {
+            w.create_replica(&hid("a"), v, 1, None);
         }
         w
     }
@@ -739,6 +757,27 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_only_starts_from_a_complete_replica() {
+        let mut w = storage_pair();
+        let (a, b) = (hid("a"), hid("b"));
+        assert_eq!(w.create_replica(&b, "x", 1, Some(a.clone())), Some("nvme0".into()), "a holds no x");
+        assert_eq!(w.replicas(&b)[0], held("x", "nvme0", 0, false, 1), "waiting, not copying");
+        assert_eq!(w.traffic.flows().count(), 0);
+        // A source whose replica is itself incomplete is no source either.
+        w.create_replica(&a, "y", 1, Some(b.clone()));
+        w.create_replica(&b, "y", 1, Some(a.clone()));
+        assert!(w.replicas(&b).iter().all(|r| !r.copying));
+        w.create_replica(&b, "v", 1, Some(a.clone()));
+        assert!(w.hosts[&b].replicas["v"].flow.is_some(), "a's v is complete");
+        // Once the source's disk fails, it has nothing to copy from.
+        w.fail_disk(&a, "nvme0");
+        w.fail_disk(&a, "nvme1");
+        w.delete_replica(&b, "v");
+        w.create_replica(&b, "v", 1, Some(a));
+        assert!(!w.replicas(&b).iter().any(|r| r.copying));
+    }
+
+    #[test]
     fn power_off_ends_instances_and_copies_but_keeps_replicas() {
         let mut w = storage_pair();
         w.start_instance(&hid("b"), spec("vm/a", 1000, vec![to_router(5.0, 50.0)]), 7);
@@ -748,11 +787,13 @@ mod tests {
         let hw = &w.hosts[&hid("b")];
         assert!(!hw.powered && hw.instances.is_empty());
         assert_eq!(w.traffic.flows().count(), 0);
-        assert_eq!(w.replicas(&hid("b")), [held("u", "nvme1", 100, false), held("v", "nvme0", 0, false)], "v's copy was interrupted");
+        assert_eq!(w.replicas(&hid("b")), [held("u", "nvme1", 100, false, 1), held("v", "nvme0", 0, false, 1)], "v's copy was interrupted");
     }
 
-    fn held(volume: &str, disk: &str, pct: u8, copying: bool) -> ReplicaReport {
-        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copying }
+    /// A report of a `size_gb` replica `pct` copied.
+    fn held(volume: &str, disk: &str, pct: u8, copying: bool, size_gb: u64) -> ReplicaReport {
+        let copied_bytes = size_gb * 1_000_000_000 * u64::from(pct) / 100;
+        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copied_bytes, copying }
     }
 
     #[test]
@@ -765,7 +806,7 @@ mod tests {
         f.create_replica(&b, "v", 1, Some(a.clone()));
         f.tick(1000);
         f.power_off(&a);
-        assert_eq!(report(&f, "v"), held("v", "nvme0", 25, false), "interrupted, keeping what it got");
+        assert_eq!(report(&f, "v"), held("v", "nvme0", 25, false, 1), "interrupted, keeping what it got");
         assert_eq!(f.world().traffic.flows().count(), 0);
         f.create_replica(&b, "v", 1, Some(a.clone()));
         assert!(!report(&f, "v").copying, "no copy from a dead source");
@@ -778,14 +819,14 @@ mod tests {
         assert_eq!(f.world().traffic.flows().count(), 1, "a running copy is not started twice");
         f.tick(3000);
         f.tick(4000);
-        assert_eq!(report(&f, "v"), held("v", "nvme0", 100, false));
+        assert_eq!(report(&f, "v"), held("v", "nvme0", 100, false, 1));
 
         // The target dies mid-copy and comes back.
         f.create_replica(&b, "w", 1, Some(a.clone()));
         f.tick(5000);
         f.power_off(&b);
         f.host_mut(&b).unwrap().power_on();
-        assert_eq!(report(&f, "w"), held("w", "nvme1", 25, false));
+        assert_eq!(report(&f, "w"), held("w", "nvme1", 25, false, 1));
         f.create_replica(&b, "w", 1, Some(a.clone()));
         for now in [6000, 7000, 8000] {
             f.tick(now);

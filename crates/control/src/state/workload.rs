@@ -8,7 +8,7 @@ use crate::runtime::SimTime;
 use model::{Deployment, HostId, PodPhase, PodStatus, ReplicaRef, Vm, VmPhase, VmStatus, Volume, VolumeHealth, VolumeStatus};
 
 /// Why a freshly created pod or VM is not running.
-const UNSCHEDULED: &str = "unscheduled";
+pub const UNSCHEDULED: &str = "unscheduled";
 
 impl ClusterState {
     pub(super) fn create_deployment(&mut self, v: u64, deployment: Deployment) -> Result<(), ApplyError> {

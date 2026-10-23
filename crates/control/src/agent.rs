@@ -341,7 +341,7 @@ mod tests {
         }
         fn create_replica(&mut self, volume: &str, _: u32, source: Option<HostId>) -> Option<String> {
             let pct = if source.is_some() { 0 } else { 100 };
-            self.replicas.push(ReplicaReport { volume: volume.into(), disk: "nvme0".into(), pct, copying: pct < 100 });
+            self.replicas.push(ReplicaReport { volume: volume.into(), disk: "nvme0".into(), pct, copied_bytes: 0, copying: pct < 100 });
             Some("nvme0".into())
         }
         fn replicas(&self) -> Vec<ReplicaReport> {
@@ -707,7 +707,7 @@ mod tests {
             panic!("no heartbeat: {sent:?}")
         };
         assert_eq!(instances, &["vm/vm1".to_string()]);
-        assert_eq!(replicas, &[ReplicaReport { volume: "disk2".into(), disk: "nvme0".into(), pct: 0, copying: true }]);
+        assert_eq!(replicas, &[ReplicaReport { volume: "disk2".into(), disk: "nvme0".into(), pct: 0, copied_bytes: 0, copying: true }]);
         let Some(Msg::Metrics { sample, .. }) = sent.iter().find(|m| matches!(m, Msg::Metrics { .. })) else { panic!("no metrics") };
         assert_eq!(sample.instances, 1);
     }

@@ -2,9 +2,12 @@
 //!
 //! * **VMs.** A VM whose host has been `NotReady` for more than
 //!   [`FAILOVER_GRACE_MS`] (or is gone) is placed again with that host
-//!   excluded and goes `Starting` on the new host. If nothing fits it goes
-//!   `Pending` with the reason, and the scheduler tries again every
-//!   [`NO_FIT_RETRY_MS`]. An event records either outcome.
+//!   excluded and goes `Starting` on the new host, once its volume has a
+//!   healthy replica. Otherwise it goes `Pending` with the reason (waiting
+//!   for the volume, or no fit), and the scheduler tries again, every
+//!   [`NO_FIT_RETRY_MS`] if nothing fit. An event records the outcome.
+//! * **Pods.** A pod whose host is lost goes back to `Pending` with no host
+//!   ([`UNSCHEDULED`]), so the scheduler places it again; with an event.
 //! * **Stale instances.** An instance that a host's heartbeat lists but the
 //!   state does not assign to that host (its VM or pod moved elsewhere, is
 //!   pending, or was deleted) is stopped with `StopInstance`, at most every
@@ -12,12 +15,12 @@
 //!   again a failed-over VM may run twice (split brain), which only ground
 //!   truth can show.
 
-use super::scheduler::{agent, Hosts, RESEND_MS};
+use super::scheduler::{agent, volume_ready, Hosts, RESEND_MS};
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
 use crate::runtime::SimTime;
-use crate::state::{ClusterState, Command, Lifecycle, ObjectRef};
-use model::{HostId, PlacementReq, Vm, VmPhase};
+use crate::state::{ClusterState, Command, Lifecycle, ObjectRef, UNSCHEDULED};
+use model::{HostId, PlacementReq, PodPhase, Vm, VmPhase};
 
 /// How long a host must have been `NotReady` before its VMs are restarted
 /// elsewhere and its volume replicas count as lost.
@@ -36,15 +39,29 @@ pub fn host_lost(state: &ClusterState, host: &HostId, now: SimTime) -> bool {
 }
 
 /// Restarts VM `id`, which ran on the lost host `from`, on another host: the
-/// status that places it (or says why nothing fits), and an event.
-pub(super) fn fail_over(id: &str, vm: &Vm, from: &HostId, hosts: &mut Hosts) -> Vec<Action> {
-    let (host, phase, message) = match hosts.place_excluding(&PlacementReq::vm(vm), &[from.clone()].into()) {
+/// status that places it (or says why it cannot start), and an event.
+pub(super) fn fail_over(state: &ClusterState, id: &str, vm: &Vm, from: &HostId, hosts: &mut Hosts) -> Vec<Action> {
+    let placed = volume_ready(state, &vm.volume).and_then(|()| hosts.place_excluding(&PlacementReq::vm(vm), &[from.clone()].into()));
+    let (host, phase, message) = match placed {
         Ok(to) => (Some(to.clone()), VmPhase::Starting, format!("{from} lost: restarting {id} on {to}")),
         Err(why) => (None, VmPhase::Pending(why.clone()), format!("{from} lost: {id} cannot restart, {why}")),
     };
     vec![
         Action::Propose(Command::SetVmStatus { id: id.into(), host, phase }),
         Action::Propose(Command::Event { entity: ObjectRef::vm(id), message }),
+    ]
+}
+
+/// Sends pod `idx` of `deployment`, which ran on the lost host `from`, back
+/// to the scheduler: pending with no host, and an event.
+pub(super) fn evict_pod(deployment: &str, idx: u32, from: &HostId) -> Vec<Action> {
+    let phase = PodPhase::Pending(UNSCHEDULED.into());
+    vec![
+        Action::Propose(Command::SetPodStatus { deployment: deployment.into(), idx, host: None, phase }),
+        Action::Propose(Command::Event {
+            entity: ObjectRef::pod(deployment, idx),
+            message: format!("{from} lost: rescheduling pod {deployment}/{idx}"),
+        }),
     ]
 }
 
@@ -155,6 +172,36 @@ mod tests {
         }
         let out = proposals(&scheduler::run(&s, &v, t0 + NO_FIT_RETRY_MS));
         assert_eq!(vm_statuses(&out), [Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m2")), phase: VmPhase::Starting }]);
+    }
+
+    #[test]
+    fn a_vm_whose_volume_has_no_healthy_replica_waits_for_it() {
+        let mut s = running_on_m1();
+        let stale = vec![ReplicaRef { host: hid("m1"), disk: "nvme0".into(), state: ReplicaState::Stale }];
+        s.apply(0, Command::SetVolumeStatus { id: "vm1-disk".into(), replicas: stale, health: VolumeHealth::Faulted }).unwrap();
+        not_ready(&mut s, "m1", 0);
+        let out = proposals(&scheduler::run(&s, &Volatile::new(0, 1), FAILOVER_GRACE_MS + 1000));
+        let waiting = VmPhase::Pending("waiting for volume vm1-disk".into());
+        assert_eq!(vm_statuses(&out), [Command::SetVmStatus { id: "vm1".into(), host: None, phase: waiting }]);
+    }
+
+    #[test]
+    fn pods_on_a_lost_host_go_back_to_the_scheduler() {
+        let mut s = running_on_m1();
+        s.apply(0, Command::CreateDeployment { deployment: deployment("web", 2, 100, None) }).unwrap();
+        s.apply(0, Command::SetPodStatus { deployment: "web".into(), idx: 0, host: Some(hid("m1")), phase: PodPhase::Running }).unwrap();
+        s.apply(0, Command::SetPodStatus { deployment: "web".into(), idx: 1, host: Some(hid("m1")), phase: PodPhase::Pending(STARTING.into()) }).unwrap();
+        not_ready(&mut s, "m1", 0);
+        let v = Volatile::new(0, 1);
+        let pods = |out: &[Command]| -> Vec<Command> { out.iter().filter(|c| matches!(c, Command::SetPodStatus { .. })).cloned().collect() };
+        assert!(pods(&proposals(&scheduler::run(&s, &v, FAILOVER_GRACE_MS))).is_empty(), "within the grace period");
+        let out = proposals(&scheduler::run(&s, &v, FAILOVER_GRACE_MS + 1));
+        let unscheduled = |idx| Command::SetPodStatus { deployment: "web".into(), idx, host: None, phase: PodPhase::Pending(UNSCHEDULED.into()) };
+        assert_eq!(pods(&out), [unscheduled(0), unscheduled(1)], "running or still starting");
+        assert!(out.iter().any(|c| matches!(c, Command::Event { message, .. } if message == "m1 lost: rescheduling pod web/0")), "{out:?}");
+        apply(&mut s, out);
+        let out = proposals(&scheduler::run(&s, &v, FAILOVER_GRACE_MS + 2000));
+        assert!(pods(&out).iter().all(|c| matches!(c, Command::SetPodStatus { host: Some(h), .. } if *h != hid("m1"))) && pods(&out).len() == 2, "{out:?}");
     }
 
     #[test]

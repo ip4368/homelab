@@ -9,6 +9,7 @@ mod workload;
 
 pub use command::{ApplyError, Command};
 pub use objects::*;
+pub use workload::UNSCHEDULED;
 
 use crate::controllers::join::UNKNOWN_LOCATION;
 use crate::controllers::membership::CP_REPLACEMENT_SUGGESTED;

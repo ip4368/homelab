@@ -12,8 +12,8 @@
 //! * **Lost instances.** A running pod or VM whose host's heartbeat no
 //!   longer lists it (the host rebooted within the not-ready window) goes
 //!   back to starting on the same host, so it is sent `StartInstance` again.
-//! * **Lost hosts.** A VM whose host is lost is placed again elsewhere
-//!   ([`failover`](super::failover)). Volumes are the storage controller's
+//! * **Lost hosts.** A VM whose host is lost is placed again elsewhere, a
+//!   pod is sent back to pending ([`failover`](super::failover)). Volumes are the storage controller's
 //!   ([`storage`](super::storage)).
 //!
 //! Statuses are only proposed when they would change.
@@ -199,7 +199,7 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
         let status = &st.status;
         match (&status.phase, &status.host) {
             (VmPhase::Starting | VmPhase::Running, Some(host)) if host_lost(state, host, now) => {
-                out.extend(failover::fail_over(id, vm, host, hosts));
+                out.extend(failover::fail_over(state, id, vm, host, hosts));
             }
             (VmPhase::Pending(why), _) if why.starts_with(NO_FIT) && !retry_due(status.since, now) => {}
             (VmPhase::Pending(_), _) => {
@@ -235,7 +235,7 @@ fn retry_due(since: SimTime, now: SimTime) -> bool {
 }
 
 /// A VM only starts once its volume has a healthy replica.
-fn volume_ready(state: &ClusterState, volume: &str) -> Result<(), String> {
+pub(super) fn volume_ready(state: &ClusterState, volume: &str) -> Result<(), String> {
     let healthy = state
         .volume_status
         .get(volume)
@@ -276,6 +276,7 @@ fn pods(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> 
             Action::Propose(Command::SetPodStatus { deployment: dep.clone(), idx: *idx, host, phase })
         };
         match (&status.phase, &status.host) {
+            (_, Some(host)) if host_lost(state, host, now) => out.extend(failover::evict_pod(dep, *idx, host)),
             (PodPhase::Pending(_), None) => {
                 let (host, phase) = match hosts.place(&PlacementReq::pod(d)) {
                     Ok(host) => (Some(host), PodPhase::Pending(STARTING.into())),
@@ -376,8 +377,9 @@ pub(super) mod tests {
         }
     }
 
+    /// A report of a replica `pct` copied; each percent is a million bytes.
     pub(crate) fn rep(volume: &str, disk: &str, pct: u8, copying: bool) -> ReplicaReport {
-        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copying }
+        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copied_bytes: u64::from(pct) * 1_000_000, copying }
     }
 
     pub(crate) fn seeding(host: &str) -> ReplicaRef {

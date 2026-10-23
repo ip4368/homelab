@@ -120,6 +120,9 @@ pub struct ReplicaReport {
     pub disk: String,
     /// How much of it is copied, 0 to 100.
     pub pct: u8,
+    /// How much of it is copied, in bytes: progress too fine to move `pct`
+    /// (a large volume, a slow link) still shows here.
+    pub copied_bytes: u64,
     /// Whether a copy into it is running. An incomplete replica that is not
     /// copying was interrupted (its host or source lost power) and waits for
     /// a `CreateReplica` naming a source to resume.

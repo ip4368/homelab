@@ -7,9 +7,9 @@
 //!   later ones are placed `Rebuilding` and copied from a healthy replica,
 //!   waiting until there is one. A target is never a host that holds a
 //!   replica of the volume that the status does not list (an old one, to be
-//!   deleted), nor, for a copy, a host this leader has not heard from (it
-//!   might hold one): a host's report of a complete replica only counts for
-//!   one the control plane placed there.
+//!   deleted), nor a host this leader has not heard from (it might hold
+//!   one): a host's report of a complete replica only counts for one the
+//!   control plane placed there.
 //! * **Progress.** A target's heartbeat reports its progress, which is
 //!   written in steps of [`PROGRESS_STEP_PCT`], and `Healthy` once complete.
 //!   A copy its target reports interrupted is sent again, with a healthy
@@ -171,9 +171,9 @@ fn plan(
         return (replicas, false);
     }
     let need = u8::try_from(want - live).unwrap_or(u8::MAX);
-    let mut picks = place_replicas(need, size_gb, views, &excluded(state, v, volume, &replicas, seed, false));
+    let mut picks = place_replicas(need, size_gb, views, &excluded(state, v, volume, &replicas, false));
     if picks.len() < usize::from(need) {
-        let mut relaxed = excluded(state, v, volume, &replicas, seed, true);
+        let mut relaxed = excluded(state, v, volume, &replicas, true);
         relaxed.extend(picks.iter().map(|(h, _)| h.clone()));
         picks.extend(place_replicas(need - picks.len() as u8, size_gb, views, &relaxed));
     }
@@ -191,8 +191,8 @@ fn plan(
 /// The hosts a new replica of `volume` must not go to: those of its
 /// `replicas` (unless `relaxed`, the stale ones whose host dropped its copy
 /// are allowed again), those holding a replica of it that `replicas` does
-/// not list, and for a copy (not a `seed`), those not heard from.
-fn excluded(state: &ClusterState, v: &Volatile, volume: &str, replicas: &[ReplicaRef], seed: bool, relaxed: bool) -> Vec<HostId> {
+/// not list, and those not heard from (they might hold one).
+fn excluded(state: &ClusterState, v: &Volatile, volume: &str, replicas: &[ReplicaRef], relaxed: bool) -> Vec<HostId> {
     let mut out: Vec<HostId> = replicas
         .iter()
         .filter(|r| !(relaxed && r.state == ReplicaState::Stale && dropped(state, v, volume, &r.host)))
@@ -200,7 +200,7 @@ fn excluded(state: &ClusterState, v: &Volatile, volume: &str, replicas: &[Replic
         .collect();
     for h in state.hosts.keys() {
         let unlisted = report(v, h, volume).is_some() && !replicas.iter().any(|r| r.host == *h);
-        if unlisted || (!seed && !v.replicas.contains_key(h)) {
+        if unlisted || !v.replicas.contains_key(h) {
             out.push(h.clone());
         }
     }
@@ -402,6 +402,15 @@ mod tests {
     use super::*;
     use model::{ProfileId, Role, Volume};
 
+    /// A leader of `term` that has heard from every host of `s`, which holds no replicas.
+    fn heard_from(s: &ClusterState, term: u64) -> Volatile {
+        let mut v = Volatile::new(0, term);
+        for h in s.hosts.keys() {
+            v.replicas.insert(h.clone(), vec![]);
+        }
+        v
+    }
+
     /// The actions, less alert raises.
     fn no_alerts(actions: Vec<Action>) -> Vec<Action> {
         actions.into_iter().filter(|a| !matches!(a, Action::Propose(Command::RaiseAlert { .. }))).collect()
@@ -415,7 +424,7 @@ mod tests {
     fn a_new_volume_gets_empty_replicas_status_first_then_healthy_once_reported() {
         let mut s = three_ms01();
         s.apply(0, Command::CreateVolume { volume: Volume::new("d", 40) }).unwrap();
-        let mut v = Volatile::new(0, 1);
+        let mut v = heard_from(&s, 1);
         let out = run(&s, &v, 1000);
         assert!(sends(&out).is_empty(), "nothing is sent before the status names the targets");
         let placed = vec![seeding("m1"), seeding("m3"), seeding("m2")];
@@ -525,7 +534,7 @@ mod tests {
     fn too_few_storage_hosts_leave_the_volume_degraded_with_one_alert() {
         let mut s = state(&[("m1", ProfileId::Ms01, STORAGE_VM, "a"), ("m2", ProfileId::Ms01, STORAGE_VM, "b"), ("p1", ProfileId::Pi5, &[Role::Compute], "a")]);
         s.apply(0, Command::CreateVolume { volume: Volume::new("d", 40) }).unwrap();
-        let mut v = Volatile::new(0, 4);
+        let mut v = heard_from(&s, 4);
         let out = proposals(&run(&s, &v, 1000));
         assert_eq!(out.len(), 2, "{out:?}");
         let Command::RaiseAlert { id, kind, entity, message, .. } = &out[1] else { panic!("{out:?}") };
@@ -557,7 +566,7 @@ mod tests {
         let big = vec![ReplicaRef { host: hid("m3"), disk: "nvme0".into(), state: ReplicaState::Healthy }, ReplicaRef { host: hid("m3"), disk: "nvme1".into(), state: ReplicaState::Healthy }];
         s.apply(0, Command::SetVolumeStatus { id: "big".into(), replicas: big, health: VolumeHealth::Degraded }).unwrap();
         s.apply(0, Command::CreateVolume { volume: Volume { replicas: 2, ..Volume::new("d", 20) } }).unwrap();
-        let out = proposals(&run(&s, &Volatile::new(0, 1), 1000));
+        let out = proposals(&run(&s, &heard_from(&s, 1), 1000));
         let placed = out.iter().find_map(|c| match c {
             Command::SetVolumeStatus { id, replicas, .. } if id == "d" => Some(replicas.iter().map(|r| r.host.clone()).collect::<Vec<_>>()),
             _ => None,
@@ -641,7 +650,7 @@ mod tests {
         let st = vec![healthy("m1"), healthy("m2"), rebuilding("m3", 10)];
         s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
         v.replicas.insert(hid("m3"), vec![rep("d", "nvme0", 12, true)]);
-        v.copy_progress.insert(("d".into(), hid("m3")), (12, 1000));
+        v.copy_progress.insert(("d".into(), hid("m3")), (12_000_000, 1000));
         assert!(statuses(&run(&s, &v, 1000 + REBUILD_STALL_MS)).is_empty(), "not yet");
         let out = run(&s, &v, 1001 + REBUILD_STALL_MS);
         let placed = vec![healthy("m1"), healthy("m2"), stale("m3"), rebuilding("m5", 0)];
@@ -663,10 +672,44 @@ mod tests {
         v.note_replicas(hid("m3"), vec![rep("d", "nvme0", 0, true)], 5000);
         assert_eq!(v.copy_progress[&("d".to_string(), hid("m3"))], (0, 1000));
         v.note_replicas(hid("m3"), vec![rep("d", "nvme0", 3, true)], 10_000);
-        assert_eq!(v.copy_progress[&("d".to_string(), hid("m3"))], (3, 10_000));
+        assert_eq!(v.copy_progress[&("d".to_string(), hid("m3"))], (3_000_000, 10_000));
+        // Progress too small to move the percentage still counts.
+        let crawl = ReplicaReport { copied_bytes: 3_000_001, ..rep("d", "nvme0", 3, true) };
+        v.note_replicas(hid("m3"), vec![crawl.clone()], 70_000);
+        assert_eq!(v.copy_progress[&("d".to_string(), hid("m3"))], (3_000_001, 70_000));
+        v.note_replicas(hid("m3"), vec![crawl], 75_000);
+        assert_eq!(v.copy_progress[&("d".to_string(), hid("m3"))], (3_000_001, 70_000), "no bytes: no progress");
         v.note_replicas(hid("m3"), vec![rep("d", "nvme0", 100, false)], 15_000);
         assert!(v.copy_progress.is_empty(), "complete: forgotten");
         assert_eq!(v.replicas[&hid("m3")], [rep("d", "nvme0", 100, false)]);
+    }
+
+    #[test]
+    fn placing_a_target_afresh_or_marking_it_stale_restarts_its_stall_clock() {
+        let (s, mut v) = whole(4);
+        let key = |h: &str| ("d".to_string(), hid(h));
+        for h in ["m1", "m4"] {
+            v.copy_progress.insert(key(h), (5, 0));
+        }
+        v.copy_progress.insert(key("m2"), (5, 0));
+        let cmd = Command::SetVolumeStatus {
+            id: "d".into(),
+            replicas: vec![stale("m1"), healthy("m2"), healthy("m3"), rebuilding("m4", 0)],
+            health: VolumeHealth::Rebuilding,
+        };
+        v.note_proposed(&s, &cmd);
+        assert_eq!(v.copy_progress.keys().cloned().collect::<Vec<_>>(), [key("m2")], "m1 went stale, m4 is a new target");
+        // A status that only moves an existing copy on keeps its clock.
+        let mut s = s;
+        apply(&mut s, vec![cmd]);
+        v.copy_progress.insert(key("m4"), (5, 0));
+        let progress = Command::SetVolumeStatus {
+            id: "d".into(),
+            replicas: vec![stale("m1"), healthy("m2"), healthy("m3"), rebuilding("m4", 10)],
+            health: VolumeHealth::Rebuilding,
+        };
+        v.note_proposed(&s, &progress);
+        assert!(v.copy_progress.contains_key(&key("m4")));
     }
 
     #[test]
@@ -727,12 +770,12 @@ mod tests {
         // A volume deleted and created again: m1 still holds the old one, complete.
         let mut s = three_ms01();
         s.apply(0, Command::CreateVolume { volume: Volume { replicas: 2, ..Volume::new("d", 40) } }).unwrap();
-        let mut v = Volatile::new(0, 1);
+        let mut v = heard_from(&s, 1);
         v.replicas.insert(hid("m1"), vec![rep("d", "nvme0", 100, false)]);
         let out = run(&s, &v, 1000);
         assert_eq!(statuses(&out), [(vec![seeding("m3"), seeding("m2")], VolumeHealth::Faulted)], "never on m1");
         assert_eq!(deletes(&out), [(hid("m1"), "d".to_string())]);
-        // A copy only goes to a host heard from: one not heard from might hold an old copy.
+        // Nor does a copy (or a seed) go to a host not heard from: it might hold an old copy.
         let (mut s, mut v) = whole(4);
         s.apply(0, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
         v.replicas.remove(&hid("m4"));
