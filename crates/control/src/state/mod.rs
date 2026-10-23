@@ -30,6 +30,8 @@ pub struct ClusterState {
     pub networks: BTreeMap<NetworkId, NetworkObj>,
     pub templates: BTreeMap<String, TemplateObj>,
     pub switches: BTreeMap<SwitchId, SwitchObj>,
+    /// Every rollout, done ones included; at most one is not done.
+    pub rollouts: BTreeMap<String, Rollout>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -56,6 +58,7 @@ impl ClusterState {
             networks: BTreeMap::new(),
             templates: BTreeMap::new(),
             switches: BTreeMap::new(),
+            rollouts: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
@@ -220,10 +223,7 @@ impl ClusterState {
             Command::SetCp { voters, mode } => {
                 self.cp = CpInfo { voters, mode, version: v };
             }
-            Command::UpsertNetwork { network } => {
-                self.revive(ObjectKind::Network, network.id.as_str());
-                self.networks.insert(network.id.clone(), NetworkObj { network, version: v });
-            }
+            Command::UpsertNetwork { network } => self.upsert_network(v, network),
             Command::DeleteNetwork { id } => {
                 if !self.networks.contains_key(&id) {
                     return Err(ApplyError::NotFound);
@@ -235,10 +235,7 @@ impl ClusterState {
                 self.networks.remove(&id);
                 self.tombstone(v, ObjectKind::Network, id.to_string());
             }
-            Command::UpsertTemplate { template } => {
-                self.revive(ObjectKind::Template, &template.id);
-                self.templates.insert(template.id.clone(), TemplateObj { template, version: v });
-            }
+            Command::UpsertTemplate { template } => self.upsert_template(v, template),
             Command::DeleteTemplate { id } => {
                 if !self.templates.contains_key(&id) {
                     return Err(ApplyError::NotFound);
@@ -256,6 +253,8 @@ impl ClusterState {
             Command::SetHostOverride { host, config } => {
                 let host = self.hosts.get_mut(&host).ok_or(ApplyError::NotFound)?;
                 host.override_ = config;
+                // The user's hand-written config wins over a rollout's pin.
+                host.net.pinned_config = None;
                 host.version = v;
             }
             Command::ObserveHost { id, lldp, inventory } => {
@@ -311,6 +310,91 @@ impl ClusterState {
                 self.revive(ObjectKind::Switch, id.as_str());
                 self.switches.insert(id.clone(), SwitchObj { id, model, ports, mlag_peer, last_seen, version: v });
             }
+            Command::StartRollout { id, change, hosts, batch_size, soak_ms } => {
+                if let Some(active) = self.rollouts.values().find(|r| r.is_active()) {
+                    return Err(ApplyError::RolloutInProgress(active.id.clone()));
+                }
+                if self.rollouts.contains_key(&id) {
+                    return Err(ApplyError::AlreadyExists);
+                }
+                let template_change = matches!(change, Change::Template(_));
+                match change.clone() {
+                    Change::Template(t) => self.upsert_template(v, t),
+                    Change::Network(n) => self.upsert_network(v, n),
+                }
+                for h in &hosts {
+                    let Some(host) = self.hosts.get_mut(h) else { continue };
+                    host.net.pinned_config = host.net.desired.clone();
+                    if template_change {
+                        host.override_ = None;
+                    }
+                    host.version = v;
+                }
+                let state = if hosts.is_empty() { RolloutState::Done } else { RolloutState::Running };
+                let r = Rollout {
+                    id: id.clone(),
+                    change,
+                    hosts,
+                    batch_size: batch_size.max(1),
+                    current_batch: 0,
+                    state,
+                    failed: vec![],
+                    soak_ms,
+                    base_generation: BTreeMap::new(),
+                    version: v,
+                };
+                self.rollouts.insert(id.clone(), r);
+                self.start_batch(v, &id);
+            }
+            Command::SoakRollout { id, batch } => {
+                let r = self.rollouts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if r.state != RolloutState::Running || r.current_batch != batch {
+                    return Err(ApplyError::InvalidRolloutState);
+                }
+                r.state = RolloutState::Soaking { until: at + r.soak_ms };
+                r.version = v;
+            }
+            Command::AdvanceRollout { id, batch } => {
+                let r = self.rollouts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if !matches!(r.state, RolloutState::Soaking { .. }) || r.current_batch != batch {
+                    return Err(ApplyError::InvalidRolloutState);
+                }
+                r.version = v;
+                if batch + 1 >= r.batches() {
+                    r.state = RolloutState::Done;
+                    r.base_generation.clear();
+                } else {
+                    r.current_batch = batch + 1;
+                    r.state = RolloutState::Running;
+                    self.start_batch(v, &id);
+                }
+            }
+            Command::PauseRollout { id, reason, failed } => {
+                let r = self.rollouts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if !matches!(r.state, RolloutState::Running | RolloutState::Soaking { .. }) {
+                    return Err(ApplyError::InvalidRolloutState);
+                }
+                r.state = RolloutState::Paused { reason };
+                r.failed = failed;
+                r.version = v;
+            }
+            Command::ResumeRollout { id } => {
+                let r = self.rollouts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if !matches!(r.state, RolloutState::Paused { .. }) {
+                    return Err(ApplyError::InvalidRolloutState);
+                }
+                r.state = RolloutState::Running;
+                r.failed.clear();
+                r.version = v;
+                // A failed generation is not pushed again: retry with the next one.
+                for id in r.batch(r.current_batch).to_vec() {
+                    if let Some(host) = self.hosts.get(&id)
+                        && matches!(host.net.state, NetState::Failed | NetState::Reverted)
+                    {
+                        r.base_generation.insert(id, host.net.desired_generation);
+                    }
+                }
+            }
         }
         self.version = v;
         Ok(())
@@ -325,6 +409,7 @@ impl ClusterState {
         upserts.extend(self.networks.values().filter(|o| o.version > v).cloned().map(Object::Network));
         upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
         upserts.extend(self.switches.values().filter(|o| o.version > v).cloned().map(Object::Switch));
+        upserts.extend(self.rollouts.values().filter(|o| o.version > v).cloned().map(Object::Rollout));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
@@ -332,6 +417,30 @@ impl ClusterState {
         }
         let removed = self.tombstones.iter().filter(|(at, _)| *at > v).map(|(_, r)| r.clone()).collect();
         Changes { version: self.version, upserts, removed }
+    }
+
+    fn upsert_network(&mut self, v: u64, network: model::LogicalNetwork) {
+        self.revive(ObjectKind::Network, network.id.as_str());
+        self.networks.insert(network.id.clone(), NetworkObj { network, version: v });
+    }
+
+    fn upsert_template(&mut self, v: u64, template: model::NetworkTemplate) {
+        self.revive(ObjectKind::Template, &template.id);
+        self.templates.insert(template.id.clone(), TemplateObj { template, version: v });
+    }
+
+    /// Starts rollout `id`'s current batch: its hosts drop their pins, so
+    /// the network controller renders the change for them, and their desired
+    /// generations are noted to tell when they applied a newer one.
+    fn start_batch(&mut self, v: u64, id: &str) {
+        let Some(r) = self.rollouts.get_mut(id) else { return };
+        r.base_generation.clear();
+        for h in r.batch(r.current_batch).to_vec() {
+            let Some(host) = self.hosts.get_mut(&h) else { continue };
+            host.net.pinned_config = None;
+            host.version = v;
+            r.base_generation.insert(h, host.net.desired_generation);
+        }
     }
 
     /// The templates and hosts (through their override) that attach `network`.

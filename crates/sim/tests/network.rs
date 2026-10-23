@@ -4,13 +4,14 @@
 
 use control::agent::HostAgent;
 use control::controllers::network::{NETWORK_APPLY_FAILED, NETWORK_MISMATCH};
-use control::proto::{ApiOp, LogCmd};
+use control::controllers::rollout::Preview;
+use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::EntryPayload;
 use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, Svc};
-use control::state::{Alert, Command, HostObj, Lifecycle, NetState, ObjectRef};
+use control::state::{Alert, Change, Command, HostObj, Lifecycle, NetState, ObjectRef, Rollout, RolloutState};
 use model::network::{LldpNeighbor, PortMode, SwitchPortCfg};
-use model::{HostId, NetworkId, PortName, ProfileId, Role, SwitchId};
+use model::{BondMode, HostId, HostNetworkConfig, LinkKind, NetworkId, NetworkTemplate, PortName, ProfileId, Role, SwitchId};
 use sim::engine::Engine;
 use sim::faults::Fault;
 use sim::presets::Preset;
@@ -369,4 +370,177 @@ fn a_host_rebooted_during_a_trial_boots_its_last_confirmed_config() {
     assert_eq!(e.fabric().world().hosts[&h].applied_net, running);
     let ready = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.lifecycle == Lifecycle::Ready);
     assert!(e.run_until(e.now() + 15_000, ready), "{:?}", host_obj(&e, &h).map(|o| o.lifecycle));
+}
+
+// ---- rollouts: preview, batches with soak, auto-pause, failover ----
+
+/// Submits `op` and runs until its answer arrives (at most 5 s).
+fn api_answer(e: &mut Engine, op: ApiOp) -> ApiResult {
+    let req = e.api(op);
+    let deadline = e.now() + 5000;
+    while e.now() < deadline {
+        e.run_for(100);
+        if let Some(r) = e.take_api_result(req) {
+            return r;
+        }
+    }
+    panic!("no answer to request {req} within 5 s");
+}
+
+fn seed_template(e: &Engine, id: &str) -> NetworkTemplate {
+    e.client_view().state.templates[id].template.clone()
+}
+
+fn rollout(e: &Engine, id: &str) -> Rollout {
+    e.client_view().state.rollouts.get(id).cloned().unwrap_or_else(|| panic!("no rollout {id}"))
+}
+
+/// Starts a rollout of `change` with the default batch size and soak; returns its id.
+fn start_rollout(e: &mut Engine, change: Change) -> String {
+    let op = ApiOp::StartRollout { change, include_overridden: false, batch_pct: 10, soak_s: 30 };
+    let ApiResult::Ok(serde_json::Value::String(id)) = api_answer(e, op) else { panic!("StartRollout refused") };
+    assert!(e.run_until(e.now() + 2000, |e| e.client_view().state.rollouts.contains_key(&id)), "rollout {id} not in the view");
+    id
+}
+
+/// `minipc-standard` with its eth0 at MTU 1500.
+fn minipc_mtu_1500(e: &Engine) -> NetworkTemplate {
+    let mut t = seed_template(e, "minipc-standard");
+    t.config.links[0].mtu = 1500;
+    t
+}
+
+/// Mini PCs whose control-plane record says they applied a config with eth0 at `mtu`.
+fn applied_with_mtu(e: &Engine, mtu: u16) -> Vec<HostId> {
+    let s = &e.client_view().state;
+    let on = |c: &Option<HostNetworkConfig>| c.as_ref().and_then(|c| c.link("eth0")).is_some_and(|l| l.mtu == mtu);
+    let minipc = |h: &&HostObj| h.profile.id == ProfileId::MiniPc;
+    s.hosts.values().filter(minipc).filter(|h| h.net.state == NetState::Applied && on(&h.net.applied)).map(|h| h.id.clone()).collect()
+}
+
+#[test]
+fn preview_counts_affected() {
+    let mut e = settled_fleet(50);
+    let mut t = seed_template(&e, "ms01-standard");
+    let LinkKind::Bond { mode, .. } = &mut t.config.links[0].kind else { panic!("bond0 comes first") };
+    *mode = BondMode::ActiveBackup;
+    let before = e.client_view().state.clone();
+    let ApiResult::Ok(json) = api_answer(&mut e, ApiOp::PreviewChange { change: Change::Template(t) }) else { panic!() };
+    let p: Preview = serde_json::from_value(json).unwrap();
+    assert_eq!((p.affected.len(), p.overridden.len()), (12, 0), "{p:?}");
+    assert!(p.affected.iter().all(|h| h.as_str().starts_with("ms01-")), "{:?}", p.affected);
+
+    // No side effects: the template and every host's desired config are as they were.
+    e.run_for(5000);
+    let after = &e.client_view().state;
+    assert_eq!(after.templates["ms01-standard"].template, before.templates["ms01-standard"].template);
+    assert!(after.rollouts.is_empty());
+    for (id, h) in &before.hosts {
+        assert_eq!(after.hosts[id].net.desired_generation, h.net.desired_generation, "{id}");
+    }
+}
+
+#[test]
+fn rollout_batches_of_10pct() {
+    let mut e = settled_fleet(51);
+    let change = Change::Template(minipc_mtu_1500(&e));
+    let id = start_rollout(&mut e, change);
+    let r = rollout(&e, &id);
+    assert_eq!((r.hosts.len(), r.batch_size), (24, 3));
+    assert!(r.hosts.iter().all(|h| h.as_str().starts_with("minipc-")));
+    assert_eq!(e.client_view().state.templates["minipc-standard"].template.config.links[0].mtu, 1500, "applied at start");
+
+    let soaking = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Soaking { .. }) && rollout(e, &id).current_batch == 0;
+    assert!(e.run_until(e.now() + 20_000, soaking), "batch 1 never soaked: {:?}", rollout(&e, &id));
+    let RolloutState::Soaking { until } = rollout(&e, &id).state else { unreachable!() };
+    let first: Vec<HostId> = r.hosts[..3].to_vec();
+    assert_eq!(applied_with_mtu(&e, 1500), first);
+    for h in &r.hosts[3..] {
+        let o = host_obj(&e, h).unwrap();
+        assert_eq!(o.net.desired.as_ref().unwrap().links[0].mtu, 9000, "{h} is pinned to its previous config");
+        assert_eq!(e.fabric().world().hosts[h].applied_net.links[0].mtu, 9000, "{h} still runs it");
+    }
+    // Exactly the first batch has it until the soak ends.
+    let more = |e: &Engine| applied_with_mtu(e, 1500).len() != 3;
+    assert!(!e.run_until(until - 500, more), "{:?} before the soak ended", applied_with_mtu(&e, 1500));
+    assert_eq!(rollout(&e, &id).current_batch, 0);
+    let six = |e: &Engine| applied_with_mtu(e, 1500).len() == 6;
+    assert!(e.run_until(until + 15_000, six), "batch 2 did not apply: {:?}", rollout(&e, &id));
+    assert_eq!(rollout(&e, &id).current_batch, 1);
+
+    let done = |e: &Engine| rollout(e, &id).state == RolloutState::Done;
+    assert!(e.run_until(e.now() + 400_000, done), "{:?}", rollout(&e, &id));
+    assert_eq!(applied_with_mtu(&e, 1500).len(), 24);
+    assert!(rollout(&e, &id).failed.is_empty());
+}
+
+#[test]
+fn rollout_pauses_on_revert() {
+    let mut e = settled_fleet(52);
+    // mgmt tagged on VLAN 1: the SBCs sit on access ports, so they lose mgmt and revert.
+    let mut t = seed_template(&e, "sbc-transcode");
+    t.config.attachments[0].tagged = true;
+    let before = e.client_view().state.clone();
+    let id = start_rollout(&mut e, Change::Template(t));
+    let r = rollout(&e, &id);
+    assert_eq!((r.hosts.len(), r.batch_size), (24, 3));
+    let paused = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Paused { .. });
+    assert!(e.run_until(e.now() + 60_000, paused), "{:?}", rollout(&e, &id));
+    let r = rollout(&e, &id);
+    let first = r.hosts[..3].to_vec();
+    assert_eq!((r.current_batch, &r.failed), (0, &first));
+    let RolloutState::Paused { reason } = &r.state else { unreachable!() };
+    assert!(first.iter().all(|h| reason.contains(h.as_str())), "{reason}");
+
+    // Paused: nothing moves on, and the remaining hosts keep what they ran.
+    e.run_for(120_000);
+    let r = rollout(&e, &id);
+    assert!(matches!(r.state, RolloutState::Paused { .. }) && r.current_batch == 0, "{r:?}");
+    for h in &r.hosts[3..] {
+        let (now, then) = (host_obj(&e, h).unwrap(), &before.hosts[h]);
+        assert_eq!((now.net.desired_generation, &now.net.desired), (then.net.desired_generation, &then.net.desired), "{h}");
+        assert_eq!(e.fabric().world().hosts[h].applied_net, *then.net.desired.as_ref().unwrap(), "{h}");
+    }
+    for h in &first {
+        assert_eq!(e.fabric().world().hosts[h].applied_net, *before.hosts[h].net.desired.as_ref().unwrap(), "{h} reverted");
+    }
+
+    // Only one rollout at a time.
+    let again = ApiOp::StartRollout { change: Change::Template(seed_template(&e, "minipc-standard")), include_overridden: false, batch_pct: 10, soak_s: 30 };
+    assert_eq!(api_answer(&mut e, again), ApiResult::Err(format!("rollout {id} in progress")));
+}
+
+#[test]
+fn rollout_survives_leader_failover() {
+    let mut e = settled_fleet(53);
+    let change = Change::Template(minipc_mtu_1500(&e));
+    let id = start_rollout(&mut e, change);
+    // Kill the leader just after batch 3 starts.
+    let third = |e: &Engine| rollout(e, &id).current_batch == 2 && rollout(e, &id).state == RolloutState::Running;
+    assert!(e.run_until(e.now() + 120_000, third), "{:?}", rollout(&e, &id));
+    let done_before: Vec<(HostId, u64)> =
+        rollout(&e, &id).hosts[..6].iter().map(|h| (h.clone(), host_obj(&e, h).unwrap().net.desired_generation)).collect();
+    let old = e.true_leader().expect("a leader");
+    e.fault(Fault::KillHost { host: old.clone() }).unwrap();
+
+    // Within 10 s a new leader finishes batch 3: the same batch, not a restart.
+    let resumed = |e: &Engine| {
+        e.true_leader().is_some_and(|l| l != old)
+            && rollout(e, &id).current_batch == 2
+            && matches!(rollout(e, &id).state, RolloutState::Soaking { .. })
+    };
+    assert!(e.run_until(e.now() + 10_000, resumed), "{:?}", rollout(&e, &id));
+    assert_eq!(applied_with_mtu(&e, 1500).len(), 9);
+
+    let mut went_back = false;
+    let done = |e: &Engine| {
+        went_back |= rollout(e, &id).current_batch < 2;
+        rollout(e, &id).state == RolloutState::Done
+    };
+    assert!(e.run_until(e.now() + 400_000, done), "{:?}", rollout(&e, &id));
+    assert!(!went_back, "current_batch went backwards");
+    assert_eq!(applied_with_mtu(&e, 1500).len(), 24);
+    for (h, generation) in done_before {
+        assert_eq!(host_obj(&e, &h).unwrap().net.desired_generation, generation, "{h} was pushed again");
+    }
 }

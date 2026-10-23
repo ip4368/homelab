@@ -12,6 +12,7 @@ pub mod health;
 pub mod join;
 pub mod network;
 pub mod observe;
+pub mod rollout;
 
 use crate::proto::{MetricSample, Msg, Observed};
 use crate::runtime::{Addr, Endpoint, SimTime};
@@ -166,5 +167,6 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(join::run(state, volatile));
     out.extend(network::run(state, volatile, now));
     out.extend(observe::run(state, volatile, now));
+    out.extend(rollout::run(state, now));
     out
 }

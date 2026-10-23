@@ -6,7 +6,8 @@ import type { Event } from "./Event";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
 import type { NetworkObj } from "./NetworkObj";
+import type { Rollout } from "./Rollout";
 import type { SwitchObj } from "./SwitchObj";
 import type { TemplateObj } from "./TemplateObj";
 
-export type Object = { "type": "Host" } & HostObj | { "type": "Token" } & JoinToken | { "type": "Rule" } & AutoApproveRule | { "type": "Alert" } & Alert | { "type": "Event" } & Event | { "type": "Cp" } & CpInfo | { "type": "Network" } & NetworkObj | { "type": "Template" } & TemplateObj | { "type": "Switch" } & SwitchObj;
+export type Object = { "type": "Host" } & HostObj | { "type": "Token" } & JoinToken | { "type": "Rule" } & AutoApproveRule | { "type": "Alert" } & Alert | { "type": "Event" } & Event | { "type": "Cp" } & CpInfo | { "type": "Network" } & NetworkObj | { "type": "Template" } & TemplateObj | { "type": "Switch" } & SwitchObj | { "type": "Rollout" } & Rollout;

@@ -1,6 +1,6 @@
 //! Commands replicated through the Raft log, and the errors `apply` can return.
 
-use super::objects::{CpMode, Lifecycle, NetworkResult, ObjectRef, Severity};
+use super::objects::{Change, CpMode, Lifecycle, NetworkResult, ObjectRef, Severity};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{
     HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId, Role,
@@ -59,6 +59,24 @@ pub enum Command {
     RecordNetworkResult { id: HostId, generation: u64, result: NetworkResult },
     /// The network controller's latest judgement of the host's desired config.
     AssessNetwork { id: HostId, issues: Vec<Issue>, fixes: Vec<String>, held_roles: BTreeMap<Role, NetworkId>, drift: bool },
+    /// Applies `change` (as `UpsertTemplate` or `UpsertNetwork` would) and
+    /// starts rolling it out to `hosts`, `batch_size` at a time with a soak of
+    /// `soak_ms` after each batch. Every listed host pins its desired config
+    /// until its batch starts; the first batch starts at once. A listed host
+    /// with an override was included on purpose: a template change drops its
+    /// override, so it runs the template once its batch starts. Fails with
+    /// `RolloutInProgress` while another rollout is not done.
+    StartRollout { id: String, change: Change, hosts: Vec<HostId>, batch_size: usize, soak_ms: u64 },
+    /// Every host of the current batch, `batch`, applied the change: soak.
+    SoakRollout { id: String, batch: usize },
+    /// The soak after the current batch, `batch`, is over: start the next batch, or finish.
+    AdvanceRollout { id: String, batch: usize },
+    /// Stops a running or soaking rollout; `failed` are the current batch's
+    /// hosts that failed or reverted the change.
+    PauseRollout { id: String, reason: String, failed: Vec<HostId> },
+    /// Runs a paused rollout's current batch again; its hosts that failed or
+    /// reverted are retried with a new generation.
+    ResumeRollout { id: String },
     /// What polling a switch showed; `last_seen` is when it answered.
     /// Creates or replaces the switch object.
     ObserveSwitch {
@@ -81,6 +99,10 @@ pub enum ApplyError {
     InUse(Vec<ObjectRef>),
     /// A result for a network config generation that is no longer the desired one.
     StaleGeneration,
+    /// Only one rollout runs at a time; this one is not done.
+    RolloutInProgress(String),
+    /// The rollout is not in a state (or at a batch) that allows this command.
+    InvalidRolloutState,
 }
 
 impl fmt::Display for ApplyError {
@@ -95,6 +117,8 @@ impl fmt::Display for ApplyError {
                 write!(f, "in use by {}", by.join(", "))
             }
             Self::StaleGeneration => f.write_str("not the desired network config generation"),
+            Self::RolloutInProgress(id) => write!(f, "rollout {id} in progress"),
+            Self::InvalidRolloutState => f.write_str("rollout state does not allow this change"),
         }
     }
 }

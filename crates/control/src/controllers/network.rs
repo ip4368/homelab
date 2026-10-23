@@ -2,7 +2,8 @@
 //! (design §6). Each run, for each host:
 //!
 //! 1. **Render** its config: the override, else its template, else its
-//!    profile's bootstrap config, with its addresses ([`render_host`]). A
+//!    profile's bootstrap config, with its addresses ([`render_host`]); a
+//!    host a rollout has not reached yet keeps its pinned config instead. A
 //!    config different from the stored desired one becomes the next
 //!    generation (`SetDesiredNetwork`).
 //! 2. **Push** the stored desired generation to the agent (`ApplyNetwork`)
@@ -59,15 +60,21 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
 }
 
 /// Hosts the controller manages: provisioned and not removed.
-fn managed(lc: Lifecycle) -> bool {
+pub(crate) fn managed(lc: Lifecycle) -> bool {
     !matches!(lc, Lifecycle::Pending | Lifecycle::Approved | Lifecycle::Removed)
 }
 
-/// The config `host` should run: its override, else its template, else the
-/// bootstrap config of its profile, with each attachment addressed from the
-/// host's `ips`. Deterministic, so it is only a new generation when an
-/// input changed.
+/// The config `host` should run: the one a rollout pinned it to until the
+/// rollout reaches it, else [`render_fresh`]. Deterministic, so it is only a
+/// new generation when an input changed.
 pub fn render_host(state: &ClusterState, host: &HostObj) -> HostNetworkConfig {
+    host.net.pinned_config.clone().unwrap_or_else(|| render_fresh(state, host))
+}
+
+/// The config the host's inputs render to, ignoring any rollout pin: its
+/// override, else its template, else the bootstrap config of its profile,
+/// with each attachment addressed from the host's `ips`.
+pub fn render_fresh(state: &ClusterState, host: &HostObj) -> HostNetworkConfig {
     render(&base_template(state, host), host.override_.as_ref(), &host.ips)
 }
 
@@ -123,7 +130,7 @@ fn record(host: &HostObj, v: &Volatile) -> Option<Action> {
 }
 
 /// Which hosts hold each address.
-fn address_owners(state: &ClusterState) -> BTreeMap<Ipv4Addr, Vec<&HostId>> {
+pub(crate) fn address_owners(state: &ClusterState) -> BTreeMap<Ipv4Addr, Vec<&HostId>> {
     let mut owners: BTreeMap<Ipv4Addr, Vec<&HostId>> = BTreeMap::new();
     for h in state.hosts.values() {
         for ip in h.ips.values() {
@@ -153,22 +160,7 @@ fn assess(
     let (issues, fixes, held_roles) = if host.lldp.is_empty() {
         (net.issues.clone(), net.fixes.clone(), net.held_roles.clone())
     } else {
-        let ports: Vec<ObservedSwitchPort> = host
-            .lldp
-            .iter()
-            .filter_map(|n| state.switches.get(&n.switch)?.ports.iter().find(|p| p.port == n.switch_port).cloned())
-            .collect();
-        // Addresses this config uses that another host holds.
-        let in_use: BTreeMap<Ipv4Addr, HostId> = running
-            .attachments
-            .iter()
-            .filter_map(|a| {
-                let ip = a.ip?;
-                let other = owners.get(&ip)?.iter().find(|o| ***o != host.id)?;
-                Some((ip, (*other).clone()))
-            })
-            .collect();
-        let issues = validate_host(running, &host.roles, networks, &host.lldp, &ports, &in_use);
+        let issues = validate_config(state, host, running, networks, owners);
         let (_, held) = effective_roles(&host.roles, &unavailable_networks(&issues));
         let mut fixes: Vec<String> = vec![];
         for fix in issues.iter().map(|i| suggestion(state, &host.id, i)) {
@@ -181,6 +173,33 @@ fn assess(
     let drift = host.override_.as_ref().is_some_and(|o| *o != base_template(state, host).config);
     let changed = net.issues != issues || net.fixes != fixes || net.held_roles != held_roles || net.drift != drift;
     changed.then(|| Action::Propose(Command::AssessNetwork { id: host.id.clone(), issues, fixes, held_roles, drift }))
+}
+
+/// What is wrong with `cfg` on `host`, judged against the host's LLDP
+/// neighbours and the observed switch ports; an address `cfg` uses that
+/// another host holds is a conflict.
+pub(crate) fn validate_config(
+    state: &ClusterState,
+    host: &HostObj,
+    cfg: &HostNetworkConfig,
+    networks: &[LogicalNetwork],
+    owners: &BTreeMap<Ipv4Addr, Vec<&HostId>>,
+) -> Vec<Issue> {
+    let ports: Vec<ObservedSwitchPort> = host
+        .lldp
+        .iter()
+        .filter_map(|n| state.switches.get(&n.switch)?.ports.iter().find(|p| p.port == n.switch_port).cloned())
+        .collect();
+    let in_use: BTreeMap<Ipv4Addr, HostId> = cfg
+        .attachments
+        .iter()
+        .filter_map(|a| {
+            let ip = a.ip?;
+            let other = owners.get(&ip)?.iter().find(|o| ***o != host.id)?;
+            Some((ip, (*other).clone()))
+        })
+        .collect();
+    validate_host(cfg, &host.roles, networks, &host.lldp, &ports, &in_use)
 }
 
 /// Open `NetworkMismatch` and `NetworkApplyFailed` alerts, by host.

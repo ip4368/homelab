@@ -3,7 +3,8 @@
 
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
-use crate::state::{Changes, Command, NetworkResult};
+use crate::controllers::rollout::{DEFAULT_BATCH_PCT, DEFAULT_SOAK_S};
+use crate::state::{Change, Changes, Command, NetworkResult};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
@@ -65,6 +66,29 @@ pub enum ApiOp {
     SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
     UpsertRule { id: String, profile: ProfileId, roles: BTreeSet<Role>, template: Option<String> },
     DeleteRule { id: String },
+    /// What `change` would do; changes nothing. The result is a `Preview`.
+    PreviewChange { change: Change },
+    /// Applies `change` and rolls it out to the affected hosts in batches of
+    /// `batch_pct` percent, soaking `soak_s` seconds after each. Hosts with an
+    /// override are skipped unless `include_overridden`. The result is the rollout id.
+    StartRollout {
+        change: Change,
+        include_overridden: bool,
+        #[serde(default = "default_batch_pct")]
+        batch_pct: u8,
+        #[serde(default = "default_soak_s")]
+        soak_s: u32,
+    },
+    PauseRollout { id: String },
+    ResumeRollout { id: String },
+}
+
+fn default_batch_pct() -> u8 {
+    DEFAULT_BATCH_PCT
+}
+
+fn default_soak_s() -> u32 {
+    DEFAULT_SOAK_S
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

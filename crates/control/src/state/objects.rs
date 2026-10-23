@@ -142,6 +142,10 @@ pub struct HostNet {
     pub drift: bool,
     /// Roles held inactive, each with the first unavailable network it needs.
     pub held_roles: BTreeMap<Role, NetworkId>,
+    /// While a rollout has not reached the host's batch: the desired config
+    /// it had when the rollout started, which the network controller keeps
+    /// instead of rendering the changed template.
+    pub pinned_config: Option<HostNetworkConfig>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -206,6 +210,72 @@ pub struct SwitchObj {
     pub last_seen: SimTime,
     #[ts(type = "number")]
     pub version: u64,
+}
+
+/// An edit to a template or a logical network, as previewed and rolled out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum Change {
+    Template(NetworkTemplate),
+    Network(LogicalNetwork),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum RolloutState {
+    /// The current batch is being pushed.
+    Running,
+    /// The current batch applied everywhere; the next starts at `until`.
+    Soaking {
+        #[ts(type = "number")]
+        until: SimTime,
+    },
+    /// Stopped by a failure in the current batch, or by the user.
+    Paused { reason: String },
+    Done,
+}
+
+/// A change rolled out to its affected hosts batch by batch: batch `k` is
+/// `hosts[k * batch_size..]`, at most `batch_size` of them. The change itself
+/// applied when the rollout started; hosts whose batch has not started stay
+/// on their `pinned_config`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Rollout {
+    pub id: String,
+    pub change: Change,
+    pub hosts: Vec<HostId>,
+    pub batch_size: usize,
+    pub current_batch: usize,
+    pub state: RolloutState,
+    /// Hosts of the current batch that failed or reverted the new config.
+    pub failed: Vec<HostId>,
+    #[ts(type = "number")]
+    pub soak_ms: u64,
+    /// Each current-batch host's desired generation when its batch started
+    /// (or was resumed); it is done once it applied a later one.
+    #[ts(type = "{ [key: string]: number }")]
+    pub base_generation: BTreeMap<HostId, u64>,
+    #[ts(type = "number")]
+    pub version: u64,
+}
+
+impl Rollout {
+    pub fn batches(&self) -> usize {
+        self.hosts.len().div_ceil(self.batch_size.max(1))
+    }
+
+    /// The hosts of batch `k`; empty past the last one.
+    pub fn batch(&self, k: usize) -> &[HostId] {
+        let size = self.batch_size.max(1);
+        let start = (k * size).min(self.hosts.len());
+        &self.hosts[start..(start + size).min(self.hosts.len())]
+    }
+
+    /// Running, soaking or paused: not yet done.
+    pub fn is_active(&self) -> bool {
+        self.state != RolloutState::Done
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -276,6 +346,7 @@ pub enum ObjectKind {
     Network,
     Template,
     Switch,
+    Rollout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -316,6 +387,7 @@ pub enum Object {
     Network(NetworkObj),
     Template(TemplateObj),
     Switch(SwitchObj),
+    Rollout(Rollout),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

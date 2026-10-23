@@ -75,6 +75,10 @@ impl ClusterView {
                     s.revive(ObjectKind::Switch, o.id.as_str());
                     s.switches.insert(o.id.clone(), o);
                 }
+                Object::Rollout(o) => {
+                    s.revive(ObjectKind::Rollout, &o.id);
+                    s.rollouts.insert(o.id.clone(), o);
+                }
             }
         }
         for ObjectRef { kind, id } in changes.removed {
@@ -107,6 +111,9 @@ impl ClusterView {
                 }
                 ObjectKind::Switch => {
                     s.switches.remove(&SwitchId::new(id));
+                }
+                ObjectKind::Rollout => {
+                    s.rollouts.remove(&id);
                 }
             }
         }

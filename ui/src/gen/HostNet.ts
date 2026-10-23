@@ -50,4 +50,10 @@ drift: boolean,
 /**
  * Roles held inactive, each with the first unavailable network it needs.
  */
-held_roles: { [key in Role]?: NetworkId }, };
+held_roles: { [key in Role]?: NetworkId }, 
+/**
+ * While a rollout has not reached the host's batch: the desired config
+ * it had when the rollout started, which the network controller keeps
+ * instead of rendering the changed template.
+ */
+pinned_config: HostNetworkConfig | null, };

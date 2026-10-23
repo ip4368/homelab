@@ -3,6 +3,7 @@
 //! and syncs, and runs the controllers; followers only replicate.
 
 use crate::controllers::join::{self, JoinOutcome};
+use crate::controllers::rollout;
 use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
@@ -171,8 +172,11 @@ impl CpReplica {
         if !raft.has_quorum(now) {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Unavailable });
         }
-        let (cmd, ok) = command_for(ctx, op);
         let term = raft.term();
+        let (cmd, ok) = match handle_op(ctx, &self.state, term, op) {
+            Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
+            Handling::Propose(cmd, ok) => (cmd, ok),
+        };
         let index = raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above");
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
@@ -264,14 +268,33 @@ impl CpReplica {
     }
 }
 
-/// The command for a client op and the value to answer with once it applies.
-fn command_for(ctx: &mut dyn Ctx, op: ApiOp) -> (Command, serde_json::Value) {
+/// What the leader does with a client op.
+enum Handling {
+    /// Answer now; nothing to write.
+    Answer(ApiResult),
+    /// Propose the command; answer with the value once it applies.
+    Propose(Command, serde_json::Value),
+}
+
+/// How the leader of `term` handles `op`, given its state.
+fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> Handling {
     let cmd = match op {
         ApiOp::CreateJoinToken => {
             let token = format!("{:016x}", ctx.rand_u64());
             let ok = serde_json::Value::String(token.clone());
-            return (Command::CreateJoinToken { token, ttl_ms: JOIN_TOKEN_TTL_MS }, ok);
+            return Handling::Propose(Command::CreateJoinToken { token, ttl_ms: JOIN_TOKEN_TTL_MS }, ok);
         }
+        ApiOp::PreviewChange { change } => {
+            let preview = serde_json::to_value(rollout::preview(state, &change)).expect("a preview serializes");
+            return Handling::Answer(ApiResult::Ok(preview));
+        }
+        ApiOp::StartRollout { change, include_overridden, batch_pct, soak_s } => {
+            let id = format!("rollout-{term}-{}", ctx.now());
+            let cmd = rollout::start(state, id.clone(), change, include_overridden, batch_pct, soak_s);
+            return Handling::Propose(cmd, serde_json::Value::String(id));
+        }
+        ApiOp::PauseRollout { id } => Command::PauseRollout { id, reason: "paused by the user".into(), failed: vec![] },
+        ApiOp::ResumeRollout { id } => Command::ResumeRollout { id },
         ApiOp::ApproveHost { id, roles } => Command::ApproveHost { id, roles },
         ApiOp::SetRoles { id, roles } => Command::SetRoles { id, roles },
         ApiOp::SetLabels { id, labels } => Command::SetLabels { id, labels },
@@ -282,7 +305,7 @@ fn command_for(ctx: &mut dyn Ctx, op: ApiOp) -> (Command, serde_json::Value) {
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
     };
-    (cmd, serde_json::Value::Null)
+    Handling::Propose(cmd, serde_json::Value::Null)
 }
 
 fn reply(ctx: &mut dyn Ctx, p: &PendingApi, result: ApiResult) {
