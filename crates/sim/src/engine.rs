@@ -254,9 +254,13 @@ impl HostOs for EngineCtx<'_> {
     fn instances(&self) -> Vec<String> {
         self.world().instances(&self.host_id())
     }
-    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId) {
+    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId, deadline: SimTime) {
         let (host, seed) = (self.host_id(), self.core.rng.next_u64());
-        self.workloads().migrate_in(&host, spec, from, seed);
+        self.workloads().migrate_in(&host, spec, from, deadline, seed);
+    }
+    fn abort_migration(&mut self, id: &str) {
+        let host = self.host_id();
+        self.workloads().abort_migration(&host, id);
     }
     fn migrations(&self) -> Vec<String> {
         self.world().migrations(&self.host_id())

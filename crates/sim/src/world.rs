@@ -50,6 +50,8 @@ pub struct Incoming {
     pub from: HostId,
     /// The migration flow carrying its memory: `ram_mb` × 8 Mbit in all.
     pub flow: u64,
+    /// When it is given up if not complete.
+    pub deadline: SimTime,
 }
 
 impl Instance {
@@ -325,13 +327,22 @@ impl World {
     /// `from`: an incoming instance, not running yet, whose memory (`ram_mb` ×
     /// 8 Mbit) a [`MIGRATION_MBPS`] migration flow on `migration` copies from
     /// `from`. Once that is complete the instance takes over: it runs, and
-    /// `from`'s instance ends ([`World::advance_migrations`]). A host that
-    /// already has the instance, incoming or running, changes nothing.
-    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, seed: u64) {
+    /// `from`'s instance ends ([`World::advance_migrations`]); it is given up
+    /// instead at `deadline`, or once `from` no longer runs the VM. A host
+    /// that already has the instance, incoming or running, changes nothing.
+    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, deadline: SimTime, seed: u64) {
         let Some(hw) = self.hosts.get_mut(host).filter(|hw| hw.powered && !hw.instances.contains_key(&spec.id)) else { return };
         let migration = NetworkId::from("migration");
         let flow = self.traffic.start(FlowEnd::Host(from.clone()), FlowEnd::Host(host.clone()), migration, MIGRATION_MBPS, FlowKind::Migration, None);
-        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows: vec![], incoming: Some(Incoming { from, flow }) });
+        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows: vec![], incoming: Some(Incoming { from, flow, deadline }) });
+    }
+
+    /// Gives up instance `id` on `host` if it is migrating in, ending its
+    /// copy; one that runs is left alone.
+    pub fn abort_migration(&mut self, host: &HostId, id: &str) {
+        if self.hosts.get(host).and_then(|hw| hw.instances.get(id)).is_some_and(|i| i.incoming.is_some()) {
+            self.stop_instance(host, id);
+        }
     }
 
     /// Stops instance `id` on `host`, taking its flows off the wire.
@@ -348,29 +359,45 @@ impl World {
         hw.instances.iter().filter(|(_, i)| i.incoming.is_none()).map(|(id, _)| id.clone()).collect()
     }
 
+    /// Whether powered `host` runs instance `id` (not just migrating it in).
+    fn runs(&self, host: &HostId, id: &str) -> bool {
+        self.hosts.get(host).is_some_and(|hw| hw.powered && hw.instances.get(id).is_some_and(|i| i.incoming.is_none()))
+    }
+
     /// The instances migrating in to `host`.
     pub fn migrations(&self, host: &HostId) -> Vec<String> {
         let Some(hw) = self.hosts.get(host) else { return vec![] };
         hw.instances.iter().filter(|(_, i)| i.incoming.is_some()).map(|(id, _)| id.clone()).collect()
     }
 
-    /// Completes every live migration whose flow has carried the VM's memory
+    /// Gives up every live migration past its deadline, or whose source no
+    /// longer runs the VM (powered off, stopped, or taken over elsewhere).
+    /// Then completes every one whose flow has carried the VM's memory
     /// (`ram_mb` × 1e6 bytes): its flow ends, the source's instance ends
     /// with it, and the target's instance runs, putting its own flows on the wire.
-    pub fn advance_migrations(&mut self) {
+    pub fn advance_migrations(&mut self, now: SimTime) {
         let mut done: Vec<(HostId, String, HostId)> = vec![];
+        let mut given_up: Vec<(HostId, String)> = vec![];
         for (host, hw) in &self.hosts {
             for (id, i) in &hw.instances {
                 let Some(m) = &i.incoming else { continue };
-                if self.traffic.carried_bytes(m.flow) >= f64::from(i.spec.ram_mb) * 1e6 {
+                if now >= m.deadline || !self.runs(&m.from, id) {
+                    given_up.push((host.clone(), id.clone()));
+                } else if self.traffic.carried_bytes(m.flow) >= f64::from(i.spec.ram_mb) * 1e6 {
                     done.push((host.clone(), id.clone(), m.from.clone()));
                 }
             }
         }
+        for (host, id) in given_up {
+            self.stop_instance(&host, &id);
+        }
         for (host, id, from) in done {
-            if from != host {
-                self.stop_instance(&from, &id);
+            // Two targets of one VM: only the first to complete takes over.
+            if !self.runs(&from, &id) {
+                self.stop_instance(&host, &id);
+                continue;
             }
+            self.stop_instance(&from, &id);
             let Some(i) = self.hosts.get_mut(&host).and_then(|hw| hw.instances.get_mut(&id)) else { continue };
             if let Some(m) = i.incoming.take() {
                 self.traffic.stop(m.flow);
@@ -782,6 +809,9 @@ mod tests {
         assert_eq!(pi.create_replica(&hid("pi"), "a", 1, None), None, "never on an SD card");
     }
 
+    /// A deadline that never comes.
+    const NEVER: SimTime = SimTime::MAX;
+
     /// Two MS-01s whose sfp0 (storage tagged, MTU 9000) is cabled to a jumbo
     /// trunk on `sw`; `a` holds complete 1 GB replicas of volumes v and w.
     fn storage_pair() -> World {
@@ -848,15 +878,15 @@ mod tests {
         assert!(!w.replicas(&b).iter().any(|r| r.copying));
     }
 
-    /// Two MS-01s whose sfp0 (migration tagged, MTU 9000) is cabled to a
+    /// Three MS-01s whose sfp0 (migration tagged, MTU 9000) is cabled to a
     /// jumbo trunk on `sw` allowing VLAN 30; `a` runs `vm/x` (4 GB of RAM).
     fn migration_pair() -> World {
         use model::network::{Attachment, Link, LinkKind};
         let mut w = World::new();
         let cfg = SwitchPortCfg { mode: PortMode::Trunk { native: None, allowed: [30].into() }, mtu: 9216, lacp_group: None, admin_up: true };
-        let ports = ["p1", "p2"].map(|p| (PortName::from(p), (10_000, cfg.clone()))).into();
+        let ports = ["p1", "p2", "p3"].map(|p| (PortName::from(p), (10_000, cfg.clone()))).into();
         w.topology.add_switch(Switch { id: SwitchId::from("sw"), model: "t".into(), ports, mlag_peer: None, up: true });
-        for (h, p) in [("a", "p1"), ("b", "p2")] {
+        for (h, p) in [("a", "p1"), ("b", "p2"), ("c", "p3")] {
             let net = HostNetworkConfig {
                 links: vec![Link { name: "data".into(), kind: LinkKind::Single(PortName::from("sfp0")), mtu: 9000 }],
                 attachments: vec![Attachment { network: NetworkId::from("migration"), link: "data".into(), tagged: true, ip: None }],
@@ -873,7 +903,7 @@ mod tests {
         use crate::engine::Deliver;
         let (a, b) = (hid("a"), hid("b"));
         let mut w = migration_pair();
-        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
         assert!(w.instances(&b).is_empty(), "an incoming instance is not running yet");
         assert_eq!(w.migrations(&b), ["vm/x"]);
         let f = w.traffic.flows().next().unwrap().clone();
@@ -895,19 +925,69 @@ mod tests {
     fn an_incoming_instance_is_started_once_and_ends_with_its_host_or_a_stop() {
         let (a, b) = (hid("a"), hid("b"));
         let mut w = migration_pair();
-        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
-        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 9);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 9);
         assert_eq!(w.traffic.flows().count(), 1, "a repeat changes nothing");
         w.stop_instance(&b, "vm/x");
         assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0, "stopped: its copy ends");
         assert_eq!(w.instances(&a), ["vm/x"], "the source runs on");
-        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
         w.power_off(&b);
         assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0, "power loss ends it");
-        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
         assert!(w.migrations(&b).is_empty(), "a powered-off host takes nothing");
-        w.migrate_in(&a, spec("vm/x", 1000, vec![]), b, 8);
+        w.migrate_in(&a, spec("vm/x", 1000, vec![]), b, NEVER, 8);
         assert!(w.migrations(&a).is_empty(), "a host already running the instance takes no incoming one");
+    }
+
+    #[test]
+    fn an_incoming_instance_is_given_up_at_its_deadline() {
+        use crate::engine::Deliver;
+        let (a, b) = (hid("a"), hid("b"));
+        let mut w = migration_pair();
+        // 4096 MB takes 3.3 s at 10 Gbit/s; the deadline comes first.
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 3000, 8);
+        let mut fabric = crate::fabric::Fabric::new(w, 1);
+        fabric.tick(2000);
+        assert_eq!(fabric.world().migrations(&b), ["vm/x"]);
+        fabric.tick(3000);
+        let w = fabric.world();
+        assert!(w.migrations(&b).is_empty() && w.instances(&b).is_empty() && w.traffic.flows().count() == 0, "given up, never completed");
+        assert_eq!(w.instances(&a), ["vm/x"], "the source runs on");
+    }
+
+    #[test]
+    fn an_incoming_instance_whose_source_no_longer_runs_the_vm_is_given_up() {
+        let (a, b) = (hid("a"), hid("b"));
+        let mut w = migration_pair();
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
+        w.stop_instance(&a, "vm/x");
+        w.advance_migrations(1000);
+        assert!(w.migrations(&b).is_empty() && w.instances(&b).is_empty() && w.traffic.flows().count() == 0);
+        // An abort gives up an incoming instance, but leaves a running one alone.
+        let mut w = migration_pair();
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
+        w.abort_migration(&b, "vm/x");
+        w.abort_migration(&a, "vm/x");
+        assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0);
+        assert_eq!(w.instances(&a), ["vm/x"]);
+    }
+
+    #[test]
+    fn of_two_targets_of_one_vm_only_the_first_to_complete_takes_over() {
+        use crate::engine::Deliver;
+        let (a, b, c) = (hid("a"), hid("b"), hid("c"));
+        let mut w = migration_pair();
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 8);
+        w.migrate_in(&c, spec("vm/x", 1000, vec![]), a.clone(), NEVER, 9);
+        let mut fabric = crate::fabric::Fabric::new(w, 1);
+        for now in (1..=10).map(|s| s * 1000) {
+            fabric.tick(now);
+        }
+        let w = fabric.world();
+        assert!(w.instances(&a).is_empty() && w.migrations(&b).is_empty() && w.migrations(&c).is_empty());
+        assert_eq!(w.instances(&b).len() + w.instances(&c).len(), 1, "the VM runs once");
+        assert!(w.split_brain().is_empty());
     }
 
     #[test]

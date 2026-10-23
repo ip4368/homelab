@@ -136,8 +136,13 @@ impl Fabric {
     }
 
     /// See [`World::migrate_in`].
-    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, seed: u64) {
-        self.world.migrate_in(host, spec, from, seed);
+    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, deadline: SimTime, seed: u64) {
+        self.world.migrate_in(host, spec, from, deadline, seed);
+    }
+
+    /// See [`World::abort_migration`].
+    pub fn abort_migration(&mut self, host: &HostId, id: &str) {
+        self.world.abort_migration(host, id);
     }
 
     /// See [`World::stop_instance`].
@@ -420,7 +425,7 @@ impl Deliver for Fabric {
         traffic.expire(now);
         self.world.traffic = traffic;
         self.world.advance_copies();
-        self.world.advance_migrations();
+        self.world.advance_migrations(now);
         self.world.track_truth_alerts(now);
     }
 }

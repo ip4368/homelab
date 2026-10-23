@@ -117,6 +117,16 @@ impl ClusterState {
         phase: VmPhase,
     ) -> Result<(), ApplyError> {
         let vm = self.vm_status.get_mut(id).ok_or(ApplyError::NotFound)?;
+        // Migrations are proposed by more than one party (the API, drains):
+        // only one may start, and only it may end.
+        let allowed = match (&vm.status.phase, &phase) {
+            (_, VmPhase::Migrating { to }) => vm.status.phase == VmPhase::Running && vm.status.host == host && host.as_ref() != Some(to),
+            (VmPhase::Migrating { to }, VmPhase::Running) => host.as_ref() == Some(to) || host == vm.status.host,
+            _ => true,
+        };
+        if !allowed {
+            return Err(ApplyError::InvalidVmPhase);
+        }
         if vm.status.host != host || vm.status.phase != phase {
             vm.status.since = at;
         }

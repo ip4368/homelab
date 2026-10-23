@@ -8,10 +8,9 @@
 //! instances and holds the volume replicas the leader asks for, and lists
 //! them in every heartbeat. As a live migration's target it watches each
 //! incoming instance: it reports `MigrationDone` once the instance runs, and
-//! gives it up if it has not after [`MIGRATION_TIMEOUT_MS`].
+//! gives it up if it has not by the deadline the leader set.
 
-use crate::controllers::drain::MIGRATION_TIMEOUT_MS;
-use crate::proto::{mgmt, MetricSample, Msg, Observed};
+use crate::proto::{mgmt, InstanceSpec, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::NetworkResult;
 use model::network::{bootstrap_config, HostNetworkConfig};
@@ -57,7 +56,7 @@ pub struct HostAgent {
     /// confirmed; 0 when unknown (never told, or the agent restarted).
     net_generation: u64,
     trial: Option<Trial>,
-    /// The instances migrating in, and when each began.
+    /// The instances migrating in, and the deadline of each.
     incoming: BTreeMap<String, SimTime>,
 }
 
@@ -169,36 +168,38 @@ impl HostAgent {
         ctx.set_timer(REVERT_MS, REVERT);
     }
 
-    /// Starts an incoming instance of `spec` from `from` and watches it. A
-    /// repeat for one already migrating in keeps its start; one that runs
-    /// already is reported again.
-    fn migrate_in(&mut self, ctx: &mut dyn Ctx, spec: crate::proto::InstanceSpec, from: HostId) {
+    /// Starts an incoming instance of `spec` from `from`, unless `deadline`
+    /// has passed, and watches it until then. One that runs already is
+    /// reported again.
+    fn migrate_in(&mut self, ctx: &mut dyn Ctx, spec: InstanceSpec, from: HostId, deadline: SimTime) {
         let now = ctx.now();
         let Some(os) = ctx.host() else { return };
         let (id, idle) = (spec.id.clone(), self.incoming.is_empty());
-        if !os.migrations().contains(&id) {
-            self.incoming.insert(id, now);
+        if now < deadline {
+            os.migrate_in(spec, from, deadline);
         }
-        os.migrate_in(spec, from);
+        if os.migrations().contains(&id) || os.instances().contains(&id) {
+            self.incoming.insert(id, deadline);
+        }
         if idle && !self.incoming.is_empty() {
             ctx.set_timer(MIGRATION_POLL_MS, MIGRATION);
         }
     }
 
-    /// Reports each watched instance that runs now, gives up each that has
-    /// been migrating in for [`MIGRATION_TIMEOUT_MS`], and forgets those
-    /// stopped meanwhile; looks again in [`MIGRATION_POLL_MS`] while any is left.
+    /// Reports each watched instance that runs now, gives up each still
+    /// migrating in at its deadline, and forgets those stopped meanwhile;
+    /// looks again in [`MIGRATION_POLL_MS`] while any is left.
     fn poll_migrations(&mut self, ctx: &mut dyn Ctx) {
         let now = ctx.now();
         let Some(os) = ctx.host() else { return };
         let (running, migrating) = (os.instances(), os.migrations());
         let mut done = vec![];
-        self.incoming.retain(|id, since| {
+        self.incoming.retain(|id, deadline| {
             if running.contains(id) {
                 done.push(id.clone());
                 false
-            } else if migrating.contains(id) && now >= *since + MIGRATION_TIMEOUT_MS {
-                os.stop_instance(id);
+            } else if migrating.contains(id) && now >= *deadline {
+                os.abort_migration(id);
                 false
             } else {
                 migrating.contains(id)
@@ -283,7 +284,13 @@ impl Actor for HostAgent {
                     os.stop_instance(&id);
                 }
             }
-            Msg::MigrateIn { spec, from } if self.token.is_none() => self.migrate_in(ctx, spec, from),
+            Msg::MigrateIn { spec, from, deadline } if self.token.is_none() => self.migrate_in(ctx, spec, from, deadline),
+            Msg::AbortMigration(id) if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.abort_migration(&id);
+                }
+                self.incoming.remove(&id);
+            }
             Msg::CreateReplica { volume, size_gb, source } if self.token.is_none() => {
                 if let Some(os) = ctx.host() {
                     os.create_replica(&volume, size_gb, source);
@@ -393,10 +400,13 @@ mod tests {
             self.instances.retain(|i| i.id != id);
             self.incoming.retain(|(i, _)| i.id != id);
         }
-        fn migrate_in(&mut self, spec: InstanceSpec, from: HostId) {
+        fn migrate_in(&mut self, spec: InstanceSpec, from: HostId, _deadline: SimTime) {
             if !self.instances.iter().chain(self.incoming.iter().map(|(i, _)| i)).any(|i| i.id == spec.id) {
                 self.incoming.push((spec, from));
             }
+        }
+        fn abort_migration(&mut self, id: &str) {
+            self.incoming.retain(|(i, _)| i.id != id);
         }
         fn migrations(&self) -> Vec<String> {
             self.incoming.iter().map(|(i, _)| i.id.clone()).collect()
@@ -789,12 +799,16 @@ mod tests {
         ctx.take().into_iter().filter(|m| matches!(m, Msg::MigrationDone { .. })).collect()
     }
 
+    /// `MigrateIn` of `id` from m2, given up at `deadline`.
+    fn migrate_in(id: &str, deadline: SimTime) -> Msg {
+        Msg::MigrateIn { spec: spec(id), from: HostId::from("m2"), deadline }
+    }
+
     #[test]
     fn an_incoming_instance_is_reported_once_it_runs() {
         let (mut a, mut ctx) = member();
-        let from = HostId::from("m2");
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
-        assert_eq!(ctx.os.incoming, [(spec("vm/vm1"), from.clone())]);
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", 100_000));
+        assert_eq!(ctx.os.incoming, [(spec("vm/vm1"), HostId::from("m2"))]);
         ctx.advance(&mut a, 3000);
         assert!(done_reports(&mut ctx).is_empty(), "still copying");
         take_over(&mut ctx.os, "vm/vm1");
@@ -803,31 +817,45 @@ mod tests {
         ctx.advance(&mut a, 20_000);
         assert!(done_reports(&mut ctx).is_empty(), "reported once");
         // A repeat of the request for an instance that runs is answered again.
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from });
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", 100_000));
         ctx.advance(&mut a, 21_000);
         assert_eq!(done_reports(&mut ctx), [Msg::MigrationDone { instance: "vm/vm1".into() }]);
         assert!(ctx.os.incoming.is_empty());
     }
 
     #[test]
-    fn an_incoming_instance_still_copying_after_the_timeout_is_given_up() {
+    fn an_incoming_instance_still_copying_at_its_deadline_is_given_up() {
         let (mut a, mut ctx) = member();
-        let from = HostId::from("m2");
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
-        ctx.advance(&mut a, MIGRATION_TIMEOUT_MS - 1);
-        assert_eq!(ctx.os.incoming.len(), 1, "a repeat keeps the start");
-        ctx.advance(&mut a, MIGRATION_TIMEOUT_MS + MIGRATION_POLL_MS);
+        let deadline = 50_000;
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", deadline));
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", deadline));
+        ctx.advance(&mut a, deadline - 1);
+        assert_eq!(ctx.os.incoming.len(), 1, "a repeat changes nothing");
+        ctx.advance(&mut a, deadline + MIGRATION_POLL_MS);
         assert!(ctx.os.incoming.is_empty() && done_reports(&mut ctx).is_empty(), "given up, unreported");
-        // One stopped by the leader is forgotten: a new attempt gets a full timeout.
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm2"), from: from.clone() });
-        a.on_message(&mut ctx, VIP, Msg::StopInstance("vm/vm2".into()));
+        // A request whose deadline has passed starts nothing.
+        let t = ctx.now;
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", t));
+        assert!(ctx.os.incoming.is_empty());
+        // One aborted by the leader is forgotten: a new attempt watches its own deadline.
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm2", t + 1000));
+        a.on_message(&mut ctx, VIP, Msg::AbortMigration("vm/vm2".into()));
+        assert!(ctx.os.incoming.is_empty());
         ctx.advance(&mut a, ctx.now + 5000);
         let t = ctx.now;
-        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm2"), from });
-        ctx.advance(&mut a, t + MIGRATION_TIMEOUT_MS - 1000);
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm2", t + 60_000));
+        ctx.advance(&mut a, t + 59_000);
         assert_eq!(ctx.os.migrations(), ["vm/vm2"]);
         assert_eq!(ctx.timers.len(), 1 + 2, "one poll pending, beside the heartbeat and metrics timers");
+    }
+
+    #[test]
+    fn an_abort_leaves_an_instance_that_runs_alone() {
+        let (mut a, mut ctx) = member();
+        a.on_message(&mut ctx, VIP, migrate_in("vm/vm1", 100_000));
+        take_over(&mut ctx.os, "vm/vm1");
+        a.on_message(&mut ctx, VIP, Msg::AbortMigration("vm/vm1".into()));
+        assert_eq!(ctx.os.instances(), ["vm/vm1"]);
     }
 
     #[test]

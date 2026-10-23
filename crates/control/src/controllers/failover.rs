@@ -83,7 +83,7 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
 /// Whether the state wants `instance` running on `host`: its VM starting or
 /// running there (or migrating to or from it), its pod placed there.
 /// Instances of no form the control plane knows are left alone.
-fn assigned(state: &ClusterState, host: &HostId, instance: &str) -> bool {
+pub(super) fn assigned(state: &ClusterState, host: &HostId, instance: &str) -> bool {
     if let Some(vm) = instance.strip_prefix("vm/") {
         return state.vm_status.get(vm).is_some_and(|s| {
             let on = s.status.host.as_ref() == Some(host);
@@ -264,6 +264,7 @@ mod tests {
         s.apply(0, Command::SetVmStatus { id: "vm1".into(), host: None, phase: VmPhase::Pending("no fit: x".into()) }).unwrap();
         assert!(stops(run(&s, &v, 1000)).contains(&stop("m1", "vm/vm1")));
         // Migrating: both ends keep it.
+        s.apply(0, Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m1")), phase: VmPhase::Running }).unwrap();
         s.apply(0, Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m1")), phase: VmPhase::Migrating { to: hid("m2") } }).unwrap();
         let out = stops(run(&s, &v, 1000));
         assert!(!out.contains(&stop("m1", "vm/vm1")) && !out.contains(&stop("m2", "vm/vm1")), "{out:?}");

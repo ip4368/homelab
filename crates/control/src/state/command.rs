@@ -145,6 +145,10 @@ pub enum ApplyError {
     CpVoter,
     /// Not one of the [`AlertKind`](crate::controllers::alerts::AlertKind)s.
     UnknownAlertKind(String),
+    /// The VM is not in a phase (or on a host) that allows this status: a
+    /// migration starts only from `Running` on its source, and ends only
+    /// `Running` on its source or its target.
+    InvalidVmPhase,
 }
 
 impl fmt::Display for ApplyError {
@@ -167,6 +171,7 @@ impl fmt::Display for ApplyError {
             }
             Self::CpVoter => f.write_str("host is a control-plane voter; replace it first"),
             Self::UnknownAlertKind(kind) => write!(f, "unknown alert kind {kind}"),
+            Self::InvalidVmPhase => f.write_str("VM phase does not allow this change"),
         }
     }
 }

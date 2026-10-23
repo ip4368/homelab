@@ -301,12 +301,15 @@ impl CpReplica {
     }
 
     /// The target of a live migration says its incoming instance took over:
-    /// it runs the instance now, ahead of its next heartbeat.
+    /// it runs the instance now, ahead of its next heartbeat. Only a host
+    /// whose heartbeat was heard is noted (a partial list is not made up).
     fn on_migration_done(&mut self, from: Endpoint, instance: String) {
         let Addr::Host(host) = from.addr else { return };
         let Some(v) = &mut self.volatile else { return };
-        if from.svc == Svc::Agent && self.state.hosts.contains_key(&host) {
-            v.instances.entry(host).or_default().insert(instance);
+        if from.svc == Svc::Agent
+            && let Some(running) = v.instances.get_mut(&host)
+        {
+            running.insert(instance);
         }
     }
 
@@ -461,6 +464,7 @@ impl Actor for CpReplica {
             | Msg::StartInstance(_)
             | Msg::StopInstance(_)
             | Msg::MigrateIn { .. }
+            | Msg::AbortMigration(_)
             | Msg::CreateReplica { .. }
             | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. } => {}
@@ -790,6 +794,26 @@ mod tests {
         assert!(!rig.r.volatile.as_ref().unwrap().host_reports.contains_key(&hid("zz")));
         assert!(!rig.r.volatile.as_ref().unwrap().instances.contains_key(&hid("zz")));
         assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")), "still a heartbeat");
+    }
+
+    #[test]
+    fn migration_done_only_adds_to_a_heard_hosts_instances() {
+        let add = Command::AddPendingHost {
+            id: hid("m1"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        };
+        let mut rig = Rig::new(vec![add]);
+        rig.elect();
+        rig.ack();
+        let agent = host_ep("m1", Svc::Agent);
+        let done = Msg::MigrationDone { instance: "vm/vm1".into() };
+        rig.r.on_message(&mut rig.ctx, agent.clone(), done.clone());
+        assert!(!rig.r.volatile.as_ref().unwrap().instances.contains_key(&hid("m1")), "no partial list before a heartbeat");
+        rig.r.on_message(&mut rig.ctx, agent.clone(), heartbeat(None, None));
+        rig.r.on_message(&mut rig.ctx, agent, done);
+        assert_eq!(rig.r.volatile.as_ref().unwrap().instances[&hid("m1")], ["vm/vm1".to_string()].into());
     }
 
     #[test]

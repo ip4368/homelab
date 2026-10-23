@@ -12,6 +12,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
 
+/// A live migration not complete this long after it began fails: the
+/// control plane puts the VM back on its source.
+pub const MIGRATION_TIMEOUT_MS: u64 = 120_000;
+/// A migration's target gives up this long before the control plane does
+/// ([`MigrateIn`](Msg::MigrateIn)'s `deadline`), so that a migration that
+/// completes is always heard of before the control plane would revert it.
+pub const MIGRATION_MARGIN_MS: u64 = 10_000;
+
 /// The network control traffic rides on.
 pub fn mgmt() -> NetworkId {
     NetworkId::from("mgmt")
@@ -261,8 +269,13 @@ pub enum Msg {
     StopInstance(String),
     /// Leader to the agent of a live migration's target: start an incoming
     /// instance of `spec`, copying its memory from `from` over the
-    /// `migration` network (a repeat changes nothing).
-    MigrateIn { spec: InstanceSpec, from: HostId },
+    /// `migration` network (a repeat changes nothing). The incoming instance
+    /// is given up, never completed, once the clock reaches `deadline`, or
+    /// once `from` no longer runs the VM.
+    MigrateIn { spec: InstanceSpec, from: HostId, deadline: SimTime },
+    /// Leader to agent: give up the incoming instance with this id, if it is
+    /// still migrating in (one that runs already is left alone).
+    AbortMigration(String),
     /// Agent to the VIP: the incoming instance `instance` took over from its source.
     MigrationDone { instance: String },
     /// Leader to agent: hold a replica of `volume`, copied from the replica on

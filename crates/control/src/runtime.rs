@@ -93,8 +93,12 @@ pub trait HostOs {
     /// Once the copy is complete it runs (it is listed in
     /// [`HostOs::instances`]) and `from`'s instance ends. An instance the host
     /// already has, incoming or running, changes nothing; `stop_instance`
-    /// gives an incoming one up.
-    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId);
+    /// gives an incoming one up. The incoming instance is given up, never
+    /// completed, once the clock reaches `deadline` or once `from` no longer
+    /// runs it.
+    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId, deadline: SimTime);
+    /// Gives up instance `id` if it is migrating in; one that runs is left alone.
+    fn abort_migration(&mut self, id: &str);
     /// The ids of the instances migrating in now.
     fn migrations(&self) -> Vec<String>;
     /// Starts holding a replica of `volume` on the disk with most room for
