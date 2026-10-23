@@ -68,6 +68,9 @@ pub trait HostOs {
     fn store_cp(&mut self, durable: Durable<LogCmd>);
     /// Applies one Raft persist op to the stored state (no-op if none is stored).
     fn persist_cp(&mut self, op: DurableOp<LogCmd>);
+    /// Records on disk that this host joined the cluster, so its agent boots
+    /// as a member from now on instead of joining with a token.
+    fn mark_joined(&mut self);
 }
 
 pub trait Ctx {

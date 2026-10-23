@@ -202,6 +202,9 @@ impl HostOs for EngineCtx<'_> {
             d.apply(op);
         }
     }
+    fn mark_joined(&mut self) {
+        self.hw_mut().mark_joined();
+    }
 }
 
 pub struct Engine {

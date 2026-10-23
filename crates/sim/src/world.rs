@@ -31,8 +31,9 @@ pub struct HostHw {
     pub failed_disks: BTreeSet<String>,
     /// The CP replica's Raft state on this host's disk; survives power loss.
     pub cp_durable: Option<Durable<LogCmd>>,
-    /// The join token the host's agent was booted with: `None` for a host
-    /// that was already a member. A restored host boots its agent the same way.
+    /// The token the host's agent joins with, until the agent becomes a
+    /// member ([`HostHw::mark_joined`]); `None` for a member. A restored host
+    /// boots its agent with whatever is stored here.
     pub join_token: Option<String>,
 }
 
@@ -50,6 +51,11 @@ impl HostHw {
             cp_durable: None,
             join_token: None,
         }
+    }
+
+    /// The agent became a cluster member: it never needs the token again.
+    pub fn mark_joined(&mut self) {
+        self.join_token = None;
     }
 
     /// What the OS measures now: idle usage with seeded noise, every healthy

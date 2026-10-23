@@ -75,8 +75,10 @@ impl Engine {
         for n in first..first + count {
             let (id, variant) = (host_id(profile, n), ((n - 1) % 2) as u8);
             let w = self.fabric_mut().world_mut();
+            // Cable first: if there is no room, nothing of this host exists yet.
+            let cabled = cable_host(w, &id, profile)?;
             w.hosts.insert(id.clone(), HostHw { join_token: Some(token.clone()), ..HostHw::new(profile, variant) });
-            for (s, p) in cable_host(w, &id, profile)?.switch_ports {
+            for (s, p) in cabled.switch_ports {
                 let mut cfg = host_port_cfg();
                 if let Some(m) = misconfigure {
                     m.apply(&mut cfg);

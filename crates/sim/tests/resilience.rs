@@ -386,6 +386,25 @@ fn add_hosts_join_through_the_seed_rules() {
 }
 
 #[test]
+fn restored_scenario_host_boots_as_a_member() {
+    let mut e = default_fleet(18);
+    settle(&mut e);
+    e.scenario(Scenario::AddHosts { profile: ProfileId::Pi5, count: 1, misconfigure: None }).unwrap();
+    let h = hid("pi5-13");
+    let deadline = e.now() + 30_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &h) == Some(Lifecycle::Ready)), "pi5-13 never became Ready");
+    assert_eq!(e.fabric().world().hosts[&h].join_token, None, "joining is recorded on the host");
+
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    let deadline = e.now() + 45_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &h) == Some(Lifecycle::NotReady)), "never marked NotReady");
+    e.fault(Fault::RestoreHost { host: h.clone() }).unwrap();
+    assert!(e.actor::<HostAgent>(&agent(&h)).unwrap().is_member(), "booted without a token");
+    let deadline = e.now() + 15_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &h) == Some(Lifecycle::Ready)), "pi5-13 never recovered");
+}
+
+#[test]
 fn add_hosts_fails_without_a_control_plane() {
     let mut e = default_fleet(17);
     settle(&mut e);

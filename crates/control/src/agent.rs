@@ -41,6 +41,11 @@ impl HostAgent {
         &self.roles
     }
 
+    /// Whether the agent runs as a cluster member (not trying to join).
+    pub fn is_member(&self) -> bool {
+        self.token.is_none()
+    }
+
     fn send_join(&self, ctx: &mut dyn Ctx) {
         let (Some(token), Some(os)) = (&self.token, ctx.host()) else { return };
         let msg = Msg::JoinRequest { token: token.clone(), inventory: os.inventory() };
@@ -69,9 +74,13 @@ impl HostAgent {
         ctx.send(VIP, mgmt(), Msg::Metrics { host, sample });
     }
 
-    /// Stops asking to join and starts heartbeating (right away) and reporting metrics.
+    /// Stops asking to join, records membership on the host, and starts
+    /// heartbeating (right away) and reporting metrics.
     fn start_member(&mut self, ctx: &mut dyn Ctx) {
         self.token = None;
+        if let Some(os) = ctx.host() {
+            os.mark_joined();
+        }
         self.send_heartbeat(ctx);
         ctx.set_timer(HEARTBEAT_MS, HEARTBEAT);
         ctx.set_timer(METRICS_MS, METRICS);
@@ -140,6 +149,7 @@ mod tests {
 
     struct FakeOs {
         net: HostNetworkConfig,
+        joined: bool,
     }
 
     impl HostOs for FakeOs {
@@ -168,6 +178,9 @@ mod tests {
         }
         fn store_cp(&mut self, _: Durable<LogCmd>) {}
         fn persist_cp(&mut self, _: DurableOp<LogCmd>) {}
+        fn mark_joined(&mut self) {
+            self.joined = true;
+        }
     }
 
     /// Records what the agent sends; timers fire when the test advances time.
@@ -180,7 +193,7 @@ mod tests {
 
     impl FakeCtx {
         fn new(net: HostNetworkConfig) -> Self {
-            Self { now: 0, os: FakeOs { net }, sent: vec![], timers: vec![] }
+            Self { now: 0, os: FakeOs { net, joined: false }, sent: vec![], timers: vec![] }
         }
 
         /// Fires every timer due by `to`, in time order.
@@ -243,9 +256,12 @@ mod tests {
         a.on_message(&mut ctx, VIP, Msg::JoinResp(Err("invalid token".into())));
         ctx.advance(&mut a, 15_000);
         assert_eq!(ctx.take(), [join("tok")], "a rejection does not stop the retries");
+        assert!(!a.is_member() && !ctx.os.joined);
 
         a.on_message(&mut ctx, VIP, Msg::JoinResp(Ok(())));
         assert_eq!(ctx.take(), [heartbeat()], "accepted: heartbeat right away");
+        assert!(a.is_member());
+        assert!(ctx.os.joined, "membership is recorded on the host, so a reboot skips the join");
         a.on_message(&mut ctx, VIP, Msg::JoinResp(Ok(())));
         assert!(ctx.take().is_empty(), "a duplicate answer starts nothing twice");
         ctx.advance(&mut a, 35_000);
@@ -280,6 +296,7 @@ mod tests {
         let roles: BTreeSet<Role> = [Role::Transcode].into();
         a.on_message(&mut ctx, VIP, Msg::Approved { roles: roles.clone() });
         assert_eq!(a.roles(), &roles);
+        assert!(a.is_member() && ctx.os.joined);
         assert_eq!(ctx.take(), [heartbeat()]);
         a.on_message(&mut ctx, VIP, Msg::Approved { roles });
         assert_eq!(ctx.take(), [heartbeat()], "each approval is confirmed");
