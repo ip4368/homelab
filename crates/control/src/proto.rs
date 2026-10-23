@@ -139,7 +139,15 @@ pub enum ApiOp {
     SetRoles { id: HostId, roles: BTreeSet<Role> },
     SetLabels { id: HostId, labels: BTreeMap<String, String> },
     Cordon { id: HostId },
+    /// Readies the host again; cancels a drain.
     Uncordon { id: HostId },
+    /// Empties the host so it can be serviced: its VMs live-migrate away one
+    /// at a time, its pods are rescheduled and its volume replicas move off,
+    /// then it is `Drained`.
+    Drain { host: HostId },
+    /// Live-migrates a running VM to `to`, or with `None` to the host the
+    /// scheduler picks. The result is the target host.
+    MigrateVm { vm: String, to: Option<HostId> },
     RemoveHost { id: HostId },
     /// Sets, or with `None` clears, the host's hand-written network config.
     SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
@@ -246,6 +254,12 @@ pub enum Msg {
     StartInstance(InstanceSpec),
     /// Leader to agent: stop the instance with this id.
     StopInstance(String),
+    /// Leader to the agent of a live migration's target: start an incoming
+    /// instance of `spec`, copying its memory from `from` over the
+    /// `migration` network (a repeat changes nothing).
+    MigrateIn { spec: InstanceSpec, from: HostId },
+    /// Agent to the VIP: the incoming instance `instance` took over from its source.
+    MigrationDone { instance: String },
     /// Leader to agent: hold a replica of `volume`, copied from the replica on
     /// `source`, or empty (complete at once) when `None`. A repeat for a
     /// replica the host holds changes nothing.

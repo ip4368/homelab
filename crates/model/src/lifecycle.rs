@@ -39,6 +39,7 @@ impl Lifecycle {
                 | (NotReady, Draining)
                 | (Cordoned, Ready)
                 | (Cordoned, Draining)
+                | (Draining, Ready)
                 | (Draining, Drained)
                 | (Drained, Ready)
         )

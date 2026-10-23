@@ -1,7 +1,7 @@
 //! Simulator ground truth: topology, logical networks and host hardware,
 //! plus what each host's OS sees of it (the engine exposes this to the
 //! actors on a host as their `HostOs`), including the workload instances it
-//! runs and the volume replicas on its disks.
+//! runs (and VMs live-migrating in) and the volume replicas on its disks.
 
 use crate::topology::{Node, Topology};
 use crate::traffic::{FlowEnd, FlowKind, Traffic};
@@ -23,6 +23,8 @@ pub const BASELINE_PCT: f32 = 3.0;
 const IDLE_DISK_PCT: f32 = 5.0;
 /// A replica is copied from its source at up to this rate, on `storage`.
 pub const REBUILD_MBPS: f64 = 2000.0;
+/// A live migration copies a VM's memory from its source at up to this rate, on `migration`.
+pub const MIGRATION_MBPS: f64 = 10_000.0;
 /// Usage and demand curves move between seeded knots this far apart.
 const CURVE_PERIOD_MS: u64 = 30_000;
 /// A usage burst lasts this long and adds this much.
@@ -35,8 +37,26 @@ pub struct Instance {
     pub spec: InstanceSpec,
     /// Seeds its usage and demand curves.
     pub seed: u64,
-    /// The flow started for each of `spec.flows`, in order.
+    /// The flow started for each of `spec.flows`, in order (none while incoming).
     pub flows: Vec<u64>,
+    /// `Some` while the instance is a live migration's target, not running yet.
+    pub incoming: Option<Incoming>,
+}
+
+/// The memory copy of a VM live-migrating onto a host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Incoming {
+    /// The host the VM runs on until the copy completes.
+    pub from: HostId,
+    /// The migration flow carrying its memory: `ram_mb` × 8 Mbit in all.
+    pub flow: u64,
+}
+
+impl Instance {
+    /// Every flow the instance keeps on the wire, its memory copy included.
+    fn all_flows(&self) -> impl Iterator<Item = u64> + '_ {
+        self.flows.iter().copied().chain(self.incoming.as_ref().map(|m| m.flow))
+    }
 }
 
 /// A volume replica on one of a host's disks.
@@ -165,7 +185,7 @@ impl HostHw {
         let cpu_m = f64::from(self.profile.cpu_threads) * 1000.0;
         let ram_mb = f64::from(self.profile.ram_gb) * 1024.0;
         let (mut cpu_pct, mut ram_pct) = (f64::from(BASELINE_PCT), f64::from(BASELINE_PCT));
-        for i in self.instances.values() {
+        for i in self.instances.values().filter(|i| i.incoming.is_none()) {
             let (cpu, ram) = (usage_pct(&i.spec.usage, i.seed, now), usage_pct(&i.spec.usage, !i.seed, now));
             cpu_pct += f64::from(i.spec.cpu_m) * f64::from(cpu) / cpu_m;
             ram_pct += f64::from(i.spec.ram_mb) * f64::from(ram) / ram_mb;
@@ -187,6 +207,13 @@ impl HostHw {
             port_bps: BTreeMap::new(),
         }
     }
+}
+
+/// Puts the flows of `spec`, running on `host`, on the wire; their demands
+/// follow their curves from the next traffic tick on.
+fn start_flows(traffic: &mut Traffic, host: &HostId, spec: &InstanceSpec) -> Vec<u64> {
+    let src = FlowEnd::Host(host.clone());
+    spec.flows.iter().map(|f| traffic.start(src.clone(), f.to.clone(), f.network.clone(), f.min_mbps, f.kind, None)).collect()
 }
 
 /// Where an instance's usage is at `now`, as a percentage of what it asked
@@ -287,26 +314,69 @@ impl World {
         if hw.instances.get(&spec.id).is_some_and(|i| i.spec == spec) {
             return;
         }
-        for flow in hw.instances.remove(&spec.id).into_iter().flat_map(|i| i.flows) {
+        for flow in hw.instances.remove(&spec.id).iter().flat_map(Instance::all_flows) {
             self.traffic.stop(flow);
         }
-        let src = FlowEnd::Host(host.clone());
-        // Demands follow their curves from the next traffic tick on.
-        let flows = spec.flows.iter().map(|f| self.traffic.start(src.clone(), f.to.clone(), f.network.clone(), f.min_mbps, f.kind, None)).collect();
-        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows });
+        let flows = start_flows(&mut self.traffic, host, &spec);
+        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows, incoming: None });
+    }
+
+    /// Starts `spec` on powered `host` as the target of a live migration from
+    /// `from`: an incoming instance, not running yet, whose memory (`ram_mb` ×
+    /// 8 Mbit) a [`MIGRATION_MBPS`] migration flow on `migration` copies from
+    /// `from`. Once that is complete the instance takes over: it runs, and
+    /// `from`'s instance ends ([`World::advance_migrations`]). A host that
+    /// already has the instance, incoming or running, changes nothing.
+    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, seed: u64) {
+        let Some(hw) = self.hosts.get_mut(host).filter(|hw| hw.powered && !hw.instances.contains_key(&spec.id)) else { return };
+        let migration = NetworkId::from("migration");
+        let flow = self.traffic.start(FlowEnd::Host(from.clone()), FlowEnd::Host(host.clone()), migration, MIGRATION_MBPS, FlowKind::Migration, None);
+        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows: vec![], incoming: Some(Incoming { from, flow }) });
     }
 
     /// Stops instance `id` on `host`, taking its flows off the wire.
     pub fn stop_instance(&mut self, host: &HostId, id: &str) {
         let Some(i) = self.hosts.get_mut(host).and_then(|hw| hw.instances.remove(id)) else { return };
-        for flow in i.flows {
+        for flow in i.all_flows() {
             self.traffic.stop(flow);
         }
     }
 
-    /// The instances running on `host`.
+    /// The instances running on `host` (not those still migrating in).
     pub fn instances(&self, host: &HostId) -> Vec<String> {
-        self.hosts.get(host).map(|hw| hw.instances.keys().cloned().collect()).unwrap_or_default()
+        let Some(hw) = self.hosts.get(host) else { return vec![] };
+        hw.instances.iter().filter(|(_, i)| i.incoming.is_none()).map(|(id, _)| id.clone()).collect()
+    }
+
+    /// The instances migrating in to `host`.
+    pub fn migrations(&self, host: &HostId) -> Vec<String> {
+        let Some(hw) = self.hosts.get(host) else { return vec![] };
+        hw.instances.iter().filter(|(_, i)| i.incoming.is_some()).map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Completes every live migration whose flow has carried the VM's memory
+    /// (`ram_mb` × 1e6 bytes): its flow ends, the source's instance ends
+    /// with it, and the target's instance runs, putting its own flows on the wire.
+    pub fn advance_migrations(&mut self) {
+        let mut done: Vec<(HostId, String, HostId)> = vec![];
+        for (host, hw) in &self.hosts {
+            for (id, i) in &hw.instances {
+                let Some(m) = &i.incoming else { continue };
+                if self.traffic.carried_bytes(m.flow) >= f64::from(i.spec.ram_mb) * 1e6 {
+                    done.push((host.clone(), id.clone(), m.from.clone()));
+                }
+            }
+        }
+        for (host, id, from) in done {
+            if from != host {
+                self.stop_instance(&from, &id);
+            }
+            let Some(i) = self.hosts.get_mut(&host).and_then(|hw| hw.instances.get_mut(&id)) else { continue };
+            if let Some(m) = i.incoming.take() {
+                self.traffic.stop(m.flow);
+            }
+            i.flows = start_flows(&mut self.traffic, &host, &i.spec);
+        }
     }
 
     /// Puts a replica of `volume` on the disk of powered `host` with most room
@@ -420,7 +490,7 @@ impl World {
     pub fn power_off(&mut self, host: &HostId) {
         let Some(hw) = self.hosts.get_mut(host) else { return };
         hw.powered = false;
-        for flow in std::mem::take(&mut hw.instances).into_values().flat_map(|i| i.flows) {
+        for flow in std::mem::take(&mut hw.instances).values().flat_map(Instance::all_flows) {
             self.traffic.stop(flow);
         }
         let from_host = FlowEnd::Host(host.clone());
@@ -776,6 +846,68 @@ mod tests {
         w.delete_replica(&b, "v");
         w.create_replica(&b, "v", 1, Some(a));
         assert!(!w.replicas(&b).iter().any(|r| r.copying));
+    }
+
+    /// Two MS-01s whose sfp0 (migration tagged, MTU 9000) is cabled to a
+    /// jumbo trunk on `sw` allowing VLAN 30; `a` runs `vm/x` (4 GB of RAM).
+    fn migration_pair() -> World {
+        use model::network::{Attachment, Link, LinkKind};
+        let mut w = World::new();
+        let cfg = SwitchPortCfg { mode: PortMode::Trunk { native: None, allowed: [30].into() }, mtu: 9216, lacp_group: None, admin_up: true };
+        let ports = ["p1", "p2"].map(|p| (PortName::from(p), (10_000, cfg.clone()))).into();
+        w.topology.add_switch(Switch { id: SwitchId::from("sw"), model: "t".into(), ports, mlag_peer: None, up: true });
+        for (h, p) in [("a", "p1"), ("b", "p2")] {
+            let net = HostNetworkConfig {
+                links: vec![Link { name: "data".into(), kind: LinkKind::Single(PortName::from("sfp0")), mtu: 9000 }],
+                attachments: vec![Attachment { network: NetworkId::from("migration"), link: "data".into(), tagged: true, ip: None }],
+            };
+            w.hosts.insert(hid(h), HostHw::running(ProfileId::Ms01, 0, net));
+            w.topology.connect(Node::HostPort(hid(h), PortName::from("sfp0")), sp(p));
+        }
+        w.start_instance(&hid("a"), spec("vm/x", 1000, vec![]), 7);
+        w
+    }
+
+    #[test]
+    fn a_migration_copies_ram_over_the_migration_network_then_takes_over() {
+        use crate::engine::Deliver;
+        let (a, b) = (hid("a"), hid("b"));
+        let mut w = migration_pair();
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        assert!(w.instances(&b).is_empty(), "an incoming instance is not running yet");
+        assert_eq!(w.migrations(&b), ["vm/x"]);
+        let f = w.traffic.flows().next().unwrap().clone();
+        assert_eq!((&f.src, &f.dst, f.network.as_str(), f.demand_mbps, f.kind), (&FlowEnd::Host(a.clone()), &FlowEnd::Host(b.clone()), "migration", MIGRATION_MBPS, FlowKind::Migration));
+        assert!(w.split_brain().is_empty(), "only the source runs it");
+        let mut fabric = crate::fabric::Fabric::new(w, 1);
+        // 4096 MB is 32768 Mbit: 3.3 s at 10 Gbit/s.
+        for now in [1000, 2000, 3000] {
+            fabric.tick(now);
+            assert_eq!((fabric.world().instances(&a), fabric.world().migrations(&b)), (vec!["vm/x".to_string()], vec!["vm/x".to_string()]), "at {now}");
+        }
+        fabric.tick(4000);
+        let w = fabric.world();
+        assert_eq!((w.instances(&a), w.instances(&b)), (vec![], vec!["vm/x".to_string()]), "the target took over and the source's ended");
+        assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0 && w.split_brain().is_empty());
+    }
+
+    #[test]
+    fn an_incoming_instance_is_started_once_and_ends_with_its_host_or_a_stop() {
+        let (a, b) = (hid("a"), hid("b"));
+        let mut w = migration_pair();
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 9);
+        assert_eq!(w.traffic.flows().count(), 1, "a repeat changes nothing");
+        w.stop_instance(&b, "vm/x");
+        assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0, "stopped: its copy ends");
+        assert_eq!(w.instances(&a), ["vm/x"], "the source runs on");
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        w.power_off(&b);
+        assert!(w.migrations(&b).is_empty() && w.traffic.flows().count() == 0, "power loss ends it");
+        w.migrate_in(&b, spec("vm/x", 1000, vec![]), a.clone(), 8);
+        assert!(w.migrations(&b).is_empty(), "a powered-off host takes nothing");
+        w.migrate_in(&a, spec("vm/x", 1000, vec![]), b, 8);
+        assert!(w.migrations(&a).is_empty(), "a host already running the instance takes no incoming one");
     }
 
     #[test]

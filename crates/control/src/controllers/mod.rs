@@ -9,6 +9,7 @@
 //! lags what earlier leaders committed.
 
 pub mod alerts;
+pub mod drain;
 pub mod failover;
 pub mod health;
 pub mod join;
@@ -107,7 +108,7 @@ pub struct Volatile {
     pub instances: BTreeMap<HostId, BTreeSet<String>>,
     /// The volume replicas each host's agent last said it holds.
     pub replicas: BTreeMap<HostId, Vec<ReplicaReport>>,
-    /// The host each instance was last sent `StartInstance` to, and when.
+    /// The host each instance was last sent `StartInstance` or `MigrateIn` to, and when.
     pub instance_started: BTreeMap<String, (HostId, SimTime)>,
     /// When each (volume, host) was last sent `CreateReplica`.
     pub replica_created: BTreeMap<(String, HostId), SimTime>,
@@ -217,7 +218,7 @@ impl Volatile {
             (Addr::Host(id), Msg::ApplyNetwork { generation, .. }) => {
                 self.net_pushed.insert(id.clone(), (*generation, now));
             }
-            (Addr::Host(id), Msg::StartInstance(spec)) => {
+            (Addr::Host(id), Msg::StartInstance(spec) | Msg::MigrateIn { spec, .. }) => {
                 self.instance_started.insert(spec.id.clone(), (id.clone(), now));
             }
             (Addr::Host(id), Msg::CreateReplica { volume, source, .. }) => {

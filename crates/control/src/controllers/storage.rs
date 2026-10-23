@@ -24,6 +24,11 @@
 //!   entry be picked again, once it has dropped its old copy. A volume left
 //!   with no healthy replica salvages a stale one whose host is back with it
 //!   complete.
+//! * **Drains.** A replica on a host being drained ([`evacuating`]) gets a
+//!   replacement placed as if it were missing, but stays (and stays a copy
+//!   source) until the volume has all the replicas it asks for healthy
+//!   without it; then it is dropped, and so deleted. A copy onto such a host
+//!   is given up at once.
 //! * **Cleanup.** A replica a host reports that its volume's status does not
 //!   list as live, or whose volume is gone, gets `DeleteReplica` (at most
 //!   every [`RESEND_MS`]), except a stale one while its volume has no healthy
@@ -35,6 +40,7 @@
 //!
 //! Statuses are only proposed when they would change.
 
+use super::drain::evacuating;
 use super::failover::host_lost;
 use super::scheduler::{access_switch, active_roles, agent, in_flight, RESEND_MS};
 use super::{Action, Volatile};
@@ -42,7 +48,7 @@ use crate::proto::{mgmt, Msg, ReplicaReport};
 use crate::runtime::SimTime;
 use crate::state::{Alert, ClusterState, Command, Lifecycle, ObjectKind, ObjectRef, Severity};
 use model::{place_replicas, DiskView, HostId, ReplicaRef, ReplicaState, StorageHostView, VolumeHealth};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const INSUFFICIENT_STORAGE_HOSTS: &str = "InsufficientStorageHosts";
 pub const VOLUME_DEGRADED: &str = "VolumeDegraded";
@@ -68,7 +74,7 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
 /// The storage hosts as [`place_replicas`] sees them: every host (so that
 /// the switches of replicas on hosts that cannot take more still count),
 /// each disk's free space less the replicas the volume statuses put there.
-fn storage_views(state: &ClusterState) -> Vec<StorageHostView> {
+pub(super) fn storage_views(state: &ClusterState) -> Vec<StorageHostView> {
     let mut used: BTreeMap<(&HostId, &str), u32> = BTreeMap::new();
     for (id, st) in &state.volume_status {
         let size = state.volumes.get(id).map_or(0, |v| v.volume.size_gb);
@@ -101,6 +107,7 @@ fn storage_views(state: &ClusterState) -> Vec<StorageHostView> {
 
 fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     let mut views = storage_views(state);
+    let leaving = evacuating(state);
     let mut open: BTreeMap<(&str, &str), &Alert> = state
         .alerts
         .values()
@@ -115,7 +122,7 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
             continue;
         }
         let (size_gb, want) = (vol.volume.size_gb, usize::from(vol.volume.replicas));
-        let (replicas, short) = plan(state, v, now, id, size_gb, want, &st.replicas, &mut views);
+        let (replicas, short) = plan(state, v, now, id, size_gb, want, &st.replicas, &leaving, &mut views);
         let health = health(&replicas, want);
         if replicas != st.replicas || health != st.health {
             out.push(Action::Propose(Command::SetVolumeStatus { id: id.clone(), replicas: replicas.clone(), health }));
@@ -134,8 +141,9 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
 /// Where `volume`'s replicas should be, from its committed `replicas`:
 /// progress written, lost and stalled replicas marked stale, a stale one
 /// salvaged if nothing healthy is left, stale entries dropped once the volume
-/// is whole, and targets placed for what is missing. Also whether too few
-/// hosts could take the targets it needs.
+/// is whole, replicas on the `leaving` hosts dropped once it is whole
+/// without them, and targets placed for what is missing or leaving. Also
+/// whether too few hosts could take the targets it is missing.
 #[allow(clippy::too_many_arguments)]
 fn plan(
     state: &ClusterState,
@@ -145,6 +153,7 @@ fn plan(
     size_gb: u32,
     want: usize,
     committed: &[ReplicaRef],
+    leaving: &BTreeSet<HostId>,
     views: &mut [StorageHostView],
 ) -> (Vec<ReplicaRef>, bool) {
     let mut replicas = committed.to_vec();
@@ -154,6 +163,8 @@ fn plan(
             r.state = ReplicaState::Stale;
         }
     }
+    let copying = |r: &ReplicaRef| matches!(r.state, ReplicaState::Seeding | ReplicaState::Rebuilding { .. });
+    replicas.retain(|r| !(leaving.contains(&r.host) && copying(r)));
     let healthy = |rs: &[ReplicaRef]| rs.iter().filter(|r| r.state == ReplicaState::Healthy).count();
     if healthy(&replicas) == 0 {
         for r in replicas.iter_mut().filter(|r| r.state == ReplicaState::Stale) {
@@ -163,21 +174,28 @@ fn plan(
     if healthy(&replicas) >= want {
         replicas.retain(|r| r.state != ReplicaState::Stale);
     }
+    let staying = |r: &&ReplicaRef| !leaving.contains(&r.host);
+    if replicas.iter().filter(staying).filter(|r| r.state == ReplicaState::Healthy).count() >= want {
+        replicas.retain(|r| !leaving.contains(&r.host));
+    }
     let live = replicas.iter().filter(|r| r.state != ReplicaState::Stale).count();
+    let live_staying = replicas.iter().filter(staying).filter(|r| r.state != ReplicaState::Stale).count();
     // A volume with no replicas at all never held data: its first replicas
     // start empty. Any later one needs a healthy one to copy.
     let seed = replicas.is_empty();
-    if live >= want || !(seed || healthy(&replicas) > 0) {
+    if live_staying >= want || !(seed || healthy(&replicas) > 0) {
         return (replicas, false);
     }
-    let need = u8::try_from(want - live).unwrap_or(u8::MAX);
+    let missing = want.saturating_sub(live);
+    let need = u8::try_from(want - live_staying).unwrap_or(u8::MAX);
     let mut picks = place_replicas(need, size_gb, views, &excluded(state, v, volume, &replicas, false));
     if picks.len() < usize::from(need) {
         let mut relaxed = excluded(state, v, volume, &replicas, true);
         relaxed.extend(picks.iter().map(|(h, _)| h.clone()));
         picks.extend(place_replicas(need - picks.len() as u8, size_gb, views, &relaxed));
     }
-    let short = picks.len() < usize::from(need);
+    // Only what the volume is missing counts: a replica that cannot leave stays (a drain says so).
+    let short = picks.len() < missing;
     for (host, disk) in picks {
         take_disk(views, &host, &disk, size_gb);
         // A stale entry on the host is superseded.
@@ -192,7 +210,7 @@ fn plan(
 /// `replicas` (unless `relaxed`, the stale ones whose host dropped its copy
 /// are allowed again), those holding a replica of it that `replicas` does
 /// not list, and those not heard from (they might hold one).
-fn excluded(state: &ClusterState, v: &Volatile, volume: &str, replicas: &[ReplicaRef], relaxed: bool) -> Vec<HostId> {
+pub(super) fn excluded(state: &ClusterState, v: &Volatile, volume: &str, replicas: &[ReplicaRef], relaxed: bool) -> Vec<HostId> {
     let mut out: Vec<HostId> = replicas
         .iter()
         .filter(|r| !(relaxed && r.state == ReplicaState::Stale && dropped(state, v, volume, &r.host)))

@@ -124,7 +124,9 @@ impl World {
     pub fn split_brain(&self) -> BTreeMap<String, Vec<HostId>> {
         let mut on: BTreeMap<String, Vec<HostId>> = BTreeMap::new();
         for (id, hw) in self.hosts.iter().filter(|(_, hw)| hw.powered) {
-            for vm in hw.instances.keys().filter_map(|i| i.strip_prefix("vm/")) {
+            // A VM still migrating in does not run there yet.
+            let running = hw.instances.iter().filter(|(_, i)| i.incoming.is_none());
+            for vm in running.filter_map(|(id, _)| id.strip_prefix("vm/")) {
                 on.entry(vm.to_string()).or_default().push(id.clone());
             }
         }

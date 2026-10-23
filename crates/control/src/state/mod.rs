@@ -594,6 +594,8 @@ mod tests {
         assert_eq!(set(&mut s, Lifecycle::Ready), Err(ApplyError::InvalidLifecycle));
         assert_eq!(set(&mut s, Lifecycle::Removed), Err(ApplyError::InvalidLifecycle));
         set(&mut s, Lifecycle::Draining).unwrap();
+        set(&mut s, Lifecycle::Ready).unwrap(); // uncordoned: the drain is cancelled
+        set(&mut s, Lifecycle::Draining).unwrap();
         set(&mut s, Lifecycle::Drained).unwrap();
         set(&mut s, Lifecycle::Ready).unwrap();
         set(&mut s, Lifecycle::NotReady).unwrap();

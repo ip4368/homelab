@@ -494,17 +494,22 @@ fn disk_failure_rebuilds() {
 
 /// Takes VLAN 20 off every trunk `host` is cabled to: its storage traffic goes nowhere.
 fn blackhole_storage(e: &mut Engine, host: &HostId) {
+    block_vlan(e, host, 20);
+}
+
+/// Takes `vlan` off every trunk `host` is cabled to.
+fn block_vlan(e: &mut Engine, host: &HostId, vlan: u16) {
     let w = e.fabric().world();
     let mut edits = vec![];
     for n in &w.hosts[host].profile.nics {
         let Some(Node::SwitchPort(s, p)) = w.topology.peer(&Node::HostPort(host.clone(), PortName::new(&n.name))).cloned() else { continue };
         let mut cfg = w.topology.switches[&s].port(&p).unwrap().clone();
         if let PortMode::Trunk { allowed, .. } = &mut cfg.mode {
-            allowed.remove(&20);
+            allowed.remove(&vlan);
             edits.push((s, p, cfg));
         }
     }
-    assert!(!edits.is_empty(), "{host} has no trunk to blackhole");
+    assert!(!edits.is_empty(), "{host} has no trunk carrying VLAN {vlan}");
     for (switch, port, cfg) in edits {
         e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
     }
@@ -736,4 +741,127 @@ fn pods_on_a_lost_host_run_elsewhere() {
     };
     assert!(e.run_until(killed + 60_000 + 40_000 + 15_000, elsewhere), "pods {on_h:?} of {h} not running elsewhere: {:?}", e.client_view().state.pods);
     assert!(e.now() >= killed + 60_000 + 35_000, "rescheduled before the grace period");
+}
+
+/// The VMs the control plane runs on `host`.
+fn vms_on(e: &Engine, host: &HostId) -> Vec<String> {
+    e.client_view().state.vm_status.iter().filter(|(_, v)| v.status.host.as_ref() == Some(host)).map(|(id, _)| id.clone()).collect()
+}
+
+/// The hosts that really run `vm`, not counting an incoming migration.
+fn truly_running(e: &Engine, vm: &str) -> Vec<HostId> {
+    let w = e.fabric().world();
+    w.hosts.iter().filter(|(id, hw)| hw.powered && w.instances(id).contains(&format!("vm/{vm}"))).map(|(id, _)| id.clone()).collect()
+}
+
+/// The migration flows on the wire, with the rate each got at the latest tick.
+fn migration_flows(e: &Engine) -> Vec<(sim::traffic::Flow, f64)> {
+    let traffic = &e.fabric().world().traffic;
+    traffic
+        .flows()
+        .filter(|f| f.kind == FlowKind::Migration)
+        .map(|f| (f.clone(), traffic.last().rate.get(&f.id).copied().unwrap_or(0.0)))
+        .collect()
+}
+
+#[test]
+fn drain_empties_host() {
+    let mut e = seeded(61);
+    let s = e.client_view().state.clone();
+    let h = s.vm_status.values().filter_map(|v| v.status.host.clone()).find(|h| !s.cp.voters.contains(h)).expect("a VM host that is not a CP host");
+    let vms = vms_on(&e, &h);
+    let volumes = volumes_on(&e, &h);
+    assert!(!vms.is_empty() && !volumes.is_empty(), "{h}: vms {vms:?}, volumes {volumes:?}");
+    assert_eq!(api(&mut e, ApiOp::Drain { host: h.clone() }), ok());
+    let started = e.now();
+    let draining = |e: &Engine| e.client_view().state.hosts[&h].lifecycle == Lifecycle::Draining;
+    assert!(e.run_until(started + 2000, draining), "{:?}", e.client_view().state.hosts[&h].lifecycle);
+    let drained = |e: &Engine| e.client_view().state.hosts[&h].lifecycle == Lifecycle::Drained;
+    let mut stopped: Vec<String> = vec![];
+    let mut down: Vec<String> = vec![];
+    let ok = run_checking(
+        &mut e,
+        started + 600_000,
+        |e| {
+            let s = &e.client_view().state;
+            stopped.extend(s.vm_status.iter().filter(|(_, v)| v.status.phase == VmPhase::Stopped).map(|(id, _)| id.clone()));
+            // Live migration: each VM of the drained host keeps running somewhere, all along.
+            down.extend(vms.iter().filter(|vm| truly_running(e, vm).is_empty()).cloned());
+        },
+        drained,
+    );
+    let hw = &e.fabric().world().hosts[&h];
+    assert!(ok, "{h} not drained within 600 s: instances {:?}, replicas {:?}", hw.instances.keys().collect::<Vec<_>>(), hw.replicas.keys().collect::<Vec<_>>());
+    assert!(stopped.is_empty(), "VMs went Stopped: {stopped:?}");
+    assert!(down.is_empty(), "VMs ran nowhere during the drain: {down:?}");
+    assert!(hw.instances.is_empty() && hw.replicas.is_empty(), "instances {:?}, replicas {:?}", hw.instances.keys().collect::<Vec<_>>(), hw.replicas.keys().collect::<Vec<_>>());
+    for vm in &vms {
+        assert!(running_elsewhere(&e, vm, &h), "{vm}: {:?}", e.client_view().state.vm_status[vm]);
+        assert_eq!(truly_running(&e, vm).len(), 1, "{vm} runs once");
+    }
+    assert!(healthy_without(&e, &volumes, &h), "{:?}", volumes.iter().map(|v| &e.client_view().state.volume_status[v].status).collect::<Vec<_>>());
+    assert!(e.client_view().state.pods.values().all(|p| p.status.host.as_ref() != Some(&h)));
+    assert!(e.truth().split_brain_vms.is_empty());
+}
+
+#[test]
+fn migration_traffic_on_migration_network() {
+    let mut e = seeded(62);
+    let (vm, from) = e.client_view().state.vm_status.iter().map(|(id, v)| (id.clone(), v.status.host.clone().unwrap())).next().unwrap();
+    let ApiResult::Ok(serde_json::Value::String(to)) = api(&mut e, ApiOp::MigrateVm { vm: vm.clone(), to: None }) else { panic!("migration refused") };
+    let to = HostId::from(to.as_str());
+    assert_ne!(to, from);
+    let migrating = |e: &Engine| e.client_view().state.vm_status[&vm].status.phase == VmPhase::Migrating { to: to.clone() };
+    let deadline = e.now() + 2000;
+    assert!(e.run_until(deadline, migrating), "{:?}", e.client_view().state.vm_status[&vm]);
+    let deadline = e.now() + 10_000;
+    assert!(e.run_until(deadline, |e| migration_flows(e).iter().any(|(_, rate)| *rate > 0.0)), "no migration traffic");
+    let flows = migration_flows(&e);
+    let [(flow, rate)] = flows.as_slice() else { panic!("{flows:?}") };
+    assert_eq!((&flow.src, &flow.dst, flow.network.as_str()), (&FlowEnd::Host(from.clone()), &FlowEnd::Host(to.clone()), "migration"));
+    assert!(*rate > 0.0);
+    assert_eq!(truly_running(&e, &vm), [from.clone()], "the VM runs on its source until the copy completes");
+
+    let moved = |e: &Engine| {
+        let st = &e.client_view().state.vm_status[&vm].status;
+        st.phase == VmPhase::Running && st.host.as_ref() == Some(&to)
+    };
+    let deadline = e.now() + 60_000;
+    assert!(e.run_until(deadline, moved), "{:?}", e.client_view().state.vm_status[&vm]);
+    assert_eq!(truly_running(&e, &vm), [to.clone()]);
+    assert!(migration_flows(&e).is_empty(), "the migration flow ended");
+    let events = &e.client_view().state.events;
+    assert!(events.values().any(|ev| ev.entity == ObjectRef::vm(&vm) && ev.message.contains("migrated")), "no event for the migration");
+}
+
+#[test]
+fn migration_fails_when_vlan30_blocked() {
+    let mut e = seeded(63);
+    let s = e.client_view().state.clone();
+    let (vm, from) = s.vm_status.iter().map(|(id, v)| (id.clone(), v.status.host.clone().unwrap())).next().unwrap();
+    // Another VM host, cut off from the migration network.
+    let to = s.hosts.values().find(|h| h.id != from && h.roles.contains(&Role::Vm) && h.lifecycle == Lifecycle::Ready).unwrap().id.clone();
+    block_vlan(&mut e, &to, 30);
+    assert_eq!(api(&mut e, ApiOp::MigrateVm { vm: vm.clone(), to: Some(to.clone()) }), ApiResult::Ok(serde_json::Value::String(to.to_string())));
+    let started = e.now();
+    e.run_for(10_000);
+    let flows = migration_flows(&e);
+    assert!(!flows.is_empty() && flows.iter().all(|(f, rate)| f.network.as_str() == "migration" && *rate == 0.0), "blackholed: {flows:?}");
+
+    let reverted = |e: &Engine| {
+        let st = &e.client_view().state.vm_status[&vm].status;
+        st.phase == VmPhase::Running && st.host.as_ref() == Some(&from)
+    };
+    let deadline = started + 135_000;
+    let mut early = false;
+    let ok = run_checking(&mut e, deadline, |e| early |= reverted(e) && e.now() < started + 119_000, reverted);
+    assert!(ok, "not reverted within 135 s: {:?}", e.client_view().state.vm_status[&vm]);
+    assert!(!early, "gave up before 120 s");
+    e.run_for(5000);
+    assert_eq!(truly_running(&e, &vm), [from.clone()]);
+    assert!(!e.fabric().world().hosts[&to].instances.contains_key(&format!("vm/{vm}")), "the incoming instance on {to} is gone");
+    assert!(migration_flows(&e).is_empty());
+    let events = &e.client_view().state.events;
+    assert!(events.values().any(|ev| ev.entity == ObjectRef::vm(&vm) && ev.message.contains("failed")), "no event for the failure");
+    assert!(e.truth().split_brain_vms.is_empty());
 }

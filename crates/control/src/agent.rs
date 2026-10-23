@@ -6,19 +6,25 @@
 //! it cut the host off from the control plane) is rolled back, and only a
 //! confirmed one is written for the next boot. A member also runs the
 //! instances and holds the volume replicas the leader asks for, and lists
-//! them in every heartbeat.
+//! them in every heartbeat. As a live migration's target it watches each
+//! incoming instance: it reports `MigrationDone` once the instance runs, and
+//! gives it up if it has not after [`MIGRATION_TIMEOUT_MS`].
 
+use crate::controllers::drain::MIGRATION_TIMEOUT_MS;
 use crate::proto::{mgmt, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::NetworkResult;
 use model::network::{bootstrap_config, HostNetworkConfig};
-use model::{profile, Inventory};
+use model::{profile, HostId, Inventory};
+use std::collections::BTreeMap;
 
 pub const JOIN_RETRY_MS: u64 = 5000;
 pub const HEARTBEAT_MS: u64 = 5000;
 pub const METRICS_MS: u64 = 10_000;
 /// How long a newly applied network config waits for the leader's confirmation.
 pub const REVERT_MS: u64 = 30_000;
+/// How often the agent looks in on the instances migrating in.
+pub const MIGRATION_POLL_MS: u64 = 1000;
 /// Synthetic temperature: idle plus a share of CPU load.
 const IDLE_TEMP_C: f32 = 35.0;
 const TEMP_C_PER_CPU_PCT: f32 = 0.4;
@@ -29,6 +35,7 @@ const JOIN: u64 = 0;
 const HEARTBEAT: u64 = 1;
 const METRICS: u64 = 2;
 const REVERT: u64 = 3;
+const MIGRATION: u64 = 4;
 
 /// A network config applied but not yet confirmed, and what to go back to.
 #[derive(Debug)]
@@ -50,13 +57,15 @@ pub struct HostAgent {
     /// confirmed; 0 when unknown (never told, or the agent restarted).
     net_generation: u64,
     trial: Option<Trial>,
+    /// The instances migrating in, and when each began.
+    incoming: BTreeMap<String, SimTime>,
 }
 
 impl HostAgent {
     /// `token` is the join token for an unjoined host; `None` means the host
     /// already joined (e.g. it rebooted) and the agent just heartbeats.
     pub fn new(token: Option<String>) -> Self {
-        Self { token, observed: None, net_generation: 0, trial: None }
+        Self { token, observed: None, net_generation: 0, trial: None, incoming: BTreeMap::new() }
     }
 
     /// Whether the agent runs as a cluster member (not trying to join).
@@ -160,6 +169,49 @@ impl HostAgent {
         ctx.set_timer(REVERT_MS, REVERT);
     }
 
+    /// Starts an incoming instance of `spec` from `from` and watches it. A
+    /// repeat for one already migrating in keeps its start; one that runs
+    /// already is reported again.
+    fn migrate_in(&mut self, ctx: &mut dyn Ctx, spec: crate::proto::InstanceSpec, from: HostId) {
+        let now = ctx.now();
+        let Some(os) = ctx.host() else { return };
+        let (id, idle) = (spec.id.clone(), self.incoming.is_empty());
+        if !os.migrations().contains(&id) {
+            self.incoming.insert(id, now);
+        }
+        os.migrate_in(spec, from);
+        if idle && !self.incoming.is_empty() {
+            ctx.set_timer(MIGRATION_POLL_MS, MIGRATION);
+        }
+    }
+
+    /// Reports each watched instance that runs now, gives up each that has
+    /// been migrating in for [`MIGRATION_TIMEOUT_MS`], and forgets those
+    /// stopped meanwhile; looks again in [`MIGRATION_POLL_MS`] while any is left.
+    fn poll_migrations(&mut self, ctx: &mut dyn Ctx) {
+        let now = ctx.now();
+        let Some(os) = ctx.host() else { return };
+        let (running, migrating) = (os.instances(), os.migrations());
+        let mut done = vec![];
+        self.incoming.retain(|id, since| {
+            if running.contains(id) {
+                done.push(id.clone());
+                false
+            } else if migrating.contains(id) && now >= *since + MIGRATION_TIMEOUT_MS {
+                os.stop_instance(id);
+                false
+            } else {
+                migrating.contains(id)
+            }
+        });
+        for instance in done {
+            ctx.send(VIP, mgmt(), Msg::MigrationDone { instance });
+        }
+        if !self.incoming.is_empty() {
+            ctx.set_timer(MIGRATION_POLL_MS, MIGRATION);
+        }
+    }
+
     /// Puts the last confirmed config back if the trial is still unconfirmed
     /// [`REVERT_MS`] after it started (timers of superseded trials are ignored).
     fn revert(&mut self, ctx: &mut dyn Ctx) {
@@ -231,6 +283,7 @@ impl Actor for HostAgent {
                     os.stop_instance(&id);
                 }
             }
+            Msg::MigrateIn { spec, from } if self.token.is_none() => self.migrate_in(ctx, spec, from),
             Msg::CreateReplica { volume, size_gb, source } if self.token.is_none() => {
                 if let Some(os) = ctx.host() {
                     os.create_replica(&volume, size_gb, source);
@@ -265,6 +318,7 @@ impl Actor for HostAgent {
                 ctx.set_timer(METRICS_MS, METRICS);
             }
             REVERT => self.revert(ctx),
+            MIGRATION => self.poll_migrations(ctx),
             _ => {}
         }
     }
@@ -292,6 +346,8 @@ mod tests {
         replicas: Vec<ReplicaReport>,
         /// The voters of every CP replica started.
         cp_spawned: Vec<BTreeSet<HostId>>,
+        /// Instances migrating in, and from where.
+        incoming: Vec<(InstanceSpec, HostId)>,
     }
 
     impl HostOs for FakeOs {
@@ -335,6 +391,15 @@ mod tests {
         }
         fn stop_instance(&mut self, id: &str) {
             self.instances.retain(|i| i.id != id);
+            self.incoming.retain(|(i, _)| i.id != id);
+        }
+        fn migrate_in(&mut self, spec: InstanceSpec, from: HostId) {
+            if !self.instances.iter().chain(self.incoming.iter().map(|(i, _)| i)).any(|i| i.id == spec.id) {
+                self.incoming.push((spec, from));
+            }
+        }
+        fn migrations(&self) -> Vec<String> {
+            self.incoming.iter().map(|(i, _)| i.id.clone()).collect()
         }
         fn instances(&self) -> Vec<String> {
             self.instances.iter().map(|i| i.id.clone()).collect()
@@ -374,6 +439,7 @@ mod tests {
                 instances: vec![],
                 replicas: vec![],
                 cp_spawned: vec![],
+                incoming: vec![],
             };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
@@ -710,6 +776,58 @@ mod tests {
         assert_eq!(replicas, &[ReplicaReport { volume: "disk2".into(), disk: "nvme0".into(), pct: 0, copied_bytes: 0, copying: true }]);
         let Some(Msg::Metrics { sample, .. }) = sent.iter().find(|m| matches!(m, Msg::Metrics { .. })) else { panic!("no metrics") };
         assert_eq!(sample.instances, 1);
+    }
+
+    /// The incoming instance `id` takes over on the fake host.
+    fn take_over(os: &mut FakeOs, id: &str) {
+        let i = os.incoming.iter().position(|(s, _)| s.id == id).unwrap();
+        let (spec, _) = os.incoming.remove(i);
+        os.instances.push(spec);
+    }
+
+    fn done_reports(ctx: &mut FakeCtx) -> Vec<Msg> {
+        ctx.take().into_iter().filter(|m| matches!(m, Msg::MigrationDone { .. })).collect()
+    }
+
+    #[test]
+    fn an_incoming_instance_is_reported_once_it_runs() {
+        let (mut a, mut ctx) = member();
+        let from = HostId::from("m2");
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
+        assert_eq!(ctx.os.incoming, [(spec("vm/vm1"), from.clone())]);
+        ctx.advance(&mut a, 3000);
+        assert!(done_reports(&mut ctx).is_empty(), "still copying");
+        take_over(&mut ctx.os, "vm/vm1");
+        ctx.advance(&mut a, 4000);
+        assert_eq!(done_reports(&mut ctx), [Msg::MigrationDone { instance: "vm/vm1".into() }]);
+        ctx.advance(&mut a, 20_000);
+        assert!(done_reports(&mut ctx).is_empty(), "reported once");
+        // A repeat of the request for an instance that runs is answered again.
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from });
+        ctx.advance(&mut a, 21_000);
+        assert_eq!(done_reports(&mut ctx), [Msg::MigrationDone { instance: "vm/vm1".into() }]);
+        assert!(ctx.os.incoming.is_empty());
+    }
+
+    #[test]
+    fn an_incoming_instance_still_copying_after_the_timeout_is_given_up() {
+        let (mut a, mut ctx) = member();
+        let from = HostId::from("m2");
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm1"), from: from.clone() });
+        ctx.advance(&mut a, MIGRATION_TIMEOUT_MS - 1);
+        assert_eq!(ctx.os.incoming.len(), 1, "a repeat keeps the start");
+        ctx.advance(&mut a, MIGRATION_TIMEOUT_MS + MIGRATION_POLL_MS);
+        assert!(ctx.os.incoming.is_empty() && done_reports(&mut ctx).is_empty(), "given up, unreported");
+        // One stopped by the leader is forgotten: a new attempt gets a full timeout.
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm2"), from: from.clone() });
+        a.on_message(&mut ctx, VIP, Msg::StopInstance("vm/vm2".into()));
+        ctx.advance(&mut a, ctx.now + 5000);
+        let t = ctx.now;
+        a.on_message(&mut ctx, VIP, Msg::MigrateIn { spec: spec("vm/vm2"), from });
+        ctx.advance(&mut a, t + MIGRATION_TIMEOUT_MS - 1000);
+        assert_eq!(ctx.os.migrations(), ["vm/vm2"]);
+        assert_eq!(ctx.timers.len(), 1 + 2, "one poll pending, beside the heartbeat and metrics timers");
     }
 
     #[test]

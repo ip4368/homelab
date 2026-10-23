@@ -135,6 +135,11 @@ impl Fabric {
         self.world.start_instance(host, spec, seed);
     }
 
+    /// See [`World::migrate_in`].
+    pub fn migrate_in(&mut self, host: &HostId, spec: InstanceSpec, from: HostId, seed: u64) {
+        self.world.migrate_in(host, spec, from, seed);
+    }
+
     /// See [`World::stop_instance`].
     pub fn stop_instance(&mut self, host: &HostId, id: &str) {
         self.world.stop_instance(host, id);
@@ -406,8 +411,8 @@ impl Deliver for Fabric {
 
     /// Moves instance demands along their curves, routes every flow as the
     /// world is now and accounts the interval just ended, then ends the flows
-    /// whose time is up, advances replica copies by what they carried, and
-    /// raises or resolves ground-truth alerts.
+    /// whose time is up, advances replica copies and live migrations by what
+    /// they carried, and raises or resolves ground-truth alerts.
     fn tick(&mut self, now: SimTime) {
         self.world.update_demands(now);
         let mut traffic = std::mem::take(&mut self.world.traffic);
@@ -415,6 +420,7 @@ impl Deliver for Fabric {
         traffic.expire(now);
         self.world.traffic = traffic;
         self.world.advance_copies();
+        self.world.advance_migrations();
         self.world.track_truth_alerts(now);
     }
 }

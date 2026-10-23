@@ -2,6 +2,7 @@
 //! applying its committed entries. The leader claims the VIP, answers the API
 //! and syncs, and runs the controllers; followers only replicate.
 
+use crate::controllers::drain;
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::rollout;
 use crate::controllers::membership::{self, RaftMembers};
@@ -196,7 +197,8 @@ impl CpReplica {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Unavailable });
         }
         let term = raft.term();
-        let (index, ok) = match handle_op(ctx, &self.state, term, op) {
+        let v = self.volatile.as_ref().expect("leader has volatile state");
+        let (index, ok) = match handle_op(ctx, &self.state, v, term, op) {
             Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
             Handling::Propose(cmd, ok) => (raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
             Handling::ReplaceCpMember { dead, with } => {
@@ -298,6 +300,16 @@ impl CpReplica {
         v.net_results.insert(host, (generation, result));
     }
 
+    /// The target of a live migration says its incoming instance took over:
+    /// it runs the instance now, ahead of its next heartbeat.
+    fn on_migration_done(&mut self, from: Endpoint, instance: String) {
+        let Addr::Host(host) = from.addr else { return };
+        let Some(v) = &mut self.volatile else { return };
+        if from.svc == Svc::Agent && self.state.hosts.contains_key(&host) {
+            v.instances.entry(host).or_default().insert(instance);
+        }
+    }
+
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
         let now = ctx.now();
         let raft = self.raft.as_ref().expect("on_start runs before anything else");
@@ -320,7 +332,7 @@ enum Handling {
 }
 
 /// How the leader of `term` handles `op`, given its state.
-fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> Handling {
+fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, op: ApiOp) -> Handling {
     let cmd = match op {
         ApiOp::CreateJoinToken => {
             let token = format!("{:016x}", ctx.rand_u64());
@@ -345,6 +357,11 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> H
         ApiOp::SetLabels { id, labels } => Command::SetLabels { id, labels },
         ApiOp::Cordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Cordoned },
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
+        ApiOp::Drain { host } => Command::SetLifecycle { id: host, lifecycle: Lifecycle::Draining },
+        ApiOp::MigrateVm { vm, to } => match drain::migrate_command(state, v, &vm, to) {
+            Ok((cmd, to)) => return Handling::Propose(cmd, serde_json::Value::String(to.to_string())),
+            Err(e) => return Handling::Answer(ApiResult::Err(e)),
+        },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
         ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
@@ -425,6 +442,7 @@ impl Actor for CpReplica {
                     v.metrics.insert(host, sample);
                 }
             }
+            Msg::MigrationDone { instance } => self.on_migration_done(from, instance),
             Msg::Api { req, op } => self.on_api(ctx, from, req, op),
             Msg::Sync { since } => self.on_sync(ctx, from, since),
             Msg::Ping(_)
@@ -438,6 +456,7 @@ impl Actor for CpReplica {
             | Msg::SwitchPoll
             | Msg::StartInstance(_)
             | Msg::StopInstance(_)
+            | Msg::MigrateIn { .. }
             | Msg::CreateReplica { .. }
             | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. } => {}

@@ -16,9 +16,12 @@
 //! * **Lost hosts.** A VM whose host is lost is placed again elsewhere, a
 //!   pod is sent back to pending ([`failover`](super::failover)). Volumes are the storage controller's
 //!   ([`storage`](super::storage)).
+//! * **Migrations and drains** run here too ([`drain`](super::drain)), so
+//!   their placements and the scheduler's count against each other.
 //!
 //! Statuses are only proposed when they would change.
 
+use super::drain;
 use super::failover::{self, host_lost, NO_FIT, NO_FIT_RETRY_MS};
 use super::{Action, Volatile};
 use crate::proto::{mgmt, pod_instance, vm_instance, FlowEnd, FlowKind, FlowSpec, InstanceSpec, Msg, UsageProfile};
@@ -49,6 +52,8 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     let mut hosts = Hosts::new(state, v);
     let mut out = vms(state, v, now, &mut hosts);
     out.extend(pods(state, v, now, &mut hosts));
+    let more = drain::run(state, v, now, &mut hosts, &out);
+    out.extend(more);
     out
 }
 
@@ -67,7 +72,7 @@ pub(super) struct Hosts {
 impl Hosts {
     /// Every host, with the requests of the pods and VMs assigned to it: by
     /// a status proposal still in flight, else by the state.
-    fn new(state: &ClusterState, v: &Volatile) -> Self {
+    pub(super) fn new(state: &ClusterState, v: &Volatile) -> Self {
         let mut views: Vec<HostView> = state.hosts.values().map(host_view).collect();
         // Where each pod and VM takes resources, and how much.
         let mut charges: BTreeMap<Workload, (Vec<&HostId>, (u32, u32))> = BTreeMap::new();
@@ -112,6 +117,15 @@ impl Hosts {
     /// Places `req` and counts it against the host it lands on.
     fn place(&mut self, req: &PlacementReq) -> Result<HostId, String> {
         self.place_excluding(req, &BTreeSet::new())
+    }
+
+    /// As [`Hosts::place`], only ever on `host`.
+    pub(super) fn place_on(&mut self, req: &PlacementReq, host: &HostId) -> Result<HostId, String> {
+        let view = self.views.iter_mut().find(|h| h.id == *host).ok_or_else(|| format!("no host {host}"))?;
+        let host = place(req, std::slice::from_ref(&*view), &BTreeSet::new())?;
+        view.used_cpu_m = view.used_cpu_m.saturating_add(req.cpu_m);
+        view.used_ram_mb = view.used_ram_mb.saturating_add(req.ram_mb);
+        Ok(host)
     }
 
     /// As [`Hosts::place`], never on a host in `exclude`.
@@ -171,7 +185,7 @@ pub(super) fn in_flight(v: &Volatile, pick: impl Fn(&Command) -> bool) -> bool {
 }
 
 /// Whether `host`'s latest heartbeat lists `instance`.
-fn reported(v: &Volatile, host: &HostId, instance: &str) -> bool {
+pub(super) fn reported(v: &Volatile, host: &HostId, instance: &str) -> bool {
     v.instances.get(host).is_some_and(|i| i.contains(instance))
 }
 
@@ -250,7 +264,7 @@ pub(super) fn volume_ready(state: &ClusterState, volume: &str, now: SimTime) -> 
 
 /// What `host` runs for `vm`: writes to each replica of its volume on
 /// another host, and client traffic on its first `vm-*` network.
-fn vm_spec(state: &ClusterState, vm: &Vm, host: &HostId) -> InstanceSpec {
+pub(super) fn vm_spec(state: &ClusterState, vm: &Vm, host: &HostId) -> InstanceSpec {
     let mut flows: Vec<FlowSpec> = vec![];
     let replicas = state.volume_status.get(&vm.volume).map_or(&[][..], |s| &s.status.replicas[..]);
     let mut remote: Vec<&HostId> = replicas.iter().filter(|r| r.state != ReplicaState::Stale && r.host != *host).map(|r| &r.host).collect();

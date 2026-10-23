@@ -86,8 +86,17 @@ pub trait HostOs {
     /// changes nothing; a different spec replaces it.
     fn start_instance(&mut self, spec: InstanceSpec);
     fn stop_instance(&mut self, id: &str);
-    /// The ids of the instances running now.
+    /// The ids of the instances running now (not those migrating in).
     fn instances(&self) -> Vec<String>;
+    /// Starts `spec` as the target of a live migration from `from`: an
+    /// incoming instance whose memory is copied over the `migration` network.
+    /// Once the copy is complete it runs (it is listed in
+    /// [`HostOs::instances`]) and `from`'s instance ends. An instance the host
+    /// already has, incoming or running, changes nothing; `stop_instance`
+    /// gives an incoming one up.
+    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId);
+    /// The ids of the instances migrating in now.
+    fn migrations(&self) -> Vec<String>;
     /// Starts holding a replica of `volume` on the disk with most room for
     /// it, copied over the storage network from `source`'s replica, or empty
     /// (complete at once) when `None`. A volume the host already holds keeps
