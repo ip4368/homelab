@@ -1,5 +1,6 @@
 //! Seed fleets: a cabled topology plus the control-plane state a cluster
-//! would have right after installation, so a preset starts out `Ready`.
+//! would have right after installation, so a preset starts out `Ready`, each
+//! host running its rule's network template on technician-configured ports.
 //!
 //! Topology: `core-1` and `core-2` are an MLAG pair of 64-port 10G SFP+
 //! switches joined by a 40G link. Access switches `access-1..N` (48× 2.5G,
@@ -14,14 +15,15 @@ use crate::topology::{Node, PortMode, Switch, SwitchPortCfg};
 use crate::world::{HostHw, World};
 use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
+use control::controllers::join::allocate_ips;
 use control::proto::LogCmd;
 use control::raft::{Durable, Entry, EntryPayload};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Endpoint, Svc};
-use control::state::{Command, CpMode, Lifecycle};
-use model::{eligible, seed_networks, seed_templates, HostId, PortName, ProfileId, Role, SwitchId};
+use control::state::{Command, CpMode, Lifecycle, NetworkResult};
+use model::{eligible, render, seed_networks, seed_templates, HostId, PortName, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
 
 pub const CORE_1: &str = "core-1";
@@ -48,6 +50,10 @@ const SWITCH_MTU: u16 = 9216;
 /// The VLAN untagged mgmt traffic rides on.
 const MGMT_VLAN: u16 = 1;
 const ROUTER_VLANS: [u16; 3] = [1, 100, 110];
+/// What a mini PC's port carries: mgmt untagged, storage tagged.
+const MINIPC_VLANS: [u16; 2] = [1, 20];
+/// What an MS-01's SFP+ bond carries tagged: storage, migration and the VM networks.
+const MS01_BOND_VLANS: [u16; 4] = [20, 30, 100, 110];
 /// MS-01s sit next to the cores.
 const CORE_RACK: &str = "rack-0";
 
@@ -126,18 +132,24 @@ impl Engine {
 /// The world for `spec` and the actors that run it: a CP replica on each of
 /// the first `cp_voters` control-plane-eligible hosts (MS-01s come first),
 /// all starting from the same [`seeded_durable`]; a member agent on every
-/// host; a management interface on every switch; and the UI client.
+/// host; a management interface on every switch; and the UI client. Every
+/// host runs its seed rule's template, addressed in cabling order.
 pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors) {
     let mut w = World::new();
     add_cores(&mut w);
     for n in 1..=spec.total().div_ceil(ACCESS_HOST_PORTS).max(1) {
         add_access_switch(&mut w, n);
     }
+    let templates: BTreeMap<String, _> = seed_templates().into_iter().map(|t| (t.id.clone(), t)).collect();
+    let mut taken = BTreeSet::new();
     let mut hosts = vec![];
     for (profile, count) in spec.counts() {
+        let template = &templates[seed_rule_template(profile)];
         for i in 0..count {
             let id = host_id(profile, i + 1);
-            w.hosts.insert(id.clone(), HostHw::new(profile, (i % 2) as u8));
+            let ips = allocate_ips(&template.config, |n| w.networks.get(n), &mut taken);
+            let hw = HostHw { applied_net: render(template, None, &ips), ..HostHw::new(profile, (i % 2) as u8) };
+            w.hosts.insert(id.clone(), hw);
             let cabled = cable_host(&mut w, &id, profile).expect("the fleet's switches have room for it");
             hosts.push((id, cabled.location));
         }
@@ -168,9 +180,10 @@ pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors)
 /// The Raft state of a freshly installed cluster: one term-1 log entry per
 /// command, all uncommitted until the first leader's no-op commits them.
 /// The log sets the CP voters, adds the seed networks and templates and the
-/// seed auto-approve rules (each naming its template), and adds
-/// every host at `location`, approved with its rule's roles (plus
-/// `ControlPlane` for voters) and walked to `Ready`.
+/// seed auto-approve rules (each naming its template), and adds every host
+/// at `location`, approved with its rule's roles (plus `ControlPlane` for
+/// voters), provisioned on its rule's template with the addresses of the
+/// config it runs, that config applied as generation 1, and `Ready`.
 pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<HostId>) -> Durable<LogCmd> {
     let mut cmds = vec![Command::SetCp { voters: voters.clone(), mode: CpMode::Suggest }];
     cmds.extend(seed_networks().into_iter().map(|network| Command::UpsertNetwork { network }));
@@ -190,6 +203,7 @@ pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<H
         if voters.contains(id) {
             roles.insert(Role::ControlPlane);
         }
+        let ips = hw.applied_net.attachments.iter().filter_map(|a| Some((a.network.clone(), a.ip?))).collect();
         cmds.extend([
             Command::AddPendingHost {
                 id: id.clone(),
@@ -198,7 +212,9 @@ pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<H
                 location: location.clone(),
             },
             Command::ApproveHost { id: id.clone(), roles },
-            Command::SetLifecycle { id: id.clone(), lifecycle: Lifecycle::Provisioning },
+            Command::ProvisionHost { id: id.clone(), template: Some(seed_rule_template(hw.profile.id).into()), ips },
+            Command::SetDesiredNetwork { id: id.clone(), config: hw.applied_net.clone() },
+            Command::RecordNetworkResult { id: id.clone(), generation: 1, result: NetworkResult::Applied },
             Command::SetLifecycle { id: id.clone(), lifecycle: Lifecycle::Ready },
         ]);
     }
@@ -250,6 +266,24 @@ pub fn host_port_cfg() -> SwitchPortCfg {
     SwitchPortCfg { mode: PortMode::Access(MGMT_VLAN), mtu: SWITCH_MTU, lacp_group: None, admin_up: true }
 }
 
+/// How a technician configures the switch port `nic` of a new host lands
+/// on, to suit the profile's seed template: an access port on the mgmt VLAN
+/// for SBCs and every `eth0` but a mini PC's, a trunk with mgmt native and
+/// storage tagged for a mini PC, and an LACP trunk (group named after the
+/// host) carrying the tagged networks for an MS-01's SFP+ ports.
+pub fn technician_port_cfg(profile: ProfileId, host: &HostId, nic: &str) -> SwitchPortCfg {
+    let trunk = |native, allowed: &[u16]| PortMode::Trunk { native, allowed: allowed.iter().copied().collect() };
+    match (profile, nic) {
+        (ProfileId::MiniPc, _) => SwitchPortCfg { mode: trunk(Some(MGMT_VLAN), &MINIPC_VLANS), ..host_port_cfg() },
+        (ProfileId::Ms01, n) if n.starts_with("sfp") => SwitchPortCfg {
+            mode: trunk(None, &MS01_BOND_VLANS),
+            lacp_group: Some(host.to_string()),
+            ..host_port_cfg()
+        },
+        _ => host_port_cfg(),
+    }
+}
+
 /// Where [`cable_host`] put a host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cabled {
@@ -261,7 +295,8 @@ pub struct Cabled {
 
 /// Cables `id` the way a technician would: `eth0` into the next free access
 /// host port and, for an MS-01, `sfp0`/`sfp1` into the lowest port index free
-/// on both cores. Leaves the world untouched and fails if there is no room.
+/// on both cores; then configures those ports ([`technician_port_cfg`]).
+/// Leaves the world untouched and fails if there is no room.
 pub fn cable_host(w: &mut World, id: &HostId, profile: ProfileId) -> Result<Cabled, String> {
     let (access, port) = free_access_ports(w).into_iter().next().ok_or("no free access switch port")?;
     let mut cables = vec![("eth0", access_id(access), port)];
@@ -272,6 +307,7 @@ pub fn cable_host(w: &mut World, id: &HostId, profile: ProfileId) -> Result<Cabl
     }
     for (nic, switch, port) in &cables {
         w.topology.connect(Node::HostPort(id.clone(), PortName::from(*nic)), Node::SwitchPort(switch.clone(), port.clone()));
+        w.topology.set_port(switch, port, technician_port_cfg(profile, id, nic));
     }
     Ok(Cabled {
         location: if profile == ProfileId::Ms01 { CORE_RACK.into() } else { format!("rack-{access}") },
@@ -366,7 +402,7 @@ fn add_access_switch(w: &mut World, n: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control::state::ClusterState;
+    use control::state::{ClusterState, NetState};
     use model::NetworkId;
 
     fn sp(s: &str, p: &str) -> Node {
@@ -438,8 +474,23 @@ mod tests {
         assert_eq!(t.peer(&hp("rk3588-12", "eth0")), Some(&sp("access-2", "p14")));
         assert_eq!(t.peer(&sp("access-1", "p47")), None, "p47 and up take no hosts");
 
-        // Host ports carry bootstrap mgmt; host hardware alternates variants.
-        assert_eq!(t.switches[&SwitchId::from("access-2")].port(&PortName::from("p14")), Some(&host_port_cfg()));
+        // Host ports are configured for the hosts' templates; host hardware alternates variants.
+        let port = |s: &str, p: &str| t.switches[&SwitchId::from(s)].port(&PortName::from(p)).unwrap().clone();
+        let trunk = |native, allowed: &[u16], lacp: Option<&str>| SwitchPortCfg {
+            mode: PortMode::Trunk { native, allowed: allowed.iter().copied().collect() },
+            mtu: 9216,
+            lacp_group: lacp.map(String::from),
+            admin_up: true,
+        };
+        assert_eq!(port("access-2", "p14"), host_port_cfg(), "an SBC: access on mgmt");
+        assert_eq!(port("access-1", "p1"), host_port_cfg(), "an MS-01's eth0");
+        assert_eq!(port("access-1", "p13"), trunk(Some(1), &[1, 20], None), "a mini PC");
+        assert_eq!(port(CORE_1, "p1"), trunk(None, &[20, 30, 100, 110], Some("ms01-01")), "an MS-01's bond member");
+        assert_eq!(port(CORE_2, "p12"), trunk(None, &[20, 30, 100, 110], Some("ms01-12")));
+        assert_eq!(port("access-1", "p47"), host_port_cfg(), "spare ports keep the default");
+        // Switch-to-switch links carry every network.
+        let uplink = trunk(Some(1), &[1, 20, 30, 100, 110], None);
+        assert_eq!((port("access-1", "sfp1"), port(CORE_1, "p62"), port(CORE_1, INTER_CORE_PORT)), (uplink.clone(), uplink.clone(), uplink));
         assert_eq!(w.hosts[&HostId::from("ms01-01")].profile.ram_gb, 96);
         assert_eq!(w.hosts[&HostId::from("ms01-02")].profile.ram_gb, 64);
         assert!(w.hosts.values().all(|h| h.powered && h.join_token.is_none()));
@@ -459,7 +510,7 @@ mod tests {
     #[test]
     fn seeded_state_has_every_host_ready_with_rule_roles() {
         let spec = Preset::Default.spec();
-        let (_, actors) = build_fleet(&spec, 3);
+        let (w, actors) = build_fleet(&spec, 3);
         let voters: BTreeSet<HostId> = ["ms01-01", "ms01-02", "ms01-03"].map(HostId::from).into();
         let replicas: Vec<_> = actors.iter().filter(|(e, _)| e.svc == Svc::Cp).map(|(e, _)| e.addr.clone()).collect();
         assert_eq!(replicas, voters.iter().map(|v| Addr::Host(v.clone())).collect::<Vec<_>>());
@@ -494,6 +545,23 @@ mod tests {
         );
         assert!(s.rules.values().all(|r| s.templates.contains_key(r.template.as_deref().unwrap())));
         assert_eq!(s.networks.keys().map(|n| n.as_str()).collect::<Vec<_>>(), ["mgmt", "migration", "storage", "vm-iot", "vm-lan"]);
+        // Every host runs its rule's template, recorded as applied generation 1, addressed uniquely.
+        let mut addresses = BTreeSet::new();
+        for h in s.hosts.values() {
+            assert_eq!(h.template.as_deref(), Some(seed_rule_template(h.profile.id)), "{}", h.id);
+            assert_eq!((h.net.desired_generation, h.net.applied_generation, h.net.state), (1, 1, NetState::Applied), "{}", h.id);
+            assert_eq!(h.net.desired.as_ref(), Some(&w.hosts[&h.id].applied_net), "{} runs what the log says", h.id);
+            assert!(h.ips.values().all(|ip| addresses.insert(*ip)), "{} shares an address", h.id);
+        }
+        let ip = |h: &str, n: &str| host(h).ips.get(&NetworkId::from(n)).map(|ip| ip.to_string());
+        assert_eq!([ip("ms01-01", "mgmt"), ip("ms01-01", "storage"), ip("ms01-01", "migration"), ip("ms01-01", "vm-lan")], [
+            Some("10.0.0.2".into()),
+            Some("10.20.0.2".into()),
+            Some("10.30.0.2".into()),
+            None
+        ]);
+        assert_eq!((ip("minipc-01", "mgmt"), ip("minipc-01", "storage")), (Some("10.0.0.14".into()), Some("10.20.0.14".into())));
+        assert_eq!((ip("rk3588-12", "mgmt"), ip("rk3588-12", "storage")), (Some("10.0.0.61".into()), None));
         assert_eq!(s.templates.keys().map(String::as_str).collect::<Vec<_>>(), ["minipc-standard", "ms01-standard", "sbc-transcode"]);
     }
 

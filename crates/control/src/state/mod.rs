@@ -13,6 +13,7 @@ use crate::runtime::SimTime;
 use model::network::LldpNeighbor;
 use model::{eligible, HardwareProfile, HostId, NetworkId, ProfileId, Role, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 /// Where MS-01s sit: next to the core switches.
 pub const CORE_RACK: &str = "rack-0";
@@ -101,7 +102,10 @@ impl ClusterState {
                     roles: Default::default(),
                     labels: Default::default(),
                     before_not_ready: None,
+                    template: None,
                     override_: None,
+                    ips: BTreeMap::new(),
+                    net: HostNet::default(),
                     last_transition: at,
                     version: v,
                 };
@@ -115,6 +119,32 @@ impl ClusterState {
                 check_eligible(&host.profile, &roles)?;
                 host.roles = roles;
                 host.lifecycle = Lifecycle::Approved;
+                host.last_transition = at;
+                host.version = v;
+            }
+            Command::ProvisionHost { id, template, ips } => {
+                let host = self.hosts.get(&id).ok_or(ApplyError::NotFound)?;
+                if host.lifecycle != Lifecycle::Approved {
+                    return Err(ApplyError::InvalidLifecycle);
+                }
+                if template.as_ref().is_some_and(|t| !self.templates.contains_key(t)) {
+                    return Err(ApplyError::NotFound);
+                }
+                let wanted: BTreeSet<&Ipv4Addr> = ips.values().collect();
+                let mut holders: Vec<ObjectRef> = self
+                    .hosts
+                    .values()
+                    .filter(|h| h.id != id && h.ips.values().any(|ip| wanted.contains(ip)))
+                    .map(|h| ObjectRef::host(&h.id))
+                    .collect();
+                if !holders.is_empty() {
+                    holders.sort();
+                    return Err(ApplyError::InUse(holders));
+                }
+                let host = self.hosts.get_mut(&id).expect("checked above");
+                host.template = template;
+                host.ips = ips;
+                host.lifecycle = Lifecycle::Provisioning;
                 host.last_transition = at;
                 host.version = v;
             }
@@ -213,8 +243,10 @@ impl ClusterState {
                 if !self.templates.contains_key(&id) {
                     return Err(ApplyError::NotFound);
                 }
-                let users: Vec<_> =
-                    self.rules.values().filter(|r| r.template.as_deref() == Some(id.as_str())).map(|r| ObjectRef::rule(&r.id)).collect();
+                let named = |t: &Option<String>| t.as_deref() == Some(id.as_str());
+                let rules = self.rules.values().filter(|r| named(&r.template)).map(|r| ObjectRef::rule(&r.id));
+                let hosts = self.hosts.values().filter(|h| named(&h.template)).map(|h| ObjectRef::host(&h.id));
+                let users: Vec<_> = rules.chain(hosts).collect();
                 if !users.is_empty() {
                     return Err(ApplyError::InUse(users));
                 }
@@ -235,6 +267,42 @@ impl ClusterState {
                 }
                 host.lldp = lldp;
                 host.inventory = inventory;
+                host.version = v;
+            }
+            Command::SetDesiredNetwork { id, config } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                host.net.desired = Some(config);
+                host.net.desired_generation += 1;
+                host.net.state = NetState::Applying;
+                host.net.error = None;
+                host.version = v;
+            }
+            Command::RecordNetworkResult { id, generation, result } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if generation != host.net.desired_generation {
+                    return Err(ApplyError::StaleGeneration);
+                }
+                let net = &mut host.net;
+                (net.state, net.error) = match result {
+                    NetworkResult::Applied => {
+                        net.applied_generation = generation;
+                        (NetState::Applied, None)
+                    }
+                    NetworkResult::Failed(reason) => (NetState::Failed, Some(reason)),
+                    NetworkResult::Reverted => {
+                        (NetState::Reverted, Some("lost the control plane on it and reverted".into()))
+                    }
+                };
+                host.version = v;
+            }
+            Command::AssessNetwork { id, issues, held_roles, drift } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if host.net.issues != issues {
+                    host.net.issues_since = at;
+                }
+                host.net.issues = issues;
+                host.net.held_roles = held_roles;
+                host.net.drift = drift;
                 host.version = v;
             }
             Command::ObserveSwitch { id, model, ports, mlag_peer, last_seen } => {
@@ -307,7 +375,7 @@ fn check_eligible(profile: &HardwareProfile, roles: &BTreeSet<Role>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::{profile, Inventory, NetworkId, NetworkTemplate, PortName, ProfileId, Role};
+    use model::{profile, HostNetworkConfig, Inventory, Issue, NetworkId, NetworkTemplate, PortName, ProfileId, Role};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn hid(s: &str) -> HostId {
@@ -910,5 +978,109 @@ mod tests {
         let c = s.changes_since(1);
         assert!(matches!(c.upserts.as_slice(), [Object::Switch(o)] if o.last_seen == 9));
         assert!(s.changes_since(2).upserts.is_empty());
+    }
+
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
+
+    fn approved(s: &mut ClusterState, id: &str) {
+        s.apply(1, add_cmd(id, ProfileId::Pi5, 0)).unwrap();
+        s.apply(2, Command::ApproveHost { id: hid(id), roles: roles(&[Role::Compute]) }).unwrap();
+    }
+
+    fn provision(id: &str, template: Option<&str>, mgmt: &str) -> Command {
+        Command::ProvisionHost {
+            id: hid(id),
+            template: template.map(String::from),
+            ips: [(NetworkId::from("mgmt"), ip(mgmt))].into(),
+        }
+    }
+
+    #[test]
+    fn provision_host_records_template_and_addresses() {
+        let mut s = ClusterState::new();
+        s.apply(0, Command::UpsertTemplate { template: template("sbc-transcode") }).unwrap();
+        s.apply(0, add_cmd("p", ProfileId::Pi5, 0)).unwrap();
+        assert_eq!(s.apply(1, provision("p", None, "10.0.0.2")), Err(ApplyError::InvalidLifecycle), "not approved yet");
+        approved(&mut s, "h1");
+        assert_eq!(s.apply(3, provision("h1", Some("nope"), "10.0.0.2")), Err(ApplyError::NotFound));
+        s.apply(3, provision("h1", Some("sbc-transcode"), "10.0.0.2")).unwrap();
+        let h = &s.hosts[&hid("h1")];
+        assert_eq!((h.lifecycle, h.template.as_deref(), h.last_transition), (Lifecycle::Provisioning, Some("sbc-transcode"), 3));
+        assert_eq!(h.ips, [(NetworkId::from("mgmt"), ip("10.0.0.2"))].into());
+        assert_eq!(h.net, HostNet::default(), "nothing rendered yet");
+        assert_eq!(s.apply(4, provision("h1", None, "10.0.0.2")), Err(ApplyError::InvalidLifecycle), "only once");
+
+        // Another host may not take an address in use.
+        approved(&mut s, "h2");
+        let v = s.version;
+        assert_eq!(s.apply(5, provision("h2", None, "10.0.0.2")), Err(ApplyError::InUse(vec![ObjectRef::host(&hid("h1"))])));
+        assert_eq!((s.version, s.hosts[&hid("h2")].lifecycle), (v, Lifecycle::Approved));
+        s.apply(5, provision("h2", None, "10.0.0.3")).unwrap();
+        assert_eq!(s.hosts[&hid("h2")].template, None);
+    }
+
+    #[test]
+    fn desired_network_generations_and_agent_results() {
+        let mut s = ClusterState::new();
+        approved(&mut s, "h1");
+        let cfg = template("sbc-transcode").config;
+        s.apply(3, Command::SetDesiredNetwork { id: hid("h1"), config: cfg.clone() }).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((net.desired.as_ref(), net.desired_generation, net.applied_generation, net.state), (Some(&cfg), 1, 0, NetState::Applying));
+
+        let result = |generation, result| Command::RecordNetworkResult { id: hid("h1"), generation, result };
+        assert_eq!(s.apply(4, result(2, NetworkResult::Applied)), Err(ApplyError::StaleGeneration));
+        s.apply(4, result(1, NetworkResult::Applied)).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((net.applied_generation, net.state, &net.error), (1, NetState::Applied, &None));
+
+        let mut mtu = cfg.clone();
+        mtu.links[0].mtu = 1400;
+        s.apply(5, Command::SetDesiredNetwork { id: hid("h1"), config: mtu }).unwrap();
+        assert_eq!(s.apply(6, result(1, NetworkResult::Reverted)), Err(ApplyError::StaleGeneration), "superseded");
+        s.apply(6, result(2, NetworkResult::Reverted)).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((net.desired_generation, net.applied_generation, net.state), (2, 1, NetState::Reverted), "still runs generation 1");
+        assert!(net.error.as_deref().is_some_and(|e| e.contains("reverted")), "{net:?}");
+
+        s.apply(7, Command::SetDesiredNetwork { id: hid("h1"), config: cfg }).unwrap();
+        s.apply(8, result(3, NetworkResult::Failed("no NIC sfp0".into()))).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((net.state, net.error.as_deref()), (NetState::Failed, Some("no NIC sfp0")));
+        assert_eq!(s.apply(9, Command::SetDesiredNetwork { id: hid("nope"), config: HostNetworkConfig::default() }), Err(ApplyError::NotFound));
+    }
+
+    #[test]
+    fn assessing_a_host_stamps_when_its_issues_changed() {
+        let mut s = ClusterState::new();
+        approved(&mut s, "h1");
+        let missing = vec![Issue::MissingRequiredNetwork { role: Role::Storage, network: NetworkId::from("storage") }];
+        let held: BTreeMap<Role, NetworkId> = [(Role::Storage, NetworkId::from("storage"))].into();
+        let assess = |issues: &Vec<Issue>, drift| Command::AssessNetwork {
+            id: hid("h1"),
+            issues: issues.clone(),
+            held_roles: if issues.is_empty() { BTreeMap::new() } else { held.clone() },
+            drift,
+        };
+        s.apply(10, assess(&missing, false)).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((&net.issues, &net.held_roles, net.issues_since, net.drift), (&missing, &held, 10, false));
+        s.apply(20, assess(&missing, true)).unwrap();
+        assert_eq!((s.hosts[&hid("h1")].net.issues_since, s.hosts[&hid("h1")].net.drift), (10, true), "same issues, same incident");
+        s.apply(30, assess(&vec![], true)).unwrap();
+        let net = &s.hosts[&hid("h1")].net;
+        assert_eq!((net.issues.is_empty(), net.held_roles.is_empty(), net.issues_since), (true, true, 30));
+    }
+
+    #[test]
+    fn delete_template_in_use_by_a_host_rejected() {
+        let mut s = ClusterState::new();
+        s.apply(0, Command::UpsertTemplate { template: template("sbc-transcode") }).unwrap();
+        approved(&mut s, "h1");
+        s.apply(3, provision("h1", Some("sbc-transcode"), "10.0.0.2")).unwrap();
+        let err = s.apply(4, Command::DeleteTemplate { id: "sbc-transcode".into() }).unwrap_err();
+        assert_eq!(err, ApplyError::InUse(vec![ObjectRef::host(&hid("h1"))]));
     }
 }

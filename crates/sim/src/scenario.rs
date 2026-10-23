@@ -2,7 +2,7 @@
 //! hosts. Unlike faults they may run the simulation while they work.
 
 use crate::engine::Engine;
-use crate::presets::{cable_host, capacity, host_id, host_port_cfg, profile_prefix};
+use crate::presets::{cable_host, capacity, host_id, profile_prefix};
 use crate::topology::{PortMode, SwitchPortCfg};
 use crate::world::HostHw;
 use control::agent::HostAgent;
@@ -49,8 +49,9 @@ impl Misconfig {
 #[ts(export)]
 pub enum Scenario {
     /// Racks `count` new hosts: gets a join token through the client, cables
-    /// each host to free switch ports, configures those ports and boots its
-    /// agent with the token. Hosts are numbered after the profile's existing ones.
+    /// each host to free switch ports, configures those ports for the
+    /// profile's template (with `misconfigure`'s mistake, if any) and boots
+    /// its agent with the token. Hosts are numbered after the profile's existing ones.
     AddHosts { profile: ProfileId, count: u32, misconfigure: Option<Misconfig> },
 }
 
@@ -78,12 +79,12 @@ impl Engine {
             // Cable first: if there is no room, nothing of this host exists yet.
             let cabled = cable_host(w, &id, profile)?;
             w.hosts.insert(id.clone(), HostHw { join_token: Some(token.clone()), ..HostHw::new(profile, variant) });
-            for (s, p) in cabled.switch_ports {
-                let mut cfg = host_port_cfg();
-                if let Some(m) = misconfigure {
+            if let Some(m) = misconfigure {
+                for (s, p) in cabled.switch_ports {
+                    let Some(mut cfg) = w.topology.switches.get(&s).and_then(|sw| sw.port(&p)).cloned() else { continue };
                     m.apply(&mut cfg);
+                    w.topology.set_port(&s, &p, cfg);
                 }
-                w.topology.set_port(&s, &p, cfg);
             }
             self.spawn(Endpoint::new(Addr::Host(id), Svc::Agent), Box::new(HostAgent::new(Some(token.clone()))));
         }
@@ -110,7 +111,7 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::presets::FleetSpec;
+    use crate::presets::{host_port_cfg, FleetSpec};
     use crate::topology::Node;
     use model::{HostId, PortName, SwitchId};
 
@@ -160,12 +161,33 @@ mod tests {
         assert_eq!(peer(&h2, "eth0"), sp("access-1", "p2"));
         assert_eq!(peer(&h2, "sfp0"), sp("core-1", "p2"));
         assert_eq!(peer(&h3, "sfp1"), sp("core-2", "p3"));
+        let port = |s: &str, p: &str| w.topology.switches[&SwitchId::from(s)].port(&PortName::from(p)).unwrap().clone();
         for (s, p) in [("access-1", "p2"), ("core-1", "p2"), ("core-2", "p2")] {
-            assert_eq!(w.topology.switches[&SwitchId::from(s)].port(&PortName::from(p)).unwrap().mtu, TOO_SMALL_MTU);
+            assert_eq!(port(s, p).mtu, TOO_SMALL_MTU, "the mistake lands on every port");
         }
+        // Otherwise configured for the template: eth0 on mgmt, the SFP+ bond an LACP trunk.
+        assert_eq!(port("access-1", "p2").mode, PortMode::Access(1));
+        let sfp = port("core-2", "p3");
+        assert_eq!((sfp.mode, sfp.lacp_group.as_deref()), (PortMode::Trunk { native: None, allowed: [20, 30, 100, 110].into() }, Some("ms01-03")));
         assert!(e.actor::<HostAgent>(&Endpoint::new(Addr::Host(h3), Svc::Agent)).is_some());
         e.run_for(1000);
         assert!(e.client_view().state.tokens.contains_key(&token), "the token came from the control plane");
+    }
+
+    #[test]
+    fn add_hosts_configures_ports_for_the_template_bar_the_mistake() {
+        let mut e = engine();
+        let s = Scenario::AddHosts { profile: ProfileId::MiniPc, count: 1, misconfigure: Some(Misconfig::MissingVlan(20)) };
+        e.scenario(s).unwrap();
+        let port = |e: &Engine, s: &str, p: &str| e.fabric().world().topology.switches[&SwitchId::from(s)].port(&PortName::from(p)).unwrap().clone();
+        let trunk = |allowed: &[u16]| PortMode::Trunk { native: Some(1), allowed: allowed.iter().copied().collect() };
+        assert_eq!(port(&e, "access-1", "p2").mode, trunk(&[1]), "VLAN 20 left out");
+        e.scenario(Scenario::AddHosts { profile: ProfileId::MiniPc, count: 1, misconfigure: None }).unwrap();
+        assert_eq!(port(&e, "access-1", "p3"), SwitchPortCfg { mode: trunk(&[1, 20]), ..host_port_cfg() });
+        e.scenario(Scenario::AddHosts { profile: ProfileId::Ms01, count: 1, misconfigure: Some(Misconfig::BondNoLacp) }).unwrap();
+        assert_eq!((port(&e, "core-1", "p2").lacp_group, port(&e, "core-2", "p2").lacp_group), (None, None));
+        e.scenario(Scenario::AddHosts { profile: ProfileId::Pi5, count: 1, misconfigure: None }).unwrap();
+        assert_eq!(port(&e, "access-1", "p5"), host_port_cfg());
     }
 
     #[test]

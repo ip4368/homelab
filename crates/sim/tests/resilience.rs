@@ -154,7 +154,8 @@ fn join_pending_then_approve() {
     let deadline = e.now() + 15_000;
     assert!(e.run_until(deadline, |e| lifecycle(e, &m1) == Some(Lifecycle::Ready)), "approved m1 never became Ready");
     assert_eq!(e.client_view().state.hosts[&m1].roles, roles);
-    assert_eq!(e.actor::<HostAgent>(&agent(&m1)).unwrap().roles(), &roles, "the agent learned its roles");
+    let desired = e.client_view().state.hosts[&m1].net.desired_generation;
+    assert_eq!(e.actor::<HostAgent>(&agent(&m1)).unwrap().net_generation(), desired, "the agent runs the config it was told");
 
     // Joined agents report metrics, which reach the client through the leader.
     let deadline = e.now() + 12_000;
@@ -404,6 +405,10 @@ fn restored_scenario_host_boots_as_a_member() {
     assert!(e.actor::<HostAgent>(&agent(&h)).unwrap().is_member(), "booted without a token");
     let deadline = e.now() + 15_000;
     assert!(e.run_until(deadline, |e| lifecycle(e, &h) == Some(Lifecycle::Ready)), "pi5-13 never recovered");
+    // The restarted agent forgot its network generation; the leader pushes it again.
+    let desired = e.client_view().state.hosts[&h].net.desired_generation;
+    let converged = |e: &Engine| e.actor::<HostAgent>(&agent(&h)).unwrap().net_generation() == desired;
+    assert!(e.run_until(e.now() + 15_000, converged), "the restarted agent was not told its config again");
 }
 
 #[test]

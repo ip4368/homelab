@@ -5,9 +5,13 @@
 
 use crate::runtime::SimTime;
 use model::network::{LldpNeighbor, ObservedSwitchPort};
-use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkTemplate, ProfileId, Role, SwitchId};
+use model::{
+    HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId, Role,
+    SwitchId,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
@@ -66,12 +70,72 @@ pub struct HostObj {
     /// The lifecycle the host was in when it went `NotReady`; `SetLifecycle`
     /// back to `Ready` restores it. `None` unless the host is `NotReady`.
     pub before_not_ready: Option<Lifecycle>,
+    /// The network template picked at provisioning; `None` runs the
+    /// profile's bootstrap config.
+    pub template: Option<String>,
     /// A hand-written network configuration that replaces the template's.
     pub override_: Option<HostNetworkConfig>,
+    /// Static addresses allocated at provisioning, by network.
+    pub ips: BTreeMap<NetworkId, Ipv4Addr>,
+    pub net: HostNet,
     #[ts(type = "number")]
     pub last_transition: SimTime,
     #[ts(type = "number")]
     pub version: u64,
+}
+
+/// Where pushing a host's network config stands, for its desired generation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum NetState {
+    /// Nothing rendered yet.
+    #[default]
+    Pending,
+    /// Pushed (or about to be); the agent has not confirmed it yet.
+    Applying,
+    Applied,
+    /// The agent could not apply it, and kept its previous config.
+    Failed,
+    /// The agent applied it, lost the control plane, and put its previous config back.
+    Reverted,
+}
+
+/// What an agent reports after it was told to apply a network config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkResult {
+    /// Applied, and this report came over the new config's mgmt.
+    Applied,
+    Failed(String),
+    Reverted,
+}
+
+/// A host's network configuration as the network controller manages it.
+/// Each change of the rendered config bumps `desired_generation`; the agent
+/// is pushed that generation until it applies it, fails, or reverts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostNet {
+    /// The config the host should run (template or override, with its
+    /// addresses); `None` until first rendered.
+    pub desired: Option<HostNetworkConfig>,
+    #[ts(type = "number")]
+    pub desired_generation: u64,
+    /// The last generation the agent confirmed applying.
+    #[ts(type = "number")]
+    pub applied_generation: u64,
+    pub state: NetState,
+    /// Why the desired generation `Failed` or was `Reverted`.
+    pub error: Option<String>,
+    /// What validating the desired config against the observed cabling and
+    /// switch ports found.
+    pub issues: Vec<Issue>,
+    /// When `issues` last changed: one `NetworkMismatch` incident per value.
+    #[ts(type = "number")]
+    pub issues_since: SimTime,
+    /// The host has an override that differs from its template.
+    pub drift: bool,
+    /// Roles held inactive, each with the first unavailable network it needs.
+    pub held_roles: BTreeMap<Role, NetworkId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

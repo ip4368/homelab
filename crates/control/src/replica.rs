@@ -7,7 +7,7 @@ use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, Swit
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
-use crate::state::{ClusterState, Command, Lifecycle};
+use crate::state::{ClusterState, Command, Lifecycle, NetworkResult};
 use model::{HostId, Inventory};
 use std::collections::BTreeSet;
 
@@ -207,16 +207,25 @@ impl CpReplica {
         self.handle(ctx, outs);
     }
 
-    /// Notes the heartbeat, files the host's observation if it came with one,
-    /// and asks for it if the one held here is not the one the agent stamped
-    /// (`None` means the agent has none).
-    fn on_heartbeat(&mut self, ctx: &mut dyn Ctx, from: Endpoint, host: HostId, observed_at: Option<SimTime>, observed: Option<Observed>) {
+    /// Notes the heartbeat and the host's network generation, files the
+    /// host's observation if it came with one, and asks for it if the one held
+    /// here is not the one the agent stamped (`None` means the agent has none).
+    fn on_heartbeat(
+        &mut self,
+        ctx: &mut dyn Ctx,
+        from: Endpoint,
+        host: HostId,
+        observed_at: Option<SimTime>,
+        observed: Option<Observed>,
+        net_generation: u64,
+    ) {
         let now = ctx.now();
         let Some(v) = &mut self.volatile else { return };
         v.last_heartbeat.insert(host.clone(), now);
         if !self.state.hosts.contains_key(&host) {
             return;
         }
+        v.net_generation.insert(host.clone(), net_generation);
         match observed {
             Some(observed) => {
                 let observed_at = observed_at.unwrap_or(now);
@@ -227,6 +236,21 @@ impl CpReplica {
             }
             None => {}
         }
+    }
+
+    /// Files an agent's network apply report for the network controller. An
+    /// `Applied` report travelled over the new config, so mgmt works: confirm
+    /// it right away, before the agent's revert timer runs out.
+    fn on_network_status(&mut self, ctx: &mut dyn Ctx, from: Endpoint, generation: u64, result: NetworkResult) {
+        let Addr::Host(host) = from.addr.clone() else { return };
+        let Some(v) = &mut self.volatile else { return };
+        if from.svc != Svc::Agent || !self.state.hosts.contains_key(&host) {
+            return;
+        }
+        if result == NetworkResult::Applied {
+            ctx.send(from, mgmt(), Msg::ConfirmNetwork { generation });
+        }
+        v.net_results.insert(host, (generation, result));
     }
 
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
@@ -254,6 +278,7 @@ fn command_for(ctx: &mut dyn Ctx, op: ApiOp) -> (Command, serde_json::Value) {
         ApiOp::Cordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Cordoned },
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
+        ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
     };
@@ -296,7 +321,10 @@ impl Actor for CpReplica {
                 let outs = self.raft().step(now, peer, m);
                 self.handle(ctx, outs);
             }
-            Msg::Heartbeat { host, observed_at, observed, .. } => self.on_heartbeat(ctx, from, host, observed_at, observed),
+            Msg::Heartbeat { host, observed_at, observed, net_generation, .. } => {
+                self.on_heartbeat(ctx, from, host, observed_at, observed, net_generation)
+            }
+            Msg::NetworkStatus { generation, result } => self.on_network_status(ctx, from, generation, result),
             Msg::SwitchReport { switch, model, ports, mlag_peer } => {
                 // A report only counts from the switch it describes.
                 if from.addr == Addr::Switch(switch.clone())
@@ -320,7 +348,8 @@ impl Actor for CpReplica {
             | Msg::ApiResp { .. }
             | Msg::SyncResp { .. }
             | Msg::JoinResp(_)
-            | Msg::Approved { .. }
+            | Msg::ApplyNetwork { .. }
+            | Msg::ConfirmNetwork { .. }
             | Msg::ReportRequest
             | Msg::SwitchPoll => {}
         }
@@ -582,7 +611,7 @@ mod tests {
     }
 
     fn heartbeat(at: Option<SimTime>, observed: Option<Observed>) -> Msg {
-        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed }
+        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed, net_generation: 0 }
     }
 
     #[test]
@@ -613,7 +642,7 @@ mod tests {
         assert_eq!(rig.r.volatile.as_ref().unwrap().host_reports[&hid("m1")].observed, observed(false));
 
         // Unknown hosts are neither stored nor asked.
-        let stranger = Msg::Heartbeat { host: hid("zz"), lifecycle_seen: 0, observed_at: Some(1), observed: Some(observed(true)) };
+        let stranger = Msg::Heartbeat { host: hid("zz"), lifecycle_seen: 0, observed_at: Some(1), observed: Some(observed(true)), net_generation: 0 };
         assert!(hb(&mut rig, stranger).is_empty());
         assert!(!rig.r.volatile.as_ref().unwrap().host_reports.contains_key(&hid("zz")));
         assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")), "still a heartbeat");
@@ -665,5 +694,36 @@ mod tests {
         rig.r.on_message(&mut rig.ctx, sw("access-1"), report("access-1"));
         let now = rig.ctx.now;
         assert_eq!(rig.r.volatile.as_ref().unwrap().switch_reports[&model::SwitchId::from("access-1")].at, now);
+    }
+
+    #[test]
+    fn leader_confirms_applied_network_configs_and_files_reports() {
+        let add = Command::AddPendingHost {
+            id: hid("m1"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        };
+        let mut rig = Rig::new(vec![add]);
+        rig.elect();
+        rig.ack();
+        let agent = host_ep("m1", Svc::Agent);
+        let status = |generation, result| Msg::NetworkStatus { generation, result };
+        rig.r.on_message(&mut rig.ctx, agent.clone(), status(3, NetworkResult::Applied));
+        assert_eq!(std::mem::take(&mut rig.ctx.sent), [(agent.clone(), Msg::ConfirmNetwork { generation: 3 })], "confirmed at once");
+        rig.r.on_message(&mut rig.ctx, agent.clone(), status(4, NetworkResult::Reverted));
+        assert!(rig.ctx.sent.is_empty(), "nothing to confirm");
+        let v = rig.r.volatile.as_ref().unwrap();
+        assert_eq!(v.net_results[&hid("m1")], (4, NetworkResult::Reverted), "the latest report is kept");
+
+        // Only a known host's agent is listened to.
+        rig.r.on_message(&mut rig.ctx, host_ep("m1", Svc::Cp), status(5, NetworkResult::Applied));
+        rig.r.on_message(&mut rig.ctx, host_ep("zz", Svc::Agent), status(5, NetworkResult::Applied));
+        assert!(rig.ctx.sent.is_empty());
+        assert_eq!(rig.r.volatile.as_ref().unwrap().net_results.len(), 1);
+
+        let hb = Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 7 };
+        rig.r.on_message(&mut rig.ctx, agent, hb);
+        assert_eq!(rig.r.volatile.as_ref().unwrap().net_generation[&hid("m1")], 7, "heartbeats carry the running generation");
     }
 }

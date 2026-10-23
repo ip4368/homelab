@@ -1,16 +1,18 @@
 //! Join: an unjoined agent sends `JoinRequest`s with a token. A known,
 //! unexpired token creates a `Pending` host from the reported inventory
 //! ([`on_request`], answered by the replica). The periodic [`run`] then
-//! approves pending hosts that match an auto-approve rule, moves approved
-//! hosts to `Provisioning`, tells their agents the roles, and marks them
-//! `Ready` on their first heartbeat after that.
+//! approves pending hosts that match an auto-approve rule, and provisions
+//! approved hosts: it picks their network template and allocates their
+//! addresses. The network controller pushes the rendered config; once the
+//! agent confirmed applying it (over its new mgmt), the host is `Ready`.
 
 use super::{Action, Volatile};
-use crate::proto::{mgmt, Msg};
-use crate::runtime::{Addr, Endpoint, SimTime, Svc};
-use crate::state::{ClusterState, Command, HostObj, Lifecycle, ObjectRef};
-use model::{eligible, profile, HostId, Inventory};
-use std::collections::BTreeSet;
+use crate::runtime::{Addr, SimTime};
+use crate::state::{ClusterState, Command, HostObj, Lifecycle, NetState, ObjectRef};
+use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, NetworkPurpose};
+use model::{allocate, eligible, profile, HostId, Inventory, NetworkId};
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 /// At most one "join rejected" event per host this often, however often its agent retries.
 pub const REJECT_EVENT_EVERY_MS: u64 = 60_000;
@@ -65,20 +67,15 @@ pub fn on_request(
 
 pub fn run(state: &ClusterState, v: &Volatile) -> Vec<Action> {
     let mut out = vec![];
+    let mut taken = addresses_taken(state, v);
     for host in state.hosts.values() {
         let id = &host.id;
         match host.lifecycle {
             Lifecycle::Pending => out.extend(auto_approve(state, host)),
-            // Task 14 pushes the host's network config here, before provisioning.
-            Lifecycle::Approved => {
-                out.push(Action::Propose(Command::SetLifecycle { id: id.clone(), lifecycle: Lifecycle::Provisioning }))
-            }
-            Lifecycle::Provisioning if heartbeat_since(v, id, host.last_transition) => {
+            Lifecycle::Approved => out.push(Action::Propose(provision(state, v, host, &mut taken))),
+            // `Applied` comes from the agent over its new config: mgmt works.
+            Lifecycle::Provisioning if host.net.state == NetState::Applied => {
                 out.push(Action::Propose(Command::SetLifecycle { id: id.clone(), lifecycle: Lifecycle::Ready }))
-            }
-            Lifecycle::Provisioning => {
-                let agent = Endpoint::new(Addr::Host(id.clone()), Svc::Agent);
-                out.push(Action::Send(agent, mgmt(), Msg::Approved { roles: host.roles.clone() }));
             }
             _ => {}
         }
@@ -86,8 +83,67 @@ pub fn run(state: &ClusterState, v: &Volatile) -> Vec<Action> {
     out
 }
 
-fn heartbeat_since(v: &Volatile, host: &HostId, since: SimTime) -> bool {
-    v.last_heartbeat.get(host).is_some_and(|&at| at > since)
+/// Addresses held by hosts, or being handed out by provisioning proposals in flight.
+fn addresses_taken(state: &ClusterState, v: &Volatile) -> BTreeSet<Ipv4Addr> {
+    let held = state.hosts.values().flat_map(|h| h.ips.values().copied());
+    let in_flight = v.in_flight.values().flat_map(|c| match c {
+        Command::ProvisionHost { ips, .. } => ips.values().copied().collect(),
+        _ => vec![],
+    });
+    held.chain(in_flight).collect()
+}
+
+/// Provisioning for an approved host: its template (see [`pick_template`])
+/// and an address for each mgmt, storage and migration network the config
+/// it will run attaches. A proposal already in flight is asked for again
+/// unchanged, so its addresses stay put.
+fn provision(state: &ClusterState, v: &Volatile, host: &HostObj, taken: &mut BTreeSet<Ipv4Addr>) -> Command {
+    let in_flight = v.in_flight.values().find(|c| matches!(c, Command::ProvisionHost { id, .. } if *id == host.id));
+    if let Some(cmd) = in_flight {
+        return cmd.clone();
+    }
+    let template = pick_template(state, host);
+    let config = match (&host.override_, template.as_ref().and_then(|t| state.templates.get(t))) {
+        (Some(o), _) => o.clone(),
+        (None, Some(t)) => t.template.config.clone(),
+        (None, None) => bootstrap_config(&host.profile),
+    };
+    let ips = allocate_ips(&config, |n| state.networks.get(n).map(|o| &o.network), taken);
+    Command::ProvisionHost { id: host.id.clone(), template, ips }
+}
+
+/// The template of the auto-approve rule for the host's profile, if it
+/// names one that exists; else the first template written for the profile.
+fn pick_template(state: &ClusterState, host: &HostObj) -> Option<String> {
+    let rule = state.rules.values().find(|r| r.profile == host.profile.id);
+    let from_rule = rule.and_then(|r| r.template.clone()).filter(|t| state.templates.contains_key(t));
+    from_rule.or_else(|| {
+        state.templates.values().find(|t| t.template.profile == host.profile.id).map(|t| t.template.id.clone())
+    })
+}
+
+/// The lowest free address for each mgmt, storage and migration network
+/// `config` attaches (VM networks address their guests, not the host). Each
+/// address handed out joins `taken`. Networks `network` does not know, or
+/// that are full, get none.
+pub fn allocate_ips<'n>(
+    config: &HostNetworkConfig,
+    network: impl Fn(&NetworkId) -> Option<&'n LogicalNetwork>,
+    taken: &mut BTreeSet<Ipv4Addr>,
+) -> BTreeMap<NetworkId, Ipv4Addr> {
+    let mut ips = BTreeMap::new();
+    for a in &config.attachments {
+        let Some(net) = network(&a.network) else { continue };
+        let addressed = matches!(net.purpose, NetworkPurpose::Mgmt | NetworkPurpose::Storage | NetworkPurpose::Migration);
+        if !addressed || ips.contains_key(&net.id) {
+            continue;
+        }
+        if let Some(ip) = allocate(net, taken) {
+            taken.insert(ip);
+            ips.insert(net.id.clone(), ip);
+        }
+    }
+    ips
 }
 
 /// Approval by the first rule (by id) for the host's profile, keeping only
@@ -117,7 +173,11 @@ fn auto_approve(state: &ClusterState, host: &HostObj) -> Vec<Action> {
 mod tests {
     use super::*;
     use crate::controllers::PendingJoin;
-    use model::{ProfileId, Role};
+    use crate::runtime::{Endpoint, Svc};
+    use crate::state::NetworkResult;
+    use model::{seed_networks, seed_templates, NetworkId, ProfileId, Role};
+    use std::collections::BTreeMap;
+    use std::net::Ipv4Addr;
 
     fn hid(s: &str) -> HostId {
         HostId::from(s)
@@ -207,24 +267,105 @@ mod tests {
         assert_eq!(s.hosts[&hid("pi")].lifecycle, Lifecycle::Approved);
     }
 
-    #[test]
-    fn approved_host_provisions_then_is_ready_on_its_next_heartbeat() {
-        let mut s = with_token(1000);
-        add(&mut s, "m1", ProfileId::MiniPc, 0);
-        let roles: BTreeSet<Role> = [Role::Compute].into();
-        s.apply(1, Command::ApproveHost { id: hid("m1"), roles: roles.clone() }).unwrap();
-        let mut v = Volatile::new(0, 1);
-        v.last_heartbeat.insert(hid("m1"), 1500); // heard from while still approved
-        let provision = Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::Provisioning };
-        assert_eq!(proposals(&run(&s, &v)), std::slice::from_ref(&provision));
-        s.apply(2000, provision).unwrap();
+    fn ip(s: &str) -> Ipv4Addr {
+        s.parse().unwrap()
+    }
 
-        let agent = Endpoint::new(Addr::Host(hid("m1")), Svc::Agent);
-        assert_eq!(run(&s, &v), [Action::Send(agent, mgmt(), Msg::Approved { roles })], "tell the agent, wait");
+    fn ips(pairs: &[(&str, &str)]) -> BTreeMap<NetworkId, Ipv4Addr> {
+        pairs.iter().map(|(n, a)| (NetworkId::from(*n), ip(a))).collect()
+    }
+
+    /// A token, the seed networks and templates, and `hosts` approved for Compute.
+    fn with_networks(hosts: &[(&str, ProfileId)]) -> ClusterState {
+        let mut s = with_token(1000);
+        for network in seed_networks() {
+            s.apply(0, Command::UpsertNetwork { network }).unwrap();
+        }
+        for template in seed_templates() {
+            s.apply(0, Command::UpsertTemplate { template }).unwrap();
+        }
+        for &(id, p) in hosts {
+            add(&mut s, id, p, 1);
+            s.apply(0, Command::ApproveHost { id: hid(id), roles: [Role::Compute].into() }).unwrap();
+        }
+        s
+    }
+
+    fn provision(id: &str, template: Option<&str>, addrs: &[(&str, &str)]) -> Command {
+        Command::ProvisionHost { id: hid(id), template: template.map(String::from), ips: ips(addrs) }
+    }
+
+    #[test]
+    fn approved_host_is_provisioned_with_its_rule_template_and_addresses() {
+        let mut s = with_networks(&[("ms", ProfileId::Ms01), ("mini", ProfileId::MiniPc), ("rk", ProfileId::Rk3588)]);
+        let rule = |id: &str, profile, template: &str| Command::UpsertRule {
+            id: id.into(),
+            profile,
+            roles: [Role::Compute].into(),
+            template: Some(template.into()),
+        };
+        s.apply(0, rule("rk", ProfileId::Rk3588, "sbc-transcode")).unwrap();
+        // A rule naming a template that does not exist is passed over for profile matching.
+        s.apply(0, rule("mini", ProfileId::MiniPc, "gone")).unwrap();
+        assert_eq!(
+            proposals(&run(&s, &Volatile::new(0, 1))),
+            [
+                // mini: the first template written for its profile; mgmt and storage get addresses.
+                provision("mini", Some("minipc-standard"), &[("mgmt", "10.0.0.2"), ("storage", "10.20.0.2")]),
+                // ms: VM networks get no host address; mgmt, storage and migration do.
+                provision("ms", Some("ms01-standard"), &[("mgmt", "10.0.0.3"), ("migration", "10.30.0.2"), ("storage", "10.20.0.3")]),
+                // rk: no template is profiled Rk3588, but its rule names one.
+                provision("rk", Some("sbc-transcode"), &[("mgmt", "10.0.0.4")]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_without_a_template_gets_a_mgmt_address_for_its_bootstrap_config() {
+        let mut s = with_token(1000);
+        for network in seed_networks() {
+            s.apply(0, Command::UpsertNetwork { network }).unwrap();
+        }
+        add(&mut s, "rk", ProfileId::Rk3588, 0);
+        s.apply(0, Command::ApproveHost { id: hid("rk"), roles: [Role::Compute].into() }).unwrap();
+        assert_eq!(proposals(&run(&s, &Volatile::new(0, 1))), [provision("rk", None, &[("mgmt", "10.0.0.2")])]);
+        // No networks at all: nothing to address, but the host still provisions.
+        let mut s = with_token(1000);
+        add(&mut s, "rk", ProfileId::Rk3588, 0);
+        s.apply(0, Command::ApproveHost { id: hid("rk"), roles: [Role::Compute].into() }).unwrap();
+        assert_eq!(proposals(&run(&s, &Volatile::new(0, 1))), [provision("rk", None, &[])]);
+    }
+
+    #[test]
+    fn addresses_skip_those_held_or_being_handed_out() {
+        let mut s = with_networks(&[("a", ProfileId::Pi5), ("b", ProfileId::Pi5), ("c", ProfileId::Pi5)]);
+        s.apply(0, provision("a", Some("sbc-transcode"), &[("mgmt", "10.0.0.2")])).unwrap();
+        let mut v = Volatile::new(0, 1);
+        let b = provision("b", Some("sbc-transcode"), &[("mgmt", "10.0.0.4")]);
+        v.in_flight.insert(9, b.clone());
+        // b's proposal (from an earlier run) still stands, so c steers clear of it, and b's is asked for unchanged.
+        assert_eq!(proposals(&run(&s, &v)), [b, provision("c", Some("sbc-transcode"), &[("mgmt", "10.0.0.3")])]);
+    }
+
+    #[test]
+    fn provisioning_host_is_ready_once_its_network_config_applied() {
+        let mut s = with_networks(&[("m1", ProfileId::Pi5)]);
+        s.apply(1, provision("m1", Some("sbc-transcode"), &[("mgmt", "10.0.0.2")])).unwrap();
+        let mut v = Volatile::new(0, 1);
         v.last_heartbeat.insert(hid("m1"), 2500);
+        assert!(run(&s, &v).is_empty(), "a heartbeat is not enough: nothing applied yet");
+        let config = seed_templates()[2].config.clone();
+        s.apply(2, Command::SetDesiredNetwork { id: hid("m1"), config: config.clone() }).unwrap();
+        s.apply(3, Command::RecordNetworkResult { id: hid("m1"), generation: 1, result: NetworkResult::Reverted }).unwrap();
+        assert!(run(&s, &v).is_empty(), "a reverted host stays provisioning");
+        let mut changed = config;
+        changed.links[0].mtu = 1400;
+        s.apply(4, Command::SetDesiredNetwork { id: hid("m1"), config: changed }).unwrap();
+        assert!(run(&s, &v).is_empty());
+        s.apply(5, Command::RecordNetworkResult { id: hid("m1"), generation: 2, result: NetworkResult::Applied }).unwrap();
         let ready = Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::Ready };
         assert_eq!(run(&s, &v), [Action::Propose(ready.clone())]);
-        s.apply(2500, ready).unwrap();
+        s.apply(6, ready).unwrap();
         assert!(run(&s, &v).is_empty());
     }
 }

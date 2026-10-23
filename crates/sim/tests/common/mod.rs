@@ -9,7 +9,7 @@ use control::raft::{Durable, Entry, EntryPayload};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, Svc};
 use control::state::{Command, CpMode, Lifecycle};
-use model::{profile, HostId, Inventory, PortName, ProfileId, Role, SwitchId};
+use model::{profile, seed_networks, HostId, Inventory, PortName, ProfileId, Role, SwitchId};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
 use sim::topology::{Node, PortMode, Switch, SwitchPortCfg};
@@ -44,7 +44,7 @@ impl Actor for HeartbeatStub {
     }
     fn on_message(&mut self, _: &mut dyn Ctx, _: Endpoint, _: Msg) {}
     fn on_timer(&mut self, ctx: &mut dyn Ctx, _: u64) {
-        let hb = Msg::Heartbeat { host: self.host.clone(), lifecycle_seen: 0, observed_at: None, observed: None };
+        let hb = Msg::Heartbeat { host: self.host.clone(), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0 };
         ctx.send(Endpoint::new(Addr::Vip, Svc::Cp), mgmt(), hb);
         ctx.set_timer(HEARTBEAT_MS, 0);
     }
@@ -65,11 +65,11 @@ fn world() -> World {
     w
 }
 
-/// The installed cluster every replica starts from: the three hosts already
-/// `Ready` with the control-plane role, and them as CP voters.
+/// The installed cluster every replica starts from: the seed networks, the
+/// three hosts already `Ready` with the control-plane role, and them as CP voters.
 pub fn seeded_durable() -> Durable<LogCmd> {
     let voters: BTreeSet<HostId> = HOSTS.iter().map(|h| hid(h)).collect();
-    let mut cmds = vec![];
+    let mut cmds: Vec<Command> = seed_networks().into_iter().map(|network| Command::UpsertNetwork { network }).collect();
     for h in HOSTS {
         let id = hid(h);
         cmds.push(Command::AddPendingHost {

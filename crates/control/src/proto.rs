@@ -3,9 +3,9 @@
 
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
-use crate::state::{Changes, Command};
+use crate::state::{Changes, Command, NetworkResult};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
-use model::{HostId, Inventory, NetworkId, ProfileId, Role, SwitchId};
+use model::{HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -61,6 +61,8 @@ pub enum ApiOp {
     Cordon { id: HostId },
     Uncordon { id: HostId },
     RemoveHost { id: HostId },
+    /// Sets, or with `None` clears, the host's hand-written network config.
+    SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
     UpsertRule { id: String, profile: ProfileId, roles: BTreeSet<Role>, template: Option<String> },
     DeleteRule { id: String },
 }
@@ -88,7 +90,15 @@ pub enum Msg {
     /// `observed_at` is when the agent last saw its observation change (`None` if
     /// it has none); `observed` carries it only on the first heartbeat, after a
     /// change, or when the leader asked ([`Msg::ReportRequest`]).
-    Heartbeat { host: HostId, lifecycle_seen: u64, observed_at: Option<SimTime>, observed: Option<Observed> },
+    /// `net_generation` is the network config generation the host runs (0
+    /// when the agent does not know, e.g. after a restart).
+    Heartbeat {
+        host: HostId,
+        lifecycle_seen: u64,
+        observed_at: Option<SimTime>,
+        observed: Option<Observed>,
+        net_generation: u64,
+    },
     /// Leader to agent: send your observation, I don't have the one stamped
     /// in your last heartbeat.
     ReportRequest,
@@ -96,8 +106,14 @@ pub enum Msg {
     JoinRequest { token: String, inventory: Inventory },
     /// Leader to agent: `Ok` once the host object exists.
     JoinResp(Result<(), String>),
-    /// Leader to agent: the host was approved with these roles.
-    Approved { roles: BTreeSet<Role> },
+    /// Leader to agent: run this network config. The agent keeps its previous
+    /// one and puts it back unless confirmed within its revert timeout.
+    ApplyNetwork { generation: u64, config: HostNetworkConfig },
+    /// Agent to the VIP: what became of `ApplyNetwork { generation }`. An
+    /// `Applied` report is sent over the new config, so its arrival proves mgmt works.
+    NetworkStatus { generation: u64, result: NetworkResult },
+    /// Leader to agent: keep `generation`.
+    ConfirmNetwork { generation: u64 },
     /// Agent to the VIP, every metrics interval.
     Metrics { host: HostId, sample: MetricSample },
     /// Leader to a switch's management interface, every poll interval.

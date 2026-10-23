@@ -10,11 +10,12 @@
 
 pub mod health;
 pub mod join;
+pub mod network;
 pub mod observe;
 
 use crate::proto::{MetricSample, Msg, Observed};
 use crate::runtime::{Addr, Endpoint, SimTime};
-use crate::state::{ClusterState, Command};
+use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
 use model::{HostId, NetworkId, SwitchId};
 use std::collections::BTreeMap;
@@ -84,6 +85,12 @@ pub struct Volatile {
     pub switch_reports: BTreeMap<SwitchId, SwitchReading>,
     /// When each switch was last sent a poll.
     pub switch_polled_at: BTreeMap<SwitchId, SimTime>,
+    /// The network config generation each host's agent last said it runs.
+    pub net_generation: BTreeMap<HostId, u64>,
+    /// Each agent's latest report on applying a network config: (generation, result).
+    pub net_results: BTreeMap<HostId, (u64, NetworkResult)>,
+    /// The network config generation each host was last pushed, and when.
+    pub net_pushed: BTreeMap<HostId, (u64, SimTime)>,
     /// Client requests by log index.
     pub pending: BTreeMap<u64, PendingApi>,
     /// Joins by log index.
@@ -107,6 +114,9 @@ impl Volatile {
             host_reports: BTreeMap::new(),
             switch_reports: BTreeMap::new(),
             switch_polled_at: BTreeMap::new(),
+            net_generation: BTreeMap::new(),
+            net_results: BTreeMap::new(),
+            net_pushed: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
             join_rejected_at: BTreeMap::new(),
@@ -139,8 +149,14 @@ impl Volatile {
     /// Records that the replica sent `msg` to `to`, for controllers that pace
     /// themselves by when they last sent something.
     pub fn note_sent(&mut self, to: &Endpoint, msg: &Msg, now: SimTime) {
-        if let (Addr::Switch(id), Msg::SwitchPoll) = (&to.addr, msg) {
-            self.switch_polled_at.insert(id.clone(), now);
+        match (&to.addr, msg) {
+            (Addr::Switch(id), Msg::SwitchPoll) => {
+                self.switch_polled_at.insert(id.clone(), now);
+            }
+            (Addr::Host(id), Msg::ApplyNetwork { generation, .. }) => {
+                self.net_pushed.insert(id.clone(), (*generation, now));
+            }
+            _ => {}
         }
     }
 }
@@ -148,6 +164,7 @@ impl Volatile {
 pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<Action> {
     let mut out = health::run(state, volatile, now);
     out.extend(join::run(state, volatile));
+    out.extend(network::run(state, volatile, now));
     out.extend(observe::run(state, volatile, now));
     out
 }

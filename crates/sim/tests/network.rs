@@ -2,16 +2,21 @@
 //! switch configuration (polling) over the fabric, without reading the world.
 //! Tests may read ground truth to inject faults and to check the log.
 
-use control::proto::LogCmd;
+use control::agent::HostAgent;
+use control::controllers::network::{NETWORK_APPLY_FAILED, NETWORK_MISMATCH};
+use control::proto::{ApiOp, LogCmd};
 use control::raft::EntryPayload;
 use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, Svc};
-use control::state::{Command, ObjectRef};
+use control::state::{Alert, Command, HostObj, Lifecycle, NetState, ObjectRef};
 use model::network::{LldpNeighbor, PortMode, SwitchPortCfg};
-use model::{HostId, PortName, SwitchId};
+use model::{HostId, NetworkId, PortName, ProfileId, Role, SwitchId};
 use sim::engine::Engine;
 use sim::faults::Fault;
 use sim::presets::Preset;
+use sim::scenario::{Misconfig, Scenario};
+use sim::topology::Node;
+use std::collections::BTreeSet;
 
 fn hid(s: &str) -> HostId {
     HostId::from(s)
@@ -178,4 +183,157 @@ fn a_new_leader_keeps_observing() {
         port == changed && lldp_of(e, "ms01-10").len() == 2
     };
     assert!(e.run_until(e.now() + 40_000, observed), "the new leader missed a change");
+}
+
+// ---- the network controller: templated joins, held roles, auto-revert ----
+
+fn host_obj(e: &Engine, id: &HostId) -> Option<HostObj> {
+    e.client_view().state.hosts.get(id).cloned()
+}
+
+/// Runs until the default fleet is settled: all 60 hosts `Ready` and every switch observed.
+fn settled_fleet(seed: u64) -> Engine {
+    let mut e = default_fleet(seed);
+    observed_all_switches(&mut e);
+    let ready = |e: &Engine| e.client_view().state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Ready).count() == 60;
+    assert!(e.run_until(e.now() + 30_000, ready), "the fleet did not settle");
+    e
+}
+
+/// Open alerts of `kind` about `host`.
+fn open_alerts(e: &Engine, kind: &str, host: &HostId) -> Vec<Alert> {
+    let entity = ObjectRef::host(host);
+    e.client_view().state.alerts.values().filter(|a| a.kind == kind && a.entity == entity && a.resolved_at.is_none()).cloned().collect()
+}
+
+#[test]
+fn default_preset_starts_clean() {
+    let mut e = default_fleet(40);
+    e.run_for(60_000);
+    let s = &e.client_view().state;
+    assert_eq!(s.hosts.len(), 60);
+    for h in s.hosts.values() {
+        assert_eq!((h.lifecycle, h.net.state), (Lifecycle::Ready, NetState::Applied), "{}", h.id);
+        assert!(h.net.desired_generation > 0 && h.net.applied_generation == h.net.desired_generation, "{}: {:?}", h.id, h.net);
+        assert!(h.net.held_roles.is_empty() && h.net.issues.is_empty(), "{}: {:?}", h.id, h.net);
+        assert_eq!(e.fabric().world().hosts[&h.id].applied_net, *h.net.desired.as_ref().unwrap(), "{} runs its desired config", h.id);
+    }
+    let mismatches: Vec<_> = s.alerts.values().filter(|a| a.kind == NETWORK_MISMATCH).collect();
+    assert!(mismatches.is_empty(), "{mismatches:?}");
+    // The template is what the hosts run: an MS-01 has its storage bond, with an address.
+    let ms01 = &s.hosts[&hid("ms01-01")];
+    assert_eq!(ms01.template.as_deref(), Some("ms01-standard"));
+    let storage = ms01.net.desired.as_ref().unwrap().attachments.iter().find(|a| a.network.as_str() == "storage").cloned();
+    assert_eq!(storage.map(|a| (a.link, a.ip)), Some(("bond0".to_string(), ms01.ips.get(&NetworkId::from("storage")).copied())));
+    assert!(ms01.ips.contains_key(&NetworkId::from("storage")) && ms01.ips.contains_key(&NetworkId::from("migration")));
+    // Every agent converged on the generation it was told (a restart re-pushes it).
+    for h in s.hosts.values() {
+        let a = e.actor::<HostAgent>(&Endpoint::new(Addr::Host(h.id.clone()), Svc::Agent)).unwrap();
+        assert_eq!(a.net_generation(), h.net.desired_generation, "{}", h.id);
+    }
+}
+
+#[test]
+fn criterion_2_twenty_rk3588_join() {
+    let mut e = settled_fleet(41);
+    let rule = &e.client_view().state.rules["rk3588"];
+    assert_eq!((rule.roles.clone(), rule.template.as_deref()), ([Role::Transcode, Role::Compute].into(), Some("sbc-transcode")));
+    e.scenario(Scenario::AddHosts { profile: ProfileId::Rk3588, count: 20, misconfigure: None }).unwrap();
+    let added: Vec<HostId> = (13..=32).map(|n| hid(&format!("rk3588-{n}"))).collect();
+    let done = |e: &Engine| {
+        added.iter().all(|h| host_obj(e, h).is_some_and(|o| o.lifecycle == Lifecycle::Ready && o.net.state == NetState::Applied))
+    };
+    let deadline = e.now() + 60_000;
+    assert!(
+        e.run_until(deadline, done),
+        "{:?}",
+        added.iter().map(|h| host_obj(&e, h).map(|o| (o.lifecycle, o.net.state))).collect::<Vec<_>>()
+    );
+    let s = &e.client_view().state;
+    let mut mgmt_ips = BTreeSet::new();
+    for h in &added {
+        let o = &s.hosts[h];
+        assert_eq!(o.template.as_deref(), Some("sbc-transcode"));
+        assert_eq!(o.roles, [Role::Transcode, Role::Compute].into());
+        let ip = o.ips[&NetworkId::from("mgmt")];
+        assert!(mgmt_ips.insert(ip), "{h} got a duplicate address {ip}");
+        assert_eq!(e.fabric().world().hosts[h].applied_net, *o.net.desired.as_ref().unwrap(), "{h} runs the template");
+    }
+}
+
+#[test]
+fn misconfigured_join_ready_but_role_held() {
+    let mut e = settled_fleet(42);
+    let roles: BTreeSet<Role> = [Role::Storage, Role::Compute].into();
+    let rule = ApiOp::UpsertRule {
+        id: "minipc".into(),
+        profile: ProfileId::MiniPc,
+        roles: roles.clone(),
+        template: Some("minipc-standard".into()),
+    };
+    e.api(rule);
+    e.run_for(2000);
+    let s = Scenario::AddHosts { profile: ProfileId::MiniPc, count: 1, misconfigure: Some(Misconfig::MissingVlan(20)) };
+    e.scenario(s).unwrap();
+    let h = hid("minipc-25");
+    let held = |e: &Engine| {
+        host_obj(e, &h).is_some_and(|o| o.lifecycle == Lifecycle::Ready && o.net.held_roles.contains_key(&Role::Storage))
+            && open_alerts(e, NETWORK_MISMATCH, &h).iter().any(|a| a.message.contains("add VLAN 20"))
+    };
+    let deadline = e.now() + 60_000;
+    assert!(e.run_until(deadline, held), "{:?} alerts {:?}", host_obj(&e, &h).map(|o| (o.lifecycle, o.net)), open_alerts(&e, NETWORK_MISMATCH, &h));
+    let o = host_obj(&e, &h).unwrap();
+    assert_eq!(o.roles, roles);
+    assert_eq!(o.net.held_roles, [(Role::Storage, NetworkId::from("storage"))].into(), "compute only needs mgmt");
+    assert_eq!(o.net.state, NetState::Applied);
+    let alerts = open_alerts(&e, NETWORK_MISMATCH, &h);
+    assert_eq!(alerts.len(), 1, "one alert per host: {alerts:?}");
+    let port = e.client_view().state.hosts[&h].lldp[0].clone();
+    let want = format!("{} {}: add VLAN 20 to trunk allowed", port.switch, port.switch_port);
+    assert!(alerts[0].message.contains(&want), "{} lacks {want}", alerts[0].message);
+
+    // The technician fixes the port: the alert resolves and the role is released.
+    let mut cfg = e.fabric().world().topology.switches[&port.switch].port(&port.switch_port).unwrap().clone();
+    let PortMode::Trunk { allowed, .. } = &mut cfg.mode else { panic!("a mini PC port is a trunk: {cfg:?}") };
+    allowed.insert(20);
+    e.fault(Fault::SetSwitchPort { switch: port.switch.clone(), port: port.switch_port.clone(), cfg }).unwrap();
+    let fixed = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.net.held_roles.is_empty()) && open_alerts(e, NETWORK_MISMATCH, &h).is_empty();
+    assert!(e.run_until(e.now() + 40_000, fixed), "not released after the fix: {:?}", host_obj(&e, &h).map(|o| o.net));
+}
+
+#[test]
+fn mgmt_breaking_override_reverts() {
+    let mut e = settled_fleet(43);
+    let h = hid("pi5-01");
+    let before = host_obj(&e, &h).unwrap();
+    let running = e.fabric().world().hosts[&h].applied_net.clone();
+    // mgmt tagged on VLAN 1, but the host sits on an access port: it would lose mgmt.
+    let mut broken = running.clone();
+    broken.attachments[0].tagged = true;
+    e.api(ApiOp::SetHostOverride { id: h.clone(), config: Some(broken) });
+    let start = e.now();
+    let reverted = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.net.state == NetState::Reverted);
+    assert!(e.run_until(start + 35_000, reverted), "not Reverted 35 s after the override: {:?}", host_obj(&e, &h).map(|o| o.net));
+    let o = host_obj(&e, &h).unwrap();
+    assert_eq!(o.net.desired_generation, before.net.desired_generation + 1);
+    assert_eq!(o.net.applied_generation, before.net.desired_generation, "still on the old generation");
+    assert!(o.net.drift, "an override that differs from the template is drift");
+    assert_eq!(e.fabric().world().hosts[&h].applied_net, running, "the agent put the old config back");
+    let alerted = |e: &Engine| open_alerts(e, NETWORK_APPLY_FAILED, &h).len() == 1;
+    assert!(e.run_until(e.now() + 2000, alerted), "the failure is not alerted");
+
+    // The host stays reachable: it keeps heartbeating, stays Ready, and the failed generation is not retried.
+    e.run_for(60_000);
+    let o = host_obj(&e, &h).unwrap();
+    assert_eq!((o.lifecycle, o.net.state), (Lifecycle::Ready, NetState::Reverted));
+    assert_eq!(e.fabric().world().hosts[&h].applied_net, running, "no retry of the broken generation");
+    let mgmt = e.fabric().world().networks[&NetworkId::from("mgmt")].clone();
+    let eth0 = Node::HostPort(h.clone(), PortName::from("eth0"));
+    assert!(e.fabric().reachable(&eth0, &Node::Client, mgmt.vlan, mgmt.mtu));
+
+    // Clearing the override changes the desired config again: it applies and the alert resolves.
+    e.api(ApiOp::SetHostOverride { id: h.clone(), config: None });
+    let healed = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.net.state == NetState::Applied && !o.net.drift)
+        && open_alerts(e, NETWORK_APPLY_FAILED, &h).is_empty();
+    assert!(e.run_until(e.now() + 15_000, healed), "{:?}", host_obj(&e, &h).map(|o| o.net));
 }
