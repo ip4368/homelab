@@ -70,6 +70,7 @@ const emptyTruth: GroundTruth = {
   split_brain_vms: [],
   ports: [],
   flows: [],
+  alerts: [],
   sim_time: 0,
 }
 

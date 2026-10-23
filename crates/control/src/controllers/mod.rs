@@ -9,12 +9,14 @@
 //! lags what earlier leaders committed.
 
 pub mod alerts;
+pub mod failover;
 pub mod health;
 pub mod join;
 pub mod network;
 pub mod observe;
 pub mod rollout;
 pub mod scheduler;
+pub mod storage;
 
 use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
@@ -108,6 +110,14 @@ pub struct Volatile {
     pub instance_started: BTreeMap<String, (HostId, SimTime)>,
     /// When each (volume, host) was last sent `CreateReplica`.
     pub replica_created: BTreeMap<(String, HostId), SimTime>,
+    /// When each (host, instance) was last sent `StopInstance`.
+    pub instance_stopped: BTreeMap<(HostId, String), SimTime>,
+    /// When each (volume, host) was last sent `DeleteReplica`.
+    pub replica_deleted: BTreeMap<(String, HostId), SimTime>,
+    /// For each copy onto a host, by (volume, host): the percentage its host
+    /// last reported, and since when it has stood there. Starts at 0 when the
+    /// first `CreateReplica` with a source is sent; dropped once complete.
+    pub copy_progress: BTreeMap<(String, HostId), (u8, SimTime)>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -135,6 +145,9 @@ impl Volatile {
             replicas: BTreeMap::new(),
             instance_started: BTreeMap::new(),
             replica_created: BTreeMap::new(),
+            instance_stopped: BTreeMap::new(),
+            replica_deleted: BTreeMap::new(),
+            copy_progress: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -161,6 +174,20 @@ impl Volatile {
         self.switch_reports.get(id).map_or(self.elected_at, |r| r.at)
     }
 
+    /// Files the replicas `host`'s heartbeat lists, noting when each copy's
+    /// reported percentage last moved ([`Volatile::copy_progress`]).
+    pub fn note_replicas(&mut self, host: HostId, replicas: Vec<ReplicaReport>, now: SimTime) {
+        for r in &replicas {
+            let key = (r.volume.clone(), host.clone());
+            if r.pct >= 100 {
+                self.copy_progress.remove(&key);
+            } else if self.copy_progress.get(&key).is_none_or(|(pct, _)| *pct != r.pct) {
+                self.copy_progress.insert(key, (r.pct, now));
+            }
+        }
+        self.replicas.insert(host, replicas);
+    }
+
     /// Records that the replica sent `msg` to `to`, for controllers that pace
     /// themselves by when they last sent something.
     pub fn note_sent(&mut self, to: &Endpoint, msg: &Msg, now: SimTime) {
@@ -174,8 +201,18 @@ impl Volatile {
             (Addr::Host(id), Msg::StartInstance(spec)) => {
                 self.instance_started.insert(spec.id.clone(), (id.clone(), now));
             }
-            (Addr::Host(id), Msg::CreateReplica { volume, .. }) => {
+            (Addr::Host(id), Msg::CreateReplica { volume, source, .. }) => {
                 self.replica_created.insert((volume.clone(), id.clone()), now);
+                if source.is_some() {
+                    self.copy_progress.entry((volume.clone(), id.clone())).or_insert((0, now));
+                }
+            }
+            (Addr::Host(id), Msg::StopInstance(instance)) => {
+                self.instance_stopped.insert((id.clone(), instance.clone()), now);
+            }
+            (Addr::Host(id), Msg::DeleteReplica { volume }) => {
+                self.replica_deleted.insert((volume.clone(), id.clone()), now);
+                self.copy_progress.remove(&(volume.clone(), id.clone()));
             }
             _ => {}
         }
@@ -189,6 +226,8 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(observe::run(state, volatile, now));
     out.extend(alerts::run(state, volatile));
     out.extend(rollout::run(state, now));
+    out.extend(storage::run(state, volatile, now));
     out.extend(scheduler::run(state, volatile, now));
+    out.extend(failover::run(state, volatile, now));
     out
 }

@@ -406,7 +406,8 @@ impl Deliver for Fabric {
 
     /// Moves instance demands along their curves, routes every flow as the
     /// world is now and accounts the interval just ended, then ends the flows
-    /// whose time is up and advances replica copies by what they carried.
+    /// whose time is up, advances replica copies by what they carried, and
+    /// raises or resolves ground-truth alerts.
     fn tick(&mut self, now: SimTime) {
         self.world.update_demands(now);
         let mut traffic = std::mem::take(&mut self.world.traffic);
@@ -414,6 +415,7 @@ impl Deliver for Fabric {
         traffic.expire(now);
         self.world.traffic = traffic;
         self.world.advance_copies();
+        self.world.track_truth_alerts(now);
     }
 }
 

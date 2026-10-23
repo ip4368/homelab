@@ -22,6 +22,9 @@ pub enum Fault {
     /// config, its agent boots as it did originally, and its CP replica
     /// resumes from disk if one ever ran there.
     RestoreHost { host: HostId },
+    /// The host's disk dies: the volume replicas on it are lost (copies onto
+    /// and from them end), and the host's OS reports it failed from now on.
+    FailDisk { host: HostId, disk: String },
     UnplugPort { host: HostId, port: PortName },
     ReplugPort { host: HostId, port: PortName },
     /// The NIC negotiates `mbps` (e.g. a bad cable); its own speed restores it.
@@ -61,6 +64,12 @@ impl Engine {
                     self.spawn(cp(&host), Box::new(CpReplica::new(host.clone(), None, BTreeSet::new())));
                 }
                 self.spawn(agent(&host), Box::new(HostAgent::new(token)));
+            }
+            Fault::FailDisk { host, disk } => {
+                if !self.host_hw(&host)?.profile.disks.iter().any(|d| d.name == disk) {
+                    return Err(format!("{host} has no disk {disk}"));
+                }
+                self.fabric_mut().world_mut().fail_disk(&host, &disk);
             }
             Fault::UnplugPort { host, port } => self.set_cable(&host, &port, false)?,
             Fault::ReplugPort { host, port } => self.set_cable(&host, &port, true)?,
@@ -264,6 +273,23 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_disk_loses_its_replicas_and_the_copies_from_them() {
+        let mut e = engine();
+        let (m, mini) = (hid("ms01-01"), hid("minipc-01"));
+        let w = e.fabric_mut().world_mut();
+        assert_eq!(w.create_replica(&m, "a", 10, None), Some("nvme0".into()));
+        assert_eq!(w.create_replica(&m, "b", 10, None), Some("nvme1".into()));
+        assert_eq!(w.create_replica(&mini, "a", 10, Some(m.clone())), Some("nvme0".into()));
+        assert!(w.hosts[&mini].replicas["a"].flow.is_some(), "copying from ms01-01");
+        e.fault(Fault::FailDisk { host: m.clone(), disk: "nvme0".into() }).unwrap();
+        let w = world(&e);
+        assert_eq!(w.hosts[&m].replicas.keys().collect::<Vec<_>>(), ["b"], "the replica on nvme0 is gone");
+        assert!(w.inventory(&m).unwrap().disks.iter().any(|d| d.name == "nvme0" && d.failed), "and the OS reports the disk failed");
+        assert!(w.hosts[&mini].replicas["a"].flow.is_none(), "the copy from it ends");
+        assert_eq!(w.traffic.flows().count(), 0);
+    }
+
+    #[test]
     fn bad_targets_are_rejected_without_changes() {
         let mut e = engine();
         let before = world(&e).clone();
@@ -278,6 +304,8 @@ mod tests {
             Fault::SetSwitchPort { switch: sw("access-1"), port: pn("p99"), cfg: crate::presets::host_port_cfg() },
             Fault::MoveClient { switch: sw("access-1"), port: pn("p1") },
             Fault::DegradePort { host: hid("nope"), port: pn("eth0"), mbps: 100 },
+            Fault::FailDisk { host: hid("nope"), disk: "nvme0".into() },
+            Fault::FailDisk { host: hid("ms01-01"), disk: "nvme9".into() },
             Fault::DegradePort { host: hid("ms01-01"), port: pn("eth9"), mbps: 100 },
             Fault::DegradePort { host: hid("ms01-01"), port: pn("sfp0"), mbps: 0 },
             Fault::DegradePort { host: hid("ms01-01"), port: pn("sfp0"), mbps: 25_000 },

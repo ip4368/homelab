@@ -235,7 +235,7 @@ impl CpReplica {
         }
         v.net_generation.insert(host.clone(), net_generation);
         v.instances.insert(host.clone(), instances.into_iter().collect());
-        v.replicas.insert(host.clone(), replicas);
+        v.note_replicas(host.clone(), replicas, now);
         match observed {
             Some(observed) => {
                 let observed_at = observed_at.unwrap_or(now);

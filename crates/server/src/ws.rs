@@ -219,6 +219,7 @@ mod tests {
             split_brain_vms: vec![],
             ports: vec![],
             flows: vec![],
+            alerts: vec![],
             sim_time: now,
         };
         Published { epoch: 0, view: view.clone(), truth, sim: SimInfo { now, speed: 1, paused: false } }

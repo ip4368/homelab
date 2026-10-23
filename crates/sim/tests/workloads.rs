@@ -3,21 +3,23 @@
 //! usage and traffic. Tests read ground truth only to check the outcome.
 
 use control::client::{ClientActor, CLIENT};
-use control::controllers::scheduler::INSUFFICIENT_STORAGE_HOSTS;
+use control::controllers::storage::INSUFFICIENT_STORAGE_HOSTS;
 use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::EntryPayload;
 use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, Svc};
-use control::state::{Command, ObjectKind, ObjectRef};
+use control::state::{Command, Lifecycle, ObjectKind, ObjectRef};
 use model::{
-    Deployment, HostId, NetworkId, PodPhase, ReplicaState, Role, Selector, VmPhase, Volume, VolumeHealth,
-    TRANSCODE_CAPABILITY_PREFIX,
+    Deployment, HostId, NetworkId, PodPhase, PortName, ProfileId, ReplicaState, Role, Selector, SwitchId, Vm, VmPhase, Volume,
+    VolumeHealth, TRANSCODE_CAPABILITY_PREFIX,
 };
 use sim::engine::Engine;
 use sim::faults::Fault;
 use sim::presets::{FleetSpec, Preset};
 use sim::scenario::{Scenario, TRANSCODE_DEPLOYMENT};
+use sim::topology::{Node, PartitionMember, PortMode};
 use sim::traffic::{FlowEnd, FlowKind};
+use sim::truth::SPLIT_BRAIN;
 use std::collections::BTreeSet;
 
 fn default_fleet(seed: u64) -> Engine {
@@ -308,4 +310,317 @@ fn interrupted_copies_resume() {
     };
     assert!(e.run_until(deadline, healthy), "copy never completed: {:?}", e.client_view().state.volume_status["data"]);
     assert_eq!(copy(&e, &target, "data"), Some((100, false)));
+}
+
+fn ok() -> ApiResult {
+    ApiResult::Ok(serde_json::Value::Null)
+}
+
+/// Submits every op at once and checks each was accepted.
+fn api_all(e: &mut Engine, ops: Vec<ApiOp>) {
+    let reqs: Vec<u64> = ops.into_iter().map(|op| e.api(op)).collect();
+    let deadline = e.now() + 5000;
+    e.run_until(deadline, |e| e.actor::<ClientActor>(&CLIENT).is_some_and(|c| reqs.iter().all(|r| c.result(*r).is_some())));
+    for r in reqs {
+        assert_eq!(e.take_api_result(r), Some(ok()), "request {r}");
+    }
+}
+
+/// Creates `n` VMs `vm-01..`, each with `vcpu` vCPUs and its own `disk_gb` volume, and runs until all run.
+fn create_vms(e: &mut Engine, n: u32, vcpu: u32, disk_gb: u32) {
+    let ids: Vec<String> = (1..=n).map(|i| format!("vm-{i:02}")).collect();
+    api_all(e, ids.iter().map(|id| ApiOp::CreateVolume { volume: Volume::new(format!("{id}-disk"), disk_gb) }).collect());
+    let vm = |id: &String| Vm { id: id.clone(), vcpu, ram_mb: 8192, disk_gb, networks: vec![NetworkId::from("vm-lan")], volume: format!("{id}-disk") };
+    api_all(e, ids.iter().map(|id| ApiOp::CreateVm { vm: vm(id) }).collect());
+    let deadline = e.now() + 120_000;
+    assert!(e.run_until(deadline, all_running), "VMs not all running: {:?}", e.client_view().state.vm_status);
+}
+
+/// The host the control plane runs `vm` on.
+fn vm_host(e: &Engine, vm: &str) -> Option<HostId> {
+    e.client_view().state.vm_status[vm].status.host.clone()
+}
+
+/// Whether `vm` runs on a host other than `not`, as the control plane sees it, and really does there.
+fn running_elsewhere(e: &Engine, vm: &str, not: &HostId) -> bool {
+    let st = &e.client_view().state.vm_status[vm].status;
+    st.phase == VmPhase::Running
+        && st.host.as_ref().is_some_and(|h| h != not && e.fabric().world().hosts[h].instances.contains_key(&format!("vm/{vm}")))
+}
+
+/// The volumes with a replica (of any state) on `host`.
+fn volumes_on(e: &Engine, host: &HostId) -> Vec<String> {
+    let s = &e.client_view().state;
+    s.volume_status.iter().filter(|(_, v)| v.status.replicas.iter().any(|r| r.host == *host)).map(|(id, _)| id.clone()).collect()
+}
+
+/// Every one of `volumes` is healthy with none of its replicas on `host`.
+fn healthy_without(e: &Engine, volumes: &[String], host: &HostId) -> bool {
+    let s = &e.client_view().state;
+    volumes.iter().all(|v| {
+        let st = &s.volume_status[v].status;
+        st.health == VolumeHealth::Healthy && st.replicas.iter().all(|r| r.host != *host)
+    })
+}
+
+/// A rebuild flow on `storage` got a rate at the latest traffic tick, and the port it leaves through carried traffic.
+fn rebuild_traffic_on_storage(e: &Engine) -> bool {
+    let traffic = &e.fabric().world().traffic;
+    let last = traffic.last();
+    traffic.flows().filter(|f| f.kind == FlowKind::Rebuild && f.network.as_str() == "storage").any(|f| {
+        last.rate.get(&f.id).is_some_and(|&r| r > 0.0)
+            && last.paths.get(&f.id).and_then(|p| p.first()).is_some_and(|hop| last.port_bps.get(&hop.from).is_some_and(|&(_, tx)| tx > 0.0))
+    })
+}
+
+/// Runs a second at a time until `done` holds or `deadline` passes, calling `each` after every second.
+fn run_checking(e: &mut Engine, deadline: u64, mut each: impl FnMut(&Engine), done: impl Fn(&Engine) -> bool) -> bool {
+    while !done(e) {
+        if e.now() >= deadline {
+            return false;
+        }
+        e.run_for(1000);
+        each(e);
+    }
+    true
+}
+
+#[test]
+fn criterion_4_host_failure() {
+    let mut e = default_fleet(51);
+    create_vms(&mut e, 24, 2, 20);
+    let s = e.client_view().state.clone();
+    let h = s.vm_status.values().filter_map(|v| v.status.host.clone()).find(|h| !s.cp.voters.contains(h)).expect("a VM host that is not a CP host");
+    let vms: Vec<String> = s.vm_status.keys().filter(|id| vm_host(&e, id).as_ref() == Some(&h)).cloned().collect();
+    let volumes = volumes_on(&e, &h);
+    assert!(!vms.is_empty() && !volumes.is_empty(), "{h}: vms {vms:?}, volumes {volumes:?}");
+
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    let moved = |e: &Engine| vms.iter().all(|vm| running_elsewhere(e, vm, &h));
+    assert!(e.run_until(killed + 60_000 + 40_000 + 15_000, moved), "VMs of {h} not running elsewhere: {:?}", e.client_view().state.vm_status);
+
+    let mut rebuild_seen = false;
+    let healed = run_checking(&mut e, killed + 300_000, |e| rebuild_seen |= rebuild_traffic_on_storage(e), |e| healthy_without(e, &volumes, &h));
+    let st: Vec<_> = volumes.iter().map(|v| &e.client_view().state.volume_status[v].status).collect();
+    assert!(healed, "volumes not rebuilt off {h} within 300 s: {st:?}");
+    assert!(rebuild_seen, "no rebuild traffic seen on the storage network");
+}
+
+/// Every host cabled to `switch`.
+fn hosts_on(e: &Engine, switch: &str) -> Vec<HostId> {
+    let t = &e.fabric().world().topology;
+    let w = e.fabric().world();
+    w.hosts
+        .iter()
+        .filter(|(id, hw)| {
+            hw.profile.nics.iter().any(|n| {
+                matches!(t.peer(&Node::HostPort((*id).clone(), PortName::new(&n.name))), Some(Node::SwitchPort(s, _)) if s.as_str() == switch)
+            })
+        })
+        .map(|(id, _)| id.clone())
+        .collect()
+}
+
+#[test]
+fn criterion_6_partition_split_brain() {
+    let mut e = default_fleet(52);
+    // The default fleet's MS-01s all hang off access-1; the next one racked lands on access-2.
+    e.scenario(Scenario::AddHosts { profile: ProfileId::Ms01, count: 1, misconfigure: None }).unwrap();
+    let m = HostId::from("ms01-13");
+    let peer = e.fabric().world().topology.peer(&Node::HostPort(m.clone(), PortName::from("eth0"))).cloned();
+    assert!(matches!(&peer, Some(Node::SwitchPort(s, _)) if s.as_str() == "access-2"), "{peer:?}");
+    let ready = |e: &Engine| e.client_view().state.hosts.get(&m).is_some_and(|h| h.lifecycle == Lifecycle::Ready && h.net.held_roles.is_empty());
+    let deadline = e.now() + 120_000;
+    assert!(e.run_until(deadline, ready), "{m} never ready");
+    create_vms(&mut e, 13, 2, 20);
+    let s = e.client_view().state.clone();
+    let vm = s.vm_status.keys().find(|id| vm_host(&e, id).as_ref() == Some(&m)).expect("a VM on the new MS-01").clone();
+
+    let mut group: Vec<PartitionMember> = vec![PartitionMember::Switch(SwitchId::from("access-2"))];
+    group.extend(hosts_on(&e, "access-2").into_iter().map(PartitionMember::Host));
+    assert!(group.contains(&PartitionMember::Host(m.clone())));
+    let cut = e.now();
+    e.fault(Fault::Partition { nodes: group }).unwrap();
+    let split = |e: &Engine| running_elsewhere(e, &vm, &m) && e.truth().split_brain_vms.contains(&vm);
+    assert!(e.run_until(cut + 60_000 + 40_000 + 15_000, split), "{vm} not restarted elsewhere: {:?}", e.client_view().state.vm_status[&vm]);
+    assert!(e.now() >= cut + 60_000 + 35_000, "restarted before the grace period");
+    assert!(e.fabric().world().hosts[&m].instances.contains_key(&format!("vm/{vm}")), "the old instance runs on behind the partition");
+    let t = e.truth();
+    let alert = t.alerts.iter().find(|a| a.entity == ObjectRef::vm(&vm)).expect("a ground-truth split-brain alert");
+    assert!(alert.ground_truth && alert.resolved_at.is_none() && alert.kind == SPLIT_BRAIN, "{alert:?}");
+    assert!(e.client_view().state.alerts.values().all(|a| !a.ground_truth), "ground truth stays out of the control plane's state");
+    e.run_for(10_000);
+    assert!(e.truth().split_brain_vms.contains(&vm), "split brain holds with the partition");
+
+    let healed = e.now();
+    e.fault(Fault::HealPartitions).unwrap();
+    let stopped = |e: &Engine| !e.fabric().world().hosts[&m].instances.contains_key(&format!("vm/{vm}")) && e.truth().split_brain_vms.is_empty();
+    assert!(e.run_until(healed + 15_000, stopped), "stale instance of {vm} still on {m}");
+    assert!(running_elsewhere(&e, &vm, &m));
+    e.run_for(2000);
+    let t = e.truth();
+    assert!(t.alerts.iter().filter(|a| a.entity == ObjectRef::vm(&vm)).all(|a| a.resolved_at.is_some()), "{:?}", t.alerts);
+}
+
+#[test]
+fn disk_failure_rebuilds() {
+    let mut e = default_fleet(53);
+    create_vms(&mut e, 6, 2, 20);
+    let s = e.client_view().state.clone();
+    let r = s.volume_status["vm-01-disk"].status.replicas[0].clone();
+    let on_disk: Vec<String> = s
+        .volume_status
+        .iter()
+        .filter(|(_, v)| v.status.replicas.iter().any(|x| x.host == r.host && x.disk == r.disk))
+        .map(|(id, _)| id.clone())
+        .collect();
+    let failed = e.now();
+    e.fault(Fault::FailDisk { host: r.host.clone(), disk: r.disk.clone() }).unwrap();
+    let hw = &e.fabric().world().hosts[&r.host];
+    assert!(hw.failed_disks.contains(&r.disk) && hw.replicas.values().all(|x| x.disk != r.disk), "its replicas are lost");
+    let reported = |e: &Engine| e.client_view().state.hosts[&r.host].inventory.disks.iter().any(|d| d.name == r.disk && d.failed);
+    assert!(e.run_until(failed + 15_000, reported), "the agent never reported the failed disk");
+    let rebuilt = |e: &Engine| {
+        let s = &e.client_view().state;
+        on_disk.iter().all(|v| {
+            let st = &s.volume_status[v].status;
+            st.health == VolumeHealth::Healthy && st.replicas.iter().all(|x| !(x.host == r.host && x.disk == r.disk))
+        })
+    };
+    assert!(e.run_until(failed + 150_000, rebuilt), "{:?}", on_disk.iter().map(|v| &e.client_view().state.volume_status[v].status).collect::<Vec<_>>());
+    assert!(e.fault(Fault::FailDisk { host: r.host.clone(), disk: "nope".into() }).is_err());
+}
+
+/// Takes VLAN 20 off every trunk `host` is cabled to: its storage traffic goes nowhere.
+fn blackhole_storage(e: &mut Engine, host: &HostId) {
+    let w = e.fabric().world();
+    let mut edits = vec![];
+    for n in &w.hosts[host].profile.nics {
+        let Some(Node::SwitchPort(s, p)) = w.topology.peer(&Node::HostPort(host.clone(), PortName::new(&n.name))).cloned() else { continue };
+        let mut cfg = w.topology.switches[&s].port(&p).unwrap().clone();
+        if let PortMode::Trunk { allowed, .. } = &mut cfg.mode {
+            allowed.remove(&20);
+            edits.push((s, p, cfg));
+        }
+    }
+    assert!(!edits.is_empty(), "{host} has no trunk to blackhole");
+    for (switch, port, cfg) in edits {
+        e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
+    }
+}
+
+/// The host `volume`'s status has copying (rebuilding) a replica, if any.
+fn rebuild_target(e: &Engine, volume: &str) -> Option<HostId> {
+    let st = &e.client_view().state.volume_status[volume].status;
+    st.replicas.iter().find(|r| matches!(r.state, ReplicaState::Rebuilding { .. })).map(|r| r.host.clone())
+}
+
+#[test]
+fn rebuild_stall_retargets() {
+    let mut e = Engine::new(54);
+    e.load_fleet(&FleetSpec { ms01: 3, minipc: 3, pi5: 0, rk3588: 0 }, 3);
+    assert!(e.run_until(15_000, |e| e.client_view().leader.is_some()), "no leader");
+    api_all(&mut e, vec![ApiOp::CreateVolume { volume: Volume::new("data", 20) }]);
+    let deadline = e.now() + 30_000;
+    let healthy = |e: &Engine| e.client_view().state.volume_status.get("data").is_some_and(|v| v.status.health == VolumeHealth::Healthy);
+    assert!(e.run_until(deadline, healthy), "volume never healthy");
+    let r = e.client_view().state.volume_status["data"].status.replicas[0].clone();
+    e.fault(Fault::FailDisk { host: r.host.clone(), disk: r.disk.clone() }).unwrap();
+    let deadline = e.now() + 30_000;
+    assert!(e.run_until(deadline, |e| rebuild_target(e, "data").is_some()), "no rebuild placed");
+    let t = rebuild_target(&e, "data").unwrap();
+    blackhole_storage(&mut e, &t);
+    let cut = e.now();
+
+    e.run_for(50_000);
+    assert_eq!(rebuild_target(&e, "data"), Some(t.clone()), "abandoned before 60 s without progress");
+    let retargeted = |e: &Engine| rebuild_target(e, "data").is_some_and(|x| x != t);
+    assert!(e.run_until(cut + 60_000 + 15_000, retargeted), "{:?}", e.client_view().state.volume_status["data"]);
+    let new = rebuild_target(&e, "data").unwrap();
+    assert_ne!(new, r.host);
+    let st = &e.client_view().state.volume_status["data"].status;
+    assert!(st.replicas.iter().all(|x| x.host != t || x.state == ReplicaState::Stale), "{st:?}");
+    let done = |e: &Engine| healthy_without(e, &["data".to_string()], &t) && !e.fabric().world().hosts[&t].replicas.contains_key("data");
+    let deadline = e.now() + 200_000;
+    assert!(e.run_until(deadline, done), "{:?}", e.client_view().state.volume_status["data"]);
+}
+
+#[test]
+fn restore_after_failover() {
+    let mut e = default_fleet(55);
+    create_vms(&mut e, 24, 2, 20);
+    let s = e.client_view().state.clone();
+    let leader = e.true_leader().unwrap();
+    // A CP follower that runs VMs: its replica must catch up once it is back.
+    let h = s.cp.voters.iter().find(|h| **h != leader && s.vm_status.values().any(|v| v.status.host.as_ref() == Some(*h))).unwrap().clone();
+    let vms: Vec<String> = s.vm_status.keys().filter(|id| vm_host(&e, id).as_ref() == Some(&h)).cloned().collect();
+    let volumes = volumes_on(&e, &h);
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    let recovered = |e: &Engine| vms.iter().all(|vm| running_elsewhere(e, vm, &h)) && healthy_without(e, &volumes, &h);
+    assert!(e.run_until(killed + 300_000, recovered), "no failover and rebuild off {h}");
+
+    let restored = e.now();
+    e.fault(Fault::RestoreHost { host: h.clone() }).unwrap();
+    let cp = |e: &Engine, x: &HostId| e.actor::<CpReplica>(&Endpoint::new(Addr::Host(x.clone()), Svc::Cp)).map(|r| r.commit_index());
+    let clean = |e: &Engine| {
+        let hw = &e.fabric().world().hosts[&h];
+        let s = &e.client_view().state;
+        let stale = hw.replicas.keys().any(|v| {
+            s.volume_status.get(v).is_none_or(|st| !st.status.replicas.iter().any(|r| r.host == h && r.state != ReplicaState::Stale))
+        });
+        let leader = e.true_leader();
+        !hw.instances.keys().any(|i| i.starts_with("vm/")) && !stale && leader.is_some_and(|l| l != h && cp(e, &h) == cp(e, &l))
+    };
+    assert!(e.run_until(restored + 30_000, clean), "{h} not clean: instances {:?}, replicas {:?}", e.fabric().world().hosts[&h].instances.keys().collect::<Vec<_>>(), e.fabric().world().hosts[&h].replicas.keys().collect::<Vec<_>>());
+}
+
+#[test]
+fn failover_without_room_waits_pending_without_busy_looping() {
+    // Four MS-01s each run one VM too big to share a host; ms01-04 is not a CP voter.
+    let mut e = Engine::new(56);
+    e.load_fleet(&FleetSpec { ms01: 4, minipc: 0, pi5: 0, rk3588: 0 }, 3);
+    assert!(e.run_until(15_000, |e| e.client_view().leader.is_some()), "no leader");
+    create_vms(&mut e, 4, 16, 10);
+    let h = HostId::from("ms01-04");
+    let vm = e.client_view().state.vm_status.keys().find(|id| vm_host(&e, id).as_ref() == Some(&h)).unwrap().clone();
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    let pending = |e: &Engine| matches!(&e.client_view().state.vm_status[&vm].status.phase, VmPhase::Pending(why) if why.starts_with("no fit:"));
+    assert!(e.run_until(killed + 115_000, pending), "{:?}", e.client_view().state.vm_status[&vm]);
+    let VmPhase::Pending(why) = e.client_view().state.vm_status[&vm].status.phase.clone() else { unreachable!() };
+    assert!(why.contains("insufficient cpu"), "{why}");
+    let about_vm = |c: &Command| matches!(c, Command::SetVmStatus { id, .. } if *id == vm);
+    let before = logged(&e, about_vm);
+    e.run_for(120_000);
+    let written = logged(&e, about_vm) - before;
+    assert!(written <= 4, "{written} status writes for {vm} in 2 minutes");
+    assert!(pending(&e), "{:?}", e.client_view().state.vm_status[&vm]);
+
+    // Room comes back: the next retry places it.
+    let restored = e.now();
+    e.fault(Fault::RestoreHost { host: h.clone() }).unwrap();
+    let back = |e: &Engine| e.client_view().state.vm_status[&vm].status.phase == VmPhase::Running;
+    assert!(e.run_until(restored + 30_000 + 15_000, back), "{:?}", e.client_view().state.vm_status[&vm]);
+}
+
+#[test]
+fn instances_lost_in_a_quick_reboot_start_again() {
+    let mut e = default_fleet(57);
+    create_vms(&mut e, 12, 2, 20);
+    let s = e.client_view().state.clone();
+    let h = s.vm_status.values().filter_map(|v| v.status.host.clone()).find(|h| !s.cp.voters.contains(h)).unwrap();
+    let vms: Vec<String> = s.vm_status.keys().filter(|id| vm_host(&e, id).as_ref() == Some(&h)).cloned().collect();
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    e.run_for(10_000);
+    let restored = e.now();
+    e.fault(Fault::RestoreHost { host: h.clone() }).unwrap();
+    // Back well within the not-ready window: the control plane must notice the instances are gone.
+    let running = |e: &Engine| {
+        let w = &e.fabric().world().hosts[&h];
+        vms.iter().all(|vm| w.instances.contains_key(&format!("vm/{vm}")) && vm_host(e, vm).as_ref() == Some(&h))
+    };
+    assert!(e.run_until(restored + 30_000, running), "instances on {h} not started again");
+    assert_eq!(e.client_view().state.hosts[&h].lifecycle, Lifecycle::Ready);
 }

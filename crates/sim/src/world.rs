@@ -5,6 +5,7 @@
 
 use crate::topology::{Node, Topology};
 use crate::traffic::{FlowEnd, FlowKind, Traffic};
+use crate::truth::TruthAlerts;
 use control::proto::{InstanceSpec, LogCmd, ReplicaReport, UsageProfile};
 use control::raft::Durable;
 use control::runtime::{HostUsage, SimTime, SwitchConfig};
@@ -224,6 +225,8 @@ pub struct World {
     pub hosts: BTreeMap<HostId, HostHw>,
     /// The flows on the wire and what the last traffic tick made of them.
     pub traffic: Traffic,
+    /// Alerts the simulator raises from ground truth (e.g. split brain).
+    pub truth_alerts: TruthAlerts,
 }
 
 impl World {
@@ -234,6 +237,7 @@ impl World {
             networks: seed_networks().into_iter().map(|n| (n.id.clone(), n)).collect(),
             hosts: BTreeMap::new(),
             traffic: Traffic::default(),
+            truth_alerts: TruthAlerts::default(),
         }
     }
 
@@ -372,6 +376,27 @@ impl World {
                 r.interrupt(&mut self.traffic);
             } else {
                 r.pct = (100.0 * copied / total).floor() as u8;
+            }
+        }
+    }
+
+    /// Fails `host`'s disk `disk`: it is marked failed, the replicas on it
+    /// are gone (ending their copies, and the copies from them to other hosts).
+    pub fn fail_disk(&mut self, host: &HostId, disk: &str) {
+        let Some(hw) = self.hosts.get_mut(host) else { return };
+        hw.failed_disks.insert(disk.to_string());
+        let lost: Vec<String> = hw.replicas.iter().filter(|(_, r)| r.disk == disk).map(|(v, _)| v.clone()).collect();
+        for volume in &lost {
+            if let Some(mut r) = hw.replicas.remove(volume) {
+                r.interrupt(&mut self.traffic);
+            }
+        }
+        let from_host = FlowEnd::Host(host.clone());
+        for hw in self.hosts.values_mut() {
+            for r in hw.replicas.iter_mut().filter_map(|(v, r)| lost.contains(v).then_some(r)) {
+                if r.flow.and_then(|f| self.traffic.flow(f)).is_some_and(|f| f.src == from_host) {
+                    r.interrupt(&mut self.traffic);
+                }
             }
         }
     }
