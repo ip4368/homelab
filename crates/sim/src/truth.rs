@@ -176,6 +176,7 @@ impl TruthAlerts {
                 raised_at: now,
                 resolved_at: None,
                 ground_truth: true,
+                action: None,
                 version: 0,
             });
         }
