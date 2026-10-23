@@ -1,0 +1,248 @@
+import { useSyncExternalStore } from 'react'
+import type { Alert } from './gen/Alert'
+import type { AutoApproveRule } from './gen/AutoApproveRule'
+import type { CpInfo } from './gen/CpInfo'
+import type { Event as ClusterEvent } from './gen/Event'
+import type { GroundTruth } from './gen/GroundTruth'
+import type { HostObj } from './gen/HostObj'
+import type { JoinToken } from './gen/JoinToken'
+import type { MetricSample } from './gen/MetricSample'
+import type { Object as ClusterObject } from './gen/Object'
+import type { ObjectRef } from './gen/ObjectRef'
+import type { ServerMsg } from './gen/ServerMsg'
+import type { SimInfo } from './gen/SimInfo'
+
+/** The server's wire message, as sent over `/api/ws`. */
+export type WsMessage = ServerMsg
+
+/** The UI keeps this many of the newest events; the server's ring drops old ones without tombstones. */
+export const EVENT_CAP = 500
+/** The control plane is unavailable when the client last synced with a leader this long (sim ms) ago. */
+export const STALE_AFTER_MS = 3000
+
+export type Connection = 'connecting' | 'live' | 'cp-unavailable'
+
+export interface View {
+  version: number
+  leader: string | null
+  term: number
+  last_sync_at: number | null
+  hosts: Record<string, HostObj>
+  tokens: Record<string, JoinToken>
+  rules: Record<string, AutoApproveRule>
+  alerts: Record<string, Alert>
+  /** Oldest first, at most EVENT_CAP. */
+  events: ClusterEvent[]
+  cp: CpInfo
+  /** Latest sample per host. */
+  metrics: Record<string, MetricSample>
+}
+
+export interface UiState {
+  view: View
+  truth: GroundTruth
+  sim: SimInfo
+  connection: Connection
+}
+
+export interface Store {
+  getState(): UiState
+  subscribe(fn: () => void): () => void
+  applyMessage(msg: WsMessage): void
+  /** The socket dropped: keep the last view on screen and show that we are reconnecting. */
+  setDisconnected(): void
+}
+
+const emptyTruth: GroundTruth = {
+  hosts: [],
+  vip_owner_by_switch: {},
+  partitions: [],
+  split_brain_vms: [],
+  sim_time: 0,
+}
+
+function initialState(): UiState {
+  return {
+    view: {
+      version: 0,
+      leader: null,
+      term: 0,
+      last_sync_at: null,
+      hosts: {},
+      tokens: {},
+      rules: {},
+      alerts: {},
+      events: [],
+      cp: { voters: [], mode: 'Suggest', version: 0 },
+      metrics: {},
+    },
+    truth: emptyTruth,
+    sim: { now: 0, speed: 1, paused: false },
+    connection: 'connecting',
+  }
+}
+
+function connectionOf(view: View, sim: SimInfo): Connection {
+  return view.last_sync_at !== null && sim.now - view.last_sync_at <= STALE_AFTER_MS ? 'live' : 'cp-unavailable'
+}
+
+function byKey<T>(items: T[], key: (t: T) => string): Record<string, T> {
+  return Object.fromEntries(items.map((t) => [key(t), t]))
+}
+
+function capEvents(events: ClusterEvent[]): ClusterEvent[] {
+  return events.length > EVENT_CAP ? events.slice(events.length - EVENT_CAP) : events
+}
+
+/** `Object` is the wire type with a "type" tag mixed into the object's own fields. */
+function withoutTag<T extends { type: string }>(o: T): Omit<T, 'type'> {
+  const { type: _type, ...rest } = o
+  return rest
+}
+
+function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): View {
+  return {
+    version: s.version,
+    leader: s.leader,
+    term: s.term,
+    last_sync_at: s.last_sync_at,
+    hosts: byKey(s.hosts, (h) => h.id),
+    tokens: byKey(s.tokens, (t) => t.token),
+    rules: byKey(s.rules, (r) => r.id),
+    alerts: byKey(s.alerts, (a) => a.id),
+    events: capEvents([...s.events].sort((a, b) => a.seq - b.seq)),
+    cp: s.cp,
+    metrics: s.metrics,
+  }
+}
+
+/** Applies a delta's upserts and removals, copying only the slices that change. */
+function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
+  let { hosts, tokens, rules, alerts, events, cp, metrics } = view
+  const upsertedEvents = new Map<number, ClusterEvent>()
+  const removedEvents = new Set<number>()
+  const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
+    if (copied.has(rec)) return rec
+    const copy = { ...rec }
+    copied.add(copy)
+    return copy
+  }
+  const copied = new Set<unknown>()
+
+  for (const o of d.upserts as ClusterObject[]) {
+    switch (o.type) {
+      case 'Host':
+        hosts = edit(hosts, copied)
+        hosts[o.id] = withoutTag(o) as HostObj
+        break
+      case 'Token':
+        tokens = edit(tokens, copied)
+        tokens[o.token] = withoutTag(o)
+        break
+      case 'Rule':
+        rules = edit(rules, copied)
+        rules[o.id] = withoutTag(o)
+        break
+      case 'Alert':
+        alerts = edit(alerts, copied)
+        alerts[o.id] = withoutTag(o)
+        break
+      case 'Event':
+        upsertedEvents.set(o.seq, withoutTag(o))
+        break
+      case 'Cp':
+        cp = withoutTag(o)
+        break
+    }
+  }
+
+  for (const r of d.removed as ObjectRef[]) {
+    switch (r.kind) {
+      case 'Host':
+        hosts = edit(hosts, copied)
+        delete hosts[r.id]
+        metrics = edit(metrics, copied)
+        delete metrics[r.id]
+        break
+      case 'Token':
+        tokens = edit(tokens, copied)
+        delete tokens[r.id]
+        break
+      case 'Rule':
+        rules = edit(rules, copied)
+        delete rules[r.id]
+        break
+      case 'Alert':
+        alerts = edit(alerts, copied)
+        delete alerts[r.id]
+        break
+      case 'Event':
+        removedEvents.add(Number(r.id))
+        break
+      case 'Cp':
+        break
+    }
+  }
+
+  if (Object.keys(d.metrics).length > 0) metrics = { ...metrics, ...d.metrics }
+
+  if (upsertedEvents.size > 0 || removedEvents.size > 0) {
+    const merged = new Map(events.map((e) => [e.seq, e]))
+    upsertedEvents.forEach((e, seq) => merged.set(seq, e))
+    removedEvents.forEach((seq) => merged.delete(seq))
+    events = capEvents([...merged.values()].sort((a, b) => a.seq - b.seq))
+  }
+
+  return {
+    version: d.version,
+    leader: d.leader,
+    term: d.term,
+    last_sync_at: d.last_sync_at,
+    hosts,
+    tokens,
+    rules,
+    alerts,
+    events,
+    cp,
+    metrics,
+  }
+}
+
+export function createStore(): Store {
+  let state = initialState()
+  const listeners = new Set<() => void>()
+  const set = (next: UiState) => {
+    state = next
+    listeners.forEach((fn) => fn())
+  }
+
+  return {
+    getState: () => state,
+    subscribe(fn) {
+      listeners.add(fn)
+      return () => {
+        listeners.delete(fn)
+      }
+    },
+    applyMessage(msg) {
+      if (msg.type === 'snapshot') {
+        const view = viewFromSnapshot(msg.view)
+        set({ view, truth: msg.truth, sim: msg.sim, connection: connectionOf(view, msg.sim) })
+      } else {
+        const view = mergeDelta(state.view, msg)
+        set({ view, truth: msg.truth, sim: msg.sim, connection: connectionOf(view, msg.sim) })
+      }
+    },
+    setDisconnected() {
+      set({ ...state, connection: 'connecting' })
+    },
+  }
+}
+
+/** The app's one store, fed by `connect()` in ws.ts. */
+export const store = createStore()
+
+/** Subscribes to a slice of the app's store. The selector must return an existing value, not build a new one each call. */
+export function useStore<T>(selector: (s: UiState) => T): T {
+  return useSyncExternalStore(store.subscribe, () => selector(store.getState()))
+}
