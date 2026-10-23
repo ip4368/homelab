@@ -40,8 +40,9 @@ pub fn host_lost(state: &ClusterState, host: &HostId, now: SimTime) -> bool {
 
 /// Restarts VM `id`, which ran on the lost host `from`, on another host: the
 /// status that places it (or says why it cannot start), and an event.
-pub(super) fn fail_over(state: &ClusterState, id: &str, vm: &Vm, from: &HostId, hosts: &mut Hosts) -> Vec<Action> {
-    let placed = volume_ready(state, &vm.volume).and_then(|()| hosts.place_excluding(&PlacementReq::vm(vm), &[from.clone()].into()));
+pub(super) fn fail_over(state: &ClusterState, now: SimTime, id: &str, vm: &Vm, from: &HostId, hosts: &mut Hosts) -> Vec<Action> {
+    // `from` is lost, so its replica does not count towards the volume being ready.
+    let placed = volume_ready(state, &vm.volume, now).and_then(|()| hosts.place_excluding(&PlacementReq::vm(vm), &[from.clone()].into()));
     let (host, phase, message) = match placed {
         Ok(to) => (Some(to.clone()), VmPhase::Starting, format!("{from} lost: restarting {id} on {to}")),
         Err(why) => (None, VmPhase::Pending(why.clone()), format!("{from} lost: {id} cannot restart, {why}")),
@@ -183,6 +184,25 @@ mod tests {
         let out = proposals(&scheduler::run(&s, &Volatile::new(0, 1), FAILOVER_GRACE_MS + 1000));
         let waiting = VmPhase::Pending("waiting for volume vm1-disk".into());
         assert_eq!(vm_statuses(&out), [Command::SetVmStatus { id: "vm1".into(), host: None, phase: waiting }]);
+    }
+
+    #[test]
+    fn a_vm_whose_only_healthy_replica_was_on_the_lost_host_waits() {
+        let mut s = running_on_m1();
+        let only_m1 = vec![ReplicaRef { host: hid("m1"), disk: "nvme0".into(), state: ReplicaState::Healthy }];
+        s.apply(0, Command::SetVolumeStatus { id: "vm1-disk".into(), replicas: only_m1, health: VolumeHealth::Healthy }).unwrap();
+        not_ready(&mut s, "m1", 0);
+        let v = Volatile::new(0, 1);
+        let now = FAILOVER_GRACE_MS + 1000;
+        let out = scheduler::run(&s, &v, now);
+        let waiting = VmPhase::Pending("waiting for volume vm1-disk".into());
+        assert_eq!(vm_statuses(&proposals(&out)), [Command::SetVmStatus { id: "vm1".into(), host: None, phase: waiting.clone() }], "m1's replica is still Healthy in the status, but m1 is lost");
+        assert!(sends(&out).is_empty(), "{out:?}");
+        // A VM already starting elsewhere when that happens goes back to waiting, without StartInstance.
+        s.apply(now, Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m2")), phase: VmPhase::Starting }).unwrap();
+        let out = scheduler::run(&s, &v, now + 1000);
+        assert_eq!(vm_statuses(&proposals(&out)), [Command::SetVmStatus { id: "vm1".into(), host: None, phase: waiting }]);
+        assert!(sends(&out).is_empty(), "{out:?}");
     }
 
     #[test]

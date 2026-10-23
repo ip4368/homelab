@@ -314,16 +314,15 @@ impl World {
     /// `source` by a [`REBUILD_MBPS`] rebuild flow on `storage`. A volume the
     /// host holds keeps its replica; if that is incomplete with no copy
     /// running (interrupted), the copy resumes from `source`. A copy only
-    /// starts from a powered source that holds a complete replica of the
-    /// volume; with any other source the replica waits, not copying, for a
+    /// starts from another powered host that holds a complete replica of
+    /// the volume; with any other source (the host itself included) the replica waits, not copying, for a
     /// better one. The replica's disk, or `None` if no disk has room.
     pub fn create_replica(&mut self, host: &HostId, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
         if !self.hosts.get(host).is_some_and(|hw| hw.powered) {
             return None;
         }
-        let source = source.filter(|s| s != host);
         let complete = |hw: &HostHw| hw.replicas.get(volume).is_some_and(|r| r.pct >= 100 && !hw.failed_disks.contains(&r.disk));
-        let copy_from = source.clone().filter(|s| self.hosts.get(s).is_some_and(|hw| hw.powered && complete(hw)));
+        let copy_from = source.clone().filter(|s| s != host && self.hosts.get(s).is_some_and(|hw| hw.powered && complete(hw)));
         let start = |traffic: &mut Traffic| {
             copy_from.clone().map(|s| {
                 let storage = NetworkId::from("storage");
@@ -767,6 +766,8 @@ mod tests {
         w.create_replica(&a, "y", 1, Some(b.clone()));
         w.create_replica(&b, "y", 1, Some(a.clone()));
         assert!(w.replicas(&b).iter().all(|r| !r.copying));
+        w.create_replica(&b, "z", 1, Some(b.clone()));
+        assert_eq!(w.hosts[&b].replicas["z"].pct, 0, "a host is no source for itself: the replica waits, empty");
         w.create_replica(&b, "v", 1, Some(a.clone()));
         assert!(w.hosts[&b].replicas["v"].flow.is_some(), "a's v is complete");
         // Once the source's disk fails, it has nothing to copy from.

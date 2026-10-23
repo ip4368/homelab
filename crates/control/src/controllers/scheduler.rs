@@ -6,7 +6,8 @@
 //!   `Starting`), then the host's agent is sent `StartInstance` (again every
 //!   [`RESEND_MS`] until it reports the instance). Once the assigned host's
 //!   heartbeat lists the instance it is `Running`. A VM waits for its volume
-//!   to have a healthy replica. One that fits nowhere stays `Pending` with
+//!   to have a healthy replica on a host that is not lost, and one starting
+//!   goes back to waiting if the volume loses it. One that fits nowhere stays `Pending` with
 //!   the reason, written only when it changes; a VM that fits nowhere is
 //!   only tried again every [`NO_FIT_RETRY_MS`].
 //! * **Lost instances.** A running pod or VM whose host's heartbeat no
@@ -199,11 +200,11 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
         let status = &st.status;
         match (&status.phase, &status.host) {
             (VmPhase::Starting | VmPhase::Running, Some(host)) if host_lost(state, host, now) => {
-                out.extend(failover::fail_over(state, id, vm, host, hosts));
+                out.extend(failover::fail_over(state, now, id, vm, host, hosts));
             }
             (VmPhase::Pending(why), _) if why.starts_with(NO_FIT) && !retry_due(status.since, now) => {}
             (VmPhase::Pending(_), _) => {
-                let (host, phase) = match volume_ready(state, &vm.volume).and_then(|()| hosts.place(&PlacementReq::vm(vm))) {
+                let (host, phase) = match volume_ready(state, &vm.volume, now).and_then(|()| hosts.place(&PlacementReq::vm(vm))) {
                     Ok(host) => (Some(host), VmPhase::Starting),
                     Err(why) => (None, VmPhase::Pending(why)),
                 };
@@ -214,6 +215,9 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
             (VmPhase::Starting, Some(host)) => {
                 if reported(v, host, &vm_instance(id)) {
                     out.push(Action::Propose(Command::SetVmStatus { id: id.clone(), host: Some(host.clone()), phase: VmPhase::Running }));
+                } else if let Err(why) = volume_ready(state, &vm.volume, now) {
+                    // Its volume lost its last healthy replica before the VM came up.
+                    out.push(Action::Propose(Command::SetVmStatus { id: id.clone(), host: None, phase: VmPhase::Pending(why) }));
                 } else {
                     out.extend(start(v, now, host, vm_spec(state, vm, host)));
                 }
@@ -234,12 +238,13 @@ fn retry_due(since: SimTime, now: SimTime) -> bool {
     now.saturating_sub(since) % NO_FIT_RETRY_MS < crate::replica::CONTROLLER_PERIOD_MS
 }
 
-/// A VM only starts once its volume has a healthy replica.
-pub(super) fn volume_ready(state: &ClusterState, volume: &str) -> Result<(), String> {
-    let healthy = state
-        .volume_status
-        .get(volume)
-        .is_some_and(|s| s.status.replicas.iter().any(|r| r.state == ReplicaState::Healthy));
+/// A VM only starts once its volume has a healthy replica on a host that is
+/// not lost: the storage controller may not have marked a lost host's
+/// replicas stale yet (it acts on the same committed state in the same run).
+pub(super) fn volume_ready(state: &ClusterState, volume: &str, now: SimTime) -> Result<(), String> {
+    let healthy = state.volume_status.get(volume).is_some_and(|s| {
+        s.status.replicas.iter().any(|r| r.state == ReplicaState::Healthy && !host_lost(state, &r.host, now))
+    });
     if healthy { Ok(()) } else { Err(format!("waiting for volume {volume}")) }
 }
 
