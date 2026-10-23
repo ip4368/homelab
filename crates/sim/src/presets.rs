@@ -222,6 +222,7 @@ pub fn seed_rule_template(p: ProfileId) -> &'static str {
     match p {
         ProfileId::Ms01 => "ms01-standard",
         ProfileId::MiniPc => "minipc-standard",
+        // `sbc-transcode` is profiled Pi5 but deliberately shared by Rk3588 (same eth0-only NICs).
         ProfileId::Pi5 | ProfileId::Rk3588 => "sbc-transcode",
     }
 }

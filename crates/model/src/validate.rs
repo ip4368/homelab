@@ -42,7 +42,8 @@ pub enum Issue {
     LacpNotConfigured { link: String, switch: SwitchId, port: PortName, networks: BTreeSet<NetworkId> },
     /// The attachment's address is already held by `other_host`.
     IpConflict { network: NetworkId, ip: Ipv4Addr, other_host: HostId },
-    /// No LLDP neighbour on this host port: nothing is plugged in.
+    /// No LLDP neighbour on this host port: nothing is plugged in. `networks` is
+    /// empty when another member of the same bond is still cabled (degraded, not down).
     PortNotCabled { port: PortName, networks: BTreeSet<NetworkId> },
     /// An attachment names a network that does not exist.
     UnknownNetwork { id: NetworkId },
@@ -64,7 +65,8 @@ pub fn required_networks(role: Role) -> Vec<NetworkId> {
 /// neighbour table; `switch_ports` the polled ports (a port with no
 /// observation is not judged); `ips_in_use` the addresses held by *other* hosts.
 ///
-/// An attachment whose `link` the config does not define is ignored.
+/// An attachment whose `link` the config does not define is ignored, and does
+/// not count as attached for the role requirements.
 pub fn validate_host(
     cfg: &HostNetworkConfig,
     roles: &BTreeSet<Role>,
@@ -136,9 +138,14 @@ pub fn validate_host(
     for link in &cfg.links {
         let on_link: BTreeSet<NetworkId> =
             cfg.attachments.iter().filter(|a| a.link == link.name).map(|a| a.network.clone()).collect();
+        // A bond with one leg still cabled is degraded, not down: the port is
+        // reported but the link's networks stay up. They break only when no
+        // member is cabled.
+        let any_cabled = link.kind.ports().iter().any(|p| neighbor(p).is_some());
         for port in link.kind.ports() {
             if neighbor(port).is_none() {
-                issues.push(Issue::PortNotCabled { port: port.clone(), networks: on_link.clone() });
+                let networks = if any_cabled { BTreeSet::new() } else { on_link.clone() };
+                issues.push(Issue::PortNotCabled { port: port.clone(), networks });
             }
         }
         if let LinkKind::Bond { members, mode: BondMode::Lacp } = &link.kind {
@@ -164,8 +171,10 @@ pub fn validate_host(
     }
 
     let broken = broken_networks(&issues);
-    let attached = |id: &NetworkId| cfg.attachments.iter().any(|a| a.network == *id);
-    let usable_vm = cfg.attachments.iter().any(|a| {
+    // An attachment on a link the config does not define carries nothing.
+    let real: Vec<_> = cfg.attachments.iter().filter(|a| cfg.link(&a.link).is_some()).collect();
+    let attached = |id: &NetworkId| real.iter().any(|a| a.network == *id);
+    let usable_vm = real.iter().any(|a| {
         !broken.contains(&a.network)
             && networks.iter().any(|n| n.id == a.network && n.purpose == NetworkPurpose::Vm)
     });
@@ -547,12 +556,62 @@ mod tests {
     }
 
     #[test]
-    fn port_not_cabled_when_a_member_has_no_neighbor() {
+    fn one_uncabled_bond_leg_is_degraded_not_broken() {
         let (mut lldp, ports) = technician_fixture();
         lldp.remove(1); // sfp1 unplugged
-        let issues = run(&template_cfg("ms01-standard"), &[Role::Compute], &lldp, &ports);
+        let r = [Role::Storage, Role::Vm, Role::Compute];
+        let issues = run(&template_cfg("ms01-standard"), &r, &lldp, &ports);
+        assert_eq!(issues, vec![Issue::PortNotCabled { port: pn("sfp1"), networks: BTreeSet::new() }]);
+        assert_eq!(broken_networks(&issues), BTreeSet::new());
+        let (active, held) = effective_roles(&roles(&r), &unavailable_networks(&issues));
+        assert_eq!((active, held), (roles(&r), BTreeMap::new()));
+    }
+
+    #[test]
+    fn port_not_cabled_breaks_the_link_when_no_member_is_cabled() {
+        let (mut lldp, ports) = technician_fixture();
+        lldp.retain(|n| n.local_port == pn("eth0")); // both SFPs unplugged
+        let r = [Role::Storage, Role::Vm, Role::Compute];
+        let issues = run(&template_cfg("ms01-standard"), &r, &lldp, &ports);
         let nets: BTreeSet<_> = ["storage", "migration", "vm-lan", "vm-iot"].map(nid).into();
-        assert_eq!(issues, vec![Issue::PortNotCabled { port: pn("sfp1"), networks: nets }]);
+        assert_eq!(
+            issues[..2],
+            [
+                Issue::PortNotCabled { port: pn("sfp0"), networks: nets.clone() },
+                Issue::PortNotCabled { port: pn("sfp1"), networks: nets.clone() },
+            ]
+        );
+        assert_eq!(broken_networks(&issues), nets);
+        let (active, held) = effective_roles(&roles(&r), &broken_networks(&issues));
+        assert_eq!(active, roles(&[Role::Compute]));
+        assert_eq!(held.keys().copied().collect::<Vec<_>>(), [Role::Storage, Role::Vm]);
+    }
+
+    #[test]
+    fn a_single_uncabled_link_breaks_its_networks() {
+        let cfg = eth0_cfg(vec![att("mgmt", "eth0", false, None)], 1500);
+        let issues = run(&cfg, &[Role::Compute], &[], &[]);
+        assert_eq!(issues, vec![Issue::PortNotCabled { port: pn("eth0"), networks: [nid("mgmt")].into() }]);
+        assert_eq!(broken_networks(&issues), [nid("mgmt")].into());
+    }
+
+    #[test]
+    fn attachments_on_an_undefined_link_do_not_count_as_attached() {
+        let (lldp, ports) = technician_fixture();
+        let mut cfg = template_cfg("ms01-standard");
+        for a in &mut cfg.attachments {
+            if a.network == nid("mgmt") || a.network == nid("vm-lan") || a.network == nid("vm-iot") {
+                a.link = "nope".into();
+            }
+        }
+        let issues = run(&cfg, &[Role::Vm], &lldp, &ports);
+        assert_eq!(
+            issues,
+            vec![
+                Issue::MissingRequiredNetwork { role: Role::Vm, network: nid("mgmt") },
+                Issue::MissingRequiredNetwork { role: Role::Vm, network: nid(ANY_VM_NETWORK) },
+            ]
+        );
     }
 
     #[test]
