@@ -1,12 +1,15 @@
 //! Physical topology ground truth: switches, cables and partitions.
 //!
 //! Mutate through the methods here: each bumps [`Topology::version`], which
-//! the fabric uses to invalidate its cached reachability graphs. Code that
-//! edits the public fields directly must bump `version` itself.
+//! the fabric uses to invalidate its cached reachability graphs. (The fabric
+//! also drops them whenever its world is borrowed mutably, so a direct field
+//! edit cannot leave them stale.)
 
 pub use model::network::{PortMode, SwitchPortCfg};
 use model::{HostId, PortName, SwitchId};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Switch {
@@ -43,8 +46,9 @@ pub fn cable_key(a: &Node, b: &Node) -> CableKey {
 }
 
 /// A member of a partition group. A host member puts all its ports inside.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum NodeGroupKey {
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum PartitionMember {
     Host(HostId),
     Switch(SwitchId),
 }
@@ -54,11 +58,11 @@ pub enum NodeGroupKey {
 /// client, router) sits on the side of the switch it is cabled to, so
 /// partitioning a switch takes its attached hosts with it, while listing a
 /// host cuts its legs to switches outside the group.
-fn inside(group: &BTreeSet<NodeGroupKey>, end: &Node, peer: &Node) -> bool {
-    let switch_in = |n: &Node| matches!(n, Node::SwitchPort(s, _) if group.contains(&NodeGroupKey::Switch(s.clone())));
+fn inside(group: &BTreeSet<PartitionMember>, end: &Node, peer: &Node) -> bool {
+    let switch_in = |n: &Node| matches!(n, Node::SwitchPort(s, _) if group.contains(&PartitionMember::Switch(s.clone())));
     match end {
         Node::SwitchPort(..) => switch_in(end),
-        Node::HostPort(h, _) => group.contains(&NodeGroupKey::Host(h.clone())) || switch_in(peer),
+        Node::HostPort(h, _) => group.contains(&PartitionMember::Host(h.clone())) || switch_in(peer),
         Node::Client | Node::Router => switch_in(peer),
     }
 }
@@ -71,7 +75,7 @@ pub struct Topology {
     /// Cables whose link is up (plugged in at both ends).
     pub cable_up: BTreeSet<CableKey>,
     /// Each group is cut off from everything outside it (see [`Topology::is_cut`]).
-    pub partitions: Vec<BTreeSet<NodeGroupKey>>,
+    pub partitions: Vec<BTreeSet<PartitionMember>>,
     pub version: u64,
 }
 
@@ -136,7 +140,7 @@ impl Topology {
         self.bump();
     }
 
-    pub fn partition(&mut self, group: BTreeSet<NodeGroupKey>) {
+    pub fn partition(&mut self, group: BTreeSet<PartitionMember>) {
         self.partitions.push(group);
         self.bump();
     }
@@ -197,7 +201,7 @@ mod tests {
     #[test]
     fn partition_cuts_only_cables_crossing_the_group() {
         let mut t = Topology::new();
-        t.partition([NodeGroupKey::Switch(SwitchId::from("b")), NodeGroupKey::Host(HostId::from("h2"))].into());
+        t.partition([PartitionMember::Switch(SwitchId::from("b")), PartitionMember::Host(HostId::from("h2"))].into());
         assert!(t.is_cut(&sp("a", "up"), &sp("b", "up")));
         assert!(!t.is_cut(&hp("h2", "eth0"), &sp("b", "p1")), "both ends inside");
         assert!(!t.is_cut(&hp("h1", "eth0"), &sp("a", "p1")), "both ends outside");

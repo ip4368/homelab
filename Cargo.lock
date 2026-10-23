@@ -181,7 +181,9 @@ dependencies = [
  "model",
  "rand",
  "rand_chacha",
+ "serde",
  "serde_json",
+ "ts-rs",
 ]
 
 [[package]]

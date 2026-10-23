@@ -31,6 +31,9 @@ pub struct HostHw {
     pub failed_disks: BTreeSet<String>,
     /// The CP replica's Raft state on this host's disk; survives power loss.
     pub cp_durable: Option<Durable<LogCmd>>,
+    /// The join token the host's agent was booted with: `None` for a host
+    /// that was already a member. A restored host boots its agent the same way.
+    pub join_token: Option<String>,
 }
 
 impl HostHw {
@@ -38,7 +41,15 @@ impl HostHw {
     pub fn new(id: ProfileId, variant: u8) -> Self {
         let profile = profile(id, variant);
         let applied_net = bootstrap_config(&profile);
-        Self { profile, variant, powered: true, applied_net, failed_disks: BTreeSet::new(), cp_durable: None }
+        Self {
+            profile,
+            variant,
+            powered: true,
+            applied_net,
+            failed_disks: BTreeSet::new(),
+            cp_durable: None,
+            join_token: None,
+        }
     }
 
     /// What the OS measures now: idle usage with seeded noise, every healthy

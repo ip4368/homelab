@@ -5,14 +5,15 @@
 //!
 //! Reachability is computed over a switch graph (switches joined by
 //! switch-to-switch cables that carry the VLAN tagged), cached per
-//! (VLAN, MTU) and rebuilt whenever `topology.version` changes. Host,
+//! (VLAN, MTU) and rebuilt whenever `topology.version` changes or the world
+//! is borrowed mutably through [`Fabric::world_mut`]. Host,
 //! client and router attachments are evaluated per query, because they also
 //! depend on host power and applied network config, which change without
 //! touching the topology.
 
 use crate::engine::Deliver;
 use crate::topology::Node;
-use crate::world::World;
+use crate::world::{HostHw, World};
 use control::runtime::{Addr, Endpoint};
 use model::{HostId, NetworkId, PortName, SwitchId};
 use rand::{Rng, SeedableRng};
@@ -75,7 +76,8 @@ type SwitchGraph = BTreeMap<SwitchId, Vec<(PortName, SwitchId, PortName)>>;
 
 #[derive(Default)]
 struct GraphCache {
-    version: u64,
+    /// The topology version the graphs were built at; `None` when invalidated.
+    version: Option<u64>,
     graphs: HashMap<(u16, u16), SwitchGraph>,
 }
 
@@ -101,10 +103,22 @@ impl Fabric {
         &self.world
     }
 
-    /// Topology changes must go through [`crate::topology::Topology`]'s
-    /// methods (or bump its `version`) so cached graphs are rebuilt.
+    /// Drops the cached graphs: whatever the caller changes, even topology
+    /// fields edited without bumping `version`, is seen by the next query.
     pub fn world_mut(&mut self) -> &mut World {
+        *self.graphs.get_mut() = GraphCache::default();
         &mut self.world
+    }
+
+    /// One host's hardware. Host state never feeds the cached switch graphs
+    /// (attachments are evaluated per query), so this keeps them.
+    pub fn host_mut(&mut self, id: &HostId) -> Option<&mut HostHw> {
+        self.world.hosts.get_mut(id)
+    }
+
+    /// Which host each switch currently believes owns the VIP.
+    pub fn vip_arp(&self) -> &BTreeMap<SwitchId, HostId> {
+        &self.arp
     }
 
     /// Can a frame of `mtu` bytes get from `a` to `b` on `vlan`? A host port
@@ -268,7 +282,7 @@ impl Fabric {
     /// the topology changed since the cache was filled.
     fn with_graph<R>(&self, vlan: u16, mtu: u16, f: impl FnOnce(&SwitchGraph) -> R) -> R {
         let mut cache = self.graphs.borrow_mut();
-        let version = self.world.topology.version;
+        let version = Some(self.world.topology.version);
         if cache.version != version {
             *cache = GraphCache { version, graphs: HashMap::new() };
         }
@@ -331,7 +345,7 @@ impl Deliver for Fabric {
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::topology::{NodeGroupKey, PortMode, Switch, SwitchPortCfg};
+    use crate::topology::{PartitionMember, PortMode, Switch, SwitchPortCfg};
     use crate::world::HostHw;
     use control::proto::Msg;
     use control::runtime::{Actor, Addr, Ctx, SimTime, Svc};
@@ -497,9 +511,29 @@ mod tests {
     }
 
     #[test]
+    fn world_mut_invalidates_cached_graphs_even_without_a_version_bump() {
+        let mut f = fabric(fixture());
+        assert!(h1_h2(&f, 1, 1500), "fills the cache");
+        // Edit the cable set directly, bypassing Topology's version-bumping methods.
+        let key = crate::topology::cable_key(&sp("sw-a", "p48"), &sp("sw-b", "p48"));
+        f.world_mut().topology.cable_up.remove(&key);
+        assert!(!h1_h2(&f, 1, 1500), "stale graph still routes over the unplugged trunk");
+        f.world_mut().topology.cable_up.insert(key);
+        assert!(h1_h2(&f, 1, 1500));
+    }
+
+    #[test]
+    fn host_mut_reaches_host_hardware() {
+        let mut f = fabric(fixture());
+        f.host_mut(&h(H2)).unwrap().powered = false;
+        assert!(!h1_h2(&f, 1, 1500), "host state is read per query, never cached");
+        assert!(f.host_mut(&h("nope")).is_none());
+    }
+
+    #[test]
     fn partition_by_switch() {
         let mut f = fabric(fixture());
-        f.world_mut().topology.partition([NodeGroupKey::Switch(sw("sw-b"))].into());
+        f.world_mut().topology.partition([PartitionMember::Switch(sw("sw-b"))].into());
         assert!(!h1_h2(&f, 1, 1500));
         assert!(f.reachable(&hp(H1, "eth0"), &Node::Client, 1, 1500));
         assert!(!f.reachable(&hp(H2, "eth0"), &Node::Client, 1, 1500));
@@ -511,7 +545,7 @@ mod tests {
     #[test]
     fn partition_by_host_cuts_its_ports() {
         let mut f = fabric(fixture());
-        f.world_mut().topology.partition([NodeGroupKey::Host(h(H2))].into());
+        f.world_mut().topology.partition([PartitionMember::Host(h(H2))].into());
         assert!(!h1_h2(&f, 1, 1500));
         assert!(f.reachable(&hp(H1, "eth0"), &Node::Client, 1, 1500));
     }
@@ -542,7 +576,7 @@ mod tests {
         f.record_vip_claim(&h(H1));
         assert_eq!(f.resolve_vip(&h(H2)), Some(h(H1)));
 
-        f.world_mut().topology.partition([NodeGroupKey::Switch(sw("sw-b"))].into());
+        f.world_mut().topology.partition([PartitionMember::Switch(sw("sw-b"))].into());
         f.record_vip_claim(&h(H2));
         assert_eq!(f.resolve_vip(&h(H1)), Some(h(H1)), "sw-a keeps its ARP entry");
         assert_eq!(f.resolve_vip(&h(H2)), Some(h(H2)), "sw-b learned h2");
@@ -580,7 +614,7 @@ mod tests {
     fn route_follows_stale_arp_into_the_void() {
         let mut f = fabric(fixture());
         f.record_vip_claim(&h(H1));
-        f.world_mut().topology.partition([NodeGroupKey::Switch(sw("sw-b"))].into());
+        f.world_mut().topology.partition([PartitionMember::Switch(sw("sw-b"))].into());
         let vip = Endpoint::new(Addr::Vip, Svc::Cp);
         // sw-b still points at h1, which it can no longer reach.
         assert_eq!(f.route(&ep(H2, Svc::Agent), &vip, &NetworkId::from("mgmt")), None);
@@ -641,7 +675,7 @@ mod tests {
         assert_eq!(*log.lock().unwrap(), vec![(ep(H1, Svc::Cp), ep(H2, Svc::Agent), Msg::Ping(10), 11)]);
 
         let f = e.deliver_mut::<Fabric>().expect("fabric installed");
-        f.world_mut().topology.partition([NodeGroupKey::Switch(sw("sw-b"))].into());
+        f.world_mut().topology.partition([PartitionMember::Switch(sw("sw-b"))].into());
         e.run_for(100);
         assert_eq!(log.lock().unwrap().len(), 1, "partitioned ping must be dropped");
         assert_eq!(e.deliver::<Fabric>().unwrap().resolve_vip(&h(H2)), Some(h(H1)));

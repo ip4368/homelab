@@ -5,13 +5,17 @@ mod common;
 
 use common::*;
 use control::agent::HostAgent;
-use control::proto::{ApiOp, ApiResult};
+use control::proto::{ApiOp, ApiResult, LogCmd};
+use control::raft::{EntryPayload, RaftRole};
 use control::replica::CpReplica;
 use control::state::{Lifecycle, ObjectRef};
 use model::{HostId, ProfileId, Role};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
-use sim::topology::NodeGroupKey;
+use sim::faults::Fault;
+use sim::presets::Preset;
+use sim::scenario::Scenario;
+use sim::topology::PartitionMember;
 use std::collections::BTreeSet;
 
 #[test]
@@ -45,7 +49,7 @@ fn minority_leader_stops_controllers() {
     let mut e = engine(3);
     let leader = elect(&mut e, 6000);
     e.run_for(1000); // let the leader's no-op commit and settle
-    e.deliver_mut::<Fabric>().unwrap().world_mut().topology.partition([NodeGroupKey::Host(leader.clone())].into());
+    e.deliver_mut::<Fabric>().unwrap().world_mut().topology.partition([PartitionMember::Host(leader.clone())].into());
     let len = e.replica_log_len(&leader).unwrap();
     e.run_for(2000);
     assert_eq!(e.replica_log_len(&leader), Some(len), "the isolated leader appended entries");
@@ -222,4 +226,175 @@ fn replica_state_is_stored_on_its_host_and_reloaded() {
     e.kill(&cp(&follower));
     e.spawn(cp(&follower), Box::new(CpReplica::new(follower.clone(), None, BTreeSet::new())));
     assert_eq!(e.replica_log_len(&follower), Some(len));
+}
+
+// ---- the default preset (60 hosts) ----
+
+fn default_fleet(seed: u64) -> Engine {
+    let mut e = Engine::new(seed);
+    e.load_preset(Preset::Default);
+    e
+}
+
+fn ready_count(e: &Engine) -> usize {
+    e.client_view().state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Ready).count()
+}
+
+fn replica<'e>(e: &'e Engine, h: &HostId) -> &'e CpReplica {
+    e.actor::<CpReplica>(&cp(h)).unwrap_or_else(|| panic!("{h} runs no replica"))
+}
+
+/// Runs until the client sees all 60 hosts Ready under the true leader; returns it.
+fn settle(e: &mut Engine) -> HostId {
+    let deadline = e.now() + 30_000;
+    let settled = |e: &Engine| e.true_leader().is_some() && e.client_view().leader == e.true_leader() && ready_count(e) == 60;
+    assert!(e.run_until(deadline, settled), "fleet did not settle by t={deadline}: {} Ready", ready_count(e));
+    e.true_leader().unwrap()
+}
+
+#[test]
+fn default_preset_all_ready() {
+    let mut e = default_fleet(11);
+    assert_eq!(e.fabric().world().hosts.len(), 60);
+    assert!(e.run_until(30_000, |e| ready_count(e) == 60), "only {} Ready after 30 s", ready_count(&e));
+    let view = e.client_view();
+    assert_eq!(view.state.hosts.len(), 60);
+    assert_eq!(view.state.cp.voters.len(), 3, "R6: the default fleet starts with 3 voters");
+    assert!(view.state.cp.voters.iter().all(|v| v.as_str().starts_with("ms01-")));
+}
+
+/// Kills the settled leader at the end of a client write, so its log may
+/// hold an entry it has not committed. Returns (leader, kill time, its log
+/// and commit index at the kill).
+fn kill_leader(e: &mut Engine) -> (HostId, u64, Vec<control::raft::Entry<LogCmd>>, u64) {
+    let l = settle(e);
+    e.run_for(1000);
+    let len = e.replica_log_len(&l).unwrap();
+    e.api(ApiOp::Cordon { id: hid("pi5-01") });
+    let deadline = e.now() + 1000;
+    assert!(e.run_until(deadline, |e| e.replica_log_len(&l).unwrap() > len), "the leader never appended the write");
+    let (log, commit) = (replica(e, &l).durable().log.clone(), replica(e, &l).commit_index());
+    let kill_at = e.now();
+    e.fault(Fault::KillHost { host: l.clone() }).unwrap();
+    (l, kill_at, log, commit)
+}
+
+#[test]
+fn leader_failover_criterion_3() {
+    let mut e = default_fleet(12);
+    let (l, kill_at, log_at_kill, commit_at_kill) = kill_leader(&mut e);
+    assert!(e.actor::<CpReplica>(&cp(&l)).is_none() && e.actor::<HostAgent>(&agent(&l)).is_none());
+
+    assert!(e.run_until(kill_at + 6000, |e| e.true_leader().is_some_and(|n| n != l)), "no new leader within 6 s");
+    let new = e.true_leader().unwrap();
+    let deadline = e.now() + 2000;
+    assert!(
+        e.run_until(deadline, |e| e.client_view().leader.as_ref() == Some(&new)),
+        "client view shows leader {:?}, true leader {new}",
+        e.client_view().leader
+    );
+
+    e.run_for(2000);
+    let stored = e.fabric().world().hosts[&l].cp_durable.clone().unwrap();
+    assert_eq!(stored.log, log_at_kill, "a powered-off host's log changed after the kill");
+    let r = replica(&e, &new);
+    let (new_log, commit) = (&r.durable().log, r.commit_index() as usize);
+    assert!(commit >= commit_at_kill as usize);
+    assert_eq!(new_log[..commit_at_kill as usize], log_at_kill[..commit_at_kill as usize], "a committed entry was lost");
+    let old_term = log_at_kill.last().unwrap().term;
+    for entry in new_log[..commit].iter().filter(|en| en.term == old_term) {
+        if let EntryPayload::Normal(LogCmd { at, .. }) = entry.payload {
+            assert!(at <= kill_at, "entry {} of the dead leader's term was stamped after the kill", entry.index);
+        }
+    }
+}
+
+#[test]
+fn restore_host_rejoins_as_follower() {
+    let mut e = default_fleet(13);
+    let (l, kill_at, ..) = kill_leader(&mut e);
+    assert!(e.run_until(kill_at + 6000, |e| e.true_leader().is_some_and(|n| n != l)), "no new leader");
+    let new = e.true_leader().unwrap();
+    e.run_for(3000);
+    let stored = e.fabric().world().hosts[&l].cp_durable.clone().unwrap();
+
+    e.fault(Fault::RestoreHost { host: l.clone() }).unwrap();
+    assert!(e.fabric().world().hosts[&l].powered);
+    assert!(e.actor::<HostAgent>(&agent(&l)).is_some(), "the agent is back");
+    let back = replica(&e, &l).durable();
+    assert_eq!((back.term, &back.voted_for, &back.log), (stored.term, &stored.voted_for, &stored.log), "resumed from disk");
+
+    let target = replica(&e, &new).commit_index();
+    let deadline = e.now() + 5000;
+    assert!(
+        e.run_until(deadline, |e| replica(e, &l).commit_index() >= target),
+        "restored replica at commit {} never reached the leader's {target}",
+        replica(&e, &l).commit_index()
+    );
+    assert_eq!(replica(&e, &l).raft_role(), Some(RaftRole::Follower));
+    assert_eq!(e.true_leader(), Some(new), "the rejoining host must not depose the leader");
+}
+
+#[test]
+fn respawned_replica_prefers_its_disk_over_the_seed() {
+    let mut e = default_fleet(14);
+    let seeded = e.fabric().world().hosts[&hid("ms01-01")].cp_durable.clone().expect("voters store the seed at start");
+    let (l, kill_at, ..) = kill_leader(&mut e);
+    assert!(e.run_until(kill_at + 6000, |e| e.true_leader().is_some_and(|n| n != l)), "no new leader");
+    let stored = e.fabric().world().hosts[&l].cp_durable.clone().unwrap();
+    assert!(stored.term > seeded.term && stored.log.len() > seeded.log.len(), "the leader moved past the seed");
+
+    e.fabric_mut().host_mut(&l).unwrap().powered = true;
+    e.spawn(cp(&l), Box::new(CpReplica::new(l.clone(), Some(seeded.clone()), seeded.voters.clone())));
+    let d = replica(&e, &l).durable();
+    assert_eq!((d.term, &d.voted_for, &d.log), (stored.term, &stored.voted_for, &stored.log));
+}
+
+#[test]
+fn kill_host_marks_not_ready() {
+    let mut e = default_fleet(15);
+    settle(&mut e);
+    let victim = hid("pi5-03");
+    assert!(!e.client_view().state.cp.voters.contains(&victim));
+    e.fault(Fault::KillHost { host: victim.clone() }).unwrap();
+    let down = |e: &Engine| {
+        let v = e.client_view();
+        v.state.hosts[&victim].lifecycle == Lifecycle::NotReady
+            && v.state.alerts.values().any(|a| a.kind == "HostDown" && a.entity == ObjectRef::host(&victim) && a.resolved_at.is_none())
+    };
+    let deadline = e.now() + 45_000;
+    assert!(e.run_until(deadline, down), "{victim} not NotReady with a HostDown alert within 45 s");
+}
+
+#[test]
+fn add_hosts_join_through_the_seed_rules() {
+    let mut e = default_fleet(16);
+    settle(&mut e);
+    e.scenario(Scenario::AddHosts { profile: ProfileId::Rk3588, count: 2, misconfigure: None }).unwrap();
+    let added = [hid("rk3588-13"), hid("rk3588-14")];
+    let deadline = e.now() + 30_000;
+    assert!(
+        e.run_until(deadline, |e| added.iter().all(|h| lifecycle(e, h) == Some(Lifecycle::Ready))),
+        "added hosts: {:?}",
+        added.iter().map(|h| lifecycle(&e, h)).collect::<Vec<_>>()
+    );
+    for h in &added {
+        let obj = &e.client_view().state.hosts[h];
+        assert_eq!(obj.roles, [Role::Transcode, Role::Compute].into());
+        assert_eq!(obj.location, "unknown");
+    }
+}
+
+#[test]
+fn add_hosts_fails_without_a_control_plane() {
+    let mut e = default_fleet(17);
+    settle(&mut e);
+    for v in e.client_view().state.cp.voters.clone() {
+        e.fault(Fault::KillHost { host: v }).unwrap();
+    }
+    let start = e.now();
+    let err = e.scenario(Scenario::AddHosts { profile: ProfileId::Pi5, count: 1, misconfigure: None }).unwrap_err();
+    assert!(err.contains("join token"), "{err}");
+    assert!(e.now() <= start + 5000, "waited past 5 s");
+    assert!(!e.fabric().world().hosts.contains_key(&hid("pi5-13")), "no host is added without a token");
 }

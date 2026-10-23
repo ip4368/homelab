@@ -10,7 +10,7 @@
 //! - **Check-quorum:** a leader that has not heard from a quorum (counting
 //!   itself) within `election_min_ms` steps down.
 
-use super::{Durable, DurableOp, Entry, EntryPayload, NotLeader, RaftConfig, RaftMsg, RaftOut};
+use super::{Durable, DurableOp, Entry, EntryPayload, NotLeader, RaftConfig, RaftMsg, RaftOut, RaftRole};
 use crate::runtime::SimTime;
 use model::HostId;
 use rand_chacha::ChaCha8Rng;
@@ -143,6 +143,19 @@ impl<T: Clone> RaftNode<T> {
 
     pub fn is_leader(&self) -> bool {
         matches!(self.role, Role::Leader(_))
+    }
+
+    pub fn role(&self) -> RaftRole {
+        match self.role {
+            Role::Leader(_) => RaftRole::Leader,
+            Role::Follower => RaftRole::Follower,
+            Role::PreCandidate { .. } | Role::Candidate { .. } => RaftRole::Candidate,
+        }
+    }
+
+    /// Highest log index known to be committed.
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index
     }
 
     pub fn leader_hint(&self) -> Option<HostId> {
@@ -663,9 +676,20 @@ mod tests {
         assert!(c.nodes[l].term() >= 1);
         c.run_for(5000);
         assert_eq!(c.leaders(), vec![l], "a healthy cluster keeps its leader");
-        for n in &c.nodes {
+        for (i, n) in c.nodes.iter().enumerate() {
             assert_eq!(n.leader_hint(), Some(hid(l)));
+            assert_eq!(n.role(), if i == l { RaftRole::Leader } else { RaftRole::Follower });
         }
+    }
+
+    #[test]
+    fn a_node_that_cannot_reach_its_peers_reports_candidate() {
+        let voters: BTreeSet<HostId> = (0..3).map(hid).collect();
+        let mut n = RaftNode::<u64>::new(hid(0), Durable::new(voters), RaftConfig::default(), 1);
+        n.tick(0);
+        assert_eq!(n.role(), RaftRole::Follower);
+        n.tick(RaftConfig::default().election_max_ms);
+        assert_eq!(n.role(), RaftRole::Candidate, "collecting pre-votes counts as campaigning");
     }
 
     #[test]
@@ -675,6 +699,8 @@ mod tests {
         let indexes: Vec<u64> = [1, 2, 3].into_iter().map(|v| c.propose(l, v)).collect();
         assert!(indexes.windows(2).all(|w| w[1] == w[0] + 1), "indexes {indexes:?}");
         assert!(c.run_until(2000, |c| c.committed.iter().all(|x| x == &[1, 2, 3])), "{:?}", c.committed);
+        c.run_for(1000); // followers learn the commit index on the next heartbeat
+        assert!(c.nodes.iter().all(|n| n.commit_index() == 4), "the leader's no-op plus three entries");
         assert_eq!(c.nodes[(l + 1) % 3].propose(c.now, 4), Err(NotLeader { leader_hint: Some(hid(l)) }));
     }
 

@@ -128,6 +128,17 @@ impl ClientActor {
         std::mem::take(&mut self.results)
     }
 
+    /// The final answer to `req`, if it has arrived and was not taken yet.
+    pub fn result(&self, req: u64) -> Option<&ApiResult> {
+        self.results.iter().find(|(r, _)| *r == req).map(|(_, res)| res)
+    }
+
+    /// Takes the final answer to `req` only, leaving the others for [`ClientActor::take_results`].
+    pub fn take_result(&mut self, req: u64) -> Option<ApiResult> {
+        let i = self.results.iter().position(|(r, _)| *r == req)?;
+        Some(self.results.remove(i).1)
+    }
+
     fn finish(&mut self, req: u64, result: ApiResult) {
         if self.outstanding.remove(&req).is_some() {
             self.results.push((req, result));
@@ -261,6 +272,21 @@ mod tests {
             c.on_timer(&mut ctx, token);
         }
         assert!(c.take_results().is_empty(), "the give-up timer of an answered request is a no-op");
+    }
+
+    #[test]
+    fn one_answer_can_be_taken_leaving_the_rest() {
+        let (mut c, mut ctx) = (ClientActor::new(), FakeCtx::default());
+        let a = c.submit(&mut ctx, ApiOp::CreateJoinToken);
+        let b = c.submit(&mut ctx, ApiOp::CreateJoinToken);
+        assert_eq!(c.result(b), None, "not answered yet");
+        c.on_message(&mut ctx, VIP, Msg::ApiResp { req: a, result: ApiResult::Unavailable });
+        c.on_message(&mut ctx, VIP, Msg::ApiResp { req: b, result: ApiResult::NotLeader });
+        c.on_message(&mut ctx, VIP, Msg::ApiResp { req: b, result: ApiResult::Err("x".into()) });
+        assert_eq!(c.result(b), Some(&ApiResult::Err("x".into())));
+        assert_eq!(c.take_result(b), Some(ApiResult::Err("x".into())));
+        assert_eq!(c.take_result(b), None, "taken once");
+        assert_eq!(c.take_results(), [(a, ApiResult::Unavailable)]);
     }
 
     #[test]

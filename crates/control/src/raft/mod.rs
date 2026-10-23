@@ -11,6 +11,7 @@ pub use node::RaftNode;
 use model::HostId;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use ts_rs::TS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RaftConfig {
@@ -25,6 +26,16 @@ impl Default for RaftConfig {
     fn default() -> Self {
         Self { heartbeat_ms: 300, election_min_ms: 1500, election_max_ms: 3000 }
     }
+}
+
+/// What a node is doing, as an observer would describe it. A node collecting
+/// pre-votes reports `Candidate`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum RaftRole {
+    Leader,
+    Follower,
+    Candidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

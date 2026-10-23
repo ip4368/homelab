@@ -8,6 +8,6 @@ control = { path = "../control" }
 model = { path = "../model" }
 rand.workspace = true
 rand_chacha.workspace = true
-
-[dev-dependencies]
+serde.workspace = true
 serde_json.workspace = true
+ts-rs.workspace = true

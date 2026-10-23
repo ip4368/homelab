@@ -5,7 +5,7 @@
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::{self, Action, PendingApi, PendingJoin, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg};
-use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut};
+use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle};
 use model::{HostId, Inventory};
@@ -42,6 +42,16 @@ impl CpReplica {
 
     pub fn is_leader(&self) -> bool {
         self.raft.as_ref().is_some_and(|r| r.is_leader())
+    }
+
+    /// `None` until the replica has started.
+    pub fn raft_role(&self) -> Option<RaftRole> {
+        self.raft.as_ref().map(RaftNode::role)
+    }
+
+    /// Highest committed log index; 0 until the replica has started.
+    pub fn commit_index(&self) -> u64 {
+        self.raft.as_ref().map_or(0, RaftNode::commit_index)
     }
 
     pub fn log_len(&self) -> usize {
@@ -245,7 +255,11 @@ impl Actor for CpReplica {
             None => init,
         };
         self.raft = Some(RaftNode::new(self.me.clone(), durable, RaftConfig::default(), ctx.rand_u64()));
-        arm(ctx, TICK);
+        // A random phase, so replicas started together do not tick in lockstep:
+        // election deadlines only fire on ticks, and aligned ticks make
+        // simultaneous campaigns (split votes) far more likely.
+        let phase = 1 + ctx.rand_u64() % RAFT_TICK_MS;
+        ctx.set_timer(phase, TICK);
         arm(ctx, CONTROLLERS);
     }
 
@@ -308,6 +322,10 @@ mod tests {
         now: SimTime,
         /// Everything sent except Raft traffic.
         sent: Vec<(Endpoint, Msg)>,
+        /// (after_ms, token) of every timer set.
+        timers: Vec<(u64, u64)>,
+        /// What `rand_u64` returns.
+        rand: u64,
     }
 
     impl Ctx for FakeCtx {
@@ -322,9 +340,11 @@ mod tests {
                 self.sent.push((to, msg));
             }
         }
-        fn set_timer(&mut self, _: u64, _: u64) {}
+        fn set_timer(&mut self, after_ms: u64, token: u64) {
+            self.timers.push((after_ms, token));
+        }
         fn rand_u64(&mut self) -> u64 {
-            1
+            self.rand
         }
         fn claim_vip(&mut self) {}
         fn host(&mut self) -> Option<&mut dyn HostOs> {
@@ -342,7 +362,7 @@ mod tests {
         /// Started with `cmds` already applied, as if replayed from earlier terms.
         fn new(cmds: Vec<Command>) -> Self {
             let voters = ["h1", "h2", "h3"].map(hid).into();
-            let mut rig = Rig { r: CpReplica::new(hid("h1"), None, voters), ctx: FakeCtx::default() };
+            let mut rig = Rig { r: CpReplica::new(hid("h1"), None, voters), ctx: FakeCtx { rand: 1, ..FakeCtx::default() } };
             rig.r.on_start(&mut rig.ctx);
             for c in cmds {
                 rig.r.state.apply(0, c).unwrap();
@@ -451,12 +471,25 @@ mod tests {
     }
 
     #[test]
+    fn replicas_tick_at_a_random_phase() {
+        let first_tick = |rand: u64| {
+            let mut ctx = FakeCtx { rand, ..FakeCtx::default() };
+            CpReplica::new(hid("h1"), None, [hid("h1")].into()).on_start(&mut ctx);
+            ctx.timers.iter().find(|(_, token)| *token == TICK).unwrap().0
+        };
+        assert_eq!((first_tick(0), first_tick(41), first_tick(199)), (1, 42, 100));
+    }
+
+    #[test]
     fn controllers_wait_for_the_leaders_noop_to_apply() {
         let mut rig = Rig::new(orphaned_alert());
+        assert_eq!((rig.r.raft_role(), rig.r.commit_index()), (Some(RaftRole::Follower), 0));
         rig.elect();
+        assert_eq!(rig.r.raft_role(), Some(RaftRole::Leader));
         rig.controllers();
         assert!(rig.proposed().is_empty(), "controllers ran before the no-op applied: {:?}", rig.proposed());
         rig.ack();
+        assert_eq!(rig.r.commit_index(), 1, "the no-op committed");
         rig.controllers();
         assert_eq!(rig.proposed(), [Command::ResolveAlert { id: "hostdown-h9-0-0".into() }]);
     }

@@ -152,7 +152,7 @@ impl Ctx for EngineCtx<'_> {
 /// The world's host `me` runs on, if the fabric is installed and knows it.
 fn host_hw<'d>(deliver: &'d mut dyn Deliver, me: &Endpoint) -> Option<&'d mut HostHw> {
     let Addr::Host(h) = &me.addr else { return None };
-    (deliver as &mut dyn Any).downcast_mut::<Fabric>()?.world_mut().hosts.get_mut(h)
+    (deliver as &mut dyn Any).downcast_mut::<Fabric>()?.host_mut(h)
 }
 
 const NO_HOST: &str = "Ctx::host only hands out the OS of a host the world knows";
@@ -205,6 +205,7 @@ impl HostOs for EngineCtx<'_> {
 }
 
 pub struct Engine {
+    seed: u64,
     core: Core,
     actors: HashMap<Endpoint, Slot>,
     next_actor: u64,
@@ -213,6 +214,7 @@ pub struct Engine {
 impl Engine {
     pub fn new(seed: u64) -> Self {
         Self {
+            seed,
             core: Core {
                 now: 0,
                 seq: 0,
@@ -225,7 +227,20 @@ impl Engine {
         }
     }
 
+    /// The seed the engine was created with; presets seed their fabric from it.
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
     pub fn set_deliver(&mut self, d: Box<dyn Deliver>) {
+        self.core.deliver = d;
+    }
+
+    /// Starts over on `d`: every actor and every pending event is dropped.
+    /// Time keeps running from `now()`.
+    pub fn reset(&mut self, d: Box<dyn Deliver>) {
+        self.actors.clear();
+        self.core.queue.clear();
         self.core.deliver = d;
     }
 
@@ -271,6 +286,11 @@ impl Engine {
         self.deliver().expect("the fabric is installed")
     }
 
+    /// The installed fabric, mutably. Panics if a different [`Deliver`] is installed.
+    pub fn fabric_mut(&mut self) -> &mut Fabric {
+        self.deliver_mut().expect("the fabric is installed")
+    }
+
     /// What the UI client currently knows. Panics if no client is spawned.
     pub fn client_view(&self) -> &ClusterView {
         self.actor::<ClientActor>(&CLIENT).expect("client actor spawned").view()
@@ -289,6 +309,14 @@ impl Engine {
             client.downcast_mut::<ClientActor>().expect("client endpoint runs a ClientActor").submit(ctx, op)
         })
         .expect("client actor spawned")
+    }
+
+    /// The final answer to request `req` alone, if it has arrived; other
+    /// answers stay for [`Engine::take_api_results`].
+    pub fn take_api_result(&mut self, req: u64) -> Option<ApiResult> {
+        let slot = self.actors.get_mut(&CLIENT)?;
+        let client: &mut dyn Any = slot.actor.as_mut();
+        client.downcast_mut::<ClientActor>()?.take_result(req)
     }
 
     /// Final API answers since the last call, as `(request id, result)`.
@@ -500,6 +528,24 @@ mod tests {
         e.spawn(ep("a"), Box::new(PingActor::new(&l).timers(&[(8, 2)])));
         e.run_for(20);
         assert_eq!(*l.lock().unwrap(), vec![Seen::Timer { token: 2, at: 8 }]);
+    }
+
+    #[test]
+    fn reset_drops_actors_and_pending_events_but_keeps_time() {
+        let l = log();
+        let mut e = Engine::new(1);
+        e.spawn(ep("a"), Box::new(PingActor::new(&l).timers(&[(50, 1)])));
+        e.spawn(ep("b"), Box::new(PingActor::new(&l).pings(ep("a"))));
+        e.run_for(10);
+        l.lock().unwrap().clear();
+        e.reset(Box::new(CountClaims(vec![])));
+        assert!(e.actor::<PingActor>(&ep("a")).is_none());
+        assert!(e.deliver::<CountClaims>().is_some());
+        // A new actor at the old endpoint inherits nothing.
+        e.spawn(ep("a"), Box::new(PingActor::new(&l)));
+        e.run_for(100);
+        assert!(l.lock().unwrap().is_empty(), "{:?}", l.lock().unwrap());
+        assert_eq!(e.now(), 110);
     }
 
     #[test]
