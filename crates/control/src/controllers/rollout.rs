@@ -216,7 +216,7 @@ mod tests {
         for (i, (id, p, t)) in hosts.enumerate() {
             let port = PortName::new(format!("p{}", i + 1));
             let trunk = SwitchPortCfg { mode: PortMode::Trunk { native: Some(1), allowed: [1, 20].into() }, mtu: 9216, lacp_group: None, admin_up: true };
-            ports.push(ObservedSwitchPort { switch: SwitchId::from("access-1"), port: port.clone(), cfg: trunk, mlag_peer: None });
+            ports.push(ObservedSwitchPort { switch: SwitchId::from("access-1"), port: port.clone(), cfg: trunk, mlag_peer: None, link_up: true, speed_mbps: 1000, neighbor: None });
             let inventory = Inventory::from_profile(p, 1);
             s.apply(0, Command::AddPendingHost { id: hid(&id), profile: profile(p, 1), inventory: inventory.clone(), location: "rack-1".into() }).unwrap();
             s.apply(0, Command::ApproveHost { id: hid(&id), roles: [Role::Compute].into() }).unwrap();

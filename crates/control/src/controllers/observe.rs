@@ -128,7 +128,7 @@ mod tests {
 
     fn port(switch: &str, vlan: u16) -> ObservedSwitchPort {
         let cfg = SwitchPortCfg { mode: PortMode::Access(vlan), mtu: 9216, lacp_group: None, admin_up: true };
-        ObservedSwitchPort { switch: sid(switch), port: PortName::from("p1"), cfg, mlag_peer: None }
+        ObservedSwitchPort { switch: sid(switch), port: PortName::from("p1"), cfg, mlag_peer: None, link_up: true, speed_mbps: 1000, neighbor: None }
     }
 
     fn reading(switch: &str, at: SimTime, vlan: u16) -> SwitchReading {
@@ -246,6 +246,29 @@ mod tests {
         s.apply(91_000, observe("a", 91_000, 20)).unwrap();
         let later = proposals(run(&s, &v, 91_000 + 10 * SWITCH_REFRESH_MS));
         assert!(later.iter().all(|c| !matches!(c, Command::ObserveSwitch { .. })), "{later:?}");
+    }
+
+    #[test]
+    fn a_link_change_alone_is_written_at_once() {
+        let mut s = ClusterState::new();
+        let mut v = Volatile::new(0, 1);
+        s.apply(1000, observe("a", 1000, 1)).unwrap();
+        let mut r = reading("a", 2000, 1);
+        v.switch_reports.insert(sid("a"), r.clone());
+        assert!(proposals(run(&s, &v, 2000)).is_empty());
+
+        r.ports[0].link_up = false;
+        v.switch_reports.insert(sid("a"), r.clone());
+        assert!(matches!(proposals(run(&s, &v, 2000)).as_slice(), [Command::ObserveSwitch { ports, .. }] if !ports[0].link_up));
+
+        r.ports[0].link_up = true;
+        r.ports[0].speed_mbps = 40_000;
+        v.switch_reports.insert(sid("a"), r.clone());
+        assert_eq!(proposals(run(&s, &v, 2000)).len(), 1, "negotiated speed");
+        r.ports[0].speed_mbps = 1000;
+        r.ports[0].neighbor = Some(model::network::LldpPeer { switch: sid("b"), port: PortName::from("p2") });
+        v.switch_reports.insert(sid("a"), r);
+        assert_eq!(proposals(run(&s, &v, 2000)).len(), 1, "neighbour");
     }
 
     fn alert_kinds(actions: Vec<Action>) -> Vec<Command> {

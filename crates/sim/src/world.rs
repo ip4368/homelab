@@ -8,7 +8,7 @@ use control::proto::LogCmd;
 use control::raft::Durable;
 use control::runtime::{HostUsage, SwitchConfig};
 use model::network::{
-    HostNetworkConfig, LldpNeighbor, LogicalNetwork, ObservedSwitchPort, bootstrap_config, seed_networks,
+    HostNetworkConfig, LldpNeighbor, LldpPeer, LogicalNetwork, ObservedSwitchPort, bootstrap_config, seed_networks,
 };
 use model::{DiskState, HardwareProfile, HostId, Inventory, NetworkId, NicState, PortName, ProfileId, SwitchId, profile};
 use rand::Rng;
@@ -193,26 +193,46 @@ impl World {
             .collect()
     }
 
-    /// A switch's own configuration, which is what its management interface
-    /// reports. `None` for an unknown switch.
+    /// A switch's own view of itself, which is what its management interface
+    /// reports: port configuration plus what its ports see on the wire (carrier,
+    /// negotiated speed, and the LLDP neighbour of switch-to-switch cables).
+    /// `None` for an unknown switch.
     pub fn switch_config(&self, id: &SwitchId) -> Option<SwitchConfig> {
         let sw = self.topology.switches.get(id)?;
         let ports = sw
             .ports
             .iter()
-            .map(|(port, (_, cfg))| ObservedSwitchPort {
-                switch: id.clone(),
-                port: port.clone(),
-                cfg: cfg.clone(),
-                mlag_peer: sw.mlag_peer.clone(),
+            .map(|(port, (own_mbps, cfg))| {
+                let end = Node::SwitchPort(id.clone(), port.clone());
+                let far = self.topology.peer(&end);
+                let speed_mbps = match far {
+                    Some(Node::SwitchPort(s, p)) => {
+                        self.topology.switches.get(s).and_then(|o| o.ports.get(p)).map_or(*own_mbps, |(f, _)| (*f).min(*own_mbps))
+                    }
+                    Some(Node::HostPort(h, p)) => self.nic_speed(h, p.as_str()).map_or(*own_mbps, |f| f.min(*own_mbps)),
+                    _ => *own_mbps,
+                };
+                let neighbor = match far {
+                    Some(Node::SwitchPort(switch, port)) => Some(LldpPeer { switch: switch.clone(), port: port.clone() }),
+                    _ => None,
+                };
+                ObservedSwitchPort {
+                    switch: id.clone(),
+                    port: port.clone(),
+                    cfg: cfg.clone(),
+                    mlag_peer: sw.mlag_peer.clone(),
+                    link_up: cfg.admin_up && self.link_up(&end),
+                    speed_mbps,
+                    neighbor,
+                }
             })
             .collect();
         Some(SwitchConfig { model: sw.model.clone(), ports, mlag_peer: sw.mlag_peer.clone() })
     }
 
     /// Whether the port at `end` has carrier: cabled, the cable plugged in,
-    /// and a far-end switch that is up with the port admin-up. Partitions do
-    /// not matter: they cut traffic, not carrier.
+    /// and a far end that is alive: a switch that is up with the port admin-up,
+    /// or a powered host. Partitions do not matter: they cut traffic, not carrier.
     pub fn link_up(&self, end: &Node) -> bool {
         let Some(peer) = self.topology.peer(end) else { return false };
         if !self.topology.is_cable_up(end, peer) {
@@ -222,6 +242,7 @@ impl World {
             Node::SwitchPort(s, p) => {
                 self.topology.switches.get(s).is_some_and(|sw| sw.up && sw.port(p).is_some_and(|c| c.admin_up))
             }
+            Node::HostPort(h, _) => self.hosts.get(h).is_some_and(|hw| hw.powered),
             _ => true,
         }
     }
@@ -378,6 +399,31 @@ mod tests {
         w.topology.set_port(&sw, &PortName::from("p1"), changed.clone());
         assert_eq!(w.switch_config(&sw).unwrap().ports[0].cfg, changed);
         assert!(w.switch_config(&SwitchId::from("nope")).is_none());
+    }
+
+    #[test]
+    fn switch_ports_report_carrier_speed_and_switch_neighbours() {
+        let mut w = world();
+        let sw = SwitchId::from("sw");
+        let cfg = SwitchPortCfg { mode: PortMode::Access(1), mtu: 1500, lacp_group: None, admin_up: true };
+        let other = SwitchId::from("sw2");
+        let ports = [("p1", 1_000)].map(|(p, mbps)| (PortName::from(p), (mbps, cfg.clone()))).into();
+        w.topology.add_switch(Switch { id: other.clone(), model: "t".into(), ports, mlag_peer: None, up: true });
+        // sw p2 is re-cabled from the host to the slower switch sw2.
+        w.topology.connect(sp("p2"), Node::SwitchPort(other.clone(), PortName::from("p1")));
+        let report = |w: &World, id: &SwitchId, p: &str| w.switch_config(id).unwrap().ports.into_iter().find(|o| o.port.as_str() == p).unwrap();
+
+        let host_facing = report(&w, &sw, "p1");
+        assert_eq!((host_facing.link_up, host_facing.speed_mbps, host_facing.neighbor), (true, 10_000, None));
+        let trunk = report(&w, &sw, "p2");
+        let peer = LldpPeer { switch: other.clone(), port: PortName::from("p1") };
+        assert_eq!((trunk.link_up, trunk.speed_mbps, trunk.neighbor.clone()), (true, 1_000, Some(peer.clone())));
+
+        w.topology.set_switch_up(&other, false);
+        let down = report(&w, &sw, "p2");
+        assert_eq!((down.link_up, down.neighbor), (false, Some(peer)), "the far switch is dead but the cabling is known");
+        w.hosts.get_mut(&hid("h")).unwrap().powered = false;
+        assert!(!report(&w, &sw, "p1").link_up, "a powered-off host has no carrier");
     }
 
     #[test]

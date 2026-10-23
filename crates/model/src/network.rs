@@ -170,6 +170,15 @@ pub struct LldpNeighbor {
 /// A switch port's configuration as the controller observed it by polling.
 pub type SwitchPortCfgView = SwitchPortCfg;
 
+/// What a switch's LLDP daemon reports for one of its ports: the port of
+/// another switch on the other end of the cable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LldpPeer {
+    pub switch: SwitchId,
+    pub port: PortName,
+}
+
 /// One polled switch port, with the MLAG peer of the switch it sits on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -178,6 +187,13 @@ pub struct ObservedSwitchPort {
     pub port: PortName,
     pub cfg: SwitchPortCfgView,
     pub mlag_peer: Option<SwitchId>,
+    /// The port has carrier: cabled, cable plugged in, admin-up on both ends, far end alive.
+    pub link_up: bool,
+    /// The negotiated speed in Mbit/s: the slower of the two ends.
+    pub speed_mbps: u32,
+    /// The switch port on the other end of a switch-to-switch cable. `None`
+    /// for host-facing and uncabled ports (hosts report their own LLDP).
+    pub neighbor: Option<LldpPeer>,
 }
 
 #[cfg(test)]

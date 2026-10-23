@@ -942,7 +942,7 @@ mod tests {
     fn observe_switch(id: &str, last_seen: SimTime) -> Command {
         let sw = SwitchId::from(id);
         let cfg = model::SwitchPortCfg { mode: model::PortMode::Access(1), mtu: 9216, lacp_group: None, admin_up: true };
-        let ports = vec![model::ObservedSwitchPort { switch: sw.clone(), port: PortName::from("p1"), cfg, mlag_peer: None }];
+        let ports = vec![model::ObservedSwitchPort { switch: sw.clone(), port: PortName::from("p1"), cfg, mlag_peer: None, link_up: true, speed_mbps: 1000, neighbor: None }];
         Command::ObserveSwitch { id: sw, model: "m".into(), ports, mlag_peer: None, last_seen }
     }
 

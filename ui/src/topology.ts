@@ -7,8 +7,6 @@ import type { SwitchObj } from './gen/SwitchObj'
 import { MGMT_NIC } from './grouping'
 
 export const DEFAULT_COLLAPSE_OVER = 24
-/** Access-switch uplinks are SFP+ ports; observed switch ports carry no speed. */
-export const UPLINK_MBPS = 10_000
 
 export type NodeKind = 'core' | 'access' | 'host' | 'group'
 export type EdgeState = 'up' | 'down' | 'mismatch'
@@ -20,6 +18,8 @@ export interface TopoNode {
   y: number
   kind: NodeKind
   label: string
+  /** Switches only: the control plane has lost contact with it. */
+  unreachable?: boolean
   /** Groups only: how many hosts they stand for, and how many of those have a down or mismatched leg. */
   hosts?: number
   down?: number
@@ -32,8 +32,10 @@ export interface TopoEdge {
   /** Busier direction over link capacity, 0 to 1. */
   utilisation: number
   state: EdgeState
+  /** Host edges: the host's NIC and the switch port. Switch edges: the ports on `a` and on `b`. */
   hostPort?: string
   switchPort?: string
+  farPort?: string
 }
 
 export interface LayoutOpts {
@@ -41,11 +43,15 @@ export interface LayoutOpts {
   collapseOver?: number
   /** Latest per-port throughput, from the ground truth. */
   ports?: PortLoad[]
+  /** Switches the control plane cannot reach (open `SwitchUnreachable` alert): their links are down. */
+  unreachable?: ReadonlySet<string>
 }
 
 export interface Layout {
   nodes: TopoNode[]
   edges: TopoEdge[]
+  /** Hosts left out because their mgmt NIC does not (yet) lead to a known access switch. */
+  unplaced: number
 }
 
 export const NODE_W = 76
@@ -69,8 +75,6 @@ export function utilisationBand(u: number): Band {
   return u > 0.8 ? 'high' : u > 0.5 ? 'mid' : 'low'
 }
 
-const isCore = (s: SwitchObj) => s.mlag_peer !== null || s.id.startsWith('core')
-
 const portKey = (kind: 'h' | 's', node: string, port: string) => `${kind}:${node}/${port}`
 
 function indexLoads(ports: PortLoad[]): Map<string, number> {
@@ -92,6 +96,10 @@ function concerns(issue: Issue, leg: LldpNeighbor, host: HostObj): boolean {
   if ('LacpNotConfigured' in issue) {
     return issue.LacpNotConfigured.switch === leg.switch && issue.LacpNotConfigured.port === leg.switch_port
   }
+  if ('MtuTooSmall' in issue) {
+    // Switch-side MTU is `<switch> <port>`; `link <name>` is the host's own config.
+    return issue.MtuTooSmall.where_ === `${leg.switch} ${leg.switch_port}`
+  }
   if ('BondSplitWithoutMlag' in issue) {
     const config = host.net.desired ?? host.net.applied
     const link = config?.links.find((l) => l.name === issue.BondSplitWithoutMlag.link)
@@ -107,10 +115,16 @@ interface Leg {
   state: EdgeState
 }
 
-function legOf(host: HostObj, neighbour: LldpNeighbor, switches: Map<string, SwitchObj>, loads: Map<string, number>): Leg {
+function legOf(
+  host: HostObj,
+  neighbour: LldpNeighbor,
+  switches: Map<string, SwitchObj>,
+  loads: Map<string, number>,
+  unreachable: ReadonlySet<string>,
+): Leg {
   const nic = host.inventory.nics.find((n) => n.name === neighbour.local_port)
   const observed = switches.get(neighbour.switch)?.ports.find((p) => p.port === neighbour.switch_port)
-  const down = !nic || !nic.link_up || observed?.cfg.admin_up === false
+  const down = !nic || !nic.link_up || observed?.cfg.admin_up === false || unreachable.has(neighbour.switch)
   const mismatch = host.net.issues.some((i) => concerns(i, neighbour, host))
   const capacity = (nic?.speed_mbps ?? 0) * 1e6
   const load = loads.get(portKey('h', host.id, neighbour.local_port)) ?? 0
@@ -130,14 +144,19 @@ function worst(legs: Leg[]): EdgeState {
 
 /**
  * Lays the fabric out in three rows: cores on top, access switches below,
- * hosts under the access switch their mgmt NIC is cabled to. Hosts that have
- * not reported LLDP yet are left out. Access uplink `sfp<k>` is taken to go to
- * the k-th core by name, the way the presets cable them.
+ * hosts under the access switch their mgmt NIC is cabled to. A switch is an
+ * access switch if some host's mgmt NIC plugs into it and it has no MLAG peer;
+ * every other switch is a core. Switch-to-switch edges come from the
+ * neighbours the switches report over LLDP. Hosts whose mgmt NIC does not
+ * lead to a known access switch are left out and counted in `unplaced`.
  */
 export function layoutTopology(switches: SwitchObj[], hosts: HostObj[], opts: LayoutOpts = {}): Layout {
   const collapseOver = opts.collapseOver ?? DEFAULT_COLLAPSE_OVER
   const loads = indexLoads(opts.ports ?? [])
+  const unreachable = opts.unreachable ?? new Set<string>()
   const bySwitch = new Map(switches.map((s) => [s.id, s]))
+  const mgmtSwitches = new Set(hosts.flatMap((h) => h.lldp.filter((n) => n.local_port === MGMT_NIC).map((n) => n.switch)))
+  const isCore = (s: SwitchObj) => s.mlag_peer !== null || !mgmtSwitches.has(s.id)
   const cores = switches.filter(isCore).sort((a, b) => byText(a.id, b.id))
   const accesses = switches.filter((s) => !isCore(s)).sort((a, b) => byText(a.id, b.id))
 
@@ -146,23 +165,22 @@ export function layoutTopology(switches: SwitchObj[], hosts: HostObj[], opts: La
     const mgmt = h.lldp.find((n) => n.local_port === MGMT_NIC)
     hostsOf.get(mgmt?.switch ?? '')?.push(h)
   }
+  const unplaced = hosts.length - [...hostsOf.values()].reduce((n, m) => n + m.length, 0)
 
   const nodes: TopoNode[] = []
   const edges: TopoEdge[] = []
 
   // Columns, left to right: one block per access switch.
   let cursor = MARGIN
-  const accessX = new Map<string, number>()
   for (const sw of accesses) {
     const members = hostsOf.get(sw.id)!
     const collapsed = members.length > collapseOver
     const cols = collapsed ? 1 : Math.max(1, Math.min(HOST_COLS, members.length))
     const width = collapsed ? GROUP_W : cols * HOST_STEP_X
     const centre = cursor + width / 2
-    accessX.set(sw.id, centre)
-    nodes.push({ id: sw.id, x: centre, y: Y_ACCESS, kind: 'access', label: sw.id })
+    nodes.push({ id: sw.id, x: centre, y: Y_ACCESS, kind: 'access', label: sw.id, unreachable: unreachable.has(sw.id) })
 
-    const legs = members.flatMap((h) => h.lldp.filter((n) => bySwitch.has(n.switch)).map((n) => legOf(h, n, bySwitch, loads)))
+    const legs = members.flatMap((h) => h.lldp.filter((n) => bySwitch.has(n.switch)).map((n) => legOf(h, n, bySwitch, loads, unreachable)))
     if (collapsed) {
       const gid = `group:${sw.id}`
       const flagged = (state: EdgeState) => members.filter((h) => legs.some((l) => l.host === h && l.state === state)).length
@@ -207,29 +225,40 @@ export function layoutTopology(switches: SwitchObj[], hosts: HostObj[], opts: La
 
   const total = Math.max(cursor - BLOCK_GAP + MARGIN, 2 * MARGIN + cores.length * HOST_STEP_X)
   const coreStep = total / (cores.length + 1)
-  cores.forEach((sw, i) => nodes.push({ id: sw.id, x: coreStep * (i + 1), y: Y_CORE, kind: 'core', label: sw.id }))
+  cores.forEach((sw, i) =>
+    nodes.push({ id: sw.id, x: coreStep * (i + 1), y: Y_CORE, kind: 'core', label: sw.id, unreachable: unreachable.has(sw.id) }),
+  )
 
-  // Uplinks: every access switch is dual-homed, `sfp<k>` to the k-th core.
-  for (const sw of accesses) {
-    cores.forEach((core, i) => {
-      const port = `sfp${i + 1}`
-      const observed = sw.ports.find((p) => p.port === port)
-      const down = observed?.cfg.admin_up === false
-      const load = loads.get(portKey('s', sw.id, port)) ?? 0
+  // Switch-to-switch cables, from the LLDP neighbours the switches report. Each
+  // cable is reported from both ends: draw it once, from the lexically first end.
+  const level = (id: string) => (isCore(bySwitch.get(id)!) ? 0 : 1)
+  for (const sw of switches) {
+    for (const p of sw.ports) {
+      const far = p.neighbor && bySwitch.get(p.neighbor.switch)?.ports.find((q) => q.port === p.neighbor!.port)
+      if (!p.neighbor || !far) continue
+      if (`${sw.id}/${p.port}` > `${p.neighbor.switch}/${p.neighbor.port}`) continue
+      // Access switches hang below cores; between equals, the first by name is `a`.
+      const flip = level(sw.id) < level(p.neighbor.switch)
+      const [a, b] = flip ? [p.neighbor.switch, sw.id] : [sw.id, p.neighbor.switch]
+      const [pa, pb] = flip ? [far, p] : [p, far]
+      const capacity = Math.min(p.speed_mbps, far.speed_mbps) * 1e6
+      const down = !p.link_up || !far.link_up || !p.cfg.admin_up || !far.cfg.admin_up || unreachable.has(a) || unreachable.has(b)
+      const load = Math.max(loads.get(portKey('s', a, pa.port)) ?? 0, loads.get(portKey('s', b, pb.port)) ?? 0)
       edges.push({
-        a: sw.id,
-        b: core.id,
-        utilisation: down ? 0 : Math.min(1, load / (UPLINK_MBPS * 1e6)),
+        a,
+        b,
+        utilisation: down || capacity === 0 ? 0 : Math.min(1, load / capacity),
         state: down ? 'down' : 'up',
-        switchPort: port,
+        switchPort: pa.port,
+        farPort: pb.port,
       })
-    })
+    }
   }
 
   // Deterministic output: nodes by row then x, edges by endpoints.
   nodes.sort((p, q) => p.y - q.y || p.x - q.x || byText(p.id, q.id))
   edges.sort((p, q) => byText(p.a, q.a) || byText(p.b, q.b) || byText(p.hostPort ?? '', q.hostPort ?? ''))
-  return { nodes, edges }
+  return { nodes, edges, unplaced }
 }
 
 /** The host and NIC cabled to each port of switch `id`, from the hosts' LLDP. */

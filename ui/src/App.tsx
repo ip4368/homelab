@@ -29,6 +29,10 @@ export default function App() {
   useEffect(() => {
     if (sw !== null && !switchExists) setSwitch(null)
   }, [sw, switchExists])
+  // The switch drawer belongs to the topology view.
+  useEffect(() => {
+    if (view !== 'topology') setSwitch(null)
+  }, [view])
   useEffect(() => {
     const onHash = () => setView(viewFromHash(location.hash))
     window.addEventListener('hashchange', onHash)
@@ -66,7 +70,7 @@ export default function App() {
               )}
             </main>
             {host && <HostDrawer key={host} id={host} onClose={() => setHost(null)} />}
-            {sw && <SwitchDrawer key={sw} id={sw} onClose={() => setSwitch(null)} onSelectHost={selectHost} />}
+            {view === 'topology' && sw && <SwitchDrawer key={sw} id={sw} onClose={() => setSwitch(null)} onSelectHost={selectHost} onSelectSwitch={selectSwitch} />}
           </div>
           <FaultPanel selected={host} />
         </div>

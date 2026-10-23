@@ -294,7 +294,7 @@ mod tests {
     }
 
     fn observed(switch: &str, port: &str, cfg: SwitchPortCfg, mlag_peer: Option<&str>) -> ObservedSwitchPort {
-        ObservedSwitchPort { switch: sid(switch), port: pn(port), cfg, mlag_peer: mlag_peer.map(sid) }
+        ObservedSwitchPort { switch: sid(switch), port: pn(port), cfg, mlag_peer: mlag_peer.map(sid), link_up: true, speed_mbps: 1000, neighbor: None }
     }
 
     /// One mgmt-only host on `eth0`, cabled to access-1 p1 (access VLAN 1).

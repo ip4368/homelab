@@ -324,7 +324,7 @@ mod tests {
 
     fn observe_switch(port_cfg: SwitchPortCfg) -> Command {
         let id = SwitchId::from("access-1");
-        let port = ObservedSwitchPort { switch: id.clone(), port: PortName::from("p7"), cfg: port_cfg, mlag_peer: None };
+        let port = ObservedSwitchPort { switch: id.clone(), port: PortName::from("p7"), cfg: port_cfg, mlag_peer: None, link_up: true, speed_mbps: 1000, neighbor: None };
         Command::ObserveSwitch { id, model: "m".into(), ports: vec![port], mlag_peer: None, last_seen: 0 }
     }
 
@@ -616,7 +616,7 @@ mod tests {
         let p = |s: &str| PortName::from(s);
         // access-1 p7 is a trunk, p8 an access port on VLAN 1; p9 was never observed.
         let mut s = ClusterState::new();
-        let port = |name: &str, cfg| ObservedSwitchPort { switch: sw(), port: p(name), cfg, mlag_peer: None };
+        let port = |name: &str, cfg| ObservedSwitchPort { switch: sw(), port: p(name), cfg, mlag_peer: None, link_up: true, speed_mbps: 1000, neighbor: None };
         let access = SwitchPortCfg { mode: PortMode::Access(1), ..trunk(&[1], 9216) };
         let ports = vec![port("p7", trunk(&[1], 9216)), port("p8", access)];
         s.apply(0, Command::ObserveSwitch { id: sw(), model: "m".into(), ports, mlag_peer: None, last_seen: 0 }).unwrap();

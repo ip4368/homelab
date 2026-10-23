@@ -729,3 +729,46 @@ fn iperf_flows_end_after_their_duration() {
     assert_eq!(e.fabric().world().traffic.flows().count(), 0, "done after 5 s");
     assert!(e.truth().flows.is_empty());
 }
+
+#[test]
+fn switch_links_observed() {
+    let mut e = default_fleet(36);
+    observed_all_switches(&mut e);
+    let port = |e: &Engine, sw: &str, p: &str| {
+        e.client_view().state.switches[&sid(sw)].ports.iter().find(|o| o.port == PortName::from(p)).cloned().unwrap()
+    };
+    let peer = |sw: &str, p: &str| Some(model::network::LldpPeer { switch: sid(sw), port: PortName::from(p) });
+
+    // Switch-to-switch cables report their neighbour and the slower end's speed.
+    let uplink = port(&e, "access-1", "sfp2");
+    assert_eq!((uplink.link_up, uplink.speed_mbps, uplink.neighbor), (true, 10_000, peer("core-2", "p62")));
+    let inter_core = port(&e, "core-1", "qsfp1");
+    assert_eq!((inter_core.link_up, inter_core.speed_mbps, inter_core.neighbor), (true, 40_000, peer("core-2", "qsfp1")));
+    // Host-facing ports have carrier but no switch neighbour; uncabled ports have neither.
+    let host_port = port(&e, "access-1", "p1");
+    assert_eq!((host_port.link_up, host_port.speed_mbps, host_port.neighbor), (true, 2_500, None));
+    let spare = port(&e, "access-1", "p47");
+    assert_eq!((spare.link_up, spare.neighbor), (false, None));
+
+    // A dead core takes its cables' carrier with it, as seen from the live end.
+    e.fault(Fault::KillSwitch { switch: sid("core-2") }).unwrap();
+    let down = |e: &Engine| !port(e, "access-1", "sfp2").link_up && !port(e, "core-1", "qsfp1").link_up;
+    let deadline = e.now() + 35_000;
+    assert!(e.run_until(deadline, down), "uplink to core-2 still up: {:?}", port(&e, "access-1", "sfp2"));
+    assert!(port(&e, "access-1", "sfp1").link_up, "the other uplink is unaffected");
+    assert_eq!(port(&e, "access-1", "sfp2").neighbor, peer("core-2", "p62"), "the cabling is still known");
+
+    // An unplugged or dead host drops the switch-side carrier too.
+    e.fault(Fault::UnplugPort { host: hid("ms01-02"), port: PortName::from("eth0") }).unwrap();
+    e.fault(Fault::KillHost { host: hid("minipc-01") }).unwrap();
+    let hosts_down = |e: &Engine| !port(e, "access-1", "p2").link_up && !port(e, "access-1", "p13").link_up;
+    let deadline = e.now() + 35_000;
+    assert!(e.run_until(deadline, hosts_down), "host-facing ports still up");
+
+    // An admin-down port has no carrier either.
+    let mut cfg = port(&e, "access-1", "p5").cfg;
+    cfg.admin_up = false;
+    e.fault(Fault::SetSwitchPort { switch: sid("access-1"), port: PortName::from("p5"), cfg }).unwrap();
+    let deadline = e.now() + 35_000;
+    assert!(e.run_until(deadline, |e| !port(e, "access-1", "p5").link_up), "admin-down port still has carrier");
+}

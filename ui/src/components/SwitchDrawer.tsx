@@ -123,7 +123,14 @@ function PortEditor({ switchId, port, cfg }: { switchId: string; port: string; c
   )
 }
 
-export function SwitchDrawer({ id, onClose, onSelectHost }: { id: string; onClose(): void; onSelectHost(id: string): void }) {
+interface DrawerProps {
+  id: string
+  onClose(): void
+  onSelectHost(id: string): void
+  onSelectSwitch(id: string): void
+}
+
+export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: DrawerProps) {
   const sw = useStore((s) => s.view.switches[id])
   const hostMap = useStore((s) => s.view.hosts)
   const alerts = useStore((s) => s.view.alerts)
@@ -137,16 +144,17 @@ export function SwitchDrawer({ id, onClose, onSelectHost }: { id: string; onClos
   const load = new Map(
     loads.flatMap((l) => (typeof l.port !== 'string' && 'SwitchPort' in l.port && l.port.SwitchPort[0] === id ? [[l.port.SwitchPort[1], l] as const] : [])),
   )
-  const rows = [...sw.ports].sort((a, b) => a.port.localeCompare(b.port, 'en', { numeric: true })).filter((p) => showAll || peers.has(p.port) || load.has(p.port))
+  // A port stands out if it is cabled, busy, admin-down or configured unlike most of the switch.
+  const configs = sw.ports.map((p) => JSON.stringify(p.cfg))
+  const usual = [...configs].sort((a, b) => configs.filter((c) => c === b).length - configs.filter((c) => c === a).length)[0]
+  const rows = [...sw.ports].sort((a, b) => a.port.localeCompare(b.port, 'en', { numeric: true })).filter((p) => showAll || peers.has(p.port) || p.neighbor !== null || load.has(p.port) || !p.cfg.admin_up || JSON.stringify(p.cfg) !== usual)
   const fixes = suggestedFixes(id, hosts, Object.values(alerts))
   const editing = sw.ports.find((p) => p.port === port)
 
   const linkOf = (p: (typeof sw.ports)[number]) => {
-    const peer = peers.get(p.port)
-    const nic = peer?.host.inventory.nics.find((n) => n.name === peer.nic)
     if (!p.cfg.admin_up) return { text: 'admin down', cls: 'bad' }
-    if (peer) return nic?.link_up ? { text: `up ${nic.speed_mbps / 1000} Gb/s`, cls: '' } : { text: 'down', cls: 'bad' }
-    return { text: load.has(p.port) ? 'up' : '-', cls: '' }
+    if (p.link_up) return { text: `up ${p.speed_mbps / 1000} Gb/s`, cls: '' }
+    return peers.has(p.port) || p.neighbor ? { text: 'down', cls: 'bad' } : { text: '-', cls: '' }
   }
 
   return (
@@ -221,10 +229,15 @@ export function SwitchDrawer({ id, onClose, onSelectHost }: { id: string; onClos
                       <button className="link" onClick={() => onSelectHost(peer.host.id)}>
                         {peer.host.id}
                       </button>
+                    ) : p.neighbor ? (
+                      <button className="link" onClick={() => onSelectSwitch(p.neighbor!.switch)}>
+                        {p.neighbor.switch}
+                      </button>
                     ) : (
                       ''
                     )}
                     {peer && <span className="muted"> {peer.nic}</span>}
+                    {p.neighbor && <span className="muted"> {p.neighbor.port}</span>}
                   </td>
                 </tr>
               )

@@ -13,7 +13,11 @@ const SIZE: Record<TopoNode['kind'], { w: number; h: number }> = {
 const ORDER = { up: 0, down: 1, mismatch: 2 }
 
 function edgeTitle(e: TopoEdge): string {
-  const ports = e.hostPort ? `${e.a} ${e.hostPort} - ${e.b} ${e.switchPort}` : `${e.a} - ${e.b}${e.switchPort ? ` (${e.switchPort})` : ''}`
+  const ports = e.hostPort
+    ? `${e.a} ${e.hostPort} - ${e.b} ${e.switchPort}`
+    : e.farPort
+      ? `${e.a} ${e.switchPort} - ${e.b} ${e.farPort}`
+      : `${e.a} - ${e.b}`
   const state = e.state === 'up' ? `${Math.round(e.utilisation * 100)}% used` : e.state === 'down' ? 'link down' : 'config mismatch'
   return `${ports}: ${state}`
 }
@@ -66,14 +70,25 @@ export function Topology({ selectedSwitch, selectedHost, onSelectSwitch, onSelec
   const switches = useStore((s) => s.view.switches)
   const hosts = useStore((s) => s.view.hosts)
   const ports = useStore((s) => s.truth.ports)
+  const alerts = useStore((s) => s.view.alerts)
+  const unreachable = useMemo(
+    () =>
+      new Set(
+        Object.values(alerts)
+          .filter((a) => a.kind === 'SwitchUnreachable' && a.resolved_at === null && a.entity.kind === 'Switch')
+          .map((a) => a.entity.id),
+      ),
+    [alerts],
+  )
   const [expand, setExpand] = useState(false)
   const layout = useMemo(
     () =>
       layoutTopology(Object.values(switches), Object.values(hosts), {
         collapseOver: expand ? Infinity : DEFAULT_COLLAPSE_OVER,
         ports,
+        unreachable,
       }),
-    [switches, hosts, ports, expand],
+    [switches, hosts, ports, unreachable, expand],
   )
   const at = new Map(layout.nodes.map((n) => [n.id, n]))
   const width = Math.max(600, ...layout.nodes.map((n) => n.x + SIZE[n.kind].w / 2 + 40))
@@ -92,7 +107,8 @@ export function Topology({ selectedSwitch, selectedHost, onSelectSwitch, onSelec
         </label>
         <span className="muted">
           {Object.keys(switches).length} switches, busiest link {Math.round(busiest * 100)}%
-          {mismatches > 0 && <span className="bad"> , {mismatches} mismatched</span>}
+          {mismatches > 0 && <span className="bad">, {mismatches} mismatched</span>}
+          {layout.unplaced > 0 && `, ${layout.unplaced} ${layout.unplaced === 1 ? 'host' : 'hosts'} not placed`}
         </span>
       </div>
       {layout.nodes.length === 0 && <p className="muted">No switches observed yet.</p>}
@@ -126,9 +142,13 @@ export function Topology({ selectedSwitch, selectedHost, onSelectSwitch, onSelec
             const click = () => (isSwitch ? onSelectSwitch(n.id) : n.kind === 'host' ? onSelectHost(n.id) : onSelectSwitch(n.id.replace(/^group:/, '')))
             const problems = n.kind === 'group' ? [n.down ? `${n.down} down` : '', n.mismatched ? `${n.mismatched} mismatch` : ''].filter(Boolean).join(', ') : ''
             return (
-              <g key={n.id} className={`topo-node ${n.kind}${host ? ` lc-${host.lifecycle}` : ''}${selected ? ' selected' : ''}`} onClick={click}>
+              <g key={n.id} className={`topo-node ${n.kind}${host ? ` lc-${host.lifecycle}` : ''}${n.unreachable ? ' unreachable' : ''}${selected ? ' selected' : ''}`} onClick={click}>
                 <title>
-                  {n.kind === 'group' ? `${n.label} on ${n.id.replace(/^group:/, '')}; tick "Expand large switches" to see them` : n.label}
+                  {n.kind === 'group'
+                    ? `${n.label} on ${n.id.replace(/^group:/, '')}; tick "Expand large switches" to see them`
+                    : n.unreachable
+                      ? `${n.label}: not answering polls`
+                      : n.label}
                 </title>
                 <rect x={n.x - w / 2} y={n.y - h / 2} width={w} height={h} rx={4} />
                 <text x={n.x} y={n.kind === 'group' ? n.y - 5 : n.y} textAnchor="middle" dominantBaseline="central">
