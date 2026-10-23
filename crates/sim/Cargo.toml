@@ -1,0 +1,10 @@
+[package]
+name = "sim"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+control = { path = "../control" }
+model = { path = "../model" }
+rand.workspace = true
+rand_chacha.workspace = true
