@@ -3,7 +3,13 @@ import type { ApiOp } from "./ApiOp";
 import type { ObjectRef } from "./ObjectRef";
 import type { Severity } from "./Severity";
 
-export type Alert = { id: string, severity: Severity, kind: string, entity: ObjectRef, message: string, raised_at: number, resolved_at: number | null, 
+export type Alert = { id: string, severity: Severity, kind: string, entity: ObjectRef, 
+/**
+ * What on the entity the alert is about (a port, a link, a disk), when
+ * the entity can have several alerts of the kind. An alert's identity
+ * is `(kind, entity, subject)`: at most one such is open at a time.
+ */
+subject?: string, message: string, raised_at: number, resolved_at: number | null, 
 /**
  * Set when the alert matches an injected fault; lets the UI score detection.
  */

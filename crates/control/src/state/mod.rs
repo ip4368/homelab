@@ -11,6 +11,7 @@ pub use command::{ApplyError, Command};
 pub use objects::*;
 pub use workload::UNSCHEDULED;
 
+use crate::controllers::alerts::AlertKind;
 use crate::controllers::join::UNKNOWN_LOCATION;
 use crate::controllers::membership::CP_REPLACEMENT_SUGGESTED;
 use crate::runtime::SimTime;
@@ -209,8 +210,9 @@ impl ClusterState {
                 }
                 self.tombstone(v, ObjectKind::Host, id.to_string());
             }
-            Command::RaiseAlert { id, severity, kind, entity, message, ground_truth } => {
-                if self.alerts.contains_key(&id) {
+            Command::RaiseAlert { id, kind, entity, subject, message, ground_truth } => {
+                let severity = AlertKind::parse(&kind).ok_or_else(|| ApplyError::UnknownAlertKind(kind.clone()))?.severity();
+                if self.alerts.contains_key(&id) || self.open_alert(&kind, &entity, subject.as_deref()).is_some() {
                     return Err(ApplyError::AlreadyExists);
                 }
                 let alert = Alert {
@@ -218,6 +220,7 @@ impl ClusterState {
                     severity,
                     kind,
                     entity,
+                    subject,
                     message,
                     raised_at: at,
                     resolved_at: None,
@@ -228,14 +231,16 @@ impl ClusterState {
                 self.alerts.insert(id, alert);
             }
             Command::SuggestCpReplacement { id, dead, with } => {
-                if self.alerts.contains_key(&id) {
+                let entity = ObjectRef::host(&dead);
+                if self.alerts.contains_key(&id) || self.open_alert(CP_REPLACEMENT_SUGGESTED, &entity, None).is_some() {
                     return Err(ApplyError::AlreadyExists);
                 }
                 let alert = Alert {
                     id: id.clone(),
-                    severity: Severity::Warning,
+                    severity: AlertKind::CpReplacementSuggested.severity(),
                     kind: CP_REPLACEMENT_SUGGESTED.into(),
-                    entity: ObjectRef::host(&dead),
+                    entity,
+                    subject: None,
                     message: format!("control-plane member {dead} has been down for over 10 min; replace it with {with}"),
                     raised_at: at,
                     resolved_at: None,
@@ -251,6 +256,14 @@ impl ClusterState {
                     return Err(ApplyError::AlreadyExists);
                 }
                 alert.resolved_at = Some(at);
+                alert.version = v;
+            }
+            Command::SetAlertMessage { id, message } => {
+                let alert = self.alerts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if alert.resolved_at.is_some() {
+                    return Err(ApplyError::AlreadyExists);
+                }
+                alert.message = message;
                 alert.version = v;
             }
             Command::Event { entity, message } => {
@@ -389,6 +402,13 @@ impl ClusterState {
             self.cp.voters = voters;
             self.cp.version = self.version;
         }
+    }
+
+    /// The open alert with identity `(kind, entity, subject)`, if any.
+    pub fn open_alert(&self, kind: &str, entity: &ObjectRef, subject: Option<&str>) -> Option<&Alert> {
+        self.alerts
+            .values()
+            .find(|a| a.resolved_at.is_none() && a.kind == kind && a.entity == *entity && a.subject.as_deref() == subject)
     }
 
     /// Everything that changed after version `v`: current objects and tombstones.
@@ -668,9 +688,9 @@ mod tests {
         s.apply(5, Command::SetHostOverride { host: hid("h1"), config: Some(model::seed_templates().remove(2).config) }).unwrap();
         s.apply(5, Command::RaiseAlert {
             id: "a".into(),
-            severity: Severity::Warning,
             kind: "HostDown".into(),
             entity: host_ref("h1"),
+            subject: None,
             message: "m".into(),
             ground_truth: false,
         })
@@ -804,22 +824,60 @@ mod tests {
         let mut s = ClusterState::new();
         let raise = || Command::RaiseAlert {
             id: "down-h1".into(),
-            severity: Severity::Critical,
             kind: "HostDown".into(),
             entity: host_ref("h1"),
+            subject: None,
             message: "no heartbeat".into(),
             ground_truth: true,
         };
         s.apply(10, raise()).unwrap();
         assert_eq!(s.apply(11, raise()), Err(ApplyError::AlreadyExists));
         let a = &s.alerts["down-h1"];
-        assert_eq!((a.raised_at, a.resolved_at, a.ground_truth), (10, None, true));
+        assert_eq!((a.raised_at, a.resolved_at, a.ground_truth, a.severity), (10, None, true, Severity::Critical));
+        s.apply(15, Command::SetAlertMessage { id: "down-h1".into(), message: "still nothing".into() }).unwrap();
+        assert_eq!((s.alerts["down-h1"].message.as_str(), s.alerts["down-h1"].version), ("still nothing", s.version));
         s.apply(20, Command::ResolveAlert { id: "down-h1".into() }).unwrap();
         assert_eq!(s.alerts["down-h1"].resolved_at, Some(20));
         // resolving twice is rejected, resolving a stranger is not found
         assert_eq!(s.apply(21, Command::ResolveAlert { id: "down-h1".into() }), Err(ApplyError::AlreadyExists));
         assert_eq!(s.apply(22, Command::ResolveAlert { id: "x".into() }), Err(ApplyError::NotFound));
         assert!(s.changes_since(1).upserts.iter().any(|o| matches!(o, Object::Alert(a) if a.resolved_at == Some(20))));
+    }
+
+    fn raise(id: &str, kind: &str, entity: ObjectRef, subject: Option<&str>) -> Command {
+        Command::RaiseAlert { id: id.into(), kind: kind.into(), entity, subject: subject.map(Into::into), message: "m".into(), ground_truth: false }
+    }
+
+    #[test]
+    fn alert_kinds_are_a_defined_set_whose_kind_sets_the_severity() {
+        let mut s = ClusterState::new();
+        assert_eq!(s.apply(1, raise("x", "Gremlins", host_ref("h1"), None)), Err(ApplyError::UnknownAlertKind("Gremlins".into())));
+        s.apply(1, raise("p", "PortDown", host_ref("h1"), Some("sfp0"))).unwrap();
+        s.apply(1, raise("v", "VolumeFaulted", ObjectRef::volume("data"), None)).unwrap();
+        assert_eq!((s.alerts["p"].severity, s.alerts["v"].severity), (Severity::Warning, Severity::Critical));
+        assert_eq!(s.alerts["p"].subject.as_deref(), Some("sfp0"));
+    }
+
+    #[test]
+    fn at_most_one_alert_per_kind_entity_and_subject_is_open() {
+        let mut s = ClusterState::new();
+        s.apply(1, raise("bond-1", "BondDegraded", host_ref("h1"), Some("data"))).unwrap();
+        // Another incident id for the same identity is a duplicate while the first is open...
+        assert_eq!(s.apply(2, raise("bond-2", "BondDegraded", host_ref("h1"), Some("data"))), Err(ApplyError::AlreadyExists));
+        // ...but a hyphenated sibling, another host, kind or subject is not.
+        s.apply(2, raise("bond-3", "BondDegraded", host_ref("h1"), Some("data-2"))).unwrap();
+        s.apply(2, raise("bond-4", "BondDegraded", host_ref("h2"), Some("data"))).unwrap();
+        s.apply(2, raise("port-1", "PortDown", host_ref("h1"), Some("data"))).unwrap();
+        s.apply(2, raise("host-1", "HostDown", host_ref("h1"), None)).unwrap();
+        assert_eq!(s.open_alert("BondDegraded", &host_ref("h1"), Some("data")).map(|a| a.id.as_str()), Some("bond-1"));
+        s.apply(3, Command::ResolveAlert { id: "bond-1".into() }).unwrap();
+        s.apply(4, raise("bond-2", "BondDegraded", host_ref("h1"), Some("data"))).unwrap();
+        assert_eq!(s.apply(5, Command::SetAlertMessage { id: "bond-1".into(), message: "x".into() }), Err(ApplyError::AlreadyExists));
+        assert_eq!(s.apply(5, Command::SetAlertMessage { id: "zz".into(), message: "x".into() }), Err(ApplyError::NotFound));
+
+        let suggest = |id: &str| Command::SuggestCpReplacement { id: id.into(), dead: hid("h1"), with: hid("h2") };
+        s.apply(6, suggest("cp-1")).unwrap();
+        assert_eq!(s.apply(7, suggest("cp-2")), Err(ApplyError::AlreadyExists));
     }
 
     #[test]

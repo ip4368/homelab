@@ -5,6 +5,7 @@
 pub mod agent;
 pub mod client;
 pub mod controllers;
+pub mod metrics;
 pub mod proto;
 pub mod raft;
 pub mod replica;

@@ -276,7 +276,7 @@ impl CpReplica {
         match observed {
             Some(observed) => {
                 let observed_at = observed_at.unwrap_or(now);
-                v.host_reports.insert(host, HostReport { observed_at, observed });
+                v.note_report(host, HostReport { observed_at, observed });
             }
             None if observed_at.is_some() && v.host_reports.get(&host).is_none_or(|r| Some(r.observed_at) != observed_at) => {
                 ctx.send(from, mgmt(), Msg::ReportRequest);
@@ -382,6 +382,10 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
+        ApiOp::GetSeries { entity, metrics } => {
+            let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
+            return Handling::Answer(result);
+        }
     };
     Handling::Propose(cmd, serde_json::Value::Null)
 }
@@ -439,7 +443,7 @@ impl Actor for CpReplica {
                 if let Some(v) = &mut self.volatile
                     && self.state.hosts.contains_key(&host)
                 {
-                    v.metrics.insert(host, sample);
+                    v.note_sample(host, sample);
                 }
             }
             Msg::MigrationDone { instance } => self.on_migration_done(from, instance),
@@ -478,7 +482,7 @@ mod tests {
     use crate::controllers::health::NOT_READY_AFTER_MS;
     use crate::raft::RaftMsg;
     use crate::runtime::HostOs;
-    use crate::state::{ObjectRef, Severity};
+    use crate::state::ObjectRef;
     use model::{profile, Inventory, NetworkId, ProfileId, Role};
 
     fn hid(s: &str) -> HostId {
@@ -602,9 +606,9 @@ mod tests {
     fn raise(id: &str) -> Command {
         Command::RaiseAlert {
             id: id.into(),
-            severity: Severity::Critical,
             kind: "HostDown".into(),
             entity: ObjectRef::host(&hid("h9")),
+            subject: None,
             message: "down".into(),
             ground_truth: false,
         }
@@ -689,9 +693,9 @@ mod tests {
         let mut rig = Rig::new(cmds);
         rig.elect();
         let id = format!("hostdown-h9-1-{}", rig.ctx.now);
+        rig.r.state.apply(0, Command::ResolveAlert { id: "hostdown-h9-0-0".into() }).unwrap();
         rig.r.state.apply(0, raise(&id)).unwrap();
         rig.r.state.apply(0, Command::ResolveAlert { id: id.clone() }).unwrap();
-        rig.r.state.apply(0, Command::ResolveAlert { id: "hostdown-h9-0-0".into() }).unwrap();
         rig.ack();
         rig.advance(NOT_READY_AFTER_MS + 1);
 
@@ -710,6 +714,29 @@ mod tests {
 
     fn host_ep(h: &str, svc: Svc) -> Endpoint {
         Endpoint::new(Addr::Host(hid(h)), svc)
+    }
+
+    #[test]
+    fn series_are_answered_from_the_leaders_memory_without_a_write() {
+        use crate::metrics::MetricEntity;
+        use crate::proto::MetricSample;
+        let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        let get = |metric: &str| ApiOp::GetSeries { entity: MetricEntity::Host(hid("h9")), metrics: vec![metric.into()] };
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 1, op: get("cpu_pct") });
+        assert_eq!(rig.ctx.sent.pop(), Some((client.clone(), Msg::ApiResp { req: 1, result: ApiResult::NotLeader })));
+
+        rig.elect();
+        rig.ack();
+        let sample = MetricSample { at: 1234, cpu_pct: 42.0, ram_pct: 1.0, temp_c: 30.0, disk_pct: Default::default(), port_rx_bps: Default::default(), port_tx_bps: Default::default(), instances: 0 };
+        rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), Msg::Metrics { host: hid("h9"), sample });
+        let log = rig.r.log_len();
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 2, op: get("cpu_pct") });
+        let ok = serde_json::json!({"since": 1234, "series": {"cpu_pct": [[1234, 42.0]]}});
+        assert_eq!(rig.ctx.sent.pop(), Some((client.clone(), Msg::ApiResp { req: 2, result: ApiResult::Ok(ok) })));
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 3, op: get("bogus") });
+        assert!(matches!(rig.ctx.sent.pop(), Some((_, Msg::ApiResp { req: 3, result: ApiResult::Err(_) }))));
+        assert_eq!(rig.r.log_len(), log, "reads are not written to the log");
     }
 
     fn observed(link_up: bool) -> Observed {

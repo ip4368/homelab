@@ -1,6 +1,6 @@
 //! Commands replicated through the Raft log, and the errors `apply` can return.
 
-use super::objects::{Change, CpMode, Lifecycle, NetworkResult, ObjectRef, Severity};
+use super::objects::{Change, CpMode, Lifecycle, NetworkResult, ObjectRef};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{
     Deployment, HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate,
@@ -28,15 +28,24 @@ pub enum Command {
     SetRoles { id: HostId, roles: BTreeSet<Role> },
     SetLabels { id: HostId, labels: BTreeMap<String, String> },
     RemoveHost { id: HostId },
+    /// Raises an alert. `kind` must be an
+    /// [`AlertKind`](crate::controllers::alerts::AlertKind), which sets the
+    /// severity. Fails with `AlreadyExists` while an alert with the same
+    /// `(kind, entity, subject)` is open.
     RaiseAlert {
         id: String,
-        severity: Severity,
         kind: String,
         entity: ObjectRef,
+        /// What on the entity the alert is about (a port, a link, a disk), if
+        /// the entity can have several alerts of the kind at once.
+        #[serde(default)]
+        subject: Option<String>,
         message: String,
         ground_truth: bool,
     },
     ResolveAlert { id: String },
+    /// Rewords an open alert, e.g. when what is known about its cause changes.
+    SetAlertMessage { id: String, message: String },
     Event { entity: ObjectRef, message: String },
     /// Replaces control-plane membership and replacement mode.
     SetCp { voters: BTreeSet<HostId>, mode: CpMode },
@@ -134,6 +143,8 @@ pub enum ApplyError {
     MissingDependency(ObjectRef),
     /// A control-plane voter's host cannot be removed; replace the member first.
     CpVoter,
+    /// Not one of the [`AlertKind`](crate::controllers::alerts::AlertKind)s.
+    UnknownAlertKind(String),
 }
 
 impl fmt::Display for ApplyError {
@@ -155,6 +166,7 @@ impl fmt::Display for ApplyError {
                 write!(f, "needs {} {}, which does not exist", format!("{:?}", r.kind).to_lowercase(), r.id)
             }
             Self::CpVoter => f.write_str("host is a control-plane voter; replace it first"),
+            Self::UnknownAlertKind(kind) => write!(f, "unknown alert kind {kind}"),
         }
     }
 }

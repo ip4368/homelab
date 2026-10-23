@@ -9,12 +9,13 @@
 //!   when a report differs from the switch object, or to refresh `last_seen`
 //!   once it is [`SWITCH_REFRESH_MS`] old, so the log does not grow with every
 //!   poll. A switch silent for [`SWITCH_UNREACHABLE_AFTER_MS`] raises a
-//!   `SwitchUnreachable` alert; its next report resolves it.
+//!   `SwitchUnreachable` alert; its next report resolves it, as does the
+//!   switch being forgotten (known only through LLDP, and no host names it).
 
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
-use crate::state::{Alert, ClusterState, Command, ObjectRef, Severity};
+use crate::state::{Alert, ClusterState, Command, ObjectRef};
 use model::SwitchId;
 use std::collections::BTreeSet;
 
@@ -94,9 +95,9 @@ fn switch_alerts(state: &ClusterState, known: &BTreeSet<SwitchId>, v: &Volatile,
                 out.push(Action::Propose(Command::RaiseAlert {
                     // Stable across runs and unique per incident, as for HostDown.
                     id: format!("switchdown-{id}-{}-{seen}", v.term),
-                    severity: Severity::Critical,
                     kind: SWITCH_UNREACHABLE.into(),
                     entity: ObjectRef::switch(id),
+                    subject: None,
                     message: format!("{id} did not answer polls for {} s", SWITCH_UNREACHABLE_AFTER_MS / 1000),
                     ground_truth: false,
                 }));
@@ -106,6 +107,9 @@ fn switch_alerts(state: &ClusterState, known: &BTreeSet<SwitchId>, v: &Volatile,
             out.push(Action::Propose(Command::ResolveAlert { id: a.id.clone() }));
         }
     }
+    // A switch heard of only through LLDP is forgotten once no host names it.
+    let forgotten = |a: &&Alert| a.kind == SWITCH_UNREACHABLE && a.resolved_at.is_none() && !known.contains(&SwitchId::new(&a.entity.id));
+    out.extend(state.alerts.values().filter(forgotten).map(|a| Action::Propose(Command::ResolveAlert { id: a.id.clone() })));
     out
 }
 
@@ -284,9 +288,9 @@ mod tests {
         assert!(alert_kinds(run(&s, &v, 100_000 + SWITCH_UNREACHABLE_AFTER_MS)).is_empty());
         let raise = Command::RaiseAlert {
             id: "switchdown-a-3-100000".into(),
-            severity: Severity::Critical,
             kind: SWITCH_UNREACHABLE.into(),
             entity: ObjectRef::switch(&sid("a")),
+            subject: None,
             message: "a did not answer polls for 90 s".into(),
             ground_truth: false,
         };
@@ -310,5 +314,18 @@ mod tests {
         let v = Volatile::new(0, 1);
         let raised = alert_kinds(run(&s, &v, SWITCH_UNREACHABLE_AFTER_MS + 1));
         assert_eq!(raised.len(), 3, "access-1, access-2 and core-1 never answered: {raised:?}");
+    }
+
+    #[test]
+    fn the_alert_of_a_switch_no_longer_known_is_resolved() {
+        let mut s = state_with_hosts();
+        let v = Volatile::new(0, 1);
+        let at = SWITCH_UNREACHABLE_AFTER_MS + 1;
+        for c in alert_kinds(run(&s, &v, at)) {
+            s.apply(at, c).unwrap();
+        }
+        // h1 was the only host cabled to access-1, and it is gone.
+        s.apply(at, Command::RemoveHost { id: HostId::from("h1") }).unwrap();
+        assert_eq!(alert_kinds(run(&s, &v, at + 1000)), [Command::ResolveAlert { id: "switchdown-access-1-1-0".into() }]);
     }
 }

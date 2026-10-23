@@ -21,7 +21,7 @@ use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
 use crate::raft::{MemberChange, RaftNode};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
-use crate::state::{ClusterState, Command, CpMode, HostObj, Lifecycle, ObjectRef, Severity};
+use crate::state::{ClusterState, Command, CpMode, HostObj, Lifecycle, ObjectRef};
 use model::{eligible, HostId, ProfileId, Role};
 use std::collections::BTreeSet;
 
@@ -200,9 +200,9 @@ fn quorum_alert(state: &ClusterState, v: &Volatile, raft: &RaftMembers) -> Vec<A
             let message = format!("{live_voters} of {} control-plane voters are up: one more failure loses quorum", raft.voters.len());
             vec![Action::Propose(Command::RaiseAlert {
                 id,
-                severity: Severity::Critical,
                 kind: CP_QUORUM_AT_RISK.into(),
                 entity: ObjectRef::cp(),
+                subject: None,
                 message,
                 ground_truth: false,
             })]
@@ -258,7 +258,7 @@ fn roles(state: &ClusterState) -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Alert;
+    use crate::state::{Alert, Severity};
     use model::{profile, Inventory};
 
     fn hid(s: &str) -> HostId {
