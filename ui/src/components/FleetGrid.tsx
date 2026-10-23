@@ -3,6 +3,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { MetricSample } from '../gen/MetricSample'
 import { GROUP_BYS, groupHosts, type GroupBy } from '../grouping'
 import { useStore } from '../store'
+import { truthDiff } from '../workloads'
 
 function Bar({ label, pct }: { label: string; pct: number | undefined }) {
   const value = pct === undefined ? 0 : Math.max(0, Math.min(100, pct))
@@ -17,15 +18,17 @@ interface TileProps {
   host: HostObj
   metric: MetricSample | undefined
   selected: boolean
+  /** Set when the ground truth contradicts the view of this host: what the truth says. */
+  mismatch: string | undefined
   onSelect(id: string): void
 }
 
-const Tile = memo(function Tile({ host, metric, selected, onSelect }: TileProps) {
+const Tile = memo(function Tile({ host, metric, selected, mismatch, onSelect }: TileProps) {
   return (
     <button
-      className={`tile lc-${host.lifecycle}${selected ? ' selected' : ''}`}
+      className={`tile lc-${host.lifecycle}${selected ? ' selected' : ''}${mismatch ? ' truth-diff' : ''}`}
       onClick={() => onSelect(host.id)}
-      title={`${host.id} — ${host.lifecycle}`}
+      title={mismatch ? `${host.id} — ${host.lifecycle} in the view, but ${mismatch}` : `${host.id} — ${host.lifecycle}`}
     >
       <span className="tile-id">{host.id}</span>
       <span className="tile-roles">
@@ -41,10 +44,15 @@ const Tile = memo(function Tile({ host, metric, selected, onSelect }: TileProps)
   )
 })
 
-export function FleetGrid({ selected, onSelect }: { selected: string | null; onSelect(id: string): void }) {
+export function FleetGrid({ selected, showTruth, onSelect }: { selected: string | null; showTruth: boolean; onSelect(id: string): void }) {
   const hosts = useStore((s) => s.view.hosts)
+  const truth = useStore((s) => s.truth)
   const metrics = useStore((s) => s.view.metrics)
   const [by, setBy] = useState<GroupBy>('rack')
+  const mismatches = useMemo(
+    () => (showTruth ? new Map(truthDiff({ hosts }, truth).map((d) => [d.hostId, d.actual])) : new Map<string, string>()),
+    [showTruth, hosts, truth],
+  )
   const groups = useMemo(() => groupHosts(Object.values(hosts), by), [hosts, by])
 
   return (
@@ -59,6 +67,11 @@ export function FleetGrid({ selected, onSelect }: { selected: string | null; onS
           </select>
         </label>
         <span className="muted">{Object.keys(hosts).length} hosts</span>
+        {showTruth && (
+          <span className="truth-legend">
+            <span className="truth-swatch" /> hatched: the view and the ground truth disagree ({mismatches.size})
+          </span>
+        )}
       </div>
       {groups.length === 0 && <p className="muted">No hosts yet.</p>}
       {groups.map((g) => (
@@ -68,7 +81,7 @@ export function FleetGrid({ selected, onSelect }: { selected: string | null; onS
           </h3>
           <div className="tiles">
             {g.hosts.map((h) => (
-              <Tile key={h.id} host={h} metric={metrics[h.id]} selected={h.id === selected} onSelect={onSelect} />
+              <Tile key={h.id} host={h} metric={metrics[h.id]} selected={h.id === selected} mismatch={mismatches.get(h.id)} onSelect={onSelect} />
             ))}
           </div>
         </div>

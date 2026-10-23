@@ -87,6 +87,10 @@ export function FaultPanel({ selected }: { selected: string | null }) {
   const [count, setCount] = useState(1)
   const hostAction = useAction()
   const hostNics = useStore((s) => (selected ? s.view.hosts[selected]?.inventory.nics : undefined))
+  const hostDisks = useStore((s) => (selected ? s.view.hosts[selected]?.inventory.disks : undefined))
+  const [disk, setDisk] = useState('')
+  const workingDisks = hostDisks?.filter((d) => !d.failed).map((d) => d.name) ?? []
+  const chosenDisk = workingDisks.includes(disk) ? disk : (workingDisks[0] ?? '')
   const [port, setPort] = useState('')
   const nicNames = hostNics?.map((n) => n.name) ?? []
   const chosenPort = nicNames.includes(port) ? port : (nicNames[0] ?? '')
@@ -131,6 +135,17 @@ export function FaultPanel({ selected }: { selected: string | null }) {
               </button>
               <button disabled={needHost || chosenPort === '' || hostAction.busy} onClick={() => injectHost({ ReplugPort: { host: selected!, port: chosenPort } })}>
                 Replug port
+              </button>
+              <select value={chosenDisk} onChange={(e) => setDisk(e.target.value)} disabled={needHost} aria-label="disk">
+                {hostDisks?.map((d) => (
+                  <option key={d.name} value={d.name} disabled={d.failed}>
+                    {d.name}
+                    {d.failed ? ' (failed)' : ''}
+                  </option>
+                ))}
+              </select>
+              <button disabled={needHost || chosenDisk === '' || hostAction.busy} onClick={() => injectHost({ FailDisk: { host: selected!, disk: chosenDisk } })}>
+                Fail disk
               </button>
             </div>
             {hostAction.error && <div className="bad">{hostAction.error}</div>}
@@ -185,6 +200,9 @@ export function FaultPanel({ selected }: { selected: string | null }) {
                 onClick={() => scenarioAction.run(() => scenario({ AddHosts: { profile, count, misconfigure: null } }))}
               >
                 Add hosts
+              </button>
+              <button disabled={paused || scenarioAction.busy} onClick={() => scenarioAction.run(() => scenario('SeedWorkloads'))}>
+                Seed workloads
               </button>
               <button disabled={paused || scenarioAction.busy} onClick={() => scenarioAction.run(() => scenario({ preset: 'default' }))}>
                 Preset: default

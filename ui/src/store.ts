@@ -2,6 +2,7 @@ import { useSyncExternalStore } from 'react'
 import type { Alert } from './gen/Alert'
 import type { AutoApproveRule } from './gen/AutoApproveRule'
 import type { CpInfo } from './gen/CpInfo'
+import type { DeploymentObj } from './gen/DeploymentObj'
 import type { Event as ClusterEvent } from './gen/Event'
 import type { GroundTruth } from './gen/GroundTruth'
 import type { HostObj } from './gen/HostObj'
@@ -10,11 +11,16 @@ import type { MetricSample } from './gen/MetricSample'
 import type { NetworkObj } from './gen/NetworkObj'
 import type { Object as ClusterObject } from './gen/Object'
 import type { ObjectRef } from './gen/ObjectRef'
+import type { PodObj } from './gen/PodObj'
 import type { Rollout } from './gen/Rollout'
 import type { ServerMsg } from './gen/ServerMsg'
 import type { SimInfo } from './gen/SimInfo'
 import type { SwitchObj } from './gen/SwitchObj'
 import type { TemplateObj } from './gen/TemplateObj'
+import type { VmObj } from './gen/VmObj'
+import type { VmStatusObj } from './gen/VmStatusObj'
+import type { VolumeObj } from './gen/VolumeObj'
+import type { VolumeStatusObj } from './gen/VolumeStatusObj'
 
 /** The server's wire message, as sent over `/api/ws`. */
 export type WsMessage = ServerMsg
@@ -46,6 +52,15 @@ export interface View {
   cp: CpInfo
   /** Latest sample per host. */
   metrics: Record<string, MetricSample>
+  deployments: Record<string, DeploymentObj>
+  /** Keyed `<deployment>/<idx>`. */
+  pods: Record<string, PodObj>
+  vms: Record<string, VmObj>
+  /** Keyed by VM id. */
+  vmStatus: Record<string, VmStatusObj>
+  volumes: Record<string, VolumeObj>
+  /** Keyed by volume id. */
+  volumeStatus: Record<string, VolumeStatusObj>
 }
 
 export interface UiState {
@@ -92,6 +107,12 @@ function initialState(): UiState {
       events: [],
       cp: { voters: [], mode: 'Suggest', version: 0 },
       metrics: {},
+      deployments: {},
+      pods: {},
+      vms: {},
+      vmStatus: {},
+      volumes: {},
+      volumeStatus: {},
     },
     truth: emptyTruth,
     sim: { now: 0, speed: 1, paused: false },
@@ -101,6 +122,11 @@ function initialState(): UiState {
 
 function connectionOf(view: View, sim: SimInfo): Connection {
   return view.last_sync_at !== null && sim.now - view.last_sync_at <= STALE_AFTER_MS ? 'live' : 'cp-unavailable'
+}
+
+/** A pod's key in `View.pods`, and its id in `ObjectRef`s. */
+export function podKey(p: { deployment: string; idx: number }): string {
+  return `${p.deployment}/${p.idx}`
 }
 
 function byKey<T>(items: T[], key: (t: T) => string): Record<string, T> {
@@ -134,12 +160,19 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
     events: capEvents([...s.events].sort((a, b) => a.seq - b.seq)),
     cp: s.cp,
     metrics: s.metrics,
+    deployments: byKey(s.deployments, (d) => d.id),
+    pods: byKey(s.pods, (p) => podKey(p)),
+    vms: byKey(s.vms, (v) => v.id),
+    vmStatus: byKey(s.vm_status, (v) => v.id),
+    volumes: byKey(s.volumes, (v) => v.id),
+    volumeStatus: byKey(s.volume_status, (v) => v.id),
   }
 }
 
 /** Applies a delta's upserts and removals, copying only the slices that change. */
 function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
   let { hosts, tokens, rules, switches, networks, templates, rollouts, alerts, events, cp, metrics } = view
+  let { deployments, pods, vms, vmStatus, volumes, volumeStatus } = view
   const upsertedEvents = new Map<number, ClusterEvent>()
   const removedEvents = new Set<number>()
   const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
@@ -187,6 +220,30 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
       case 'Event':
         upsertedEvents.set(o.seq, withoutTag(o))
         break
+      case 'Deployment':
+        deployments = edit(deployments, copied)
+        deployments[o.id] = withoutTag(o)
+        break
+      case 'Pod':
+        pods = edit(pods, copied)
+        pods[podKey(o)] = withoutTag(o)
+        break
+      case 'Vm':
+        vms = edit(vms, copied)
+        vms[o.id] = withoutTag(o)
+        break
+      case 'VmStatus':
+        vmStatus = edit(vmStatus, copied)
+        vmStatus[o.id] = withoutTag(o)
+        break
+      case 'Volume':
+        volumes = edit(volumes, copied)
+        volumes[o.id] = withoutTag(o)
+        break
+      case 'VolumeStatus':
+        volumeStatus = edit(volumeStatus, copied)
+        volumeStatus[o.id] = withoutTag(o)
+        break
       case 'Cp':
         cp = withoutTag(o)
         break
@@ -232,6 +289,30 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
       case 'Event':
         removedEvents.add(Number(r.id))
         break
+      case 'Deployment':
+        deployments = edit(deployments, copied)
+        delete deployments[r.id]
+        break
+      case 'Pod':
+        pods = edit(pods, copied)
+        delete pods[r.id]
+        break
+      case 'Vm':
+        vms = edit(vms, copied)
+        delete vms[r.id]
+        break
+      case 'VmStatus':
+        vmStatus = edit(vmStatus, copied)
+        delete vmStatus[r.id]
+        break
+      case 'Volume':
+        volumes = edit(volumes, copied)
+        delete volumes[r.id]
+        break
+      case 'VolumeStatus':
+        volumeStatus = edit(volumeStatus, copied)
+        delete volumeStatus[r.id]
+        break
       case 'Cp':
         break
     }
@@ -262,6 +343,12 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
     events,
     cp,
     metrics,
+    deployments,
+    pods,
+    vms,
+    vmStatus,
+    volumes,
+    volumeStatus,
   }
 }
 
