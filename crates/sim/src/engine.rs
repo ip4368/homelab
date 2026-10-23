@@ -196,10 +196,10 @@ impl EngineCtx<'_> {
         self.fabric().expect(NO_HOST).world()
     }
 
-    /// The world, to run workloads on this host.
-    fn workloads(&mut self) -> &mut World {
+    /// The fabric, to run workloads on this host.
+    fn workloads(&mut self) -> &mut Fabric {
         let fabric: Option<&mut Fabric> = (self.core.deliver.as_mut() as &mut dyn Any).downcast_mut();
-        fabric.expect(NO_HOST).workloads_mut()
+        fabric.expect(NO_HOST)
     }
 }
 

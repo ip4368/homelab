@@ -29,6 +29,9 @@ use model::{BondMode, HostId, LinkKind, LogicalNetwork, NetworkId, PortName};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 
+/// How long the final byte count of a flow that ran out stays readable.
+pub const FINISHED_KEEP_MS: u64 = 10_000;
+
 // Defined in `control` (instances name their flows); kept importable from here.
 pub use control::proto::{FlowEnd, FlowKind};
 
@@ -62,8 +65,9 @@ pub struct Traffic {
     next_id: u64,
     /// Bytes each flow has carried so far.
     carried: BTreeMap<u64, f64>,
-    /// The flows the latest [`Traffic::expire`] ended, with their final byte counts.
-    finished: BTreeMap<u64, f64>,
+    /// Flows [`Traffic::expire`] ended: their final byte count and when they
+    /// ended, kept [`FINISHED_KEEP_MS`] or until taken.
+    finished: BTreeMap<u64, (f64, SimTime)>,
     last: TickResult,
 }
 
@@ -106,10 +110,16 @@ impl Traffic {
         self.flows.get(&id)
     }
 
-    /// Bytes flow `id` has carried since it started: its final count if the
-    /// latest [`Traffic::expire`] ended it, 0 for an unknown flow.
+    /// Bytes flow `id` has carried since it started: its final count if it
+    /// ran out (see [`Traffic::take_finished`]), 0 for an unknown flow.
     pub fn carried_bytes(&self, id: u64) -> f64 {
-        self.carried.get(&id).or_else(|| self.finished.get(&id)).copied().unwrap_or(0.0)
+        self.carried.get(&id).copied().or_else(|| self.finished.get(&id).map(|(bytes, _)| *bytes)).unwrap_or(0.0)
+    }
+
+    /// The final byte count of flow `id`, which ran out, consumed: it is
+    /// readable until taken, or for [`FINISHED_KEEP_MS`] after it ended.
+    pub fn take_finished(&mut self, id: u64) -> Option<f64> {
+        self.finished.remove(&id).map(|(bytes, _)| bytes)
     }
 
     /// The latest tick's result.
@@ -118,13 +128,14 @@ impl Traffic {
     }
 
     /// Stops every flow whose time is up at `now`, returning each with its
-    /// final byte count; [`Traffic::carried_bytes`] keeps reporting those
-    /// until the next call. Run it after the tick that accounts the last
-    /// interval, so a flow carries its whole lifetime.
+    /// final byte count, which also stays readable ([`Traffic::take_finished`]).
+    /// Run it after the tick that accounts the last interval, so a flow
+    /// carries its whole lifetime.
     pub fn expire(&mut self, now: SimTime) -> Vec<(Flow, f64)> {
+        self.finished.retain(|_, (_, ended)| now < *ended + FINISHED_KEEP_MS);
         let done: Vec<u64> = self.flows.values().filter(|f| f.until.is_some_and(|u| u <= now)).map(|f| f.id).collect();
         let ended: Vec<(Flow, f64)> = done.into_iter().filter_map(|id| self.stop(id)).collect();
-        self.finished = ended.iter().map(|(f, bytes)| (f.id, *bytes)).collect();
+        self.finished.extend(ended.iter().map(|(f, bytes)| (f.id, (*bytes, now))));
         ended
     }
 
@@ -565,12 +576,19 @@ mod tests {
         assert_eq!(ended.iter().map(|(f, bytes)| (f.id, *bytes)).collect::<Vec<_>>(), [(id, 200e6)], "with its final count");
         assert!(t.flow(id).is_none());
         assert_eq!(t.carried_bytes(id), 200e6, "still readable after it ended");
-        t.expire(6000);
-        assert_eq!(t.carried_bytes(id), 0.0, "until the next expiry");
+        t.expire(5000 + FINISHED_KEEP_MS - 1);
+        assert_eq!(t.carried_bytes(id), 200e6, "for a while");
+        t.expire(5000 + FINISHED_KEEP_MS);
+        assert_eq!(t.carried_bytes(id), 0.0, "then forgotten");
+        let short = t.start(FlowEnd::Host(h("h1")), FlowEnd::Host(h("h2")), storage(), 800.0, FlowKind::Rebuild, Some(16_000));
+        t.tick(&f);
+        t.expire(16_000);
+        assert_eq!(t.take_finished(short), Some(100e6), "taken once");
+        assert_eq!((t.take_finished(short), t.carried_bytes(short)), (None, 0.0));
         assert_eq!(t.flows().map(|f| f.id).collect::<Vec<_>>(), [other]);
         assert!(other > id, "ids are not reused");
         let (flow, bytes) = t.stop(other).unwrap();
-        assert_eq!((flow.id, bytes), (other, 200e6), "a stopped flow hands back what it carried");
+        assert_eq!((flow.id, bytes), (other, 300e6), "a stopped flow hands back what it carried (three ticks)");
         assert!(t.stop(other).is_none());
     }
 

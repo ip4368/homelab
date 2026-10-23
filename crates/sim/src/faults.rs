@@ -45,7 +45,7 @@ impl Engine {
         match f {
             Fault::KillHost { host } => {
                 self.host_hw(&host)?;
-                self.fabric_mut().workloads_mut().power_off(&host);
+                self.fabric_mut().power_off(&host);
                 self.kill(&agent(&host));
                 self.kill(&cp(&host));
             }

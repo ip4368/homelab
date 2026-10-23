@@ -146,6 +146,9 @@ pub struct VmStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub enum ReplicaState {
+    /// One of the first replicas of a volume that never held data: created
+    /// empty, until its host confirms it. Decided when it was placed.
+    Seeding,
     Healthy,
     Rebuilding { pct: u8 },
     Stale,

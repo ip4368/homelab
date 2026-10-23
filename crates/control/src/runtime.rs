@@ -91,7 +91,9 @@ pub trait HostOs {
     /// Starts holding a replica of `volume` on the disk with most room for
     /// it, copied over the storage network from `source`'s replica, or empty
     /// (complete at once) when `None`. A volume the host already holds keeps
-    /// its replica. The disk the replica is on, or `None` if no disk can hold it.
+    /// its replica; an incomplete one whose copy was interrupted resumes
+    /// copying from `source`. The disk the replica is on, or `None` if no
+    /// disk can hold it.
     fn create_replica(&mut self, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String>;
     /// Every replica the host holds, with how much of it is copied.
     fn replicas(&self) -> Vec<ReplicaReport>;

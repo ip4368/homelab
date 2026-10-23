@@ -47,6 +47,22 @@ pub struct Replica {
     pub pct: u8,
     /// The rebuild flow copying it from its source, while it copies.
     pub flow: Option<u64>,
+    /// Bytes earlier, interrupted copies got across; a resumed copy goes on from there.
+    pub base_bytes: f64,
+}
+
+impl Replica {
+    /// Bytes copied so far, of `size_gb` × 1e9 (8e9 bits per GB).
+    fn copied(&self, traffic: &Traffic) -> f64 {
+        self.base_bytes + self.flow.map_or(0.0, |f| traffic.carried_bytes(f))
+    }
+
+    /// Ends the running copy, keeping what it got across.
+    fn interrupt(&mut self, traffic: &mut Traffic) {
+        if let Some((_, bytes)) = self.flow.take().and_then(|f| traffic.stop(f)) {
+            self.base_bytes += bytes;
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -168,11 +184,13 @@ impl HostHw {
 
 /// Where an instance's usage is at `now`, as a percentage of what it asked
 /// for: its base, smooth noise up to `noise_pct`, and a burst of
-/// [`BURST_PCT`] for [`BURST_MS`] at a seeded moment of every `burst_every_s`.
+/// [`BURST_PCT`] for [`BURST_MS`] at a seeded moment of every `burst_every_s`
+/// (at least 2 × [`BURST_MS`]).
 fn usage_pct(p: &UsageProfile, seed: u64, now: SimTime) -> f32 {
     let mut pct = p.base_pct + p.noise_pct * curve(seed, now) as f32;
     if p.burst_every_s > 0 {
-        let period = u64::from(p.burst_every_s) * 1000;
+        // A period too short to fit a burst and some calm is stretched.
+        let period = (u64::from(p.burst_every_s) * 1000).max(2 * BURST_MS);
         let start = mix(seed ^ 0xB0B5, now / period) % period.saturating_sub(BURST_MS).max(1);
         if (start..start + BURST_MS).contains(&(now % period)) {
             pct += BURST_PCT;
@@ -284,35 +302,51 @@ impl World {
     /// Puts a replica of `volume` on the disk of powered `host` with most room
     /// for it: empty and complete when `source` is `None`, else copied from
     /// `source` by a [`REBUILD_MBPS`] rebuild flow on `storage`. A volume the
-    /// host holds keeps its replica. The replica's disk, or `None` if no disk
-    /// has room.
+    /// host holds keeps its replica; if that is incomplete with no copy
+    /// running (interrupted), the copy resumes from `source`. A copy only
+    /// runs while its source is powered. The replica's disk, or `None` if no
+    /// disk has room.
     pub fn create_replica(&mut self, host: &HostId, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
-        let hw = self.hosts.get_mut(host).filter(|hw| hw.powered)?;
-        if let Some(r) = hw.replicas.get(volume) {
+        if !self.hosts.get(host).is_some_and(|hw| hw.powered) {
+            return None;
+        }
+        let source = source.filter(|s| s != host);
+        let copy_from = source.clone().filter(|s| self.hosts.get(s).is_some_and(|hw| hw.powered));
+        let start = |traffic: &mut Traffic| {
+            copy_from.clone().map(|s| {
+                let storage = NetworkId::from("storage");
+                traffic.start(FlowEnd::Host(s), FlowEnd::Host(host.clone()), storage, REBUILD_MBPS, FlowKind::Rebuild, None)
+            })
+        };
+        let hw = self.hosts.get_mut(host).expect("checked above");
+        if let Some(r) = hw.replicas.get_mut(volume) {
+            if r.pct < 100 && r.flow.is_none() {
+                r.flow = start(&mut self.traffic);
+            }
             return Some(r.disk.clone());
         }
         let disk = hw.disk_for(size_gb)?;
-        let flow = source.filter(|s| s != host).map(|s| {
-            let storage = NetworkId::from("storage");
-            self.traffic.start(FlowEnd::Host(s), FlowEnd::Host(host.clone()), storage, REBUILD_MBPS, FlowKind::Rebuild, None)
-        });
-        let pct = if flow.is_some() { 0 } else { 100 };
-        hw.replicas.insert(volume.into(), Replica { disk: disk.clone(), size_gb, pct, flow });
+        let (pct, flow) = match source {
+            None => (100, None),
+            Some(_) => (0, start(&mut self.traffic)),
+        };
+        hw.replicas.insert(volume.into(), Replica { disk: disk.clone(), size_gb, pct, flow, base_bytes: 0.0 });
         Some(disk)
     }
 
     /// Drops `host`'s replica of `volume`, ending its copy if one runs.
     pub fn delete_replica(&mut self, host: &HostId, volume: &str) {
-        let Some(r) = self.hosts.get_mut(host).and_then(|hw| hw.replicas.remove(volume)) else { return };
-        if let Some(flow) = r.flow {
-            self.traffic.stop(flow);
-        }
+        let Some(mut r) = self.hosts.get_mut(host).and_then(|hw| hw.replicas.remove(volume)) else { return };
+        r.interrupt(&mut self.traffic);
     }
 
-    /// The replicas on `host`: (volume, disk, pct copied).
+    /// The replicas on `host`, as its OS reports them.
     pub fn replicas(&self, host: &HostId) -> Vec<ReplicaReport> {
         let Some(hw) = self.hosts.get(host) else { return vec![] };
-        hw.replicas.iter().map(|(v, r)| (v.clone(), r.disk.clone(), r.pct)).collect()
+        hw.replicas
+            .iter()
+            .map(|(v, r)| ReplicaReport { volume: v.clone(), disk: r.disk.clone(), pct: r.pct, copying: r.flow.is_some() })
+            .collect()
     }
 
     /// Moves every instance flow's demand to where its curve is at `now`.
@@ -325,31 +359,40 @@ impl World {
         }
     }
 
-    /// Advances each copying replica by the bytes its rebuild flow has
-    /// carried (`size_gb` × 8e9 bits is all of it); a complete one ends its flow.
+    /// Advances each copying replica by the bytes its copies have carried
+    /// (`size_gb` × 8e9 bits is all of it); a complete one ends its flow.
     pub fn advance_copies(&mut self) {
         for r in self.hosts.values_mut().flat_map(|hw| hw.replicas.values_mut()) {
-            let Some(flow) = r.flow else { continue };
-            let (copied, total) = (self.traffic.carried_bytes(flow), f64::from(r.size_gb) * 1e9);
+            if r.flow.is_none() {
+                continue;
+            }
+            let (copied, total) = (r.copied(&self.traffic), f64::from(r.size_gb) * 1e9);
             if copied >= total {
                 r.pct = 100;
-                r.flow = None;
-                self.traffic.stop(flow);
+                r.interrupt(&mut self.traffic);
             } else {
                 r.pct = (100.0 * copied / total).floor() as u8;
             }
         }
     }
 
-    /// Cuts `host`'s power: its instances and the copies onto it end (their
-    /// flows leave the wire); its disks, replicas included, keep what they hold.
+    /// Cuts `host`'s power: its instances end, and so do the copies onto it
+    /// and from it (their flows leave the wire, each copy keeping what it got
+    /// across). Its disks, replicas included, keep what they hold.
     pub fn power_off(&mut self, host: &HostId) {
         let Some(hw) = self.hosts.get_mut(host) else { return };
         hw.powered = false;
-        let flows = std::mem::take(&mut hw.instances).into_values().flat_map(|i| i.flows);
-        let copies: Vec<u64> = hw.replicas.values_mut().filter_map(|r| r.flow.take()).collect();
-        for flow in flows.chain(copies) {
+        for flow in std::mem::take(&mut hw.instances).into_values().flat_map(|i| i.flows) {
             self.traffic.stop(flow);
+        }
+        let from_host = FlowEnd::Host(host.clone());
+        for (id, hw) in self.hosts.iter_mut() {
+            for r in hw.replicas.values_mut() {
+                let from = r.flow.and_then(|f| self.traffic.flow(f)).is_some_and(|f| f.src == from_host);
+                if id == host || from {
+                    r.interrupt(&mut self.traffic);
+                }
+            }
         }
     }
 
@@ -457,7 +500,7 @@ impl Default for World {
 mod tests {
     use super::*;
     use crate::topology::{PortMode, Switch, SwitchPortCfg};
-    use control::proto::FlowSpec;
+    use control::proto::{FlowSpec, ReplicaReport};
     use model::SwitchId;
 
     fn hid(s: &str) -> HostId {
@@ -574,6 +617,9 @@ mod tests {
         }
         let bursting = (0..600).filter(|&s| samples[s as usize] > usage_pct(&calm, 9, s * 1000)).count();
         assert_eq!(bursting, 5 * 20, "a 20 s burst every 2 minutes");
+        let short = UsageProfile { burst_every_s: 10, ..p };
+        let bursting = (0..600).filter(|&s| usage_pct(&short, 9, s * 1000) > usage_pct(&calm, 9, s * 1000)).count();
+        assert_eq!(bursting, 15 * 20, "a period shorter than a burst is stretched to 40 s");
     }
 
     #[test]
@@ -618,7 +664,7 @@ mod tests {
         assert_eq!(w.create_replica(&h, "b", 100, None), Some("nvme1".into()), "nvme1 has more room now");
         assert_eq!(w.create_replica(&h, "a", 1500, None), Some("nvme0".into()), "a held volume keeps its replica");
         assert_eq!(w.create_replica(&h, "c", 1950, None), None, "no disk has room");
-        assert_eq!(w.replicas(&h), [("a".to_string(), "nvme0".to_string(), 100), ("b".to_string(), "nvme1".to_string(), 100)]);
+        assert_eq!(w.replicas(&h), [held("a", "nvme0", 100, false), held("b", "nvme1", 100, false)]);
         let u = w.usage(&h, 0).unwrap();
         assert_eq!(u.disk_pct["nvme0"], IDLE_DISK_PCT + 75.0);
         w.delete_replica(&h, "a");
@@ -656,7 +702,7 @@ mod tests {
         assert_eq!((f.src, f.dst, f.network.as_str(), f.demand_mbps, f.kind), (FlowEnd::Host(hid("a")), FlowEnd::Host(hid("b")), "storage", REBUILD_MBPS, FlowKind::Rebuild));
         let mut fabric = crate::fabric::Fabric::new(w, 1);
         // 1 GB at 2000 Mbit/s is 4 s.
-        let pct = |f: &crate::fabric::Fabric| f.world().replicas(&hid("b"))[0].2;
+        let pct = |f: &crate::fabric::Fabric| f.world().replicas(&hid("b"))[0].pct;
         fabric.tick(1000);
         assert_eq!(pct(&fabric), 25);
         fabric.tick(2000);
@@ -677,7 +723,49 @@ mod tests {
         let hw = &w.hosts[&hid("b")];
         assert!(!hw.powered && hw.instances.is_empty());
         assert_eq!(w.traffic.flows().count(), 0);
-        assert_eq!(w.replicas(&hid("b")), [("u".to_string(), "nvme1".to_string(), 100), ("v".to_string(), "nvme0".to_string(), 0)]);
+        assert_eq!(w.replicas(&hid("b")), [held("u", "nvme1", 100, false), held("v", "nvme0", 0, false)], "v's copy was interrupted");
+    }
+
+    fn held(volume: &str, disk: &str, pct: u8, copying: bool) -> ReplicaReport {
+        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copying }
+    }
+
+    #[test]
+    fn an_interrupted_copy_resumes_where_it_stopped() {
+        use crate::engine::Deliver;
+        let mut f = crate::fabric::Fabric::new(storage_pair(), 1);
+        let (a, b) = (hid("a"), hid("b"));
+        let report = |f: &crate::fabric::Fabric, v: &str| f.world().replicas(&b).into_iter().find(|r| r.volume == v).unwrap();
+        // The source dies a quarter of the way through a 4 s copy.
+        f.create_replica(&b, "v", 1, Some(a.clone()));
+        f.tick(1000);
+        f.power_off(&a);
+        assert_eq!(report(&f, "v"), held("v", "nvme0", 25, false), "interrupted, keeping what it got");
+        assert_eq!(f.world().traffic.flows().count(), 0);
+        f.create_replica(&b, "v", 1, Some(a.clone()));
+        assert!(!report(&f, "v").copying, "no copy from a dead source");
+        f.host_mut(&a).unwrap().power_on();
+        f.create_replica(&b, "v", 1, Some(a.clone()));
+        assert!(report(&f, "v").copying, "resumed");
+        f.tick(2000);
+        assert_eq!(report(&f, "v").pct, 50, "from 25 %");
+        f.create_replica(&b, "v", 1, Some(a.clone()));
+        assert_eq!(f.world().traffic.flows().count(), 1, "a running copy is not started twice");
+        f.tick(3000);
+        f.tick(4000);
+        assert_eq!(report(&f, "v"), held("v", "nvme0", 100, false));
+
+        // The target dies mid-copy and comes back.
+        f.create_replica(&b, "w", 1, Some(a.clone()));
+        f.tick(5000);
+        f.power_off(&b);
+        f.host_mut(&b).unwrap().power_on();
+        assert_eq!(report(&f, "w"), held("w", "nvme1", 25, false));
+        f.create_replica(&b, "w", 1, Some(a.clone()));
+        for now in [6000, 7000, 8000] {
+            f.tick(now);
+        }
+        assert_eq!(report(&f, "w").pct, 100);
     }
 
     fn lldp_of(w: &World) -> Vec<(String, String, String)> {

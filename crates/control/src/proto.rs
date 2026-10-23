@@ -113,8 +113,18 @@ pub fn pod_instance(deployment: &str, idx: u32) -> String {
     format!("pod/{deployment}/{idx}")
 }
 
-/// A volume replica a host holds: `(volume, disk, pct_complete)`.
-pub type ReplicaReport = (String, String, u8);
+/// A volume replica a host holds, as its agent reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicaReport {
+    pub volume: String,
+    pub disk: String,
+    /// How much of it is copied, 0 to 100.
+    pub pct: u8,
+    /// Whether a copy into it is running. An incomplete replica that is not
+    /// copying was interrupted (its host or source lost power) and waits for
+    /// a `CreateReplica` naming a source to resume.
+    pub copying: bool,
+}
 
 /// A user operation, as submitted through the API.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]

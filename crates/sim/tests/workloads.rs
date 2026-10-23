@@ -14,6 +14,7 @@ use model::{
     TRANSCODE_CAPABILITY_PREFIX,
 };
 use sim::engine::Engine;
+use sim::faults::Fault;
 use sim::presets::{FleetSpec, Preset};
 use sim::scenario::{Scenario, TRANSCODE_DEPLOYMENT};
 use sim::traffic::{FlowEnd, FlowKind};
@@ -173,9 +174,9 @@ fn workload_traffic_and_usage() {
     for h in s.hosts.keys().filter(|h| w.hosts[*h].instances.is_empty()) {
         assert_eq!((m[h].cpu_pct, m[h].instances), (3.0, 0), "{h}");
     }
-    // Replicas fill their disks.
+    // Replicas fill their disks, above the 5 % an empty disk shows.
     let r = s.volume_status.values().next().unwrap().status.replicas[0].clone();
-    assert!(m[&r.host].disk_pct[&r.disk] > 0.0);
+    assert!(m[&r.host].disk_pct[&r.disk] > 5.0, "{:?}", m[&r.host].disk_pct);
 }
 
 /// Log entries of the leader's replica that satisfy `pick`.
@@ -254,4 +255,57 @@ fn workload_api_validates() {
     assert_eq!(api(&mut e, ApiOp::CreateDeployment { deployment: dep(2) }), ApiResult::Ok(serde_json::Value::Null));
     assert_eq!(api(&mut e, ApiOp::DeleteDeployment { id: "web".into() }), ApiResult::Ok(serde_json::Value::Null));
     assert!(matches!(api(&mut e, ApiOp::DeleteVolume { id: "nope".into() }), ApiResult::Err(_)));
+}
+
+/// How far the copy of `volume` onto `host` has got, in ground truth.
+fn copy(e: &Engine, host: &HostId, volume: &str) -> Option<(u8, bool)> {
+    let r = e.fabric().world().hosts.get(host)?.replicas.get(volume)?;
+    Some((r.pct, r.flow.is_some()))
+}
+
+#[test]
+fn interrupted_copies_resume() {
+    // Two storage hosts hold the volume; a third joins and gets a copy.
+    let mut e = Engine::new(47);
+    e.load_fleet(&FleetSpec { ms01: 2, minipc: 0, pi5: 0, rk3588: 1 }, 3);
+    assert!(e.run_until(15_000, |e| e.client_view().leader.is_some()), "no leader");
+    assert_eq!(api(&mut e, ApiOp::CreateVolume { volume: Volume::new("data", 20) }), ApiResult::Ok(serde_json::Value::Null));
+    e.run_for(30_000);
+    e.scenario(Scenario::AddHosts { profile: model::ProfileId::Ms01, count: 1, misconfigure: None }).unwrap();
+    let target = HostId::from("ms01-03");
+    let deadline = e.now() + 180_000;
+    assert!(e.run_until(deadline, |e| copy(e, &target, "data").is_some_and(|(pct, _)| pct >= 10)), "no copy onto {target}");
+    let rebuilding = &e.client_view().state.volume_status["data"].status;
+    assert!(rebuilding.replicas.iter().any(|r| r.host == target && matches!(r.state, ReplicaState::Rebuilding { .. })), "{rebuilding:?}");
+
+    // The target loses power mid-copy and comes back: the copy goes on from where it was.
+    e.fault(Fault::KillHost { host: target.clone() }).unwrap();
+    let (kept, copying) = copy(&e, &target, "data").unwrap();
+    assert!(!copying && kept >= 10);
+    e.run_for(5000);
+    e.fault(Fault::RestoreHost { host: target.clone() }).unwrap();
+    assert_eq!(copy(&e, &target, "data"), Some((kept, false)), "the disk kept the partial copy");
+    let deadline = e.now() + 60_000;
+    assert!(e.run_until(deadline, |e| copy(e, &target, "data").is_some_and(|(pct, on)| on && pct > kept)), "target copy never resumed");
+
+    // The source loses power: the copy resumes from the other healthy replica.
+    let w = e.fabric().world();
+    let flow = w.traffic.flows().find(|f| f.kind == FlowKind::Rebuild).expect("a rebuild flow");
+    let FlowEnd::Host(source) = flow.src.clone() else { panic!("{flow:?}") };
+    e.fault(Fault::KillHost { host: source.clone() }).unwrap();
+    let (kept, copying) = copy(&e, &target, "data").unwrap();
+    assert!(!copying, "a copy from a dead source stops");
+    let deadline = e.now() + 120_000;
+    let resumed = |e: &Engine| {
+        let from_other = e.fabric().world().traffic.flows().any(|f| f.kind == FlowKind::Rebuild && f.src != FlowEnd::Host(source.clone()));
+        from_other && copy(e, &target, "data").is_some_and(|(pct, on)| on && pct > kept)
+    };
+    assert!(e.run_until(deadline, resumed), "copy never resumed from another source: {:?}", copy(&e, &target, "data"));
+    e.fault(Fault::RestoreHost { host: source }).unwrap();
+    let deadline = e.now() + 300_000;
+    let healthy = |e: &Engine| {
+        e.client_view().state.volume_status["data"].status.replicas.iter().any(|r| r.host == target && r.state == ReplicaState::Healthy)
+    };
+    assert!(e.run_until(deadline, healthy), "copy never completed: {:?}", e.client_view().state.volume_status["data"]);
+    assert_eq!(copy(&e, &target, "data"), Some((100, false)));
 }

@@ -18,6 +18,7 @@ use crate::engine::Deliver;
 use crate::topology::Node;
 use crate::traffic::Traffic;
 use crate::world::{HostHw, World};
+use control::proto::InstanceSpec;
 use control::runtime::{Addr, Endpoint, SimTime};
 use model::{HostId, NetworkId, PortName, SwitchId};
 use rand::{Rng, SeedableRng};
@@ -126,12 +127,33 @@ impl Fabric {
         &mut self.world.traffic
     }
 
-    /// The world, for running workloads on its hosts: instances and replicas
-    /// live on the hosts and their flows in the traffic, neither of which
-    /// feeds the cached switch graphs, so this keeps them. Topology changes
-    /// go through [`Fabric::world_mut`].
-    pub fn workloads_mut(&mut self) -> &mut World {
-        &mut self.world
+    // Workloads live on the hosts and their flows in the traffic, neither of
+    // which feeds the cached switch graphs: these keep them.
+
+    /// See [`World::start_instance`].
+    pub fn start_instance(&mut self, host: &HostId, spec: InstanceSpec, seed: u64) {
+        self.world.start_instance(host, spec, seed);
+    }
+
+    /// See [`World::stop_instance`].
+    pub fn stop_instance(&mut self, host: &HostId, id: &str) {
+        self.world.stop_instance(host, id);
+    }
+
+    /// See [`World::create_replica`].
+    pub fn create_replica(&mut self, host: &HostId, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
+        self.world.create_replica(host, volume, size_gb, source)
+    }
+
+    /// See [`World::delete_replica`].
+    pub fn delete_replica(&mut self, host: &HostId, volume: &str) {
+        self.world.delete_replica(host, volume);
+    }
+
+    /// See [`World::power_off`]. Link state changes, but carrier is
+    /// evaluated per query, so the cached switch graphs stay valid.
+    pub fn power_off(&mut self, host: &HostId) {
+        self.world.power_off(host);
     }
 
     /// Which host each switch currently believes owns the VIP.

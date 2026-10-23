@@ -9,18 +9,20 @@
 //!   to have a healthy replica. One that fits nowhere stays `Pending` with
 //!   the reason, written only when it changes.
 //! * **Volumes.** A volume with fewer live (not stale) replicas than it asks
-//!   for gets [`place_replicas`] targets, written to its status as
-//!   `Rebuilding` before the targets are sent `CreateReplica`. A volume's
-//!   first replicas start empty; later ones are copied from a healthy
-//!   replica, and wait until there is one. A target's heartbeat reports its
-//!   progress, which is written in steps of [`PROGRESS_STEP_PCT`], and
-//!   `Healthy` once complete. A volume that cannot get all its replicas stays
+//!   for gets [`place_replicas`] targets, written to its status before the
+//!   targets are sent `CreateReplica`. A volume's first replicas (it has
+//!   none, so it never held data) are placed `Seeding` and start empty;
+//!   later ones are placed `Rebuilding` and copied from a healthy replica,
+//!   waiting until there is one. A target's heartbeat reports its progress,
+//!   which is written in steps of [`PROGRESS_STEP_PCT`], and `Healthy` once
+//!   complete. A copy its target reports interrupted is sent again, with a
+//!   healthy source, so it resumes. A volume that cannot get all its replicas stays
 //!   `Degraded` with an [`INSUFFICIENT_STORAGE_HOSTS`] alert until it can.
 //!
 //! Statuses are only proposed when they would change.
 
 use super::{Action, Volatile};
-use crate::proto::{mgmt, pod_instance, vm_instance, FlowEnd, FlowKind, FlowSpec, InstanceSpec, Msg, UsageProfile};
+use crate::proto::{mgmt, pod_instance, vm_instance, FlowEnd, FlowKind, FlowSpec, InstanceSpec, Msg, ReplicaReport, UsageProfile};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, ObjectKind, ObjectRef, Severity, MGMT_NIC};
 use model::{
@@ -57,48 +59,58 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     out
 }
 
+/// A pod (deployment, idx) or a VM.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Workload<'a> {
+    Pod(&'a str, u32),
+    Vm(&'a str),
+}
+
 /// The hosts as [`place`] sees them, with what each placement of this run takes.
 struct Hosts {
     views: Vec<HostView>,
 }
 
 impl Hosts {
-    /// Every host, with the requests of the pods and VMs assigned to it in
-    /// the state or by a status proposal still in flight.
+    /// Every host, with the requests of the pods and VMs assigned to it: by
+    /// a status proposal still in flight, else by the state.
     fn new(state: &ClusterState, v: &Volatile) -> Self {
         let mut views: Vec<HostView> = state.hosts.values().map(host_view).collect();
-        let mut take = |host: &HostId, (cpu_m, ram_mb): (u32, u32)| {
-            if let Some(h) = views.iter_mut().find(|h| h.id == *host) {
-                h.used_cpu_m = h.used_cpu_m.saturating_add(cpu_m);
-                h.used_ram_mb = h.used_ram_mb.saturating_add(ram_mb);
-            }
-        };
+        // Where each pod and VM takes resources, and how much.
+        let mut charges: BTreeMap<Workload, (Vec<&HostId>, (u32, u32))> = BTreeMap::new();
+        let pod_request = |dep: &str| state.deployments.get(dep).map(|d| (d.deployment.cpu_m, d.deployment.ram_mb));
         for pod in state.pods.values() {
-            if let (Some(host), Some(d)) = (&pod.status.host, state.deployments.get(&pod.status.deployment)) {
-                take(host, (d.deployment.cpu_m, d.deployment.ram_mb));
+            if let Some(req) = pod_request(&pod.status.deployment) {
+                charges.insert(Workload::Pod(&pod.status.deployment, pod.status.idx), (pod.status.host.iter().collect(), req));
             }
         }
         for (id, st) in &state.vm_status {
-            let Some(vm) = state.vms.get(id) else { continue };
-            for host in vm_hosts(&st.status.host, &st.status.phase) {
-                take(host, vm_request(&vm.vm));
+            if let Some(vm) = state.vms.get(id) {
+                charges.insert(Workload::Vm(id), (vm_hosts(&st.status.host, &st.status.phase), vm_request(&vm.vm)));
             }
         }
+        // An in-flight proposal replaces the committed assignment.
         for cmd in v.in_flight.values() {
             match cmd {
-                Command::SetPodStatus { deployment, host: Some(host), .. } => {
-                    if let Some(d) = state.deployments.get(deployment) {
-                        take(host, (d.deployment.cpu_m, d.deployment.ram_mb));
+                Command::SetPodStatus { deployment, idx, host, .. } => {
+                    if let Some(req) = pod_request(deployment) {
+                        charges.insert(Workload::Pod(deployment, *idx), (host.iter().collect(), req));
                     }
                 }
                 Command::SetVmStatus { id, host, phase } => {
                     if let Some(vm) = state.vms.get(id) {
-                        for host in vm_hosts(host, phase) {
-                            take(host, vm_request(&vm.vm));
-                        }
+                        charges.insert(Workload::Vm(id), (vm_hosts(host, phase), vm_request(&vm.vm)));
                     }
                 }
                 _ => {}
+            }
+        }
+        for (hosts, (cpu_m, ram_mb)) in charges.into_values() {
+            for host in hosts {
+                if let Some(h) = views.iter_mut().find(|h| h.id == *host) {
+                    h.used_cpu_m = h.used_cpu_m.saturating_add(cpu_m);
+                    h.used_ram_mb = h.used_ram_mb.saturating_add(ram_mb);
+                }
             }
         }
         Self { views }
@@ -333,8 +345,10 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
             progress(v, id, r);
         }
         let live = replicas.iter().filter(|r| r.state != ReplicaState::Stale).count();
-        // The first replicas start empty; later ones need a healthy one to copy.
-        let can_place = replicas.is_empty() || replicas.iter().any(|r| r.state == ReplicaState::Healthy);
+        // A volume with no replicas at all never held data: its first
+        // replicas start empty. Any later one needs a healthy one to copy.
+        let seed = replicas.is_empty();
+        let can_place = seed || replicas.iter().any(|r| r.state == ReplicaState::Healthy);
         let mut short = false;
         if live < want && can_place {
             let existing: Vec<HostId> = replicas.iter().map(|r| r.host.clone()).collect();
@@ -343,7 +357,8 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
             short = picks.len() < usize::from(need);
             for (host, disk) in picks {
                 take_disk(&mut views, &host, &disk, size_gb);
-                replicas.push(ReplicaRef { host, disk, state: ReplicaState::Rebuilding { pct: 0 } });
+                let state = if seed { ReplicaState::Seeding } else { ReplicaState::Rebuilding { pct: 0 } };
+                replicas.push(ReplicaRef { host, disk, state });
             }
         }
         let health = health(&replicas, want);
@@ -359,19 +374,28 @@ fn volumes(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     out
 }
 
-/// Moves a copying replica on as far as its host reported it: in steps of
-/// [`PROGRESS_STEP_PCT`], `Healthy` once complete, on the disk the host chose.
+/// What `host`'s latest heartbeat says of its replica of `volume`.
+fn report<'a>(v: &'a Volatile, host: &HostId, volume: &str) -> Option<&'a ReplicaReport> {
+    v.replicas.get(host)?.iter().find(|r| r.volume == volume)
+}
+
+/// Moves a seeding or copying replica on as far as its host reported it:
+/// in steps of [`PROGRESS_STEP_PCT`], `Healthy` once complete, on the disk
+/// the host chose. A seeding replica reported part-copied was given a source
+/// (data appeared meanwhile) and is copying.
 fn progress(v: &Volatile, volume: &str, r: &mut ReplicaRef) {
-    let ReplicaState::Rebuilding { pct } = r.state else { return };
-    let Some((_, disk, done)) = v.replicas.get(&r.host).and_then(|rs| rs.iter().find(|(vol, _, _)| vol == volume)) else {
-        return;
+    let floor = match r.state {
+        ReplicaState::Rebuilding { pct } => pct,
+        ReplicaState::Seeding => 0,
+        ReplicaState::Healthy | ReplicaState::Stale => return,
     };
-    r.disk = disk.clone();
-    if *done >= 100 {
+    let Some(rep) = report(v, &r.host, volume) else { return };
+    r.disk = rep.disk.clone();
+    if rep.pct >= 100 {
         r.state = ReplicaState::Healthy;
     } else {
-        let step = done / PROGRESS_STEP_PCT * PROGRESS_STEP_PCT;
-        r.state = ReplicaState::Rebuilding { pct: step.max(pct) };
+        let step = rep.pct / PROGRESS_STEP_PCT * PROGRESS_STEP_PCT;
+        r.state = ReplicaState::Rebuilding { pct: step.max(floor) };
     }
 }
 
@@ -383,38 +407,45 @@ fn take_disk(views: &mut [StorageHostView], host: &HostId, disk: &str, size_gb: 
 }
 
 /// `Healthy` with all the replicas it asks for healthy, `Faulted` with none,
-/// `Rebuilding` while one is copying, else `Degraded`.
+/// `Rebuilding` while one is seeding or copying, else `Degraded`.
 fn health(replicas: &[ReplicaRef], want: usize) -> VolumeHealth {
     let healthy = replicas.iter().filter(|r| r.state == ReplicaState::Healthy).count();
     if healthy == 0 {
         VolumeHealth::Faulted
     } else if healthy >= want {
         VolumeHealth::Healthy
-    } else if replicas.iter().any(|r| matches!(r.state, ReplicaState::Rebuilding { .. })) {
+    } else if replicas.iter().any(|r| matches!(r.state, ReplicaState::Rebuilding { .. } | ReplicaState::Seeding)) {
         VolumeHealth::Rebuilding
     } else {
         VolumeHealth::Degraded
     }
 }
 
-/// `CreateReplica` to each host the committed status has copying a replica
-/// that its heartbeat does not list yet, at most every [`RESEND_MS`]. The
-/// copy comes from a healthy replica, one on a `Ready` host if there is one,
-/// or is empty when the volume has no healthy replica (its first replicas).
+/// `CreateReplica` to each host the committed status has seeding or
+/// copying a replica that its heartbeat does not list, or lists incomplete
+/// with no copy running (interrupted), at most every [`RESEND_MS`]. The copy
+/// comes from a healthy replica, one on a `Ready` host if there is one. Only
+/// a replica placed as `Seeding` is created empty, and only while the volume
+/// has no healthy replica; a copy with no healthy source waits.
 fn create_replicas(state: &ClusterState, v: &Volatile, now: SimTime, volume: &str, size_gb: u32, replicas: &[ReplicaRef]) -> Vec<Action> {
     let healthy = || replicas.iter().filter(|r| r.state == ReplicaState::Healthy);
     let ready = |r: &&ReplicaRef| state.hosts.get(&r.host).is_some_and(|h| h.lifecycle == Lifecycle::Ready);
-    let source = healthy().find(ready).or_else(|| healthy().next()).map(|r| r.host.clone());
-    replicas
-        .iter()
-        .filter(|r| matches!(r.state, ReplicaState::Rebuilding { .. }))
-        .filter(|r| !v.replicas.get(&r.host).is_some_and(|rs| rs.iter().any(|(vol, _, _)| vol == volume)))
-        .filter(|r| v.replica_created.get(&(volume.to_string(), r.host.clone())).is_none_or(|at| now >= at + RESEND_MS))
-        .map(|r| {
-            let msg = Msg::CreateReplica { volume: volume.into(), size_gb, source: source.clone() };
-            Action::Send(agent(&r.host), mgmt(), msg)
-        })
-        .collect()
+    let healthy_source = healthy().find(ready).or_else(|| healthy().next()).map(|r| r.host.clone());
+    let mut out = vec![];
+    for r in replicas {
+        let source = match (&r.state, &healthy_source) {
+            (ReplicaState::Seeding | ReplicaState::Rebuilding { .. }, Some(s)) => Some(s.clone()),
+            (ReplicaState::Seeding, None) => None,
+            _ => continue,
+        };
+        let wanted = report(v, &r.host, volume).is_none_or(|rep| rep.pct < 100 && !rep.copying);
+        let recent = v.replica_created.get(&(volume.to_string(), r.host.clone())).is_some_and(|at| now < at + RESEND_MS);
+        if wanted && !recent {
+            let msg = Msg::CreateReplica { volume: volume.into(), size_gb, source };
+            out.push(Action::Send(agent(&r.host), mgmt(), msg));
+        }
+    }
+    out
 }
 
 /// Raises the volume's [`INSUFFICIENT_STORAGE_HOSTS`] alert when there are
@@ -514,9 +545,17 @@ mod tests {
     fn report_all(v: &mut Volatile, s: &ClusterState, volume: &str, pct: u8) {
         for r in &s.volume_status[volume].status.replicas {
             let rs: &mut Vec<ReplicaReport> = v.replicas.entry(r.host.clone()).or_default();
-            rs.retain(|(vol, _, _)| vol != volume);
-            rs.push((volume.into(), r.disk.clone(), pct));
+            rs.retain(|rep| rep.volume != volume);
+            rs.push(rep(volume, &r.disk, pct, pct < 100));
         }
+    }
+
+    fn rep(volume: &str, disk: &str, pct: u8, copying: bool) -> ReplicaReport {
+        ReplicaReport { volume: volume.into(), disk: disk.into(), pct, copying }
+    }
+
+    fn seeding(host: &str) -> ReplicaRef {
+        ReplicaRef { host: hid(host), disk: "nvme0".into(), state: ReplicaState::Seeding }
     }
 
     fn rebuilding(host: &str, pct: u8) -> ReplicaRef {
@@ -534,7 +573,7 @@ mod tests {
         let mut v = Volatile::new(0, 1);
         let out = run(&s, &v, 1000);
         assert!(sends(&out).is_empty(), "nothing is sent before the status names the targets");
-        let placed = vec![rebuilding("m1", 0), rebuilding("m3", 0), rebuilding("m2", 0)];
+        let placed = vec![seeding("m1"), seeding("m3"), seeding("m2")];
         assert_eq!(proposals(&out), [Command::SetVolumeStatus { id: "d".into(), replicas: placed.clone(), health: VolumeHealth::Faulted }]);
         apply(&mut s, proposals(&out));
 
@@ -569,16 +608,16 @@ mod tests {
         let create = Msg::CreateReplica { volume: "d".into(), size_gb: 40, source: Some(hid("m1")) };
         assert_eq!(sends(&run(&s, &v, 2000)), [(hid("m2"), create)]);
 
-        v.replicas.insert(hid("m2"), vec![("d".into(), "nvme0".into(), 9)]);
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme0", 9, true)]);
         assert!(run(&s, &v, 3000).is_empty(), "below the first step: nothing to write");
-        v.replicas.insert(hid("m2"), vec![("d".into(), "nvme1".into(), 37)]);
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme1", 37, true)]);
         let out = run(&s, &v, 4000);
         let at30 = ReplicaRef { host: hid("m2"), disk: "nvme1".into(), state: ReplicaState::Rebuilding { pct: 30 } };
         assert_eq!(proposals(&out), [Command::SetVolumeStatus { id: "d".into(), replicas: vec![healthy("m1"), healthy("m3"), at30], health: VolumeHealth::Rebuilding }], "the disk the host chose is recorded");
         apply(&mut s, proposals(&out));
-        v.replicas.insert(hid("m2"), vec![("d".into(), "nvme1".into(), 39)]);
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme1", 39, true)]);
         assert!(run(&s, &v, 5000).is_empty());
-        v.replicas.insert(hid("m2"), vec![("d".into(), "nvme1".into(), 100)]);
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme1", 100, false)]);
         let out = run(&s, &v, 6000);
         assert!(matches!(proposals(&out).as_slice(), [Command::SetVolumeStatus { health: VolumeHealth::Healthy, .. }]));
     }
@@ -591,6 +630,47 @@ mod tests {
         s.apply(0, st).unwrap();
         let out = run(&s, &Volatile::new(0, 1), 1000);
         assert!(proposals(&out).is_empty(), "no healthy replica to copy from: {out:?}");
+        assert!(sends(&out).is_empty(), "and a copy is never created empty: {out:?}");
+    }
+
+    #[test]
+    fn a_seeding_replica_is_copied_once_another_is_healthy() {
+        let mut s = three_ms01();
+        s.apply(0, Command::CreateVolume { volume: Volume { replicas: 2, ..Volume::new("d", 40) } }).unwrap();
+        let st = Command::SetVolumeStatus { id: "d".into(), replicas: vec![healthy("m1"), seeding("m2")], health: VolumeHealth::Rebuilding };
+        s.apply(0, st).unwrap();
+        let out = run(&s, &Volatile::new(0, 1), 1000);
+        let create = Msg::CreateReplica { volume: "d".into(), size_gb: 40, source: Some(hid("m1")) };
+        assert_eq!(sends(&out), [(hid("m2"), create)], "m1 may hold data by now");
+    }
+
+    #[test]
+    fn an_interrupted_copy_is_sent_again_with_a_healthy_source() {
+        let mut s = three_ms01();
+        s.apply(0, Command::CreateVolume { volume: Volume { replicas: 2, ..Volume::new("d", 40) } }).unwrap();
+        let st = Command::SetVolumeStatus { id: "d".into(), replicas: vec![healthy("m1"), rebuilding("m2", 40)], health: VolumeHealth::Rebuilding };
+        s.apply(0, st).unwrap();
+        let mut v = Volatile::new(0, 1);
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme0", 45, true)]);
+        assert!(run(&s, &v, 1000).is_empty(), "copying: nothing to do");
+        v.replicas.insert(hid("m2"), vec![rep("d", "nvme0", 45, false)]);
+        let create = Msg::CreateReplica { volume: "d".into(), size_gb: 40, source: Some(hid("m1")) };
+        assert_eq!(sends(&run(&s, &v, 2000)), [(hid("m2"), create)], "interrupted: resumed from a healthy source");
+        v.replica_created.insert(("d".into(), hid("m2")), 2000);
+        assert!(run(&s, &v, 2000 + RESEND_MS - 1).is_empty(), "paced");
+    }
+
+    #[test]
+    fn an_in_flight_placement_replaces_the_committed_one() {
+        let mut s = state(&[("a", ProfileId::MiniPc, &[Role::Compute], "a"), ("b", ProfileId::MiniPc, &[Role::Compute], "a")]);
+        s.apply(0, Command::CreateDeployment { deployment: deployment("x", 1, 3000, None) }).unwrap();
+        s.apply(0, Command::SetPodStatus { deployment: "x".into(), idx: 0, host: Some(hid("a")), phase: PodPhase::Pending(STARTING.into()) }).unwrap();
+        s.apply(0, Command::CreateDeployment { deployment: deployment("y", 1, 3000, None) }).unwrap();
+        let mut v = Volatile::new(0, 1);
+        v.in_flight.insert(1, Command::SetPodStatus { deployment: "x".into(), idx: 0, host: Some(hid("b")), phase: PodPhase::Pending(STARTING.into()) });
+        let out = proposals(&run(&s, &v, 1000));
+        let y = Command::SetPodStatus { deployment: "y".into(), idx: 0, host: Some(hid("a")), phase: PodPhase::Pending(STARTING.into()) };
+        assert_eq!(out, [y], "x is moving to b, so a has room");
     }
 
     #[test]
