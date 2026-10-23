@@ -1,10 +1,12 @@
 //! Health: hosts heartbeat to the leader. Silence beyond [`NOT_READY_AFTER_MS`]
 //! marks a host `NotReady` and raises a `HostDown` alert; a heartbeat from a
-//! `NotReady` host recovers it and resolves the alert.
+//! `NotReady` host recovers it and resolves the alert. The alert of a host
+//! that has been removed is resolved too.
 
 use super::{Action, Volatile};
 use crate::runtime::SimTime;
-use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, ObjectRef, Severity};
+use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, ObjectKind, ObjectRef, Severity};
+use model::HostId;
 
 pub const NOT_READY_AFTER_MS: u64 = 40_000;
 pub const HOST_DOWN: &str = "HostDown";
@@ -29,9 +31,9 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
             }
             if open.is_none() {
                 out.push(Action::Propose(Command::RaiseAlert {
-                    // Unique per incident and stable across runs: an incident is
-                    // identified by the last time the host was seen.
-                    id: format!("hostdown-{id}-{last_seen}"),
+                    // Stable across runs and unique per incident: an incident is
+                    // the last time this leader (term) saw the host.
+                    id: format!("hostdown-{id}-{}-{last_seen}", v.term),
                     severity: Severity::Critical,
                     kind: HOST_DOWN.into(),
                     entity: ObjectRef::host(id),
@@ -47,6 +49,13 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
             if let Some(a) = open {
                 out.push(Action::Propose(Command::ResolveAlert { id: a.id.clone() }));
             }
+        }
+    }
+    for a in state.alerts.values().filter(|a| a.kind == HOST_DOWN && a.resolved_at.is_none()) {
+        let gone = a.entity.kind == ObjectKind::Host
+            && state.hosts.get(&HostId::new(&a.entity.id)).is_none_or(|h| h.lifecycle == Lifecycle::Removed);
+        if gone {
+            out.push(Action::Propose(Command::ResolveAlert { id: a.id.clone() }));
         }
     }
     out
@@ -111,7 +120,7 @@ mod tests {
     #[test]
     fn new_leader_gives_every_host_a_grace_period() {
         let s = state_with(&[("h1", Lifecycle::Ready), ("h2", Lifecycle::Cordoned)]);
-        let v = Volatile::new(100_000);
+        let v = Volatile::new(100_000, 1);
         assert!(run(&s, &v, 100_000 + NOT_READY_AFTER_MS).is_empty(), "no mass-fail on takeover");
         let cmds = proposals(run(&s, &v, 100_000 + NOT_READY_AFTER_MS + 1));
         assert_eq!(cmds.len(), 4, "both hosts go NotReady with an alert each: {cmds:?}");
@@ -120,7 +129,7 @@ mod tests {
     #[test]
     fn silent_host_goes_not_ready_with_one_alert_then_recovers() {
         let mut s = state_with(&[("h1", Lifecycle::Draining), ("h2", Lifecycle::Ready)]);
-        let mut v = Volatile::new(0);
+        let mut v = Volatile::new(0, 1);
         v.last_heartbeat.insert(hid("h1"), 5_000);
         v.last_heartbeat.insert(hid("h2"), 44_000);
         let now = 46_000;
@@ -130,7 +139,7 @@ mod tests {
             vec![
                 Command::SetLifecycle { id: hid("h1"), lifecycle: Lifecycle::NotReady },
                 Command::RaiseAlert {
-                    id: "hostdown-h1-5000".into(),
+                    id: "hostdown-h1-1-5000".into(),
                     severity: Severity::Critical,
                     kind: HOST_DOWN.into(),
                     entity: ObjectRef::host(&hid("h1")),
@@ -149,7 +158,7 @@ mod tests {
             cmds,
             vec![
                 Command::SetLifecycle { id: hid("h1"), lifecycle: Lifecycle::Ready },
-                Command::ResolveAlert { id: "hostdown-h1-5000".into() },
+                Command::ResolveAlert { id: "hostdown-h1-1-5000".into() },
             ]
         );
         apply_all(&mut s, now + 3000, cmds);
@@ -160,17 +169,43 @@ mod tests {
     #[test]
     fn hosts_not_yet_ready_are_ignored() {
         let s = state_with(&[("h1", Lifecycle::Pending), ("h2", Lifecycle::Provisioning)]);
-        assert!(run(&s, &Volatile::new(0), 10 * NOT_READY_AFTER_MS).is_empty());
+        assert!(run(&s, &Volatile::new(0, 1), 10 * NOT_READY_AFTER_MS).is_empty());
     }
 
     #[test]
     fn not_ready_host_from_previous_leader_stays_down_until_it_heartbeats() {
         let mut s = state_with(&[("h1", Lifecycle::Ready)]);
         s.apply(1, Command::SetLifecycle { id: hid("h1"), lifecycle: Lifecycle::NotReady }).unwrap();
-        let v = Volatile::new(50_000);
+        let v = Volatile::new(50_000, 1);
         assert!(run(&s, &v, 60_000).is_empty(), "election grace is not a heartbeat");
         // Still silent past the grace: the incident had no alert yet, so raise one.
         let cmds = proposals(run(&s, &v, 95_000));
-        assert!(matches!(cmds.as_slice(), [Command::RaiseAlert { id, .. }] if id == "hostdown-h1-50000"));
+        assert!(matches!(cmds.as_slice(), [Command::RaiseAlert { id, .. }] if id == "hostdown-h1-1-50000"));
+    }
+
+    #[test]
+    fn alert_ids_carry_the_leader_term() {
+        let s = state_with(&[("h1", Lifecycle::Ready)]);
+        let cmds = proposals(run(&s, &Volatile::new(0, 7), NOT_READY_AFTER_MS + 1));
+        assert!(matches!(&cmds[1], Command::RaiseAlert { id, .. } if id == "hostdown-h1-7-0"), "{cmds:?}");
+    }
+
+    #[test]
+    fn alert_of_a_removed_host_is_resolved() {
+        let mut s = state_with(&[("h1", Lifecycle::Ready), ("h2", Lifecycle::Ready)]);
+        let v = Volatile::new(0, 1);
+        let now = NOT_READY_AFTER_MS + 1;
+        let cmds = proposals(run(&s, &v, now));
+        apply_all(&mut s, now, cmds);
+        s.apply(now, Command::RemoveHost { id: hid("h1") }).unwrap();
+        let cmds = proposals(run(&s, &v, now + 1000));
+        assert_eq!(cmds, [Command::ResolveAlert { id: "hostdown-h1-1-0".into() }], "h2 stays down, h1's alert closes");
+        apply_all(&mut s, now + 1000, cmds);
+        assert!(s.alerts["hostdown-h1-1-0"].resolved_at.is_some());
+        assert!(s.alerts["hostdown-h2-1-0"].resolved_at.is_none());
+        assert!(
+            proposals(run(&s, &v, now + 2000)).iter().all(|c| !matches!(c, Command::ResolveAlert { .. })),
+            "nothing left to resolve"
+        );
     }
 }

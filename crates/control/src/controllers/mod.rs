@@ -2,8 +2,11 @@
 //! a pure function of the replicated state, the leader's volatile memory and
 //! the time, returning [`Action`]s for the replica to carry out. They must be
 //! idempotent across consecutive runs: the replica drops a proposal that is
-//! identical to one still in flight, so a controller may keep asking for the
-//! same command until the state shows it applied.
+//! identical to one still in flight (or that failed to apply within the last
+//! [`FAILED_BACKOFF_MS`]), so a controller may keep asking for the same command
+//! until the state shows it applied. Controllers first run once the leader
+//! has applied an entry of its own term, so they never act on a state that
+//! lags what earlier leaders committed.
 
 pub mod health;
 
@@ -12,6 +15,9 @@ use crate::runtime::{Endpoint, SimTime};
 use crate::state::{ClusterState, Command};
 use model::{HostId, NetworkId};
 use std::collections::BTreeMap;
+
+/// A controller command that applied with an error is not proposed again for this long.
+pub const FAILED_BACKOFF_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -37,23 +43,41 @@ pub struct PendingApi {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Volatile {
     pub elected_at: SimTime,
+    /// The term this leader was elected in.
+    pub term: u64,
+    /// Whether an entry of `term` (the leader's no-op) has applied, i.e. the
+    /// state includes everything committed before this leader.
+    pub caught_up: bool,
     pub last_heartbeat: BTreeMap<HostId, SimTime>,
     pub metrics: BTreeMap<HostId, MetricSample>,
     /// Client requests by log index.
     pub pending: BTreeMap<u64, PendingApi>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
+    /// Controller proposals that applied with an error, and when.
+    pub failed: Vec<(Command, SimTime)>,
 }
 
 impl Volatile {
-    pub fn new(elected_at: SimTime) -> Self {
+    pub fn new(elected_at: SimTime, term: u64) -> Self {
         Self {
             elected_at,
+            term,
+            caught_up: false,
             last_heartbeat: BTreeMap::new(),
             metrics: BTreeMap::new(),
             pending: BTreeMap::new(),
             in_flight: BTreeMap::new(),
+            failed: Vec::new(),
         }
+    }
+
+    /// Whether the replica should propose controller command `cmd` now: not
+    /// while an identical proposal is in flight, nor within
+    /// [`FAILED_BACKOFF_MS`] of an identical one failing to apply.
+    pub fn may_propose(&self, cmd: &Command, now: SimTime) -> bool {
+        !self.in_flight.values().any(|c| c == cmd)
+            && !self.failed.iter().any(|(c, at)| c == cmd && now < at + FAILED_BACKOFF_MS)
     }
 
     /// When the leader last heard from `host`. A host not heard from since

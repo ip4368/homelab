@@ -2,7 +2,7 @@
 //! applying its committed entries. The leader claims the VIP, answers the API
 //! and syncs, and runs the controllers; followers only replicate.
 
-use crate::controllers::{self, Action, PendingApi, Volatile};
+use crate::controllers::{self, Action, PendingApi, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
@@ -65,8 +65,8 @@ impl CpReplica {
                 // The Raft node keeps the durable state in memory for now; the
                 // host OS will persist these ops so a restarted replica can reload them.
                 RaftOut::Persist(_) => {}
-                RaftOut::BecameLeader(_) => {
-                    self.volatile = Some(Volatile::new(ctx.now()));
+                RaftOut::BecameLeader(term) => {
+                    self.volatile = Some(Volatile::new(ctx.now(), term));
                     ctx.claim_vip();
                 }
                 RaftOut::SteppedDown => {
@@ -88,7 +88,10 @@ impl CpReplica {
                 EntryPayload::Noop | EntryPayload::Config(_) => None,
             };
             let Some(v) = &mut self.volatile else { continue };
-            v.in_flight.remove(&e.index);
+            v.caught_up |= e.term == v.term;
+            if let (Some(cmd), Some(Err(_))) = (v.in_flight.remove(&e.index), &result) {
+                v.failed.push((cmd, ctx.now()));
+            }
             let Some(p) = v.pending.remove(&e.index) else { continue };
             let answer = match result {
                 _ if p.term != e.term => ApiResult::Unavailable,
@@ -114,11 +117,12 @@ impl CpReplica {
     fn run_controllers(&mut self, ctx: &mut dyn Ctx) {
         let now = ctx.now();
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
-        let Some(v) = &mut self.volatile else { return };
+        let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
+        v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         for action in controllers::run_all(&self.state, v, now) {
             match action {
                 Action::Propose(cmd) => {
-                    if v.in_flight.values().any(|c| *c == cmd) {
+                    if !v.may_propose(&cmd, now) {
                         continue;
                     }
                     if let Ok(index) = raft.propose(now, LogCmd { at: now, cmd: cmd.clone() }) {
@@ -224,5 +228,189 @@ impl Actor for CpReplica {
             _ => self.run_controllers(ctx),
         }
         arm(ctx, token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::controllers::health::NOT_READY_AFTER_MS;
+    use crate::raft::RaftMsg;
+    use crate::runtime::HostOs;
+    use crate::state::{ObjectRef, Severity};
+    use model::{profile, Inventory, NetworkId, ProfileId, Role};
+
+    fn hid(s: &str) -> HostId {
+        HostId::from(s)
+    }
+
+    #[derive(Default)]
+    struct FakeCtx {
+        now: SimTime,
+    }
+
+    impl Ctx for FakeCtx {
+        fn now(&self) -> SimTime {
+            self.now
+        }
+        fn me(&self) -> Endpoint {
+            Endpoint::new(Addr::Host(hid("h1")), Svc::Cp)
+        }
+        fn send(&mut self, _: Endpoint, _: NetworkId, _: Msg) {}
+        fn set_timer(&mut self, _: u64, _: u64) {}
+        fn rand_u64(&mut self) -> u64 {
+            1
+        }
+        fn claim_vip(&mut self) {}
+        fn host(&mut self) -> Option<&mut dyn HostOs> {
+            None
+        }
+    }
+
+    /// Replica h1 of {h1, h2, h3}, driven by hand; h2 plays every peer.
+    struct Rig {
+        r: CpReplica,
+        ctx: FakeCtx,
+    }
+
+    impl Rig {
+        /// Started with `cmds` already applied, as if replayed from earlier terms.
+        fn new(cmds: Vec<Command>) -> Self {
+            let voters = ["h1", "h2", "h3"].map(hid).into();
+            let mut rig = Rig { r: CpReplica::new(hid("h1"), None, voters), ctx: FakeCtx::default() };
+            rig.r.on_start(&mut rig.ctx);
+            for c in cmds {
+                rig.r.state.apply(0, c).unwrap();
+            }
+            rig
+        }
+
+        fn h2_says(&mut self, m: RaftMsg<LogCmd>) {
+            let from = Endpoint::new(Addr::Host(hid("h2")), Svc::Cp);
+            self.r.on_message(&mut self.ctx, from, Msg::Raft(m));
+        }
+
+        /// Ticks until h1 campaigns, then grants it h2's pre-vote and vote.
+        fn elect(&mut self) {
+            while self.r.raft().term() == 0 && !self.r.is_leader() {
+                self.ctx.now += RAFT_TICK_MS;
+                self.r.on_timer(&mut self.ctx, TICK);
+                let term = self.r.raft().term();
+                self.h2_says(RaftMsg::VoteResp { term: term + 1, granted: true, pre_vote: true });
+            }
+            let term = self.r.raft().term();
+            self.h2_says(RaftMsg::VoteResp { term, granted: true, pre_vote: false });
+            assert!(self.r.is_leader());
+        }
+
+        /// h2 acknowledges the whole log: everything commits and applies.
+        fn ack(&mut self) {
+            let (term, last) = (self.r.raft().term(), self.r.log_len() as u64);
+            self.h2_says(RaftMsg::AppendResp { term, success: true, match_index: last, conflict_index: 0 });
+        }
+
+        fn controllers(&mut self) {
+            self.r.on_timer(&mut self.ctx, CONTROLLERS);
+        }
+
+        fn advance(&mut self, ms: u64) {
+            self.ctx.now += ms;
+            self.ack(); // keeps the leader's quorum fresh
+        }
+
+        fn proposed(&self) -> Vec<Command> {
+            self.r
+                .durable()
+                .log
+                .iter()
+                .filter_map(|e| match &e.payload {
+                    EntryPayload::Normal(c) => Some(c.cmd.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// A removed host whose HostDown alert is still open: health wants to
+    /// resolve it on every run until it is.
+    fn orphaned_alert() -> Vec<Command> {
+        vec![
+            Command::AddPendingHost {
+                id: hid("h9"),
+                profile: profile(ProfileId::MiniPc, 0),
+                inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+                location: "rack-1".into(),
+            },
+            raise("hostdown-h9-0-0"),
+            Command::RemoveHost { id: hid("h9") },
+        ]
+    }
+
+    fn raise(id: &str) -> Command {
+        Command::RaiseAlert {
+            id: id.into(),
+            severity: Severity::Critical,
+            kind: "HostDown".into(),
+            entity: ObjectRef::host(&hid("h9")),
+            message: "down".into(),
+            ground_truth: false,
+        }
+    }
+
+    #[test]
+    fn controllers_wait_for_the_leaders_noop_to_apply() {
+        let mut rig = Rig::new(orphaned_alert());
+        rig.elect();
+        rig.controllers();
+        assert!(rig.proposed().is_empty(), "controllers ran before the no-op applied: {:?}", rig.proposed());
+        rig.ack();
+        rig.controllers();
+        assert_eq!(rig.proposed(), [Command::ResolveAlert { id: "hostdown-h9-0-0".into() }]);
+    }
+
+    #[test]
+    fn identical_proposal_is_not_repeated_while_in_flight() {
+        let mut rig = Rig::new(orphaned_alert());
+        rig.elect();
+        rig.ack();
+        for _ in 0..3 {
+            rig.controllers();
+            rig.ctx.now += CONTROLLER_PERIOD_MS;
+        }
+        assert_eq!(rig.proposed().len(), 1, "one proposal while uncommitted: {:?}", rig.proposed());
+        rig.ack();
+        rig.controllers();
+        assert_eq!(rig.proposed().len(), 1, "applied, so nothing more to do");
+    }
+
+    #[test]
+    fn command_that_fails_to_apply_backs_off() {
+        // h9 is Ready and silent, and an alert with the id health will pick
+        // already exists (resolved), so its RaiseAlert keeps failing.
+        let mut cmds = orphaned_alert();
+        cmds.pop();
+        cmds.push(Command::ApproveHost { id: hid("h9"), roles: [Role::Compute].into() });
+        cmds.push(Command::SetLifecycle { id: hid("h9"), lifecycle: Lifecycle::Provisioning });
+        cmds.push(Command::SetLifecycle { id: hid("h9"), lifecycle: Lifecycle::Ready });
+        let mut rig = Rig::new(cmds);
+        rig.elect();
+        let id = format!("hostdown-h9-1-{}", rig.ctx.now);
+        rig.r.state.apply(0, raise(&id)).unwrap();
+        rig.r.state.apply(0, Command::ResolveAlert { id: id.clone() }).unwrap();
+        rig.r.state.apply(0, Command::ResolveAlert { id: "hostdown-h9-0-0".into() }).unwrap();
+        rig.ack();
+        rig.advance(NOT_READY_AFTER_MS + 1);
+
+        let raises = |rig: &Rig| rig.proposed().iter().filter(|c| matches!(c, Command::RaiseAlert { .. })).count();
+        for _ in 0..(FAILED_BACKOFF_MS / CONTROLLER_PERIOD_MS) {
+            rig.controllers();
+            rig.advance(CONTROLLER_PERIOD_MS);
+        }
+        assert_eq!(raises(&rig), 1, "the failing RaiseAlert is retried at most once per backoff period");
+        assert_eq!(rig.r.state.hosts[&hid("h9")].lifecycle, Lifecycle::NotReady, "the rest still applies");
+        // It failed when it applied, one period after it was proposed.
+        rig.advance(CONTROLLER_PERIOD_MS);
+        rig.controllers();
+        assert_eq!(raises(&rig), 2, "and is retried once the backoff expires");
     }
 }
