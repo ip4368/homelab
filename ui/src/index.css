@@ -113,6 +113,299 @@ button.active {
   gap: 4px;
 }
 
-.content {
+.app {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.workspace {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+.center {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.grid-wrap {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+  display: flex;
+}
+
+.grid-area {
+  flex: 1;
+  overflow: auto;
   padding: 16px;
+}
+
+button.link {
+  border: none;
+  background: none;
+  padding: 0;
+  color: var(--accent);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+button:disabled:hover {
+  border-color: var(--border);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.fleet-bar {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.group h3 {
+  margin: 12px 0 6px;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.tile {
+  width: 104px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  text-align: left;
+  border-left: 5px solid var(--muted);
+}
+
+.tile.selected {
+  outline: 2px solid var(--accent);
+}
+
+.tile-id {
+  font-weight: 600;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tile-roles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  min-height: 16px;
+}
+
+.badge {
+  font-size: 9px;
+  padding: 0 4px;
+  border-radius: 3px;
+  background: #e8ecf5;
+  color: var(--text);
+}
+
+.bar {
+  height: 5px;
+  background: #e8ecf5;
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.bar-fill.warn {
+  background: var(--warn);
+}
+
+.bar-fill.bad {
+  background: var(--bad);
+}
+
+.lc-Ready {
+  border-left-color: var(--ok);
+}
+
+.lc-NotReady {
+  border-left-color: var(--bad);
+  background: #fdecea;
+}
+
+.lc-Pending,
+.lc-Approved,
+.lc-Provisioning {
+  border-left-color: var(--warn);
+}
+
+.lc-Cordoned,
+.lc-Draining,
+.lc-Drained {
+  border-left-color: #7c5cc4;
+}
+
+.lc-Removed {
+  border-left-color: var(--muted);
+  opacity: 0.6;
+}
+
+.drawer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 380px;
+  max-width: 100%;
+  overflow: auto;
+  padding: 12px 16px;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -4px 0 12px rgba(0, 0, 0, 0.1);
+}
+
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.drawer-head h3 {
+  margin: 0;
+}
+
+.lifecycle {
+  font-size: 12px;
+  padding: 1px 8px;
+  border-left-width: 4px;
+  border-left-style: solid;
+  background: #eef0f4;
+}
+
+.inventory {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 4px 8px;
+  font-size: 13px;
+}
+
+.inventory dt {
+  color: var(--muted);
+}
+
+.inventory dd {
+  margin: 0;
+}
+
+.section h4,
+.fault-group h4 {
+  margin: 12px 0 2px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.role-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+}
+
+.role-picker label.disabled {
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+.rail {
+  width: 340px;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+}
+
+.tabs {
+  display: flex;
+  border-bottom: 1px solid var(--border);
+}
+
+.tabs button {
+  flex: 1;
+  border: none;
+  border-radius: 0;
+}
+
+.rail-body {
+  flex: 1;
+  overflow: auto;
+  padding: 8px 12px;
+  font-size: 13px;
+}
+
+.rail-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.rail-list li {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.rail-list li.resolved {
+  opacity: 0.55;
+}
+
+.sev {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.sev-Critical {
+  color: var(--bad);
+}
+
+.sev-Warning {
+  color: var(--warn);
+}
+
+.sev-Info {
+  color: var(--muted);
+}
+
+.faultpanel {
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  padding: 6px 16px;
+}
+
+.fault-body {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 32px;
+  padding-bottom: 6px;
 }
