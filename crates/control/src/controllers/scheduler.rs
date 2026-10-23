@@ -27,7 +27,7 @@ use super::{Action, Volatile};
 use crate::proto::{mgmt, pod_instance, vm_instance, FlowEnd, FlowKind, FlowSpec, InstanceSpec, Msg, UsageProfile};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, HostObj, MGMT_NIC};
-use model::{allocatable, place, HostId, HostView, NetworkId, PlacementReq, PodPhase, ReplicaState, Role, SwitchId, Vm, VmPhase};
+use model::{allocatable, place, Deployment, HostId, HostView, NetworkId, PlacementReq, PodPhase, ReplicaState, Role, SwitchId, Vm, VmPhase};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A `StartInstance`, `CreateReplica`, `StopInstance` or `DeleteReplica` the
@@ -67,13 +67,16 @@ enum Workload<'a> {
 /// The hosts as [`place`] sees them, with what each placement of this run takes.
 pub(super) struct Hosts {
     views: Vec<HostView>,
+    /// Where each host's view is in `views`.
+    index: BTreeMap<HostId, usize>,
 }
 
 impl Hosts {
     /// Every host, with the requests of the pods and VMs assigned to it: by
     /// a status proposal still in flight, else by the state.
     pub(super) fn new(state: &ClusterState, v: &Volatile) -> Self {
-        let mut views: Vec<HostView> = state.hosts.values().map(host_view).collect();
+        let views: Vec<HostView> = state.hosts.values().map(host_view).collect();
+        let index: BTreeMap<HostId, usize> = views.iter().enumerate().map(|(i, h)| (h.id.clone(), i)).collect();
         // Where each pod and VM takes resources, and how much.
         let mut charges: BTreeMap<Workload, (Vec<&HostId>, (u32, u32))> = BTreeMap::new();
         let pod_request = |dep: &str| state.deployments.get(dep).map(|d| (d.deployment.cpu_m, d.deployment.ram_mb));
@@ -103,15 +106,21 @@ impl Hosts {
                 _ => {}
             }
         }
-        for (hosts, (cpu_m, ram_mb)) in charges.into_values() {
-            for host in hosts {
-                if let Some(h) = views.iter_mut().find(|h| h.id == *host) {
-                    h.used_cpu_m = h.used_cpu_m.saturating_add(cpu_m);
-                    h.used_ram_mb = h.used_ram_mb.saturating_add(ram_mb);
-                }
+        let mut hosts = Self { views, index };
+        for (on, (cpu_m, ram_mb)) in charges.into_values() {
+            for host in on {
+                hosts.charge(host, cpu_m, ram_mb);
             }
         }
-        Self { views }
+        hosts
+    }
+
+    /// Counts `cpu_m` and `ram_mb` against `host`, if it has a view.
+    fn charge(&mut self, host: &HostId, cpu_m: u32, ram_mb: u32) {
+        if let Some(h) = self.index.get(host).map(|&i| &mut self.views[i]) {
+            h.used_cpu_m = h.used_cpu_m.saturating_add(cpu_m);
+            h.used_ram_mb = h.used_ram_mb.saturating_add(ram_mb);
+        }
     }
 
     /// Places `req` and counts it against the host it lands on.
@@ -121,20 +130,16 @@ impl Hosts {
 
     /// As [`Hosts::place`], only ever on `host`.
     pub(super) fn place_on(&mut self, req: &PlacementReq, host: &HostId) -> Result<HostId, String> {
-        let view = self.views.iter_mut().find(|h| h.id == *host).ok_or_else(|| format!("no host {host}"))?;
-        let host = place(req, std::slice::from_ref(&*view), &BTreeSet::new())?;
-        view.used_cpu_m = view.used_cpu_m.saturating_add(req.cpu_m);
-        view.used_ram_mb = view.used_ram_mb.saturating_add(req.ram_mb);
+        let view = self.index.get(host).map(|&i| &self.views[i]).ok_or_else(|| format!("no host {host}"))?;
+        let host = place(req, std::slice::from_ref(view), &BTreeSet::new())?;
+        self.charge(&host, req.cpu_m, req.ram_mb);
         Ok(host)
     }
 
     /// As [`Hosts::place`], never on a host in `exclude`.
     pub(super) fn place_excluding(&mut self, req: &PlacementReq, exclude: &BTreeSet<HostId>) -> Result<HostId, String> {
         let host = place(req, &self.views, exclude)?;
-        if let Some(h) = self.views.iter_mut().find(|h| h.id == host) {
-            h.used_cpu_m = h.used_cpu_m.saturating_add(req.cpu_m);
-            h.used_ram_mb = h.used_ram_mb.saturating_add(req.ram_mb);
-        }
+        self.charge(&host, req.cpu_m, req.ram_mb);
         Ok(host)
     }
 }
@@ -155,7 +160,7 @@ fn host_view(h: &HostObj) -> HostView {
 }
 
 /// The host's roles, less those held inactive by a network it cannot use.
-pub(super) fn active_roles(h: &HostObj) -> BTreeSet<Role> {
+pub fn active_roles(h: &HostObj) -> BTreeSet<Role> {
     h.roles.iter().copied().filter(|r| !h.net.held_roles.contains_key(r)).collect()
 }
 
@@ -198,10 +203,11 @@ pub(super) fn agent(host: &HostId) -> Endpoint {
     Endpoint::new(Addr::Host(host.clone()), Svc::Agent)
 }
 
-/// `StartInstance` for `spec` on `host`, unless it was sent there less than [`RESEND_MS`] ago.
-fn start(v: &Volatile, now: SimTime, host: &HostId, spec: InstanceSpec) -> Option<Action> {
-    let recent = v.instance_started.get(&spec.id).is_some_and(|(h, at)| h == host && now < at + RESEND_MS);
-    (!recent).then(|| Action::Send(agent(host), mgmt(), Msg::StartInstance(spec)))
+/// `StartInstance` for instance `id` on `host`, with the spec `spec` builds,
+/// unless it was sent there less than [`RESEND_MS`] ago.
+fn start(v: &Volatile, now: SimTime, host: &HostId, id: &str, spec: impl FnOnce() -> InstanceSpec) -> Option<Action> {
+    let recent = v.instance_started.get(id).is_some_and(|(h, at)| h == host && now < at + RESEND_MS);
+    (!recent).then(|| Action::Send(agent(host), mgmt(), Msg::StartInstance(spec())))
 }
 
 fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> Vec<Action> {
@@ -233,7 +239,7 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
                     // Its volume lost its last healthy replica before the VM came up.
                     out.push(Action::Propose(Command::SetVmStatus { id: id.clone(), host: None, phase: VmPhase::Pending(why) }));
                 } else {
-                    out.extend(start(v, now, host, vm_spec(state, vm, host)));
+                    out.extend(start(v, now, host, &vm_instance(id), || vm_spec(state, vm, host)));
                 }
             }
             (VmPhase::Running, Some(host)) if missing(v, host, &vm_instance(id)) => {
@@ -283,6 +289,17 @@ fn flow(kind: FlowKind, to: FlowEnd, network: NetworkId, (min_mbps, max_mbps): (
     FlowSpec { kind, to, network, min_mbps, max_mbps }
 }
 
+/// What a pod of `d` runs as instance `id`: streams to the router if it
+/// transcodes, else a little traffic to the router.
+fn pod_spec(d: &Deployment, id: &str) -> InstanceSpec {
+    let (usage, flow) = if d.required_roles().contains(&Role::Transcode) {
+        (TRANSCODE_USAGE, flow(FlowKind::Transcode, FlowEnd::Router, mgmt(), (TRANSCODE_MBPS, TRANSCODE_MBPS)))
+    } else {
+        (POD_USAGE, flow(FlowKind::Pod, FlowEnd::Router, mgmt(), POD_MBPS))
+    };
+    InstanceSpec { id: id.into(), cpu_m: d.cpu_m, ram_mb: d.ram_mb, usage, flows: vec![flow] }
+}
+
 fn pods(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> Vec<Action> {
     let mut out = vec![];
     for ((dep, idx), pod) in &state.pods {
@@ -310,14 +327,7 @@ fn pods(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> 
                 if reported(v, host, &id) {
                     out.push(set(Some(host.clone()), PodPhase::Running));
                 } else {
-                    let transcode = d.required_roles().contains(&Role::Transcode);
-                    let (usage, flow) = if transcode {
-                        (TRANSCODE_USAGE, flow(FlowKind::Transcode, FlowEnd::Router, mgmt(), (TRANSCODE_MBPS, TRANSCODE_MBPS)))
-                    } else {
-                        (POD_USAGE, flow(FlowKind::Pod, FlowEnd::Router, mgmt(), POD_MBPS))
-                    };
-                    let spec = InstanceSpec { id, cpu_m: d.cpu_m, ram_mb: d.ram_mb, usage, flows: vec![flow] };
-                    out.extend(start(v, now, host, spec));
+                    out.extend(start(v, now, host, &id, || pod_spec(d, &id)));
                 }
             }
             (PodPhase::Running, Some(host)) if missing(v, host, &pod_instance(dep, *idx)) => {

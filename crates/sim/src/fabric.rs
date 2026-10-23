@@ -80,11 +80,26 @@ struct Attach {
 /// Switch-to-switch adjacency: (local port, neighbour, neighbour port).
 type SwitchGraph = BTreeMap<SwitchId, Vec<(PortName, SwitchId, PortName)>>;
 
+/// A switch-to-switch path query: (from, to, VLAN, MTU).
+type PathKey = (SwitchId, SwitchId, u16, u16);
+
 #[derive(Default)]
 struct GraphCache {
     /// The topology version the graphs were built at; `None` when invalidated.
     version: Option<u64>,
     graphs: HashMap<(u16, u16), SwitchGraph>,
+    /// [`Fabric::switch_path`] answers, which depend on nothing but the graphs
+    /// and switch state: the traffic model asks the same few every tick.
+    paths: HashMap<PathKey, Option<Vec<LinkHop>>>,
+}
+
+impl GraphCache {
+    /// Empties the cache if it was filled at another topology version.
+    fn validate(&mut self, version: u64) {
+        if self.version != Some(version) {
+            *self = GraphCache { version: Some(version), ..GraphCache::default() };
+        }
+    }
 }
 
 pub struct Fabric {
@@ -195,7 +210,17 @@ impl Fabric {
     /// carry `vlan` tagged at `mtu`, ties going to the lowest switch id.
     /// Empty when `a` is `b`; `None` if either is down or there is no path.
     pub fn switch_path(&self, a: &SwitchId, b: &SwitchId, vlan: u16, mtu: u16) -> Option<Vec<LinkHop>> {
-        self.find_path(&Station::Switch(a), &Station::Switch(b), vlan, mtu)
+        let key = (a.clone(), b.clone(), vlan, mtu);
+        {
+            let mut cache = self.graphs.borrow_mut();
+            cache.validate(self.world.topology.version);
+            if let Some(path) = cache.paths.get(&key) {
+                return path.clone();
+            }
+        }
+        let path = self.find_path(&Station::Switch(a), &Station::Switch(b), vlan, mtu);
+        self.graphs.borrow_mut().paths.insert(key, path.clone());
+        path
     }
 
     /// A gratuitous ARP from `host`: every switch it reaches on mgmt learns it.
@@ -348,10 +373,7 @@ impl Fabric {
     /// the topology changed since the cache was filled.
     fn with_graph<R>(&self, vlan: u16, mtu: u16, f: impl FnOnce(&SwitchGraph) -> R) -> R {
         let mut cache = self.graphs.borrow_mut();
-        let version = Some(self.world.topology.version);
-        if cache.version != version {
-            *cache = GraphCache { version, graphs: HashMap::new() };
-        }
+        cache.validate(self.world.topology.version);
         let g = cache.graphs.entry((vlan, mtu)).or_insert_with(|| self.build_graph(vlan, mtu));
         f(g)
     }
@@ -624,6 +646,25 @@ mod tests {
         assert!(!h1_h2(&f, 1, 1500), "stale graph still routes over the unplugged trunk");
         f.world_mut().topology.cable_up.insert(key);
         assert!(h1_h2(&f, 1, 1500));
+    }
+
+    #[test]
+    fn remembered_switch_paths_follow_topology_changes() {
+        let mut f = fabric(fixture());
+        let (a, b) = (sw("sw-a"), sw("sw-b"));
+        let trunk = vec![LinkHop { from: sp("sw-a", "p48"), to: sp("sw-b", "p48") }];
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), Some(trunk.clone()));
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), Some(trunk.clone()), "asked again: the remembered answer");
+        assert_eq!(f.switch_path(&a, &b, 30, 1500), None, "VLAN 30 is not on the trunk");
+        f.world_mut().topology.set_cable_up(&sp("sw-a", "p48"), false);
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), None, "the trunk is unplugged");
+        f.world_mut().topology.set_cable_up(&sp("sw-a", "p48"), true);
+        f.world_mut().topology.partition([PartitionMember::Switch(b.clone())].into());
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), None, "the trunk is cut");
+        f.world_mut().topology.heal_partitions();
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), Some(trunk));
+        f.world_mut().topology.set_switch_up(&b, false);
+        assert_eq!(f.switch_path(&a, &b, 1, 1500), None, "sw-b is down");
     }
 
     #[test]
