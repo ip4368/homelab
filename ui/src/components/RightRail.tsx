@@ -76,7 +76,7 @@ function PendingRow({ host, disabled, onSelect }: { host: HostObj; disabled: boo
           <RolePicker profile={host.profile} value={roles} onChange={setRoles} eligibleOnly />
           <div className="actions">
             <button
-              disabled={disabled || busy}
+              disabled={disabled || busy || roles.length === 0}
               onClick={() => run(() => op({ ApproveHost: { id: host.id, roles } }))}
             >
               Confirm approve

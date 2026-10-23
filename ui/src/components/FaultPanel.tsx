@@ -14,12 +14,14 @@ export function FaultPanel({ selected }: { selected: string | null }) {
   const [switchId, setSwitchId] = useState('')
   const [profile, setProfile] = useState<ProfileId>('Ms01')
   const [count, setCount] = useState(1)
-  const faultAction = useAction()
+  const hostAction = useAction()
+  const networkAction = useAction()
   const scenarioAction = useAction()
 
   // Switch ids are known from the ground truth only while a VIP table lists them; otherwise type one.
   const switchIds = Object.keys(truth.vip_owner_by_switch)
-  const inject = (f: Fault) => faultAction.run(() => fault(f))
+  const injectHost = (f: Fault) => hostAction.run(() => fault(f))
+  const injectNetwork = (f: Fault) => networkAction.run(() => fault(f))
   const needHost = selected === null
 
   return (
@@ -32,16 +34,17 @@ export function FaultPanel({ selected }: { selected: string | null }) {
           <div className="fault-group">
             <h4>Selected host{selected ? `: ${selected}` : ''}</h4>
             <div className="actions">
-              <button disabled={needHost || faultAction.busy} onClick={() => inject({ KillHost: { host: selected! } })}>
+              <button disabled={needHost || hostAction.busy} onClick={() => injectHost({ KillHost: { host: selected! } })}>
                 Kill host
               </button>
-              <button disabled={needHost || faultAction.busy} onClick={() => inject({ RestoreHost: { host: selected! } })}>
+              <button disabled={needHost || hostAction.busy} onClick={() => injectHost({ RestoreHost: { host: selected! } })}>
                 Restore host
               </button>
-              <button disabled={needHost || faultAction.busy} onClick={() => inject({ Partition: { nodes: [{ Host: selected! }] } })}>
+              <button disabled={needHost || hostAction.busy} onClick={() => injectHost({ Partition: { nodes: [{ Host: selected! }] } })}>
                 Partition host
               </button>
             </div>
+            {hostAction.error && <div className="bad">{hostAction.error}</div>}
           </div>
           <div className="fault-group">
             <h4>Network</h4>
@@ -59,17 +62,17 @@ export function FaultPanel({ selected }: { selected: string | null }) {
                 ))}
               </datalist>
               <button
-                disabled={switchId.trim() === '' || faultAction.busy}
-                onClick={() => inject({ Partition: { nodes: [{ Switch: switchId.trim() }] } })}
+                disabled={switchId.trim() === '' || networkAction.busy}
+                onClick={() => injectNetwork({ Partition: { nodes: [{ Switch: switchId.trim() }] } })}
               >
                 Partition switch
               </button>
-              <button disabled={faultAction.busy} onClick={() => inject('HealPartitions')}>
+              <button disabled={networkAction.busy} onClick={() => injectNetwork('HealPartitions')}>
                 Heal partitions
               </button>
               <span className="muted">{truth.partitions.length} active partition group(s)</span>
             </div>
-            {faultAction.error && <div className="bad">{faultAction.error}</div>}
+            {networkAction.error && <div className="bad">{networkAction.error}</div>}
           </div>
           <div className="fault-group">
             <h4>Scenarios</h4>
