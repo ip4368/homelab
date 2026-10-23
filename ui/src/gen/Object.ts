@@ -6,4 +6,4 @@ import type { Event } from "./Event";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
 
-export type Object = { "kind": "Host" } & HostObj | { "kind": "Token" } & JoinToken | { "kind": "Rule" } & AutoApproveRule | { "kind": "Alert" } & Alert | { "kind": "Event" } & Event | { "kind": "Cp" } & CpInfo;
+export type Object = { "type": "Host" } & HostObj | { "type": "Token" } & JoinToken | { "type": "Rule" } & AutoApproveRule | { "type": "Alert" } & Alert | { "type": "Event" } & Event | { "type": "Cp" } & CpInfo;

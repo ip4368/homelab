@@ -88,6 +88,7 @@ impl ClusterState {
                     lifecycle: Lifecycle::Pending,
                     roles: Default::default(),
                     labels: Default::default(),
+                    before_not_ready: None,
                     last_transition: at,
                     version: v,
                 };
@@ -109,7 +110,14 @@ impl ClusterState {
                 if !host.lifecycle.can_become(lifecycle) {
                     return Err(ApplyError::InvalidLifecycle);
                 }
-                host.lifecycle = lifecycle;
+                // Leaving NotReady for Ready means "recovered": go back to what
+                // the host was doing before it dropped out.
+                let next = match (host.lifecycle, lifecycle) {
+                    (Lifecycle::NotReady, Lifecycle::Ready) => host.before_not_ready.unwrap_or(Lifecycle::Ready),
+                    _ => lifecycle,
+                };
+                host.before_not_ready = (lifecycle == Lifecycle::NotReady).then_some(host.lifecycle);
+                host.lifecycle = next;
                 host.last_transition = at;
                 host.version = v;
             }
@@ -273,7 +281,7 @@ mod tests {
         let mut s = ClusterState::new();
         s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
         let v = serde_json::to_value(&s.changes_since(0).upserts[0]).unwrap();
-        assert_eq!(v["kind"], "Host");
+        assert_eq!(v["type"], "Host");
         assert_eq!(v["id"], "h1");
         assert_eq!(v["lifecycle"], "Pending");
     }
@@ -344,6 +352,86 @@ mod tests {
             s.apply(1, Command::SetLifecycle { id: hid("zz"), lifecycle: Lifecycle::Ready }),
             Err(ApplyError::NotFound)
         );
+    }
+
+    #[test]
+    fn not_ready_recovery_restores_prior_lifecycle() {
+        let set = |s: &mut ClusterState, l| s.apply(10, Command::SetLifecycle { id: hid("h1"), lifecycle: l });
+        // Ready -> NotReady -> Ready
+        let mut s = ClusterState::new();
+        ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+        set(&mut s, Lifecycle::NotReady).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].before_not_ready, Some(Lifecycle::Ready));
+        set(&mut s, Lifecycle::Ready).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Ready);
+        assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
+        // Cordoned, Draining and Drained hosts come back as they were
+        for prior in [Lifecycle::Cordoned, Lifecycle::Draining, Lifecycle::Drained] {
+            let mut s = ClusterState::new();
+            ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+            if prior == Lifecycle::Cordoned {
+                set(&mut s, Lifecycle::Cordoned).unwrap();
+            } else {
+                set(&mut s, Lifecycle::Draining).unwrap();
+                if prior == Lifecycle::Drained {
+                    set(&mut s, Lifecycle::Drained).unwrap();
+                }
+            }
+            set(&mut s, Lifecycle::NotReady).unwrap();
+            set(&mut s, Lifecycle::Ready).unwrap();
+            assert_eq!(s.hosts[&hid("h1")].lifecycle, prior);
+            assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
+        }
+        // leaving NotReady any other way clears the memory
+        let mut s = ClusterState::new();
+        ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+        set(&mut s, Lifecycle::Cordoned).unwrap();
+        set(&mut s, Lifecycle::NotReady).unwrap();
+        set(&mut s, Lifecycle::Draining).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
+        // a Provisioning host cannot go NotReady
+        let mut s = ClusterState::new();
+        s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        s.apply(2, Command::ApproveHost { id: hid("h1"), roles: roles(&[]) }).unwrap();
+        set(&mut s, Lifecycle::Provisioning).unwrap();
+        assert_eq!(set(&mut s, Lifecycle::NotReady), Err(ApplyError::InvalidLifecycle));
+    }
+
+    #[test]
+    fn every_object_variant_roundtrips_through_json() {
+        let mut s = ClusterState::new();
+        ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+        s.apply(5, Command::SetLifecycle { id: hid("h1"), lifecycle: Lifecycle::NotReady }).unwrap();
+        s.apply(5, Command::CreateJoinToken { token: "t".into(), ttl_ms: 9 }).unwrap();
+        s.apply(5, Command::UpsertRule {
+            id: "r".into(),
+            profile: ProfileId::Pi5,
+            roles: roles(&[Role::Compute]),
+            template: Some("x".into()),
+        })
+        .unwrap();
+        s.apply(5, Command::RaiseAlert {
+            id: "a".into(),
+            severity: Severity::Warning,
+            kind: "HostDown".into(),
+            entity: host_ref("h1"),
+            message: "m".into(),
+            ground_truth: false,
+        })
+        .unwrap();
+        s.apply(5, Command::Event { entity: host_ref("h1"), message: "e".into() }).unwrap();
+        s.apply(5, Command::SetCp { voters: [hid("h1")].into(), mode: CpMode::Auto }).unwrap();
+        let upserts = s.changes_since(0).upserts;
+        let kinds: Vec<_> = upserts.iter().map(|o| serde_json::to_value(o).unwrap()["type"].clone()).collect();
+        assert_eq!(kinds, ["Host", "Token", "Rule", "Alert", "Event", "Cp"]);
+        for o in upserts {
+            let json = serde_json::to_string(&o).unwrap();
+            let back: Object = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, o, "{json}");
+        }
+        // Alert keeps its own `kind` field next to the `type` tag
+        let alert = serde_json::to_value(Object::Alert(s.alerts["a"].clone())).unwrap();
+        assert_eq!((alert["type"].as_str(), alert["kind"].as_str()), (Some("Alert"), Some("HostDown")));
     }
 
     #[test]

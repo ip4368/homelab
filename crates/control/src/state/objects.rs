@@ -33,8 +33,10 @@ impl Lifecycle {
             (self, to),
             (Approved, Provisioning)
                 | (Provisioning, Ready)
-                | (Provisioning, NotReady)
                 | (Ready, NotReady)
+                | (Cordoned, NotReady)
+                | (Draining, NotReady)
+                | (Drained, NotReady)
                 | (Ready, Cordoned)
                 | (Ready, Draining)
                 | (NotReady, Ready)
@@ -58,6 +60,9 @@ pub struct HostObj {
     pub lifecycle: Lifecycle,
     pub roles: BTreeSet<Role>,
     pub labels: BTreeMap<String, String>,
+    /// The lifecycle the host was in when it went `NotReady`; `SetLifecycle`
+    /// back to `Ready` restores it. `None` unless the host is `NotReady`.
+    pub before_not_ready: Option<Lifecycle>,
     #[ts(type = "number")]
     pub last_transition: SimTime,
     #[ts(type = "number")]
@@ -169,7 +174,7 @@ impl ObjectRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(tag = "kind")]
+#[serde(tag = "type")]
 #[ts(export)]
 pub enum Object {
     Host(HostObj),

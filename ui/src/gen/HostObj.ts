@@ -5,4 +5,9 @@ import type { Inventory } from "./Inventory";
 import type { Lifecycle } from "./Lifecycle";
 import type { Role } from "./Role";
 
-export type HostObj = { id: HostId, profile: HardwareProfile, inventory: Inventory, location: string, lifecycle: Lifecycle, roles: Array<Role>, labels: { [key in string]: string }, last_transition: number, version: number, };
+export type HostObj = { id: HostId, profile: HardwareProfile, inventory: Inventory, location: string, lifecycle: Lifecycle, roles: Array<Role>, labels: { [key in string]: string }, 
+/**
+ * The lifecycle the host was in when it went `NotReady`; `SetLifecycle`
+ * back to `Ready` restores it. `None` unless the host is `NotReady`.
+ */
+before_not_ready: Lifecycle | null, last_transition: number, version: number, };
