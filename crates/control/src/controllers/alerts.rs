@@ -47,10 +47,11 @@ pub enum AlertKind {
     InsufficientStorageHosts,
     SwitchUnreachable,
     CpReplacementSuggested,
+    DrainBlocked,
 }
 
 impl AlertKind {
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::HostDown,
         Self::CpQuorumAtRisk,
         Self::VolumeFaulted,
@@ -65,6 +66,7 @@ impl AlertKind {
         Self::InsufficientStorageHosts,
         Self::SwitchUnreachable,
         Self::CpReplacementSuggested,
+        Self::DrainBlocked,
     ];
 
     /// The name an alert of this kind carries in `Alert::kind`.
@@ -84,6 +86,7 @@ impl AlertKind {
             Self::InsufficientStorageHosts => "InsufficientStorageHosts",
             Self::SwitchUnreachable => "SwitchUnreachable",
             Self::CpReplacementSuggested => "CpReplacementSuggested",
+            Self::DrainBlocked => "DrainBlocked",
         }
     }
 
@@ -103,7 +106,8 @@ impl AlertKind {
             | Self::LinkSpeedLow
             | Self::InsufficientStorageHosts
             | Self::SwitchUnreachable
-            | Self::CpReplacementSuggested => Severity::Warning,
+            | Self::CpReplacementSuggested
+            | Self::DrainBlocked => Severity::Warning,
         }
     }
 }

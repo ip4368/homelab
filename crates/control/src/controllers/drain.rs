@@ -31,18 +31,19 @@
 //!   [`DRAIN_BLOCKED`] alert on the draining host says which workload and
 //!   why; it is resolved once the drain gets past that (or is cancelled).
 
+use super::alerts::AlertKind;
 use super::scheduler::{agent, in_flight, reported, vm_spec, Hosts, RESEND_MS, STARTING};
 use super::storage::{excluded, storage_views};
 use super::{Action, Volatile};
 use crate::proto::{mgmt, vm_instance, Msg};
 use crate::runtime::SimTime;
-use crate::state::{ClusterState, Command, Lifecycle, ObjectKind, ObjectRef, Severity};
+use crate::state::{ClusterState, Command, Lifecycle, ObjectKind, ObjectRef};
 use model::{place_replicas, HostId, PlacementReq, PodPhase, PodStatus, ReplicaState, VmPhase, VmStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A live migration not complete this long after it began fails.
 pub const MIGRATION_TIMEOUT_MS: u64 = 120_000;
-pub const DRAIN_BLOCKED: &str = "DrainBlocked";
+pub const DRAIN_BLOCKED: &str = AlertKind::DrainBlocked.as_str();
 
 /// Moves migrations on and drains the draining hosts. The scheduler calls
 /// it with its host views, so placements of both count against each other,
@@ -257,20 +258,20 @@ fn alerts(state: &ClusterState, v: &Volatile, mut blocked: BTreeMap<HostId, Stri
         }
     }
     for (host, message) in blocked {
-        let prefix = format!("drainblocked-{host}-");
-        if in_flight(v, |c| matches!(c, Command::RaiseAlert { id, .. } if id.starts_with(&prefix))) {
+        let entity = ObjectRef::host(&host);
+        if in_flight(v, |c| matches!(c, Command::RaiseAlert { kind, entity: e, subject: None, .. } if kind == DRAIN_BLOCKED && *e == entity)) {
             continue;
         }
-        let base = format!("{prefix}{}", v.term);
+        let base = format!("drainblocked-{host}-{}", v.term);
         let id = (1..)
             .map(|n| if n == 1 { base.clone() } else { format!("{base}-{n}") })
             .find(|id| !state.alerts.contains_key(id))
             .expect("some id is free");
         out.push(Action::Propose(Command::RaiseAlert {
             id,
-            severity: Severity::Warning,
             kind: DRAIN_BLOCKED.into(),
-            entity: ObjectRef::host(&host),
+            entity,
+            subject: None,
             message,
             ground_truth: false,
         }));
