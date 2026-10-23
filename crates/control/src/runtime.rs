@@ -1,10 +1,13 @@
 //! The runtime interface: what an [`Actor`] can see and do. The simulator
 //! implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::Msg;
-use model::{HostId, NetworkId};
+use crate::proto::{LogCmd, Msg};
+use crate::raft::{Durable, DurableOp};
+use model::network::HostNetworkConfig;
+use model::{HostId, Inventory, NetworkId};
 use serde::{Deserialize, Serialize};
 use std::any::Any;
+use std::collections::BTreeMap;
 
 /// Simulated time in milliseconds since the start of the run.
 pub type SimTime = u64;
@@ -38,9 +41,33 @@ impl Endpoint {
     }
 }
 
-/// Host operating-system surface visible to an agent. Grows per task.
+/// Resource usage as the host OS measures it right now.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostUsage {
+    pub cpu_pct: f32,
+    pub ram_pct: f32,
+    /// Per disk name; failed disks are absent.
+    pub disk_pct: BTreeMap<String, f32>,
+    /// Per port name: (rx, tx) bits per second.
+    pub port_bps: BTreeMap<String, (f64, f64)>,
+}
+
+/// Host operating-system surface visible to the actors running on a host
+/// (its agent and CP replica). Grows per task.
 pub trait HostOs {
     fn host_id(&self) -> HostId;
+    /// The hardware as discovered now: catalogue profile, NIC link state, failed disks.
+    fn inventory(&self) -> Inventory;
+    fn apply_network(&mut self, cfg: HostNetworkConfig);
+    /// The network config the OS is running; empty if none was ever applied.
+    fn applied_network(&self) -> HostNetworkConfig;
+    fn usage(&mut self) -> HostUsage;
+    /// The CP replica state on this host's disk, if a replica ever ran here.
+    fn load_cp(&self) -> Option<Durable<LogCmd>>;
+    /// Writes a replica's initial state to disk, replacing whatever was there.
+    fn store_cp(&mut self, durable: Durable<LogCmd>);
+    /// Applies one Raft persist op to the stored state (no-op if none is stored).
+    fn persist_cp(&mut self, op: DurableOp<LogCmd>);
 }
 
 pub trait Ctx {

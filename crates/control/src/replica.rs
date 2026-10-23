@@ -2,12 +2,13 @@
 //! applying its committed entries. The leader claims the VIP, answers the API
 //! and syncs, and runs the controllers; followers only replicate.
 
-use crate::controllers::{self, Action, PendingApi, Volatile, FAILED_BACKOFF_MS};
+use crate::controllers::join::{self, JoinOutcome};
+use crate::controllers::{self, Action, PendingApi, PendingJoin, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle};
-use model::HostId;
+use model::{HostId, Inventory};
 use std::collections::BTreeSet;
 
 pub const RAFT_TICK_MS: u64 = 100;
@@ -22,6 +23,7 @@ const CONTROLLERS: u64 = 1;
 pub struct CpReplica {
     me: HostId,
     /// Consumed by `on_start`, which seeds the Raft node from the runtime RNG.
+    /// State stored on the host's disk takes precedence.
     init: Option<Durable<LogCmd>>,
     raft: Option<RaftNode<LogCmd>>,
     state: ClusterState,
@@ -31,7 +33,8 @@ pub struct CpReplica {
 
 impl CpReplica {
     /// `durable` is this replica's persisted Raft state, or `None` for a
-    /// fresh member with the bootstrap `voters`.
+    /// fresh member with the bootstrap `voters`. Either is only used when the
+    /// host has no stored CP state; otherwise the replica resumes from that.
     pub fn new(me: HostId, durable: Option<Durable<LogCmd>>, voters: BTreeSet<HostId>) -> Self {
         let init = durable.unwrap_or_else(|| Durable::new(voters));
         Self { me, init: Some(init), raft: None, state: ClusterState::new(), volatile: None }
@@ -62,9 +65,13 @@ impl CpReplica {
         for out in outs {
             match out {
                 RaftOut::Send(to, m) => ctx.send(Endpoint::new(Addr::Host(to), Svc::Cp), mgmt(), Msg::Raft(m)),
-                // The Raft node keeps the durable state in memory for now; the
-                // host OS will persist these ops so a restarted replica can reload them.
-                RaftOut::Persist(_) => {}
+                // On the host's disk before any later Send leaves, so a
+                // restarted replica resumes from it.
+                RaftOut::Persist(op) => {
+                    if let Some(os) = ctx.host() {
+                        os.persist_cp(op);
+                    }
+                }
                 RaftOut::BecameLeader(term) => {
                     self.volatile = Some(Volatile::new(ctx.now(), term));
                     ctx.claim_vip();
@@ -91,6 +98,11 @@ impl CpReplica {
             v.caught_up |= e.term == v.term;
             if let (Some(cmd), Some(Err(_))) = (v.in_flight.remove(&e.index), &result) {
                 v.failed.push((cmd, ctx.now()));
+            }
+            // An overwritten join (different term) gets no answer; the agent retries.
+            if let (Some(j), Some(r)) = (v.pending_joins.remove(&e.index).filter(|j| j.term == e.term), &result) {
+                let answer = r.as_ref().map(|_| ()).map_err(ToString::to_string);
+                ctx.send(j.from, mgmt(), Msg::JoinResp(answer));
             }
             let Some(p) = v.pending.remove(&e.index) else { continue };
             let answer = match result {
@@ -155,6 +167,33 @@ impl CpReplica {
         self.handle(ctx, outs);
     }
 
+    /// Only a leader with quorum and a caught-up state can judge a token or
+    /// know whether the host exists; anyone else stays silent and the agent retries.
+    fn on_join(&mut self, ctx: &mut dyn Ctx, from: Endpoint, token: String, inventory: Inventory) {
+        let now = ctx.now();
+        let Addr::Host(host) = from.addr.clone() else { return };
+        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
+        let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
+        match join::on_request(&self.state, v, now, &host, &token, inventory) {
+            JoinOutcome::Accepted => ctx.send(from, mgmt(), Msg::JoinResp(Ok(()))),
+            JoinOutcome::InProgress => {}
+            JoinOutcome::Add(cmd) => {
+                let term = raft.term();
+                let index = raft.propose(now, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
+                v.pending_joins.insert(index, PendingJoin { from, term });
+            }
+            JoinOutcome::Rejected { reason, event } => {
+                ctx.send(from, mgmt(), Msg::JoinResp(Err(reason)));
+                if let Some(cmd) = event {
+                    raft.propose(now, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
+                }
+            }
+        }
+        // `propose` returns no effects; flush them now.
+        let outs = self.raft().tick(now);
+        self.handle(ctx, outs);
+    }
+
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
         let now = ctx.now();
         let raft = self.raft.as_ref().expect("on_start runs before anything else");
@@ -197,7 +236,14 @@ fn arm(ctx: &mut dyn Ctx, token: u64) {
 
 impl Actor for CpReplica {
     fn on_start(&mut self, ctx: &mut dyn Ctx) {
-        let durable = self.init.take().expect("on_start runs once");
+        let init = self.init.take().expect("on_start runs once");
+        let durable = match ctx.host() {
+            Some(os) => os.load_cp().unwrap_or_else(|| {
+                os.store_cp(init.clone());
+                init
+            }),
+            None => init,
+        };
         self.raft = Some(RaftNode::new(self.me.clone(), durable, RaftConfig::default(), ctx.rand_u64()));
         arm(ctx, TICK);
         arm(ctx, CONTROLLERS);
@@ -216,9 +262,22 @@ impl Actor for CpReplica {
                     v.last_heartbeat.insert(host, now);
                 }
             }
+            Msg::JoinRequest { token, inventory } => self.on_join(ctx, from, token, inventory),
+            Msg::Metrics { host, sample } => {
+                if let Some(v) = &mut self.volatile
+                    && self.state.hosts.contains_key(&host)
+                {
+                    v.metrics.insert(host, sample);
+                }
+            }
             Msg::Api { req, op } => self.on_api(ctx, from, req, op),
             Msg::Sync { since } => self.on_sync(ctx, from, since),
-            Msg::Ping(_) | Msg::Pong(_) | Msg::ApiResp { .. } | Msg::SyncResp { .. } => {}
+            Msg::Ping(_)
+            | Msg::Pong(_)
+            | Msg::ApiResp { .. }
+            | Msg::SyncResp { .. }
+            | Msg::JoinResp(_)
+            | Msg::Approved { .. } => {}
         }
     }
 
@@ -247,6 +306,8 @@ mod tests {
     #[derive(Default)]
     struct FakeCtx {
         now: SimTime,
+        /// Everything sent except Raft traffic.
+        sent: Vec<(Endpoint, Msg)>,
     }
 
     impl Ctx for FakeCtx {
@@ -256,7 +317,11 @@ mod tests {
         fn me(&self) -> Endpoint {
             Endpoint::new(Addr::Host(hid("h1")), Svc::Cp)
         }
-        fn send(&mut self, _: Endpoint, _: NetworkId, _: Msg) {}
+        fn send(&mut self, to: Endpoint, _: NetworkId, msg: Msg) {
+            if !matches!(msg, Msg::Raft(_)) {
+                self.sent.push((to, msg));
+            }
+        }
         fn set_timer(&mut self, _: u64, _: u64) {}
         fn rand_u64(&mut self) -> u64 {
             1
@@ -355,6 +420,34 @@ mod tests {
             message: "down".into(),
             ground_truth: false,
         }
+    }
+
+    #[test]
+    fn join_is_answered_once_the_host_is_added() {
+        let mut rig = Rig::new(vec![Command::CreateJoinToken { token: "tok".into(), ttl_ms: 60_000 }]);
+        rig.elect();
+        rig.ack();
+        let m1 = Endpoint::new(Addr::Host(hid("m1")), Svc::Agent);
+        let join = |rig: &mut Rig, token: &str| {
+            let inventory = Inventory::from_profile(ProfileId::MiniPc, 0);
+            let msg = Msg::JoinRequest { token: token.into(), inventory };
+            rig.r.on_message(&mut rig.ctx, m1.clone(), msg);
+            std::mem::take(&mut rig.ctx.sent)
+        };
+        assert!(join(&mut rig, "tok").is_empty(), "no answer before the host exists");
+        assert!(join(&mut rig, "tok").is_empty(), "a retry while in flight");
+        assert!(matches!(rig.proposed().as_slice(), [Command::AddPendingHost { id, .. }] if *id == hid("m1")));
+        rig.ack();
+        assert_eq!(std::mem::take(&mut rig.ctx.sent), [(m1.clone(), Msg::JoinResp(Ok(())))]);
+        assert_eq!(rig.r.state.hosts[&hid("m1")].lifecycle, Lifecycle::Pending);
+        assert_eq!(join(&mut rig, "tok"), [(m1.clone(), Msg::JoinResp(Ok(())))], "known host: answered at once");
+        assert_eq!(rig.proposed().len(), 1);
+
+        let m2 = Endpoint::new(Addr::Host(hid("m2")), Svc::Agent);
+        let msg = Msg::JoinRequest { token: "bad".into(), inventory: Inventory::from_profile(ProfileId::MiniPc, 0) };
+        rig.r.on_message(&mut rig.ctx, m2.clone(), msg);
+        assert_eq!(rig.ctx.sent, [(m2, Msg::JoinResp(Err("invalid token".into())))]);
+        assert!(matches!(rig.proposed().last(), Some(Command::Event { message, .. }) if message.contains("join rejected")));
     }
 
     #[test]

@@ -3,11 +3,14 @@
 //! delivered in insertion order, so runs are fully deterministic per seed.
 
 use crate::fabric::Fabric;
+use crate::world::HostHw;
 use control::client::{ClientActor, ClusterView, CLIENT};
-use control::proto::{ApiOp, ApiResult, Msg};
+use control::proto::{ApiOp, ApiResult, LogCmd, Msg};
+use control::raft::{Durable, DurableOp};
 use control::replica::CpReplica;
-use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, Svc, SimTime};
-use model::{HostId, NetworkId};
+use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, Svc, SimTime};
+use model::network::HostNetworkConfig;
+use model::{HostId, Inventory, NetworkId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::any::Any;
@@ -141,8 +144,63 @@ impl Ctx for EngineCtx<'_> {
         }
     }
     fn host(&mut self) -> Option<&mut dyn HostOs> {
-        // No host OS is modelled yet; later tasks attach one per host.
-        None
+        // Only actors on a host the world knows have an OS to talk to.
+        if self.hw().is_some() { Some(self) } else { None }
+    }
+}
+
+/// The world's host `me` runs on, if the fabric is installed and knows it.
+fn host_hw<'d>(deliver: &'d mut dyn Deliver, me: &Endpoint) -> Option<&'d mut HostHw> {
+    let Addr::Host(h) = &me.addr else { return None };
+    (deliver as &mut dyn Any).downcast_mut::<Fabric>()?.world_mut().hosts.get_mut(h)
+}
+
+const NO_HOST: &str = "Ctx::host only hands out the OS of a host the world knows";
+
+impl EngineCtx<'_> {
+    fn fabric(&self) -> Option<&Fabric> {
+        (self.core.deliver.as_ref() as &dyn Any).downcast_ref()
+    }
+
+    fn hw(&self) -> Option<&HostHw> {
+        let Addr::Host(h) = &self.me.addr else { return None };
+        self.fabric()?.world().hosts.get(h)
+    }
+
+    fn hw_mut(&mut self) -> &mut HostHw {
+        host_hw(self.core.deliver.as_mut(), &self.me).expect(NO_HOST)
+    }
+}
+
+/// The OS of the host an actor runs on: a view of that host in the world.
+impl HostOs for EngineCtx<'_> {
+    fn host_id(&self) -> HostId {
+        let Addr::Host(h) = &self.me.addr else { panic!("{NO_HOST}") };
+        h.clone()
+    }
+    fn inventory(&self) -> Inventory {
+        self.fabric().and_then(|f| f.world().inventory(&self.host_id())).expect(NO_HOST)
+    }
+    fn apply_network(&mut self, cfg: HostNetworkConfig) {
+        self.hw_mut().applied_net = cfg;
+    }
+    fn applied_network(&self) -> HostNetworkConfig {
+        self.hw().expect(NO_HOST).applied_net.clone()
+    }
+    fn usage(&mut self) -> HostUsage {
+        let core = &mut *self.core;
+        host_hw(core.deliver.as_mut(), &self.me).expect(NO_HOST).usage(&mut core.rng)
+    }
+    fn load_cp(&self) -> Option<Durable<LogCmd>> {
+        self.hw().expect(NO_HOST).cp_durable.clone()
+    }
+    fn store_cp(&mut self, durable: Durable<LogCmd>) {
+        self.hw_mut().cp_durable = Some(durable);
+    }
+    fn persist_cp(&mut self, op: DurableOp<LogCmd>) {
+        if let Some(d) = &mut self.hw_mut().cp_durable {
+            d.apply(op);
+        }
     }
 }
 

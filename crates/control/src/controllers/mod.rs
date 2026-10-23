@@ -9,6 +9,7 @@
 //! lags what earlier leaders committed.
 
 pub mod health;
+pub mod join;
 
 use crate::proto::{MetricSample, Msg};
 use crate::runtime::{Endpoint, SimTime};
@@ -38,6 +39,15 @@ pub struct PendingApi {
     pub proposed_at: SimTime,
 }
 
+/// A join waiting for its `AddPendingHost` to commit and apply.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingJoin {
+    /// The agent to answer.
+    pub from: Endpoint,
+    /// As for [`PendingApi::term`].
+    pub term: u64,
+}
+
 /// The leader's memory outside the log. Rebuilt from nothing by every new
 /// leader, by design.
 #[derive(Debug, Clone, PartialEq)]
@@ -52,6 +62,10 @@ pub struct Volatile {
     pub metrics: BTreeMap<HostId, MetricSample>,
     /// Client requests by log index.
     pub pending: BTreeMap<u64, PendingApi>,
+    /// Joins by log index.
+    pub pending_joins: BTreeMap<u64, PendingJoin>,
+    /// When a "join rejected" event was last recorded, per host.
+    pub join_rejected_at: BTreeMap<HostId, SimTime>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -67,6 +81,8 @@ impl Volatile {
             last_heartbeat: BTreeMap::new(),
             metrics: BTreeMap::new(),
             pending: BTreeMap::new(),
+            pending_joins: BTreeMap::new(),
+            join_rejected_at: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -89,5 +105,7 @@ impl Volatile {
 }
 
 pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<Action> {
-    health::run(state, volatile, now)
+    let mut out = health::run(state, volatile, now);
+    out.extend(join::run(state, volatile));
+    out
 }

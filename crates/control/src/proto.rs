@@ -4,7 +4,7 @@
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
 use crate::state::{Changes, Command};
-use model::{HostId, NetworkId, ProfileId, Role};
+use model::{HostId, Inventory, NetworkId, ProfileId, Role};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -77,6 +77,14 @@ pub enum Msg {
     Raft(RaftMsg<LogCmd>),
     /// Agent to the VIP. `lifecycle_seen` is the host-object version the agent last saw.
     Heartbeat { host: HostId, lifecycle_seen: u64 },
+    /// Unjoined agent to the VIP, retried until answered `Ok`.
+    JoinRequest { token: String, inventory: Inventory },
+    /// Leader to agent: `Ok` once the host object exists.
+    JoinResp(Result<(), String>),
+    /// Leader to agent: the host was approved with these roles.
+    Approved { roles: BTreeSet<Role> },
+    /// Agent to the VIP, every metrics interval.
+    Metrics { host: HostId, sample: MetricSample },
     /// Client to the VIP; `req` is the client's id for matching the reply.
     Api { req: u64, op: ApiOp },
     ApiResp { req: u64, result: ApiResult },

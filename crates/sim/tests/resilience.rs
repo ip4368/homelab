@@ -4,11 +4,15 @@
 mod common;
 
 use common::*;
+use control::agent::HostAgent;
 use control::proto::{ApiOp, ApiResult};
+use control::replica::CpReplica;
 use control::state::{Lifecycle, ObjectRef};
+use model::{HostId, ProfileId, Role};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
 use sim::topology::NodeGroupKey;
+use std::collections::BTreeSet;
 
 #[test]
 fn three_replicas_elect_and_claim_vip() {
@@ -118,4 +122,104 @@ fn heartbeat_loss_marks_not_ready_and_recovery_restores() {
     for h in HOSTS.iter().map(|h| hid(h)).filter(|h| *h != victim) {
         assert_eq!(e.client_view().state.hosts[&h].lifecycle, Lifecycle::Ready);
     }
+}
+
+fn lifecycle(e: &Engine, h: &HostId) -> Option<Lifecycle> {
+    e.client_view().state.hosts.get(h).map(|o| o.lifecycle)
+}
+
+#[test]
+fn join_pending_then_approve() {
+    let mut e = engine(6);
+    elect(&mut e, 6000);
+    let token = join_token(&mut e);
+    let m1 = boot_host(&mut e, "m1", ProfileId::MiniPc, 0, Some(token));
+    let deadline = e.now() + 10_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &m1) == Some(Lifecycle::Pending)), "m1 never showed up Pending");
+    let host = &e.client_view().state.hosts[&m1];
+    assert_eq!(host.inventory.profile, ProfileId::MiniPc);
+    assert!(host.inventory.nics.iter().any(|n| n.name == "eth0" && n.link_up), "{:?}", host.inventory.nics);
+    assert_eq!(host.location, "unknown", "the join path knows no location yet");
+
+    // No rule matches a mini PC here: it waits for a human.
+    e.run_for(10_000);
+    assert_eq!(lifecycle(&e, &m1), Some(Lifecycle::Pending));
+
+    let roles: BTreeSet<Role> = [Role::Compute, Role::Storage].into();
+    e.api(ApiOp::ApproveHost { id: m1.clone(), roles: roles.clone() });
+    let deadline = e.now() + 15_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &m1) == Some(Lifecycle::Ready)), "approved m1 never became Ready");
+    assert_eq!(e.client_view().state.hosts[&m1].roles, roles);
+    assert_eq!(e.actor::<HostAgent>(&agent(&m1)).unwrap().roles(), &roles, "the agent learned its roles");
+
+    // Joined agents report metrics, which reach the client through the leader.
+    let deadline = e.now() + 12_000;
+    assert!(e.run_until(deadline, |e| e.client_view().metrics.contains_key(&m1)), "no metrics from m1");
+    let sample = &e.client_view().metrics[&m1];
+    assert!((3.0..10.0).contains(&sample.cpu_pct), "{sample:?}");
+    assert!(sample.disk_pct.contains_key("nvme0"), "{sample:?}");
+}
+
+#[test]
+fn invalid_token_rejected() {
+    let mut e = engine(7);
+    elect(&mut e, 6000);
+    let bad = boot_host(&mut e, "bad", ProfileId::MiniPc, 0, Some("not-a-token".into()));
+    e.run_for(20_000);
+    let view = e.client_view();
+    assert!(!view.state.hosts.contains_key(&bad), "a host joined with an unknown token");
+    let rejected: Vec<_> = view.state.events.values().filter(|ev| ev.message.contains("join rejected")).collect();
+    // The agent retried every 5 s; rejections are logged at most once a minute per host.
+    assert_eq!(rejected.len(), 1, "{rejected:?}");
+    assert_eq!(rejected[0].entity, ObjectRef::host(&bad));
+}
+
+#[test]
+fn auto_approve_rk3588() {
+    let mut e = engine(8);
+    elect(&mut e, 6000);
+    let roles: BTreeSet<Role> = [Role::Transcode, Role::Compute].into();
+    api_ok(&mut e, ApiOp::UpsertRule { id: "sbc".into(), profile: ProfileId::Rk3588, roles: roles.clone(), template: None });
+    let token = join_token(&mut e);
+    let rk = boot_host(&mut e, "rk1", ProfileId::Rk3588, 0, Some(token));
+    // No ApproveHost from here on: the rule does it.
+    let deadline = e.now() + 20_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &rk) == Some(Lifecycle::Ready)), "rk1 never became Ready");
+    assert_eq!(e.client_view().state.hosts[&rk].roles, roles);
+}
+
+#[test]
+fn auto_approve_drops_ineligible_roles_with_an_event() {
+    let mut e = engine(9);
+    elect(&mut e, 6000);
+    let roles: BTreeSet<Role> = [Role::Storage, Role::Transcode].into();
+    api_ok(&mut e, ApiOp::UpsertRule { id: "sbc".into(), profile: ProfileId::Rk3588, roles, template: None });
+    let token = join_token(&mut e);
+    // Variant 0 has only eMMC, so it cannot store.
+    let rk = boot_host(&mut e, "rk1", ProfileId::Rk3588, 0, Some(token));
+    let deadline = e.now() + 20_000;
+    assert!(e.run_until(deadline, |e| lifecycle(e, &rk) == Some(Lifecycle::Ready)), "rk1 never became Ready");
+    let view = e.client_view();
+    assert_eq!(view.state.hosts[&rk].roles, [Role::Transcode].into());
+    let dropped: Vec<_> = view.state.events.values().filter(|ev| ev.message.contains("Storage")).collect();
+    assert_eq!(dropped.len(), 1, "one event per dropped role: {dropped:?}");
+    assert_eq!(dropped[0].entity, ObjectRef::host(&rk));
+}
+
+#[test]
+fn replica_state_is_stored_on_its_host_and_reloaded() {
+    let mut e = engine(10);
+    let leader = elect(&mut e, 6000);
+    e.api(ApiOp::Cordon { id: leader.clone() });
+    e.run_for(2000);
+    for h in HOSTS.map(hid) {
+        let live = e.actor::<CpReplica>(&cp(&h)).unwrap().durable().clone();
+        assert_eq!(e.fabric().world().hosts[&h].cp_durable.as_ref(), Some(&live), "{h}'s disk lags its replica");
+    }
+    // A replica started with nothing picks up what its host stored.
+    let follower = HOSTS.map(hid).into_iter().find(|h| *h != leader).unwrap();
+    let len = e.replica_log_len(&follower).unwrap();
+    e.kill(&cp(&follower));
+    e.spawn(cp(&follower), Box::new(CpReplica::new(follower.clone(), None, BTreeSet::new())));
+    assert_eq!(e.replica_log_len(&follower), Some(len));
 }

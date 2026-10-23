@@ -336,7 +336,7 @@ mod tests {
     use control::proto::Msg;
     use control::runtime::{Actor, Addr, Ctx, SimTime, Svc};
     use model::network::{Attachment, Link, LinkKind};
-    use model::{PortName, ProfileId, SwitchId, profile};
+    use model::{PortName, ProfileId, SwitchId};
     use std::sync::{Arc, Mutex};
 
     fn h(id: &str) -> HostId {
@@ -388,7 +388,7 @@ mod tests {
         t.connect(hp(H2, "eth0"), sp("sw-b", "p1"));
         t.connect(Node::Client, sp("sw-a", "p2"));
         for id in [H1, H2] {
-            w.hosts.insert(h(id), HostHw::new(profile(ProfileId::MiniPc, 0)));
+            w.hosts.insert(h(id), HostHw::new(ProfileId::MiniPc, 0));
         }
         w
     }

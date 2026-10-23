@@ -1,8 +1,10 @@
 //! Shared fixture: one switch, three MS-01 hosts each running a CP replica
 //! and a heartbeat-only agent stub, and the UI client on the same switch.
+//! Spare switch ports take hosts booted later with [`boot_host`].
 
+use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
-use control::proto::{mgmt, LogCmd, Msg};
+use control::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg};
 use control::raft::{Durable, Entry, EntryPayload};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, Svc};
@@ -16,6 +18,7 @@ use std::collections::BTreeSet;
 
 pub const HOSTS: [&str; 3] = ["h1", "h2", "h3"];
 pub const SWITCH: &str = "sw-1";
+pub const SWITCH_PORTS: usize = 8;
 pub const HEARTBEAT_MS: u64 = 5000;
 
 pub fn hid(s: &str) -> HostId {
@@ -50,13 +53,13 @@ impl Actor for HeartbeatStub {
 fn world() -> World {
     let mut w = World::new();
     let access = SwitchPortCfg { mode: PortMode::Access(1), mtu: 9216, lacp_group: None, admin_up: true };
-    let ports = (1..=4).map(|i| (PortName::new(format!("p{i}")), (2_500, access.clone()))).collect();
+    let ports = (1..=SWITCH_PORTS).map(|i| (PortName::new(format!("p{i}")), (2_500, access.clone()))).collect();
     let sw = SwitchId::from(SWITCH);
     w.topology.add_switch(Switch { id: sw.clone(), model: "test-switch".into(), ports, mlag_peer: None, up: true });
     for (i, h) in HOSTS.iter().enumerate() {
         let port = Node::SwitchPort(sw.clone(), PortName::new(format!("p{}", i + 1)));
         w.topology.connect(Node::HostPort(hid(h), PortName::from("eth0")), port);
-        w.hosts.insert(hid(h), HostHw::new(profile(ProfileId::Ms01, 0)));
+        w.hosts.insert(hid(h), HostHw::new(ProfileId::Ms01, 0));
     }
     w.topology.connect(Node::Client, Node::SwitchPort(sw, PortName::from("p4")));
     w
@@ -120,4 +123,38 @@ pub fn elect(e: &mut Engine, within_ms: u64) -> HostId {
     let deadline = e.now() + within_ms;
     assert!(e.run_until(deadline, |e| vip_leader(e).is_some()), "no leader with the VIP by t={deadline}");
     vip_leader(e).unwrap()
+}
+
+/// Submits `op` through the client and returns its `Ok` value; panics on
+/// any other answer, or none within 3 s.
+pub fn api_ok(e: &mut Engine, op: ApiOp) -> serde_json::Value {
+    let req = e.api(op);
+    e.run_for(3000);
+    match e.take_api_results().as_slice() {
+        [(r, ApiResult::Ok(v))] if *r == req => v.clone(),
+        other => panic!("expected Ok for request {req}, got {other:?}"),
+    }
+}
+
+/// A fresh join token from the leader.
+pub fn join_token(e: &mut Engine) -> String {
+    match api_ok(e, ApiOp::CreateJoinToken) {
+        serde_json::Value::String(t) => t,
+        other => panic!("expected a token string, got {other}"),
+    }
+}
+
+/// Plugs a new host's `eth0` into the first free switch port and boots its
+/// agent with `token`, as a technician would.
+pub fn boot_host(e: &mut Engine, id: &str, p: ProfileId, variant: u8, token: Option<String>) -> HostId {
+    let host = hid(id);
+    let w = e.deliver_mut::<Fabric>().unwrap().world_mut();
+    let free = (1..=SWITCH_PORTS)
+        .map(|i| Node::SwitchPort(SwitchId::from(SWITCH), PortName::new(format!("p{i}"))))
+        .find(|port| w.topology.peer(port).is_none())
+        .expect("a free switch port");
+    w.topology.connect(Node::HostPort(host.clone(), PortName::from("eth0")), free);
+    w.hosts.insert(host.clone(), HostHw::new(p, variant));
+    e.spawn(agent(&host), Box::new(HostAgent::new(token)));
+    host
 }
