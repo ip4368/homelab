@@ -230,15 +230,19 @@ pub enum RolloutState {
         #[ts(type = "number")]
         until: SimTime,
     },
-    /// Stopped by a failure in the current batch, or by the user.
+    /// Stopped by a failure or an unready host in the current batch, or by the user.
     Paused { reason: String },
     Done,
+    /// Given up: the change was taken back.
+    Aborted,
 }
 
 /// A change rolled out to its affected hosts batch by batch: batch `k` is
 /// `hosts[k * batch_size..]`, at most `batch_size` of them. The change itself
 /// applied when the rollout started; hosts whose batch has not started stay
-/// on their `pinned_config`.
+/// on their `pinned_config`. Skipped hosts (not ready at the start, or when
+/// the user resumed past them) stay pinned until the rollout finishes, then
+/// render whatever the template or network is by then.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct Rollout {
@@ -250,6 +254,12 @@ pub struct Rollout {
     pub state: RolloutState,
     /// Hosts of the current batch that failed or reverted the new config.
     pub failed: Vec<HostId>,
+    /// Hosts the change concerns that the rollout does not wait for: not ready.
+    pub skipped: Vec<HostId>,
+    /// The template or network the change replaced; `None` if it created it.
+    pub previous: Option<Change>,
+    /// The overrides of included overridden hosts, dropped by a template change.
+    pub dropped_overrides: BTreeMap<HostId, HostNetworkConfig>,
     #[ts(type = "number")]
     pub soak_ms: u64,
     /// Each current-batch host's desired generation when its batch started
@@ -272,9 +282,9 @@ impl Rollout {
         &self.hosts[start..(start + size).min(self.hosts.len())]
     }
 
-    /// Running, soaking or paused: not yet done.
+    /// Running, soaking or paused: not yet finished.
     pub fn is_active(&self) -> bool {
-        self.state != RolloutState::Done
+        !matches!(self.state, RolloutState::Done | RolloutState::Aborted)
     }
 }
 

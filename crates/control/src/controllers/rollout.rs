@@ -2,20 +2,21 @@
 //! affects a batch at a time (design §6).
 //!
 //! - [`preview`] shows what the change would do, on a copy of the state:
-//!   the hosts it affects, those with an override (skipped unless included),
-//!   what validating their new configs finds, and the switch-side changes needed.
-//! - [`start`] builds the `StartRollout` that applies the change and pins
-//!   every affected host to its current config until its batch starts.
-//! - [`run`] drives the rollout that is not done: once every host of the
-//!   current batch applied a generation newer than when its batch started, the
-//!   batch soaks, then the next one starts; a host that failed or reverted it
-//!   pauses the rollout. The rollout lives in the log, so a new leader picks
-//!   it up at the same batch.
+//!   the hosts it affects, those with an override (skipped unless included)
+//!   and those not ready (skipped), what validating the new configs finds,
+//!   and the switch-side changes needed.
+//! - `StartRollout` applies the change and pins every concerned host to its
+//!   current config until its batch starts ([`concerned`] decides, at apply time).
+//! - [`run`] drives the rollout that is running or soaking: once every host
+//!   of the current batch applied a generation newer than when its batch
+//!   started, the batch soaks, then the next one starts. A host that failed
+//!   or reverted it, or that is not ready, pauses the rollout. The rollout
+//!   lives in the log, so a new leader picks it up at the same batch.
 
 use super::network::{address_owners, managed, render_fresh, render_host, suggestion, validate_config};
 use super::Action;
 use crate::runtime::SimTime;
-use crate::state::{Change, ClusterState, Command, NetState, Rollout, RolloutState};
+use crate::state::{Change, ClusterState, Command, Lifecycle, NetState, Rollout, RolloutState};
 use model::network::LogicalNetwork;
 use model::{HostId, Issue};
 use serde::{Deserialize, Serialize};
@@ -29,10 +30,12 @@ pub const DEFAULT_SOAK_S: u32 = 30;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct Preview {
-    /// Hosts whose config the change alters, without an override.
+    /// Ready hosts whose config the change alters, without an override.
     pub affected: Vec<HostId>,
     /// Hosts the change concerns that have an override: skipped unless included.
     pub overridden: Vec<HostId>,
+    /// Hosts whose config the change alters that are not ready: skipped.
+    pub skipped: Vec<HostId>,
     /// What validating each affected host's new config finds, for hosts with issues.
     pub issues: BTreeMap<HostId, Vec<Issue>>,
     /// The switch port changes those issues call for, each once.
@@ -55,13 +58,21 @@ fn with_change(state: &ClusterState, change: &Change) -> ClusterState {
     after
 }
 
-/// The managed hosts `change` concerns, in id order: those without an
-/// override whose config it alters, and those with one. A template concerns
-/// the hosts provisioned on it; a network, the hosts whose config attaches
-/// it, unless the network is unchanged.
-pub fn affected(state: &ClusterState, change: &Change) -> (Vec<HostId>, Vec<HostId>) {
+/// The managed hosts a change concerns, each list in id order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Concerned {
+    /// Without an override, and whose config the change alters.
+    pub affected: Vec<HostId>,
+    /// With an override.
+    pub overridden: Vec<HostId>,
+}
+
+/// The managed hosts `change` concerns. A template concerns the hosts
+/// provisioned on it; a network, the hosts whose config attaches it, unless
+/// the network is unchanged.
+pub fn concerned(state: &ClusterState, change: &Change) -> Concerned {
     let after = with_change(state, change);
-    let (mut affected, mut overridden) = (vec![], vec![]);
+    let mut c = Concerned { affected: vec![], overridden: vec![] };
     for host in state.hosts.values().filter(|h| managed(h.lifecycle)) {
         let concerned = match change {
             Change::Template(t) => {
@@ -75,17 +86,19 @@ pub fn affected(state: &ClusterState, change: &Change) -> (Vec<HostId>, Vec<Host
         };
         match (concerned, host.override_.is_some()) {
             (false, _) => {}
-            (true, false) => affected.push(host.id.clone()),
-            (true, true) => overridden.push(host.id.clone()),
+            (true, false) => c.affected.push(host.id.clone()),
+            (true, true) => c.overridden.push(host.id.clone()),
         }
     }
-    (affected, overridden)
+    c
 }
 
 /// What `change` would do, judged on a copy of the state with it applied.
 /// Hosts whose cabling was never observed are not judged.
 pub fn preview(state: &ClusterState, change: &Change) -> Preview {
-    let (affected, overridden) = affected(state, change);
+    let Concerned { affected, overridden } = concerned(state, change);
+    let ready = |h: &HostId| state.hosts[h].lifecycle != Lifecycle::NotReady;
+    let (affected, skipped): (Vec<HostId>, Vec<HostId>) = affected.into_iter().partition(ready);
     let after = with_change(state, change);
     let networks: Vec<LogicalNetwork> = after.networks.values().map(|n| n.network.clone()).collect();
     let owners = address_owners(&after);
@@ -103,7 +116,7 @@ pub fn preview(state: &ClusterState, change: &Change) -> Preview {
             issues.insert(host.id.clone(), found);
         }
     }
-    Preview { affected, overridden, issues, switch_changes }
+    Preview { affected, overridden, skipped, issues, switch_changes }
 }
 
 /// Whether fixing `issue` means changing a switch port.
@@ -115,26 +128,19 @@ fn switch_side(issue: &Issue) -> bool {
     }
 }
 
-/// The command that starts rolling `change` out as rollout `id`: to the
-/// affected hosts, and the overridden ones too if `include_overridden`.
-pub fn start(state: &ClusterState, id: String, change: Change, include_overridden: bool, batch_pct: u8, soak_s: u32) -> Command {
-    let (mut hosts, overridden) = affected(state, &change);
-    if include_overridden {
-        hosts.extend(overridden);
-        hosts.sort();
-    }
-    let batch_size = batch_size(hosts.len(), batch_pct);
-    Command::StartRollout { id, change, hosts, batch_size, soak_ms: u64::from(soak_s) * 1000 }
-}
-
 pub fn run(state: &ClusterState, now: SimTime) -> Vec<Action> {
     let active = |r: &&Rollout| matches!(r.state, RolloutState::Running | RolloutState::Soaking { .. });
     let Some(r) = state.rollouts.values().find(active) else { return vec![] };
     let mut out = vec![];
-    let mut failed = vec![];
+    let (mut failed, mut not_ready) = (vec![], vec![]);
     let mut applied = true;
-    // Hosts gone or no longer managed have nothing to apply.
-    for host in r.batch(r.current_batch).iter().filter_map(|h| state.hosts.get(h)).filter(|h| managed(h.lifecycle)) {
+    // Hosts gone, no longer managed or skipped have nothing to apply.
+    let batch = r.batch(r.current_batch).iter().filter(|h| !r.skipped.contains(h)).filter_map(|h| state.hosts.get(h));
+    for host in batch.filter(|h| managed(h.lifecycle)) {
+        if host.lifecycle == Lifecycle::NotReady {
+            not_ready.push(host.id.clone());
+            continue;
+        }
         let base = r.base_generation.get(&host.id).copied().unwrap_or(0);
         if host.net.desired_generation <= base {
             // Usually the network controller asks for the same command, as the
@@ -152,14 +158,18 @@ pub fn run(state: &ClusterState, now: SimTime) -> Vec<Action> {
     }
     let id = r.id.clone();
     let batch = r.current_batch;
+    let reason = |hosts: &[HostId], what: &str| {
+        let names: Vec<String> = hosts.iter().map(ToString::to_string).collect();
+        format!("batch {} of {}: {} {what}", batch + 1, r.batches(), names.join(", "))
+    };
     let next = if !failed.is_empty() {
-        let names: Vec<String> = failed.iter().map(ToString::to_string).collect();
-        let reason = format!("batch {} of {}: {} failed or reverted", batch + 1, r.batches(), names.join(", "));
-        Some(Command::PauseRollout { id, reason, failed })
+        Some(Command::PauseRollout { id: id.clone(), reason: reason(&failed, "failed or reverted"), failed })
+    } else if !not_ready.is_empty() {
+        Some(Command::PauseRollout { id: id.clone(), reason: reason(&not_ready, "not ready"), failed: vec![] })
     } else {
         match r.state {
-            RolloutState::Running if applied => Some(Command::SoakRollout { id, batch }),
-            RolloutState::Soaking { until } if now >= until => Some(Command::AdvanceRollout { id, batch }),
+            RolloutState::Running if applied => Some(Command::SoakRollout { id: id.clone(), batch }),
+            RolloutState::Soaking { until } if now >= until => Some(Command::AdvanceRollout { id: id.clone(), batch }),
             _ => None,
         }
     };
@@ -225,8 +235,8 @@ mod tests {
 
     /// One controller period of the network and rollout controllers, with
     /// their proposals applied (identical ones once, as the replica does).
-    /// Agents answer every push with `answer`.
-    fn step(s: &mut ClusterState, v: &mut Volatile, now: SimTime, answer: impl Fn(&HostId) -> NetworkResult) {
+    /// Agents answer every push with `answer`; `None` is an agent that is down.
+    fn step(s: &mut ClusterState, v: &mut Volatile, now: SimTime, answer: impl Fn(&HostId) -> Option<NetworkResult>) {
         let mut out = network::run(s, v, now);
         out.extend(run(s, now));
         let mut done: Vec<Command> = vec![];
@@ -234,17 +244,27 @@ mod tests {
             match a {
                 Action::Propose(c) if !done.contains(&c) => {
                     done.push(c.clone());
-                    let _ = s.apply(now, c);
+                    // A duplicate rollout step finds the rollout moved on; nothing else may fail.
+                    match s.apply(now, c.clone()) {
+                        Ok(()) | Err(ApplyError::InvalidRolloutState) => {}
+                        Err(e) => panic!("{c:?} failed: {e}"),
+                    }
                 }
                 Action::Propose(_) => {}
                 Action::Send(to, _, msg) => {
                     v.note_sent(&to, &msg, now);
-                    if let (crate::runtime::Addr::Host(h), crate::proto::Msg::ApplyNetwork { generation, .. }) = (&to.addr, &msg) {
-                        v.net_results.insert(h.clone(), (*generation, answer(h)));
+                    if let (crate::runtime::Addr::Host(h), crate::proto::Msg::ApplyNetwork { generation, .. }) = (&to.addr, &msg)
+                        && let Some(result) = answer(h)
+                    {
+                        v.net_results.insert(h.clone(), (*generation, result));
                     }
                 }
             }
         }
+    }
+
+    fn start(id: &str, change: Change, include_overridden: bool, batch_pct: u8) -> Command {
+        Command::StartRollout { id: id.into(), change, include_overridden, batch_pct, soak_ms: 30_000 }
     }
 
     fn rollout(s: &ClusterState) -> &Rollout {
@@ -259,8 +279,8 @@ mod tests {
         s.hosts[&hid(h)].net.applied.as_ref().unwrap().links[0].mtu
     }
 
-    fn ok(_: &HostId) -> NetworkResult {
-        NetworkResult::Applied
+    fn ok(_: &HostId) -> Option<NetworkResult> {
+        Some(NetworkResult::Applied)
     }
 
     #[test]
@@ -272,17 +292,21 @@ mod tests {
     fn affected_hosts_are_the_ones_whose_config_changes() {
         let mut s = state(3);
         s.apply(0, Command::SetHostOverride { host: hid("m2"), config: Some(template("minipc-standard").config) }).unwrap();
-        assert_eq!(affected(&s, &Change::Template(minipc_mtu(1500))), (vec![hid("m1"), hid("m3")], vec![hid("m2")]));
-        assert_eq!(affected(&s, &Change::Template(template("minipc-standard"))), (vec![], vec![hid("m2")]), "unchanged");
+        let affected = |s: &ClusterState, change| {
+            let c = concerned(s, &change);
+            (c.affected, c.overridden)
+        };
+        assert_eq!(affected(&s, Change::Template(minipc_mtu(1500))), (vec![hid("m1"), hid("m3")], vec![hid("m2")]));
+        assert_eq!(affected(&s, Change::Template(template("minipc-standard"))), (vec![], vec![hid("m2")]), "unchanged");
 
         // A network concerns every host attaching it, unless it is unchanged.
         let mut storage = seed_networks().into_iter().find(|n| n.id.as_str() == "storage").unwrap();
-        assert_eq!(affected(&s, &Change::Network(storage.clone())), (vec![], vec![]));
+        assert_eq!(affected(&s, Change::Network(storage.clone())), (vec![], vec![]));
         storage.vlan = 21;
-        assert_eq!(affected(&s, &Change::Network(storage)), (vec![hid("m1"), hid("m3")], vec![hid("m2")]));
+        assert_eq!(affected(&s, Change::Network(storage)), (vec![hid("m1"), hid("m3")], vec![hid("m2")]));
         let mut mgmt = seed_networks().remove(0);
         mgmt.mtu = 1400;
-        assert_eq!(affected(&s, &Change::Network(mgmt)).0, [hid("m1"), hid("m3"), hid("p1")]);
+        assert_eq!(affected(&s, Change::Network(mgmt)).0, [hid("m1"), hid("m3"), hid("p1")]);
     }
 
     #[test]
@@ -307,12 +331,11 @@ mod tests {
     #[test]
     fn a_rollout_applies_the_change_and_pins_hosts_until_their_batch() {
         let mut s = state(5);
-        let cmd = start(&s, "r".into(), Change::Template(minipc_mtu(1500)), false, 40, 30);
-        let Command::StartRollout { hosts, batch_size, soak_ms, .. } = &cmd else { panic!() };
-        assert_eq!((hosts.len(), *batch_size, *soak_ms), (5, 2, 30_000));
-        s.apply(100, cmd).unwrap();
+        s.apply(100, start("r", Change::Template(minipc_mtu(1500)), false, 40)).unwrap();
         assert_eq!(s.templates["minipc-standard"].template, minipc_mtu(1500));
         let r = rollout(&s);
+        assert_eq!((r.hosts.len(), r.batch_size, r.soak_ms), (5, 2, 30_000));
+        assert_eq!(r.previous, Some(Change::Template(template("minipc-standard"))));
         assert_eq!((r.current_batch, &r.state, r.batches()), (0, &RolloutState::Running, 3));
         assert_eq!(r.base_generation, [(hid("m1"), 1), (hid("m2"), 1)].into());
         assert!(s.hosts[&hid("m1")].net.pinned_config.is_none());
@@ -328,7 +351,7 @@ mod tests {
     #[test]
     fn batches_soak_then_advance_until_done() {
         let mut s = state(5);
-        s.apply(0, start(&s, "r".into(), Change::Template(minipc_mtu(1500)), false, 40, 30)).unwrap();
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 40)).unwrap();
         let mut v = Volatile::new(0, 1);
         step(&mut s, &mut v, 1000, ok); // render
         step(&mut s, &mut v, 2000, ok); // push; the agents answer
@@ -357,9 +380,9 @@ mod tests {
     #[test]
     fn a_failure_pauses_and_resume_retries_the_failed_hosts() {
         let mut s = state(5);
-        s.apply(0, start(&s, "r".into(), Change::Template(minipc_mtu(1500)), false, 40, 30)).unwrap();
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 40)).unwrap();
         let mut v = Volatile::new(0, 1);
-        let m2_reverts = |h: &HostId| if *h == hid("m2") { NetworkResult::Reverted } else { NetworkResult::Applied };
+        let m2_reverts = |h: &HostId| Some(if *h == hid("m2") { NetworkResult::Reverted } else { NetworkResult::Applied });
         for now in [1000, 2000, 3000, 4000] {
             step(&mut s, &mut v, now, m2_reverts);
         }
@@ -375,7 +398,7 @@ mod tests {
 
         // A pause or a second rollout is refused meanwhile.
         assert_eq!(s.apply(60_000, Command::PauseRollout { id: "r".into(), reason: "x".into(), failed: vec![] }), Err(ApplyError::InvalidRolloutState));
-        let other = start(&s, "r2".into(), Change::Template(template("sbc-transcode")), false, 10, 30);
+        let other = start("r2", Change::Template(template("sbc-transcode")), false, 10);
         let err = s.apply(60_000, other).unwrap_err();
         assert_eq!(err.to_string(), "rollout r in progress");
 
@@ -394,7 +417,7 @@ mod tests {
         let mut s = state(2);
         let mut storage = seed_networks().into_iter().find(|n| n.id.as_str() == "storage").unwrap();
         storage.mtu = 8000;
-        s.apply(0, start(&s, "r".into(), Change::Network(storage.clone()), false, 50, 30)).unwrap();
+        s.apply(0, start("r", Change::Network(storage.clone()), false, 50)).unwrap();
         assert_eq!(s.networks[&NetworkId::from("storage")].network, storage);
         let mut v = Volatile::new(0, 1);
         for now in [1000, 2000, 3000, 4000] {
@@ -414,10 +437,10 @@ mod tests {
         let mut v = Volatile::new(0, 1);
         step(&mut s, &mut v, 0, ok);
         assert_eq!(mtu(&s, "m2"), 9100);
-        let cmd = start(&s, "r".into(), Change::Template(minipc_mtu(1500)), true, 50, 30);
-        assert!(matches!(&cmd, Command::StartRollout { hosts, .. } if *hosts == [hid("m1"), hid("m2")]));
-        s.apply(1000, cmd).unwrap();
+        s.apply(1000, start("r", Change::Template(minipc_mtu(1500)), true, 50)).unwrap();
+        assert_eq!(rollout(&s).hosts, [hid("m1"), hid("m2")]);
         assert_eq!(s.hosts[&hid("m2")].override_, None);
+        assert_eq!(rollout(&s).dropped_overrides.keys().collect::<Vec<_>>(), [&hid("m2")]);
         step(&mut s, &mut v, 2000, ok);
         assert_eq!(mtu(&s, "m2"), 9100, "pinned until its batch");
         let mut now = 2000;
@@ -431,7 +454,10 @@ mod tests {
     #[test]
     fn an_override_set_mid_rollout_replaces_the_pin() {
         let mut s = state(2);
-        s.apply(0, start(&s, "r".into(), Change::Template(minipc_mtu(1500)), false, 50, 30)).unwrap();
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 50)).unwrap();
+        // Clearing an override (here: none) leaves a waiting host waiting.
+        s.apply(1, Command::SetHostOverride { host: hid("m2"), config: None }).unwrap();
+        assert!(s.hosts[&hid("m2")].net.pinned_config.is_some());
         s.apply(1, Command::SetHostOverride { host: hid("m2"), config: Some(template("sbc-transcode").config) }).unwrap();
         assert!(s.hosts[&hid("m2")].net.pinned_config.is_none());
         assert_eq!(network::render_host(&s, &s.hosts[&hid("m2")]).links[0].mtu, 1500);
@@ -440,7 +466,7 @@ mod tests {
     #[test]
     fn rollout_commands_check_state_and_batch() {
         let mut s = state(4);
-        s.apply(0, start(&s, "r".into(), Change::Template(minipc_mtu(1500)), false, 50, 30)).unwrap();
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 50)).unwrap();
         let cmd = |c: Command, s: &mut ClusterState| s.apply(10, c);
         assert_eq!(cmd(Command::AdvanceRollout { id: "r".into(), batch: 0 }, &mut s), Err(ApplyError::InvalidRolloutState), "not soaking");
         assert_eq!(cmd(Command::SoakRollout { id: "r".into(), batch: 1 }, &mut s), Err(ApplyError::InvalidRolloutState), "not that batch");
@@ -457,12 +483,95 @@ mod tests {
         cmd(Command::AdvanceRollout { id: "r".into(), batch: 1 }, &mut s).unwrap();
         assert_eq!(rollout(&s).state, RolloutState::Done);
         // Done: a new rollout may start, and the old one stays as history.
-        s.apply(20, start(&s, "r2".into(), Change::Template(minipc_mtu(1400)), false, 50, 30)).unwrap();
+        s.apply(20, start("r2", Change::Template(minipc_mtu(1400)), false, 50)).unwrap();
         assert_eq!(s.rollouts.len(), 2);
         // A rollout with no hosts is done at once.
-        let empty = Command::StartRollout { id: "r3".into(), change: Change::Template(template("ms01-standard")), hosts: vec![], batch_size: 1, soak_ms: 0 };
         let mut t = state(1);
-        t.apply(0, empty).unwrap();
-        assert_eq!(rollout(&t).state, RolloutState::Done);
+        t.apply(0, start("r3", Change::Template(template("ms01-standard")), false, 10)).unwrap();
+        assert_eq!((rollout(&t).hosts.len(), &rollout(&t).state), (0, &RolloutState::Done));
+        // The batch must be 1 to 100 percent.
+        let mut t = state(1);
+        for pct in [0, 101] {
+            assert_eq!(t.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, pct)), Err(ApplyError::InvalidBatchPct(pct)));
+        }
+        assert!(t.rollouts.is_empty() && t.templates["minipc-standard"].template == template("minipc-standard"));
+    }
+
+    #[test]
+    fn hosts_are_chosen_and_pinned_when_the_rollout_applies() {
+        let mut s = state(3);
+        // m3 is down and m4 joins after the leader proposed: both decided at apply time.
+        s.apply(0, Command::SetLifecycle { id: hid("m3"), lifecycle: Lifecycle::NotReady }).unwrap();
+        let p = preview(&s, &Change::Template(minipc_mtu(1500)));
+        assert_eq!((p.affected, p.skipped), (vec![hid("m1"), hid("m2")], vec![hid("m3")]));
+        let cmd = start("r", Change::Template(minipc_mtu(1500)), false, 50);
+        let mut later = state(4);
+        later.apply(0, Command::SetLifecycle { id: hid("m3"), lifecycle: Lifecycle::NotReady }).unwrap();
+        later.apply(0, cmd).unwrap();
+        let r = rollout(&later);
+        assert_eq!((r.hosts.clone(), r.skipped.clone()), (vec![hid("m1"), hid("m2"), hid("m4")], vec![hid("m3")]));
+        assert!(later.hosts[&hid("m3")].net.pinned_config.is_some(), "a skipped host waits for the rollout to finish");
+        // A host with no desired config yet is not pinned to nothing.
+        let mut fresh = state(2);
+        fresh.hosts.get_mut(&hid("m2")).unwrap().net = Default::default();
+        fresh.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 50)).unwrap();
+        assert!(fresh.hosts[&hid("m2")].net.pinned_config.is_none());
+        assert_eq!(network::render_host(&fresh, &fresh.hosts[&hid("m2")]).links[0].mtu, 1500);
+    }
+
+    #[test]
+    fn an_unready_host_pauses_and_resume_skips_it() {
+        let mut s = state(4);
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), false, 50)).unwrap();
+        s.apply(0, Command::SetLifecycle { id: hid("m2"), lifecycle: Lifecycle::NotReady }).unwrap();
+        let mut v = Volatile::new(0, 1);
+        let answer = |h: &HostId| (*h != hid("m2")).then_some(NetworkResult::Applied);
+        for now in [1000, 2000, 3000, 4000] {
+            step(&mut s, &mut v, now, answer);
+        }
+        let r = rollout(&s);
+        assert_eq!(r.state, RolloutState::Paused { reason: "batch 1 of 2: m2 not ready".into() });
+        assert!(r.failed.is_empty());
+        s.apply(5000, Command::ResumeRollout { id: "r".into() }).unwrap();
+        assert_eq!(rollout(&s).skipped, [hid("m2")]);
+        assert_eq!(mtu(&s, "m2"), 1500, "rendered when its batch started");
+        let mut now = 5000;
+        while rollout(&s).state != RolloutState::Done && now < 200_000 {
+            now += 1000;
+            assert_eq!(network::render_host(&s, &s.hosts[&hid("m2")]).links[0].mtu, 9000, "pinned to what it last applied");
+            step(&mut s, &mut v, now, answer);
+        }
+        assert_eq!(rollout(&s).state, RolloutState::Done);
+        assert!(s.hosts[&hid("m2")].net.pinned_config.is_none(), "unpinned once the rollout is done");
+    }
+
+    #[test]
+    fn abort_takes_the_change_back() {
+        let mut s = state(4);
+        let mut ov = template("minipc-standard").config;
+        ov.links[0].mtu = 9100;
+        s.apply(0, Command::SetHostOverride { host: hid("m4"), config: Some(ov.clone()) }).unwrap();
+        let mut v = Volatile::new(0, 1);
+        step(&mut s, &mut v, 0, ok);
+        step(&mut s, &mut v, 1, ok);
+        s.apply(0, start("r", Change::Template(minipc_mtu(1500)), true, 50)).unwrap();
+        let m1_reverts = |h: &HostId| Some(if *h == hid("m1") { NetworkResult::Reverted } else { NetworkResult::Applied });
+        for now in [1000, 2000, 3000, 4000] {
+            step(&mut s, &mut v, now, m1_reverts);
+        }
+        assert!(matches!(rollout(&s).state, RolloutState::Paused { .. }));
+        s.apply(5000, Command::AbortRollout { id: "r".into() }).unwrap();
+        assert_eq!(rollout(&s).state, RolloutState::Aborted);
+        assert_eq!(s.templates["minipc-standard"].template, template("minipc-standard"));
+        assert_eq!(s.hosts[&hid("m4")].override_, Some(ov));
+        assert!(s.hosts.values().all(|h| h.net.pinned_config.is_none()));
+        assert_eq!(s.apply(5000, Command::AbortRollout { id: "r".into() }), Err(ApplyError::InvalidRolloutState));
+        for now in (6..20).map(|i| i * 1000) {
+            step(&mut s, &mut v, now, ok);
+        }
+        let mtus: Vec<u16> = ["m1", "m2", "m3", "m4"].map(|h| applied_mtu(&s, h)).into();
+        assert_eq!(mtus, [9000, 9000, 9000, 9100], "everyone is back on the old config");
+        assert!(s.hosts.values().all(|h| h.net.state == NetState::Applied), "the reverted host too");
+        s.apply(20_000, start("r2", Change::Template(minipc_mtu(1400)), false, 50)).unwrap();
     }
 }

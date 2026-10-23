@@ -7,13 +7,17 @@ import type { Issue } from "./Issue";
  */
 export type Preview = { 
 /**
- * Hosts whose config the change alters, without an override.
+ * Ready hosts whose config the change alters, without an override.
  */
 affected: Array<HostId>, 
 /**
  * Hosts the change concerns that have an override: skipped unless included.
  */
 overridden: Array<HostId>, 
+/**
+ * Hosts whose config the change alters that are not ready: skipped.
+ */
+skipped: Array<HostId>, 
 /**
  * What validating each affected host's new config finds, for hosts with issues.
  */

@@ -81,6 +81,8 @@ pub enum ApiOp {
     },
     PauseRollout { id: String },
     ResumeRollout { id: String },
+    /// Gives a rollout up and takes its change back.
+    AbortRollout { id: String },
 }
 
 fn default_batch_pct() -> u8 {

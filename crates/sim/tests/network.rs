@@ -544,3 +544,62 @@ fn rollout_survives_leader_failover() {
         assert_eq!(host_obj(&e, &h).unwrap().net.desired_generation, generation, "{h} was pushed again");
     }
 }
+
+#[test]
+fn an_aborted_rollout_puts_the_old_config_back() {
+    let mut e = settled_fleet(54);
+    let original = seed_template(&e, "sbc-transcode");
+    let mut t = original.clone();
+    t.config.attachments[0].tagged = true;
+    let before = e.client_view().state.clone();
+    let id = start_rollout(&mut e, Change::Template(t));
+    let paused = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Paused { .. });
+    assert!(e.run_until(e.now() + 60_000, paused), "{:?}", rollout(&e, &id));
+    // Resuming retries the broken config: the hosts lose mgmt again (long
+    // enough to go NotReady, or to revert), and the rollout pauses again.
+    assert!(matches!(api_answer(&mut e, ApiOp::ResumeRollout { id: id.clone() }), ApiResult::Ok(_)));
+    assert!(e.run_until(e.now() + 2000, |e| !paused(e)), "the view never showed the resume");
+    assert!(e.run_until(e.now() + 60_000, paused), "{:?}", rollout(&e, &id));
+
+    assert!(matches!(api_answer(&mut e, ApiOp::AbortRollout { id: id.clone() }), ApiResult::Ok(_)));
+    assert!(e.run_until(e.now() + 2000, |e| rollout(e, &id).state == RolloutState::Aborted), "{:?}", rollout(&e, &id));
+    assert_eq!(seed_template(&e, "sbc-transcode"), original);
+    let r = rollout(&e, &id);
+    let converged = |e: &Engine| {
+        r.hosts.iter().all(|h| {
+            let o = host_obj(e, h).unwrap();
+            let want = before.hosts[h].net.desired.as_ref().unwrap();
+            o.net.state == NetState::Applied && o.net.desired.as_ref() == Some(want) && e.fabric().world().hosts[h].applied_net == *want
+        })
+    };
+    // Hosts still on trial of the broken config revert first (30 s), then take the old one.
+    assert!(e.run_until(e.now() + 60_000, converged), "{:?}", r.hosts.iter().map(|h| host_obj(&e, h).unwrap().net.state).collect::<Vec<_>>());
+    assert!(e.client_view().state.hosts.values().all(|h| h.net.pinned_config.is_none()));
+
+    // A new rollout may start.
+    let change = Change::Template(minipc_mtu_1500(&e));
+    let next = start_rollout(&mut e, change);
+    assert_eq!(rollout(&e, &next).state, RolloutState::Running);
+}
+
+#[test]
+fn a_dead_host_in_the_batch_pauses_the_rollout() {
+    let mut e = settled_fleet(55);
+    // minipc-02 is in the first batch; it dies just before the rollout starts.
+    let dead = hid("minipc-02");
+    e.fault(Fault::KillHost { host: dead.clone() }).unwrap();
+    let change = Change::Template(minipc_mtu_1500(&e));
+    let id = start_rollout(&mut e, change);
+    assert_eq!(rollout(&e, &id).batch(0), [hid("minipc-01"), dead.clone(), hid("minipc-03")]);
+    let paused = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Paused { .. });
+    assert!(e.run_until(e.now() + 60_000, paused), "{:?}", rollout(&e, &id));
+    let RolloutState::Paused { reason } = rollout(&e, &id).state else { unreachable!() };
+    assert_eq!(reason, "batch 1 of 8: minipc-02 not ready");
+
+    // Resumed: the dead host is skipped and the batch soaks without it.
+    assert!(matches!(api_answer(&mut e, ApiOp::ResumeRollout { id: id.clone() }), ApiResult::Ok(_)));
+    assert!(e.run_until(e.now() + 2000, |e| !paused(e)), "the view never showed the resume");
+    let soaking = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Soaking { .. });
+    assert!(e.run_until(e.now() + 10_000, soaking), "{:?}", rollout(&e, &id));
+    assert_eq!(rollout(&e, &id).skipped, [dead]);
+}

@@ -290,11 +290,13 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> H
         }
         ApiOp::StartRollout { change, include_overridden, batch_pct, soak_s } => {
             let id = format!("rollout-{term}-{}", ctx.now());
-            let cmd = rollout::start(state, id.clone(), change, include_overridden, batch_pct, soak_s);
+            let soak_ms = u64::from(soak_s) * 1000;
+            let cmd = Command::StartRollout { id: id.clone(), change, include_overridden, batch_pct, soak_ms };
             return Handling::Propose(cmd, serde_json::Value::String(id));
         }
         ApiOp::PauseRollout { id } => Command::PauseRollout { id, reason: "paused by the user".into(), failed: vec![] },
         ApiOp::ResumeRollout { id } => Command::ResumeRollout { id },
+        ApiOp::AbortRollout { id } => Command::AbortRollout { id },
         ApiOp::ApproveHost { id, roles } => Command::ApproveHost { id, roles },
         ApiOp::SetRoles { id, roles } => Command::SetRoles { id, roles },
         ApiOp::SetLabels { id, labels } => Command::SetLabels { id, labels },
