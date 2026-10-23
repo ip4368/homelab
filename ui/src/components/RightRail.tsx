@@ -45,6 +45,38 @@ function Alerts({ onSelect }: { onSelect(id: string): void }) {
   )
 }
 
+/** VMs the simulator sees running on several hosts at once. The control plane cannot see this, so it is shown only with the ground-truth overlay. */
+function SplitBrain() {
+  const alerts = useStore((s) => s.truth.alerts)
+  const items = useMemo(
+    () => alerts.filter((a) => a.kind === 'VmSplitBrain').sort((a, b) => (a.resolved_at === null ? 0 : 1) - (b.resolved_at === null ? 0 : 1) || b.raised_at - a.raised_at),
+    [alerts],
+  )
+  return (
+    <div className="truth-section">
+      <h4>
+        Split-brain <span className="truth-label">ground truth</span>
+      </h4>
+      {items.length === 0 ? (
+        <p className="muted">No VM is running in two places.</p>
+      ) : (
+        <ul className="rail-list">
+          {items.map((a) => (
+            <li key={a.id} className={a.resolved_at === null ? '' : 'resolved'}>
+              <span className={`sev sev-${a.severity}`}>{a.severity}</span> <strong>{a.kind}</strong> <span className="muted">{a.entity.id}</span>
+              <div>{a.message}</div>
+              <div className="muted">
+                {formatClock(a.raised_at)}
+                {a.resolved_at !== null && ` — resolved ${formatClock(a.resolved_at)}`}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  )
+}
+
 function Events() {
   const events = useStore((s) => s.view.events)
   const shown = useMemo(() => events.slice(-EVENTS_SHOWN).reverse(), [events])
@@ -143,7 +175,7 @@ function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
   )
 }
 
-export function RightRail({ onSelect }: { onSelect(id: string): void }) {
+export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void; showTruth: boolean }) {
   const [tab, setTab] = useState<Tab>('Alerts')
   const activeAlerts = useStore((s) => s.view.alerts)
   const hosts = useStore((s) => s.view.hosts)
@@ -166,6 +198,7 @@ export function RightRail({ onSelect }: { onSelect(id: string): void }) {
         ))}
       </div>
       <div className="rail-body">
+        {tab === 'Alerts' && showTruth && <SplitBrain />}
         {tab === 'Alerts' && <Alerts onSelect={onSelect} />}
         {tab === 'Events' && <Events />}
         {tab === 'Pending joins' && <PendingJoins onSelect={onSelect} />}

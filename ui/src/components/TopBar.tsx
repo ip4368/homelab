@@ -35,7 +35,7 @@ function Stat({ label, value, tone }: { label: string; value: string | number; t
   )
 }
 
-export function TopBar() {
+export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowTruth(on: boolean): void }) {
   const hosts = useStore((s) => s.view.hosts)
   const alerts = useStore((s) => s.view.alerts)
   const cp = useStore((s) => s.view.cp)
@@ -80,6 +80,9 @@ export function TopBar() {
         />
         <Stat label="Alerts" value={activeAlerts} tone={activeAlerts > 0 ? 'warn' : undefined} />
         <div className="spacer" />
+        <label className="inline truth-toggle" title="Overlay what the simulator knows but the control plane does not">
+          <input type="checkbox" checked={showTruth} onChange={(e) => onShowTruth(e.target.checked)} /> Ground truth
+        </label>
         {connection === 'connecting' && <span className="muted">connecting…</span>}
         {error && <span className="bad">{error}</span>}
         <span className="clock" title="simulated time">

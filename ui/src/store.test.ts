@@ -196,6 +196,74 @@ describe('store', () => {
     expect(s.getState().view.rollouts).toEqual({})
   })
 
+  it('stores workloads from snapshots and deltas, pods keyed "<deployment>/<idx>"', () => {
+    const dep = (replicas: number) => ({ version: replicas, id: 'web', image: 'nginx', replicas, cpu_m: 100, ram_mb: 64, selector: { roles: [], capability_prefix: null } })
+    const pod = (idx: number, host: string | null) => ({ version: 1, deployment: 'web', idx, host, phase: 'Running' })
+    const vm = { version: 1, id: 'vm1', vcpu: 2, ram_mb: 2048, disk_gb: 20, networks: ['vm-lan'], volume: 'vol1' }
+    const vmStatus = (host: string | null) => ({ id: 'vm1', version: 2, host, phase: 'Running', since: 5 })
+    const vol = { version: 1, id: 'vol1', size_gb: 20, replicas: 3 }
+    const volStatus = (health: string) => ({ id: 'vol1', version: 2, replicas: [], health })
+    const s = createStore()
+    s.applyMessage(snapshot({ deployments: [dep(2)], pods: [pod(0, 'a'), pod(1, null)], vms: [vm], vm_status: [vmStatus('a')], volumes: [vol], volume_status: [volStatus('Degraded')] } as never))
+    let v = s.getState().view
+    expect(v.deployments.web.replicas).toBe(2)
+    expect(Object.keys(v.pods).sort()).toEqual(['web/0', 'web/1'])
+    expect(v.vms.vm1.volume).toBe('vol1')
+    expect(v.vmStatus.vm1.host).toBe('a')
+    expect(v.volumes.vol1.size_gb).toBe(20)
+    expect(v.volumeStatus.vol1.health).toBe('Degraded')
+
+    s.applyMessage(
+      delta({
+        upserts: [
+          { type: 'Deployment', ...dep(3) },
+          { type: 'Pod', ...pod(1, 'b') },
+          { type: 'Pod', ...pod(2, 'a') },
+          { type: 'VmStatus', ...vmStatus('b') },
+          { type: 'VolumeStatus', ...volStatus('Healthy') },
+        ] as never,
+      }),
+    )
+    v = s.getState().view
+    expect(v.deployments.web.replicas).toBe(3)
+    expect(v.deployments.web).not.toHaveProperty('type')
+    expect(v.pods['web/1'].host).toBe('b')
+    expect(v.pods['web/2'].host).toBe('a')
+    expect(v.pods['web/1']).not.toHaveProperty('type')
+    expect(v.vmStatus.vm1.host).toBe('b')
+    expect(v.volumeStatus.vol1.health).toBe('Healthy')
+
+    s.applyMessage(
+      delta({
+        removed: [
+          { kind: 'Pod', id: 'web/2' },
+          { kind: 'Vm', id: 'vm1' },
+          { kind: 'VmStatus', id: 'vm1' },
+          { kind: 'Volume', id: 'vol1' },
+          { kind: 'VolumeStatus', id: 'vol1' },
+          { kind: 'Deployment', id: 'web' },
+        ],
+      }),
+    )
+    const after = s.getState().view
+    expect(Object.keys(after.pods).sort()).toEqual(['web/0', 'web/1'])
+    expect([after.deployments, after.vms, after.vmStatus, after.volumes, after.volumeStatus].map((r) => Object.keys(r).length)).toEqual([0, 0, 0, 0, 0])
+    s.applyMessage(snapshot())
+    expect(s.getState().view.pods).toEqual({})
+  })
+
+  it('a delta without workload changes keeps the workload slices', () => {
+    const s = createStore()
+    s.applyMessage(snapshot())
+    const before = s.getState().view
+    s.applyMessage(delta())
+    const after = s.getState().view
+    expect([after.deployments, after.pods, after.vms, after.vmStatus, after.volumes, after.volumeStatus]).toEqual(
+      [before.deployments, before.pods, before.vms, before.vmStatus, before.volumes, before.volumeStatus],
+    )
+    expect(after.pods).toBe(before.pods)
+  })
+
   it('keeps events ordered by seq and capped at the newest EVENT_CAP', () => {
     const s = createStore()
     s.applyMessage(snapshot())

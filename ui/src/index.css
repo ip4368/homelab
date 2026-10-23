@@ -737,3 +737,117 @@ ul.problems {
   max-height: 160px;
   overflow: auto;
 }
+
+/* Ground-truth overlay: hatching where the control plane's view and the simulator disagree. */
+.tile.truth-diff {
+  background-image: repeating-linear-gradient(45deg, rgba(192, 38, 28, 0.35) 0 4px, transparent 4px 9px);
+  outline: 2px dashed var(--bad);
+  outline-offset: -2px;
+}
+
+.tile.truth-diff.selected {
+  outline: 2px solid var(--accent);
+}
+
+.truth-legend {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--bad);
+}
+
+.truth-swatch {
+  width: 16px;
+  height: 12px;
+  border: 1px dashed var(--bad);
+  background-image: repeating-linear-gradient(45deg, rgba(192, 38, 28, 0.5) 0 3px, transparent 3px 6px);
+}
+
+.truth-toggle {
+  font-size: 13px;
+}
+
+.truth-section {
+  padding: 4px 0 8px;
+  border-bottom: 2px dashed var(--bad);
+  margin-bottom: 8px;
+}
+
+.truth-section h4 {
+  margin: 4px 0;
+}
+
+.truth-label {
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: #fff;
+  background: var(--bad);
+  vertical-align: middle;
+}
+
+/* Workloads */
+.workloads {
+  max-width: 1100px;
+}
+
+.workloads .fleet-bar {
+  flex-wrap: wrap;
+  gap: 10px 16px;
+}
+
+table.workload-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+table.workload-table tr.clickable {
+  cursor: pointer;
+}
+
+table.workload-table tr.clickable:hover,
+table.workload-table tr.selected {
+  background: #eef2fb;
+}
+
+table.workload-table th {
+  text-align: left;
+  font-size: 12px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+}
+
+.workload-drawer {
+  width: 460px;
+}
+
+.workload-drawer table.data {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.replica-map td,
+.replica-map th {
+  padding: 3px 8px;
+}
+
+.drain-progress {
+  margin: 4px 0;
+  padding: 4px 8px;
+  border-left: 4px solid #7c5cc4;
+  background: #f3effb;
+  font-size: 13px;
+}
+
+button.danger {
+  background: var(--bad);
+  border-color: var(--bad);
+  color: #fff;
+}
+
+.create-workload {
+  max-width: 560px;
+}
