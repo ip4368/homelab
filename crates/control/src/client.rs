@@ -176,12 +176,20 @@ struct Outstanding {
     op: ApiOp,
 }
 
+/// How much the client has synced: answers merged and the objects they upserted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncStats {
+    pub syncs: u64,
+    pub upserts: u64,
+}
+
 #[derive(Default)]
 pub struct ClientActor {
     view: ClusterView,
     next_req: u64,
     outstanding: BTreeMap<u64, Outstanding>,
     results: Vec<(u64, ApiResult)>,
+    sync_stats: SyncStats,
 }
 
 impl ClientActor {
@@ -191,6 +199,10 @@ impl ClientActor {
 
     pub fn view(&self) -> &ClusterView {
         &self.view
+    }
+
+    pub fn sync_stats(&self) -> SyncStats {
+        self.sync_stats
     }
 
     /// Sends `op` to the leader via the VIP and returns its request id. The
@@ -235,6 +247,8 @@ impl Actor for ClientActor {
     fn on_message(&mut self, ctx: &mut dyn Ctx, _from: Endpoint, msg: Msg) {
         match msg {
             Msg::SyncResp { changes, leader, term, metrics } => {
+                self.sync_stats.syncs += 1;
+                self.sync_stats.upserts += changes.upserts.len() as u64;
                 self.view.merge(changes);
                 self.view.leader = Some(leader);
                 self.view.term = term;

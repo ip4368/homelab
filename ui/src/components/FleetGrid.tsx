@@ -4,6 +4,10 @@ import type { MetricSample } from '../gen/MetricSample'
 import { GROUP_BYS, groupHosts, type GroupBy } from '../grouping'
 import { useStore } from '../store'
 import { truthDiff } from '../workloads'
+import { FleetCanvas } from './FleetCanvas'
+
+/** Above this many hosts the grid is drawn on a canvas instead of a DOM tile each. */
+export const CANVAS_ABOVE = 120
 
 function Bar({ label, pct }: { label: string; pct: number | undefined }) {
   const value = pct === undefined ? 0 : Math.max(0, Math.min(100, pct))
@@ -46,14 +50,16 @@ const Tile = memo(function Tile({ host, metric, selected, mismatch, onSelect }: 
 
 export function FleetGrid({ selected, showTruth, onSelect }: { selected: string | null; showTruth: boolean; onSelect(id: string): void }) {
   const hosts = useStore((s) => s.view.hosts)
-  const truth = useStore((s) => s.truth)
+  // The truth changes with every push; only follow it while the overlay shows it.
+  const truth = useStore((s) => (showTruth ? s.truth : null))
   const metrics = useStore((s) => s.view.metrics)
   const [by, setBy] = useState<GroupBy>('rack')
   const mismatches = useMemo(
-    () => (showTruth ? new Map(truthDiff({ hosts }, truth).map((d) => [d.hostId, d.actual])) : new Map<string, string>()),
-    [showTruth, hosts, truth],
+    () => (truth ? new Map(truthDiff({ hosts }, truth).map((d) => [d.hostId, d.actual])) : new Map<string, string>()),
+    [hosts, truth],
   )
   const groups = useMemo(() => groupHosts(Object.values(hosts), by), [hosts, by])
+  const canvas = Object.keys(hosts).length > CANVAS_ABOVE
 
   return (
     <section className="fleet">
@@ -74,7 +80,8 @@ export function FleetGrid({ selected, showTruth, onSelect }: { selected: string 
         )}
       </div>
       {groups.length === 0 && <p className="muted">No hosts yet.</p>}
-      {groups.map((g) => (
+      {canvas && <FleetCanvas groups={groups} metrics={metrics} selected={selected} mismatches={mismatches} onSelect={onSelect} />}
+      {!canvas && groups.map((g) => (
         <div key={g.key} className="group">
           <h3>
             {g.key} <span className="muted">({g.hosts.length})</span>

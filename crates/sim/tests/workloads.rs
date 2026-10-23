@@ -16,7 +16,7 @@ use model::{
 use sim::engine::Engine;
 use sim::faults::Fault;
 use sim::presets::{FleetSpec, Preset};
-use sim::scenario::{Scenario, TRANSCODE_DEPLOYMENT};
+use sim::scenario::{Scenario, SEED_VM_FILL, TRANSCODE_DEPLOYMENT};
 use sim::topology::{Node, PartitionMember, PortMode};
 use sim::traffic::{FlowEnd, FlowKind};
 use sim::truth::SPLIT_BRAIN;
@@ -82,6 +82,25 @@ fn seed_workloads_all_running() {
     let actual: BTreeSet<(HostId, String)> =
         w.hosts.iter().flat_map(|(h, hw)| hw.instances.keys().map(move |i| (h.clone(), i.clone()))).collect();
     assert_eq!(actual, expected);
+}
+
+#[test]
+fn seed_vms_fit_the_vm_hosts() {
+    // One MS-01 can give VMs 19.5 cores; 60 hosts would otherwise get 30 VMs of 2-4 vCPU.
+    let mut e = Engine::new(43);
+    e.load_fleet(&FleetSpec { ms01: 1, minipc: 59, pi5: 0, rk3588: 0 }, 3);
+    e.scenario(Scenario::SeedWorkloads).unwrap();
+    let deadline = e.now() + 120_000;
+    let running = |e: &Engine| {
+        let s = &e.client_view().state;
+        !s.vms.is_empty() && s.vm_status.len() == s.vms.len() && s.vm_status.values().all(|v| v.status.phase == VmPhase::Running)
+    };
+    assert!(e.run_until(deadline, running), "{:?}", e.client_view().state.vm_status.values().map(|v| &v.status.phase).collect::<Vec<_>>());
+    let s = &e.client_view().state;
+    let vcpus: u32 = s.vms.values().map(|o| o.vm.vcpu).sum();
+    assert!(s.vms.len() < 30, "{} VMs", s.vms.len());
+    assert!(f64::from(vcpus * 1000) <= SEED_VM_FILL * 19_500.0, "{vcpus} vCPUs asked of one MS-01");
+    assert_eq!(s.volumes.len(), s.vms.len(), "a volume per VM");
 }
 
 #[test]

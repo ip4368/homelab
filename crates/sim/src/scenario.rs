@@ -11,7 +11,9 @@ use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::{Addr, Endpoint, Svc};
-use model::{Deployment, HostId, NetworkId, ProfileId, Selector, Vm, Volume, TRANSCODE_CAPABILITY_PREFIX};
+use control::controllers::scheduler::active_roles;
+use control::state::Lifecycle;
+use model::{allocatable, Deployment, HostId, NetworkId, PlacementReq, ProfileId, Role, Selector, Vm, Volume, TRANSCODE_CAPABILITY_PREFIX};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
@@ -25,6 +27,8 @@ pub const SEED_WAIT_MS: u64 = 10_000;
 pub const TRANSCODE_DEPLOYMENT: &str = "transcode";
 /// The seed workloads' general deployments (per 60 hosts; more get a numeric suffix).
 const GENERAL_DEPLOYMENTS: [&str; 6] = ["web", "api", "cache", "queue", "metrics", "auth"];
+/// The share of the VM hosts' allocatable CPU and RAM [`Scenario::SeedWorkloads`] fills with VMs at most.
+pub const SEED_VM_FILL: f64 = 0.8;
 /// The port MTU [`Misconfig::MtuTooSmall`] leaves: too small for jumbo networks.
 pub const TOO_SMALL_MTU: u16 = 1500;
 
@@ -77,8 +81,11 @@ pub enum Scenario {
     /// Creates a homelab's workloads through the client, per 60 hosts: 30
     /// VMs (2-4 vCPU, 4-8 GB RAM, a 40-80 GB volume each, on vm-lan or
     /// vm-iot), and 6 general deployments of 3 pods; plus one transcode
-    /// deployment with a pod per two SBCs. Volumes are created first, then
-    /// the VMs on them, then the deployments.
+    /// deployment with a pod per two SBCs. The VMs stop short of asking for
+    /// more than [`SEED_VM_FILL`] of the CPU or RAM of the `Ready` hosts the
+    /// client sees with the VM role active (waiting up to [`SEED_WAIT_MS`]
+    /// for it to see one), so the fleet can run them all.
+    /// Volumes are created first, then the VMs on them, then the deployments.
     SeedWorkloads,
 }
 
@@ -107,6 +114,10 @@ impl Engine {
         let sbcs = w.hosts.values().filter(|hw| matches!(hw.profile.id, ProfileId::Pi5 | ProfileId::Rk3588)).count();
         let per_60 = |n: u32| (n * hosts).div_ceil(60);
         let mut rng = ChaCha8Rng::seed_from_u64(self.seed() ^ 0x5EED);
+        // Like a user, size the VMs by what the UI shows, once it shows VM hosts at all.
+        let deadline = self.now() + SEED_WAIT_MS;
+        self.run_until(deadline, |e| e.vm_room() != (0, 0));
+        let (mut cpu_left, mut ram_left) = self.vm_room();
         let (mut volumes, mut vms) = (vec![], vec![]);
         for n in 1..=per_60(30) {
             let id = format!("vm-{n:02}");
@@ -121,6 +132,11 @@ impl Engine {
                 networks: vec![NetworkId::from(network)],
                 volume: volume.id.clone(),
             };
+            let req = PlacementReq::vm(&vm);
+            if req.cpu_m > cpu_left || req.ram_mb > ram_left {
+                break;
+            }
+            (cpu_left, ram_left) = (cpu_left - req.cpu_m, ram_left - req.ram_mb);
             volumes.push(ApiOp::CreateVolume { volume });
             vms.push(ApiOp::CreateVm { vm });
         }
@@ -156,6 +172,16 @@ impl Engine {
             self.api_batch(batch)?;
         }
         Ok(())
+    }
+
+    /// What seed VMs may ask for in all, `(cpu_m, ram_mb)`: [`SEED_VM_FILL`]
+    /// of what the `Ready` hosts with the VM role active can give to workloads.
+    fn vm_room(&self) -> (u32, u32) {
+        let hosts = self.client_view().state.hosts.values();
+        let vm_hosts = hosts.filter(|h| h.lifecycle == Lifecycle::Ready && active_roles(h).contains(&Role::Vm));
+        let (cpu_m, ram_mb) = vm_hosts.map(|h| allocatable(&h.profile)).fold((0u64, 0u64), |(c, r), (hc, hr)| (c + u64::from(hc), r + u64::from(hr)));
+        let fill = |total: u64| u32::try_from((total as f64 * SEED_VM_FILL) as u64).unwrap_or(u32::MAX);
+        (fill(cpu_m), fill(ram_mb))
     }
 
     /// Submits every op through the client and runs the simulation until all

@@ -3,7 +3,7 @@ import { op } from '../api'
 import type { HostObj } from '../gen/HostObj'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
-import { formatClock } from './TopBar'
+import { formatClock } from '../clock'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
 

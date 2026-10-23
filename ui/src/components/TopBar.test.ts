@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { HostObj } from '../gen/HostObj'
-import { formatClock, quorumOf } from './TopBar'
+import { formatClock } from '../clock'
+import { quorumOf } from './TopBar'
 
 const host = (lifecycle: HostObj['lifecycle']) => ({ lifecycle }) as HostObj
 

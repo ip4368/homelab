@@ -2,7 +2,9 @@ import { useMemo, useState } from 'react'
 import { setSpeed } from '../api'
 import type { CpInfo } from '../gen/CpInfo'
 import type { HostObj } from '../gen/HostObj'
+import { formatClock } from '../clock'
 import { useStore } from '../store'
+import { Charts } from './Charts'
 
 const SPEEDS = [
   { speed: 0, label: 'Pause' },
@@ -11,13 +13,6 @@ const SPEEDS = [
   { speed: 20, label: '20×' },
   { speed: 60, label: '60×' },
 ]
-
-/** Sim milliseconds as hh:mm:ss; hours keep counting past 24. */
-export function formatClock(ms: number): string {
-  const total = Math.floor(ms / 1000)
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${pad(Math.floor(total / 3600))}:${pad(Math.floor(total / 60) % 60)}:${pad(total % 60)}`
-}
 
 /** A voter is live when its host is in the view and not NotReady. */
 export function quorumOf(cp: CpInfo, hosts: Record<string, HostObj>): { live: number; voters: number; ok: boolean } {
@@ -44,6 +39,7 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
   const sim = useStore((s) => s.sim)
   const connection = useStore((s) => s.connection)
   const [error, setError] = useState<string | null>(null)
+  const [monitoring, setMonitoring] = useState(false)
 
   const counts = useMemo(() => {
     const c = { Ready: 0, NotReady: 0, Pending: 0 }
@@ -80,6 +76,9 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
         />
         <Stat label="Alerts" value={activeAlerts} tone={activeAlerts > 0 ? 'warn' : undefined} />
         <div className="spacer" />
+        <button className={monitoring ? 'active' : ''} aria-pressed={monitoring} onClick={() => setMonitoring(!monitoring)}>
+          Monitoring
+        </button>
         <label className="inline truth-toggle" title="Overlay what the simulator knows but the control plane does not">
           <input type="checkbox" checked={showTruth} onChange={(e) => onShowTruth(e.target.checked)} /> Ground truth
         </label>
@@ -96,6 +95,11 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
           ))}
         </div>
       </div>
+      {monitoring && (
+        <div className="monitoring">
+          <Charts entity="fleet" title="Fleet: average CPU and RAM, total port throughput" row />
+        </div>
+      )}
     </header>
   )
 }

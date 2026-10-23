@@ -4,6 +4,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
 import { hostWorkloads, replicaStateLabel, type WorkloadRef } from '../workloads'
+import { Charts } from './Charts'
 import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
@@ -190,6 +191,9 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           {lifecycleButton('Remove', host.lifecycle !== 'Removed', { RemoveHost: { id: host.id } })}
         </div>
         {error && <div className="bad">{error}</div>}
+      </div>
+      <div className="section">
+        <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>
       <HostWorkloads host={host} onSelectWorkload={onSelectWorkload} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
