@@ -8,9 +8,14 @@ mod objects;
 pub use command::{ApplyError, Command};
 pub use objects::*;
 
+use crate::controllers::join::UNKNOWN_LOCATION;
 use crate::runtime::SimTime;
-use model::{eligible, HardwareProfile, HostId, NetworkId, Role};
+use model::network::LldpNeighbor;
+use model::{eligible, HardwareProfile, HostId, NetworkId, ProfileId, Role, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
+
+/// Where MS-01s sit: next to the core switches.
+pub const CORE_RACK: &str = "rack-0";
 
 /// Events kept in the ring; older ones are dropped.
 pub const EVENT_RING: usize = 5000;
@@ -23,6 +28,7 @@ pub struct ClusterState {
     pub rules: BTreeMap<String, AutoApproveRule>,
     pub networks: BTreeMap<NetworkId, NetworkObj>,
     pub templates: BTreeMap<String, TemplateObj>,
+    pub switches: BTreeMap<SwitchId, SwitchObj>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -48,6 +54,7 @@ impl ClusterState {
             rules: BTreeMap::new(),
             networks: BTreeMap::new(),
             templates: BTreeMap::new(),
+            switches: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
@@ -89,6 +96,7 @@ impl ClusterState {
                     profile,
                     inventory,
                     location,
+                    lldp: Vec::new(),
                     lifecycle: Lifecycle::Pending,
                     roles: Default::default(),
                     labels: Default::default(),
@@ -218,6 +226,21 @@ impl ClusterState {
                 host.override_ = config;
                 host.version = v;
             }
+            Command::ObserveHost { id, lldp, inventory } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                if host.location == UNKNOWN_LOCATION
+                    && let Some(location) = location_of(host.profile.id, &lldp)
+                {
+                    host.location = location;
+                }
+                host.lldp = lldp;
+                host.inventory = inventory;
+                host.version = v;
+            }
+            Command::ObserveSwitch { id, model, ports, mlag_peer, last_seen } => {
+                self.revive(ObjectKind::Switch, id.as_str());
+                self.switches.insert(id.clone(), SwitchObj { id, model, ports, mlag_peer, last_seen, version: v });
+            }
         }
         self.version = v;
         Ok(())
@@ -231,6 +254,7 @@ impl ClusterState {
         upserts.extend(self.rules.values().filter(|o| o.version > v).cloned().map(Object::Rule));
         upserts.extend(self.networks.values().filter(|o| o.version > v).cloned().map(Object::Network));
         upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
+        upserts.extend(self.switches.values().filter(|o| o.version > v).cloned().map(Object::Switch));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
@@ -261,6 +285,18 @@ impl ClusterState {
     }
 }
 
+/// Where a host with an unknown location sits, judged by its cabling: MS-01s
+/// are next to the cores (`rack-0`); every other host is in `rack-<n>` for
+/// its mgmt NIC's access switch `access-<n>`.
+fn location_of(profile: ProfileId, lldp: &[LldpNeighbor]) -> Option<String> {
+    if profile == ProfileId::Ms01 {
+        return Some(CORE_RACK.into());
+    }
+    let mgmt = lldp.iter().find(|n| n.local_port.as_str() == MGMT_NIC)?;
+    let n: u32 = mgmt.switch.as_str().strip_prefix("access-")?.parse().ok()?;
+    Some(format!("rack-{n}"))
+}
+
 fn check_eligible(profile: &HardwareProfile, roles: &BTreeSet<Role>) -> Result<(), ApplyError> {
     for &role in roles {
         eligible(profile, role).map_err(|reason| ApplyError::IneligibleRole { role, reason })?;
@@ -271,7 +307,7 @@ fn check_eligible(profile: &HardwareProfile, roles: &BTreeSet<Role>) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use model::{profile, Inventory, NetworkId, NetworkTemplate, ProfileId, Role};
+    use model::{profile, Inventory, NetworkId, NetworkTemplate, PortName, ProfileId, Role};
     use std::collections::{BTreeMap, BTreeSet};
 
     fn hid(s: &str) -> HostId {
@@ -477,9 +513,10 @@ mod tests {
         .unwrap();
         s.apply(5, Command::Event { entity: host_ref("h1"), message: "e".into() }).unwrap();
         s.apply(5, Command::SetCp { voters: [hid("h1")].into(), mode: CpMode::Auto }).unwrap();
+        s.apply(5, observe_switch("access-1", 5)).unwrap();
         let upserts = s.changes_since(0).upserts;
         let kinds: Vec<_> = upserts.iter().map(|o| serde_json::to_value(o).unwrap()["type"].clone()).collect();
-        assert_eq!(kinds, ["Host", "Token", "Rule", "Network", "Template", "Alert", "Event", "Cp"]);
+        assert_eq!(kinds, ["Host", "Token", "Rule", "Network", "Template", "Switch", "Alert", "Event", "Cp"]);
         for o in upserts {
             let json = serde_json::to_string(&o).unwrap();
             let back: Object = serde_json::from_str(&json).unwrap();
@@ -804,5 +841,74 @@ mod tests {
         let c = add_cmd("h1", ProfileId::Rk3588, 1);
         let back: Command = serde_json::from_str(&serde_json::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
+    }
+
+    fn neighbor(local: &str, switch: &str, port: &str) -> LldpNeighbor {
+        LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(switch), switch_port: PortName::from(port) }
+    }
+
+    fn observe_switch(id: &str, last_seen: SimTime) -> Command {
+        let sw = SwitchId::from(id);
+        let cfg = model::SwitchPortCfg { mode: model::PortMode::Access(1), mtu: 9216, lacp_group: None, admin_up: true };
+        let ports = vec![model::ObservedSwitchPort { switch: sw.clone(), port: PortName::from("p1"), cfg, mlag_peer: None }];
+        Command::ObserveSwitch { id: sw, model: "m".into(), ports, mlag_peer: None, last_seen }
+    }
+
+    fn observe_host(id: &str, lldp: Vec<LldpNeighbor>) -> Command {
+        Command::ObserveHost { id: hid(id), lldp, inventory: Inventory::from_profile(ProfileId::Pi5, 0) }
+    }
+
+    #[test]
+    fn observe_host_replaces_lldp_and_inventory() {
+        let mut s = ClusterState::new();
+        s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        assert!(s.hosts[&hid("h1")].lldp.is_empty());
+        let mut inv = Inventory::from_profile(ProfileId::MiniPc, 0);
+        inv.nics[0].link_up = false;
+        let lldp = vec![neighbor("eth0", "access-3", "p9")];
+        s.apply(2, Command::ObserveHost { id: hid("h1"), lldp: lldp.clone(), inventory: inv.clone() }).unwrap();
+        let h = &s.hosts[&hid("h1")];
+        assert_eq!((&h.lldp, &h.inventory, h.version), (&lldp, &inv, 2));
+        assert_eq!(h.location, "rack-1", "a known location is never overwritten");
+        assert_eq!(s.apply(3, observe_host("nope", vec![])), Err(ApplyError::NotFound));
+        assert_eq!(s.version, 2);
+    }
+
+    #[test]
+    fn unknown_location_is_learned_from_lldp() {
+        let located = |p: ProfileId, lldp: Vec<LldpNeighbor>| {
+            let mut s = ClusterState::new();
+            s.apply(1, Command::AddPendingHost {
+                id: hid("h"),
+                profile: profile(p, 0),
+                inventory: Inventory::from_profile(p, 0),
+                location: UNKNOWN_LOCATION.into(),
+            })
+            .unwrap();
+            s.apply(2, Command::ObserveHost { id: hid("h"), lldp, inventory: Inventory::from_profile(p, 0) }).unwrap();
+            s.hosts[&hid("h")].location.clone()
+        };
+        let sfp = || vec![neighbor("sfp0", "core-1", "p1"), neighbor("eth0", "access-2", "p4")];
+        assert_eq!(located(ProfileId::Pi5, vec![neighbor("eth0", "access-2", "p4")]), "rack-2");
+        assert_eq!(located(ProfileId::MiniPc, vec![neighbor("eth0", "access-11", "p4")]), "rack-11");
+        assert_eq!(located(ProfileId::Ms01, sfp()), "rack-0", "MS-01s sit next to the cores whatever their eth0 says");
+        assert_eq!(located(ProfileId::Ms01, vec![]), "rack-0");
+        assert_eq!(located(ProfileId::Pi5, vec![]), "unknown", "no cabling heard yet");
+        assert_eq!(located(ProfileId::Pi5, vec![neighbor("eth0", "core-1", "p4")]), "unknown", "not an access switch");
+        assert_eq!(located(ProfileId::Pi5, vec![neighbor("eth1", "access-2", "p4")]), "unknown", "only the mgmt NIC counts");
+        assert_eq!(located(ProfileId::Pi5, vec![neighbor("eth0", "access-x", "p4")]), "unknown");
+    }
+
+    #[test]
+    fn observe_switch_upserts_and_tracks_changes() {
+        let mut s = ClusterState::new();
+        s.apply(10, observe_switch("access-1", 7)).unwrap();
+        let sw = &s.switches[&SwitchId::from("access-1")];
+        assert_eq!((sw.model.as_str(), sw.ports.len(), sw.last_seen, sw.version), ("m", 1, 7, 1));
+        s.apply(20, observe_switch("access-1", 9)).unwrap();
+        assert_eq!((s.switches[&SwitchId::from("access-1")].last_seen, s.switches.len(), s.version), (9, 1, 2));
+        let c = s.changes_since(1);
+        assert!(matches!(c.upserts.as_slice(), [Object::Switch(o)] if o.last_seen == 9));
+        assert!(s.changes_since(2).upserts.is_empty());
     }
 }

@@ -59,6 +59,7 @@ impl<'a> Station<'a> {
             Addr::Host(h) => Some(Station::Host(h, None)),
             Addr::Client => Some(Station::Client),
             Addr::Router => Some(Station::Router),
+            Addr::Switch(s) => Some(Station::Switch(s)),
             Addr::Vip => None,
         }
     }
@@ -323,6 +324,11 @@ impl Deliver for Fabric {
     /// Messages between services on one host never touch the wire.
     fn route(&mut self, from: &Endpoint, to: &Endpoint, net: &NetworkId) -> Option<(Endpoint, u64)> {
         let vlan = self.world.networks.get(net)?.vlan;
+        // A switch's management interface lives on the mgmt VLAN and nowhere else.
+        let to_or_from_switch = [from, to].iter().any(|e| matches!(e.addr, Addr::Switch(_)));
+        if to_or_from_switch && Some(vlan) != self.mgmt_vlan() {
+            return None;
+        }
         let src = Station::of_addr(&from.addr)?;
         let dest = match &to.addr {
             Addr::Vip => Endpoint::new(Addr::Host(self.vip_seen_by(&src)?), to.svc),
@@ -628,6 +634,76 @@ mod tests {
             assert_eq!(f.latency_ms(3), 1);
             assert_eq!(f.latency_ms(12), 3, "2.4–2.5 ms rounds up to 3");
         }
+    }
+
+    fn switch_ep(id: &str) -> Endpoint {
+        Endpoint::new(Addr::Switch(sw(id)), Svc::Switch)
+    }
+
+    #[test]
+    fn switch_management_is_reachable_on_mgmt_through_the_fabric() {
+        let mut f = fabric(fixture());
+        let mgmt = NetworkId::from("mgmt");
+        // From a host on the switch itself, on another switch, and from the client.
+        assert_eq!(f.route(&switch_ep("sw-a"), &ep(H1, Svc::Cp), &mgmt), Some((ep(H1, Svc::Cp), 1)));
+        assert_eq!(f.route(&ep(H1, Svc::Cp), &switch_ep("sw-a"), &mgmt), Some((switch_ep("sw-a"), 1)));
+        assert_eq!(f.route(&ep(H1, Svc::Cp), &switch_ep("sw-b"), &mgmt), Some((switch_ep("sw-b"), 1)), "over the trunk");
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        assert!(f.route(&client, &switch_ep("sw-b"), &mgmt).is_some());
+        // Switch to switch.
+        assert!(f.route(&switch_ep("sw-a"), &switch_ep("sw-b"), &mgmt).is_some());
+        // The VIP resolves through the switch's own ARP table.
+        f.record_vip_claim(&h(H2));
+        let vip = Endpoint::new(Addr::Vip, Svc::Cp);
+        assert_eq!(f.route(&switch_ep("sw-a"), &vip, &mgmt), Some((ep(H2, Svc::Cp), 1)));
+        // Unknown switches and networks other than mgmt go nowhere.
+        assert_eq!(f.route(&ep(H1, Svc::Cp), &switch_ep("nope"), &mgmt), None);
+        let f2 = fabric(with_storage(fixture()));
+        let mut f2 = f2;
+        assert_eq!(f2.route(&ep(H1, Svc::Cp), &switch_ep("sw-b"), &NetworkId::from("storage")), None, "the interface is mgmt only");
+        assert_eq!(f2.route(&switch_ep("sw-b"), &ep(H1, Svc::Cp), &NetworkId::from("storage")), None);
+    }
+
+    #[test]
+    fn switch_management_follows_switch_state_cables_and_partitions() {
+        let mut f = fabric(fixture());
+        let mgmt = NetworkId::from("mgmt");
+        let to_b = |f: &mut Fabric| f.route(&ep(H1, Svc::Cp), &switch_ep("sw-b"), &mgmt).is_some();
+        let from_b = |f: &mut Fabric| f.route(&switch_ep("sw-b"), &ep(H1, Svc::Cp), &mgmt).is_some();
+        type Toggle = fn(&mut World, bool);
+        let breakers: Vec<(&str, Toggle)> = vec![
+            ("kill sw-b", |w, up| w.topology.set_switch_up(&sw("sw-b"), up)),
+            ("unplug the trunk", |w, up| w.topology.set_cable_up(&sp("sw-a", "p48"), up)),
+            ("kill sw-a, which h1 hangs off", |w, up| w.topology.set_switch_up(&sw("sw-a"), up)),
+            ("h1 loses its cable", |w, up| w.topology.set_cable_up(&hp(H1, "eth0"), up)),
+            ("h1's port leaves mgmt", |w, up| w.topology.set_port(&sw("sw-a"), &PortName::from("p1"), access(if up { 1 } else { 100 }, 9216))),
+            ("trunk drops VLAN 1", |w, up| {
+                let allowed: &[u16] = if up { &[1, 20] } else { &[20] };
+                w.topology.set_port(&sw("sw-b"), &PortName::from("p48"), trunk(None, allowed, 9216));
+            }),
+        ];
+        for (name, set) in breakers {
+            assert!(to_b(&mut f) && from_b(&mut f), "before {name}");
+            set(f.world_mut(), false);
+            assert!(!to_b(&mut f) && !from_b(&mut f), "{name} should cut the management interface off");
+            set(f.world_mut(), true);
+            assert!(to_b(&mut f) && from_b(&mut f), "healing {name}");
+        }
+        // A dead switch cannot be reached or reach anyone, even on its own side.
+        f.world_mut().topology.set_switch_up(&sw("sw-b"), false);
+        assert!(f.route(&switch_ep("sw-b"), &ep(H2, Svc::Cp), &mgmt).is_none());
+        f.world_mut().topology.set_switch_up(&sw("sw-b"), true);
+
+        // Partitioning a switch cuts it off from hosts outside, but not from its own.
+        f.world_mut().topology.partition([PartitionMember::Switch(sw("sw-b"))].into());
+        assert!(!to_b(&mut f) && !from_b(&mut f));
+        assert!(f.route(&switch_ep("sw-b"), &ep(H2, Svc::Cp), &mgmt).is_some(), "h2 stays with its switch");
+        assert!(f.route(&switch_ep("sw-a"), &ep(H1, Svc::Cp), &mgmt).is_some());
+        f.world_mut().topology.heal_partitions();
+        // A partitioned host is cut off from the switch it hangs off.
+        f.world_mut().topology.partition([PartitionMember::Host(h(H2))].into());
+        assert!(f.route(&switch_ep("sw-b"), &ep(H2, Svc::Cp), &mgmt).is_none());
+        assert!(f.route(&switch_ep("sw-b"), &ep(H1, Svc::Cp), &mgmt).is_some());
     }
 
     type Log = Arc<Mutex<Vec<(Endpoint, Endpoint, Msg, SimTime)>>>;

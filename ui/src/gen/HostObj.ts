@@ -4,9 +4,14 @@ import type { HostId } from "./HostId";
 import type { HostNetworkConfig } from "./HostNetworkConfig";
 import type { Inventory } from "./Inventory";
 import type { Lifecycle } from "./Lifecycle";
+import type { LldpNeighbor } from "./LldpNeighbor";
 import type { Role } from "./Role";
 
-export type HostObj = { id: HostId, profile: HardwareProfile, inventory: Inventory, location: string, lifecycle: Lifecycle, roles: Array<Role>, labels: { [key in string]: string }, 
+export type HostObj = { id: HostId, profile: HardwareProfile, inventory: Inventory, location: string, 
+/**
+ * The cabling the host's agent last reported over LLDP.
+ */
+lldp: Array<LldpNeighbor>, lifecycle: Lifecycle, roles: Array<Role>, labels: { [key in string]: string }, 
 /**
  * The lifecycle the host was in when it went `NotReady`; `SetLifecycle`
  * back to `Ready` restores it. `None` unless the host is `NotReady`.

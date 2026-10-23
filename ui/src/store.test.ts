@@ -36,6 +36,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, sim: Partial<SimInfo> = {}):
     hosts: [host('a'), host('b')],
     tokens: [],
     rules: [],
+    switches: [],
     alerts: [],
     events: [],
     cp: { voters: ['cp-1'], mode: 'Suggest', version: 1 },
@@ -128,6 +129,22 @@ describe('store', () => {
     s.applyMessage(delta({ removed: [{ kind: 'Alert', id: 'al1' }, { kind: 'Token', id: 't' }, { kind: 'Rule', id: 'r' }] }))
     const after = s.getState().view
     expect([after.alerts, after.tokens, after.rules].map((r) => Object.keys(r).length)).toEqual([0, 0, 0])
+  })
+
+  it('stores observed switches from snapshots and deltas', () => {
+    const sw = (last_seen: number) => ({ id: 'access-1', model: 'm', ports: [], mlag_peer: null, last_seen, version: last_seen })
+    const s = createStore()
+    s.applyMessage(snapshot({ switches: [sw(1)] }))
+    expect(s.getState().view.switches['access-1'].last_seen).toBe(1)
+
+    s.applyMessage(delta({ upserts: [{ type: 'Switch', ...sw(61_000) }] }))
+    expect(s.getState().view.switches['access-1'].last_seen).toBe(61_000)
+    expect(s.getState().view.switches['access-1']).not.toHaveProperty('type')
+
+    s.applyMessage(delta({ removed: [{ kind: 'Switch', id: 'access-1' }] }))
+    expect(s.getState().view.switches).toEqual({})
+    s.applyMessage(snapshot())
+    expect(s.getState().view.switches).toEqual({})
   })
 
   it('keeps events ordered by seq and capped at the newest EVENT_CAP', () => {

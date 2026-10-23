@@ -3,7 +3,8 @@
 //! VIP) to join with a token until it is accepted. A joined agent heartbeats
 //! and reports metrics.
 
-use crate::proto::{mgmt, MetricSample, Msg};
+use crate::proto::{mgmt, MetricSample, Msg, Observed};
+use crate::runtime::SimTime;
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, Svc};
 use model::network::bootstrap_config;
 use model::{profile, Role};
@@ -28,13 +29,15 @@ pub struct HostAgent {
     token: Option<String>,
     /// As last told by the control plane.
     roles: BTreeSet<Role>,
+    /// What the agent last observed about its host, and when that changed.
+    observed: Option<(SimTime, Observed)>,
 }
 
 impl HostAgent {
     /// `token` is the join token for an unjoined host; `None` means the host
     /// already joined (e.g. it rebooted) and the agent just heartbeats.
     pub fn new(token: Option<String>) -> Self {
-        Self { token, roles: BTreeSet::new() }
+        Self { token, roles: BTreeSet::new(), observed: None }
     }
 
     pub fn roles(&self) -> &BTreeSet<Role> {
@@ -52,9 +55,26 @@ impl HostAgent {
         ctx.send(VIP, mgmt(), msg);
     }
 
-    fn send_heartbeat(&self, ctx: &mut dyn Ctx) {
+    /// Heartbeats the host's liveness. The observation (LLDP and inventory)
+    /// rides along only when it changed since the last one, on the first
+    /// heartbeat after start, or when `report` asks for it; every heartbeat
+    /// carries the observation's stamp so the leader can tell if it has it.
+    fn send_heartbeat(&mut self, ctx: &mut dyn Ctx, report: bool) {
         let Addr::Host(host) = ctx.me().addr else { return };
-        ctx.send(VIP, mgmt(), Msg::Heartbeat { host, lifecycle_seen: 0 });
+        let now = ctx.now();
+        let current = ctx.host().map(|os| Observed { lldp: os.lldp(), inventory: os.inventory() });
+        let mut report = report;
+        if let Some(current) = current
+            && self.observed.as_ref().is_none_or(|(_, seen)| *seen != current)
+        {
+            self.observed = Some((now, current));
+            report = true;
+        }
+        let (observed_at, observed) = match &self.observed {
+            Some((at, o)) => (Some(*at), report.then(|| o.clone())),
+            None => (None, None),
+        };
+        ctx.send(VIP, mgmt(), Msg::Heartbeat { host, lifecycle_seen: 0, observed_at, observed });
     }
 
     fn send_metrics(&self, ctx: &mut dyn Ctx) {
@@ -81,7 +101,7 @@ impl HostAgent {
         if let Some(os) = ctx.host() {
             os.mark_joined();
         }
-        self.send_heartbeat(ctx);
+        self.send_heartbeat(ctx, false);
         ctx.set_timer(HEARTBEAT_MS, HEARTBEAT);
         ctx.set_timer(METRICS_MS, METRICS);
     }
@@ -112,9 +132,10 @@ impl Actor for HostAgent {
                     self.start_member(ctx);
                 } else {
                     // Confirm promptly: the control plane waits for a heartbeat to mark us Ready.
-                    self.send_heartbeat(ctx);
+                    self.send_heartbeat(ctx, false);
                 }
             }
+            Msg::ReportRequest if self.token.is_none() => self.send_heartbeat(ctx, true),
             _ => {}
         }
     }
@@ -126,7 +147,7 @@ impl Actor for HostAgent {
                 ctx.set_timer(JOIN_RETRY_MS, JOIN);
             }
             HEARTBEAT => {
-                self.send_heartbeat(ctx);
+                self.send_heartbeat(ctx, false);
                 ctx.set_timer(HEARTBEAT_MS, HEARTBEAT);
             }
             METRICS => {
@@ -144,12 +165,14 @@ mod tests {
     use crate::proto::LogCmd;
     use crate::raft::{Durable, DurableOp};
     use crate::runtime::{HostOs, HostUsage, SimTime};
-    use model::network::HostNetworkConfig;
-    use model::{HostId, Inventory, NetworkId, ProfileId};
+    use model::network::{HostNetworkConfig, LldpNeighbor};
+    use model::{HostId, Inventory, NetworkId, PortName, ProfileId, SwitchId};
 
     struct FakeOs {
         net: HostNetworkConfig,
         joined: bool,
+        lldp: Vec<LldpNeighbor>,
+        inventory: Inventory,
     }
 
     impl HostOs for FakeOs {
@@ -157,7 +180,10 @@ mod tests {
             HostId::from("m1")
         }
         fn inventory(&self) -> Inventory {
-            Inventory::from_profile(ProfileId::Pi5, 1)
+            self.inventory.clone()
+        }
+        fn lldp(&self) -> Vec<LldpNeighbor> {
+            self.lldp.clone()
         }
         fn apply_network(&mut self, cfg: HostNetworkConfig) {
             self.net = cfg;
@@ -193,7 +219,8 @@ mod tests {
 
     impl FakeCtx {
         fn new(net: HostNetworkConfig) -> Self {
-            Self { now: 0, os: FakeOs { net, joined: false }, sent: vec![], timers: vec![] }
+            let os = FakeOs { net, joined: false, lldp: vec![neighbor("sw-1", "p1")], inventory: Inventory::from_profile(ProfileId::Pi5, 1) };
+            Self { now: 0, os, sent: vec![], timers: vec![] }
         }
 
         /// Fires every timer due by `to`, in time order.
@@ -209,6 +236,11 @@ mod tests {
 
         fn take(&mut self) -> Vec<Msg> {
             std::mem::take(&mut self.sent)
+        }
+
+        /// Like `take`, but only the heartbeats (metrics ride on their own timer).
+        fn take_heartbeats(&mut self) -> Vec<Msg> {
+            self.take().into_iter().filter(|m| matches!(m, Msg::Heartbeat { .. })).collect()
         }
     }
 
@@ -235,8 +267,22 @@ mod tests {
         }
     }
 
-    fn heartbeat() -> Msg {
-        Msg::Heartbeat { host: HostId::from("m1"), lifecycle_seen: 0 }
+    fn neighbor(switch: &str, port: &str) -> LldpNeighbor {
+        LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from(switch), switch_port: PortName::from(port) }
+    }
+
+    fn observed(os: &FakeOs) -> Observed {
+        Observed { lldp: os.lldp.clone(), inventory: os.inventory.clone() }
+    }
+
+    /// A heartbeat whose observation was last seen to change at `at`, without the observation.
+    fn heartbeat(at: SimTime) -> Msg {
+        Msg::Heartbeat { host: HostId::from("m1"), lifecycle_seen: 0, observed_at: Some(at), observed: None }
+    }
+
+    /// A heartbeat carrying the observation, which is `os`'s.
+    fn reporting(at: SimTime, os: &FakeOs) -> Msg {
+        Msg::Heartbeat { host: HostId::from("m1"), lifecycle_seen: 0, observed_at: Some(at), observed: Some(observed(os)) }
     }
 
     fn join(token: &str) -> Msg {
@@ -259,14 +305,15 @@ mod tests {
         assert!(!a.is_member() && !ctx.os.joined);
 
         a.on_message(&mut ctx, VIP, Msg::JoinResp(Ok(())));
-        assert_eq!(ctx.take(), [heartbeat()], "accepted: heartbeat right away");
+        let first = reporting(15_000, &ctx.os);
+        assert_eq!(ctx.take(), [first], "accepted: heartbeat right away, with the observation");
         assert!(a.is_member());
         assert!(ctx.os.joined, "membership is recorded on the host, so a reboot skips the join");
         a.on_message(&mut ctx, VIP, Msg::JoinResp(Ok(())));
         assert!(ctx.take().is_empty(), "a duplicate answer starts nothing twice");
         ctx.advance(&mut a, 35_000);
         let sent = ctx.take();
-        assert_eq!(sent.iter().filter(|m| **m == heartbeat()).count(), 4, "{sent:?}");
+        assert_eq!(sent.iter().filter(|m| **m == heartbeat(15_000)).count(), 4, "{sent:?}");
         let metrics: Vec<_> = sent.iter().filter(|m| matches!(m, Msg::Metrics { .. })).collect();
         assert_eq!(metrics.len(), 2, "{sent:?}");
         assert!(!sent.iter().any(|m| matches!(m, Msg::JoinRequest { .. })), "{sent:?}");
@@ -297,11 +344,11 @@ mod tests {
         a.on_message(&mut ctx, VIP, Msg::Approved { roles: roles.clone() });
         assert_eq!(a.roles(), &roles);
         assert!(a.is_member() && ctx.os.joined);
-        assert_eq!(ctx.take(), [heartbeat()]);
+        assert_eq!(ctx.take(), [reporting(0, &ctx.os)]);
         a.on_message(&mut ctx, VIP, Msg::Approved { roles });
-        assert_eq!(ctx.take(), [heartbeat()], "each approval is confirmed");
+        assert_eq!(ctx.take(), [heartbeat(0)], "each approval is confirmed");
         ctx.advance(&mut a, 5000);
-        assert_eq!(ctx.take(), [heartbeat()], "one heartbeat chain, no join retries");
+        assert_eq!(ctx.take(), [heartbeat(0)], "one heartbeat chain, no join retries");
     }
 
     #[test]
@@ -310,8 +357,52 @@ mod tests {
         let mut a = HostAgent::new(None);
         a.on_start(&mut ctx);
         assert_eq!(ctx.os.net, HostNetworkConfig::default(), "a member's network is not reset");
-        assert_eq!(ctx.take(), [heartbeat()]);
+        assert_eq!(ctx.take(), [reporting(0, &ctx.os)]);
         ctx.advance(&mut a, 5000);
-        assert_eq!(ctx.take(), [heartbeat()]);
+        assert_eq!(ctx.take(), [heartbeat(0)]);
+    }
+
+    #[test]
+    fn observation_is_sent_on_start_on_change_and_on_request_only() {
+        let mut ctx = FakeCtx::new(HostNetworkConfig::default());
+        let mut a = HostAgent::new(None);
+        a.on_start(&mut ctx);
+        assert_eq!(ctx.take_heartbeats(), [reporting(0, &ctx.os)], "the first heartbeat after start carries it");
+        ctx.advance(&mut a, 10_000);
+        assert_eq!(ctx.take_heartbeats(), [heartbeat(0), heartbeat(0)], "unchanged: stamp only");
+
+        // The cable moves: LLDP changes, and the next heartbeat says so with a new stamp.
+        ctx.os.lldp = vec![neighbor("sw-2", "p7")];
+        ctx.advance(&mut a, 15_000);
+        assert_eq!(ctx.take_heartbeats(), [reporting(15_000, &ctx.os)]);
+        ctx.advance(&mut a, 20_000);
+        assert_eq!(ctx.take_heartbeats(), [heartbeat(15_000)]);
+
+        // A NIC loses its link: the inventory changed, so that is reported too.
+        ctx.os.inventory.nics[0].link_up = false;
+        ctx.advance(&mut a, 25_000);
+        assert_eq!(ctx.take_heartbeats(), [reporting(25_000, &ctx.os)]);
+
+        // The leader lost it (new leader, lost message): asking gets an immediate full report.
+        a.on_message(&mut ctx, VIP, Msg::ReportRequest);
+        assert_eq!(ctx.take_heartbeats(), [reporting(25_000, &ctx.os)], "same stamp, full content");
+        ctx.advance(&mut a, 30_000);
+        assert_eq!(ctx.take_heartbeats(), [heartbeat(25_000)]);
+
+        // A restarted agent has no memory of what it sent.
+        let mut restarted = HostAgent::new(None);
+        ctx.now = 40_000;
+        restarted.on_start(&mut ctx);
+        assert_eq!(ctx.take_heartbeats(), [reporting(40_000, &ctx.os)]);
+    }
+
+    #[test]
+    fn an_unjoined_agent_ignores_report_requests() {
+        let mut ctx = FakeCtx::new(HostNetworkConfig::default());
+        let mut a = HostAgent::new(Some("tok".into()));
+        a.on_start(&mut ctx);
+        ctx.take();
+        a.on_message(&mut ctx, VIP, Msg::ReportRequest);
+        assert!(ctx.take().is_empty());
     }
 }

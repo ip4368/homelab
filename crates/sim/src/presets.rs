@@ -9,6 +9,7 @@
 
 use crate::engine::Engine;
 use crate::fabric::Fabric;
+use crate::switch_actor::SwitchActor;
 use crate::topology::{Node, PortMode, Switch, SwitchPortCfg};
 use crate::world::{HostHw, World};
 use control::agent::HostAgent;
@@ -125,7 +126,7 @@ impl Engine {
 /// The world for `spec` and the actors that run it: a CP replica on each of
 /// the first `cp_voters` control-plane-eligible hosts (MS-01s come first),
 /// all starting from the same [`seeded_durable`]; a member agent on every
-/// host; and the UI client.
+/// host; a management interface on every switch; and the UI client.
 pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors) {
     let mut w = World::new();
     add_cores(&mut w);
@@ -156,6 +157,9 @@ pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors)
     }
     for (id, _) in &hosts {
         actors.push((Endpoint::new(Addr::Host(id.clone()), Svc::Agent), Box::new(HostAgent::new(None))));
+    }
+    for id in w.topology.switches.keys() {
+        actors.push((Endpoint::new(Addr::Switch(id.clone()), Svc::Switch), Box::new(SwitchActor)));
     }
     actors.push((CLIENT, Box::new(ClientActor::new())));
     (w, actors)

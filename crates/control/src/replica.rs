@@ -3,8 +3,8 @@
 //! and syncs, and runs the controllers; followers only replicate.
 
 use crate::controllers::join::{self, JoinOutcome};
-use crate::controllers::{self, Action, PendingApi, PendingJoin, Volatile, FAILED_BACKOFF_MS};
-use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg};
+use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
+use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle};
@@ -151,7 +151,10 @@ impl CpReplica {
                         v.in_flight.insert(index, cmd);
                     }
                 }
-                Action::Send(to, net, msg) => ctx.send(to, net, msg),
+                Action::Send(to, net, msg) => {
+                    v.note_sent(&to, &msg, now);
+                    ctx.send(to, net, msg);
+                }
             }
         }
         // `propose` returns no effects; flush them now rather than at the next tick.
@@ -202,6 +205,28 @@ impl CpReplica {
         // `propose` returns no effects; flush them now.
         let outs = self.raft().tick(now);
         self.handle(ctx, outs);
+    }
+
+    /// Notes the heartbeat, files the host's observation if it came with one,
+    /// and asks for it if the one held here is not the one the agent stamped
+    /// (`None` means the agent has none).
+    fn on_heartbeat(&mut self, ctx: &mut dyn Ctx, from: Endpoint, host: HostId, observed_at: Option<SimTime>, observed: Option<Observed>) {
+        let now = ctx.now();
+        let Some(v) = &mut self.volatile else { return };
+        v.last_heartbeat.insert(host.clone(), now);
+        if !self.state.hosts.contains_key(&host) {
+            return;
+        }
+        match observed {
+            Some(observed) => {
+                let observed_at = observed_at.unwrap_or(now);
+                v.host_reports.insert(host, HostReport { observed_at, observed });
+            }
+            None if observed_at.is_some() && v.host_reports.get(&host).is_none_or(|r| Some(r.observed_at) != observed_at) => {
+                ctx.send(from, mgmt(), Msg::ReportRequest);
+            }
+            None => {}
+        }
     }
 
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
@@ -271,9 +296,13 @@ impl Actor for CpReplica {
                 let outs = self.raft().step(now, peer, m);
                 self.handle(ctx, outs);
             }
-            Msg::Heartbeat { host, .. } => {
-                if let Some(v) = &mut self.volatile {
-                    v.last_heartbeat.insert(host, now);
+            Msg::Heartbeat { host, observed_at, observed, .. } => self.on_heartbeat(ctx, from, host, observed_at, observed),
+            Msg::SwitchReport { switch, model, ports, mlag_peer } => {
+                // A report only counts from the switch it describes.
+                if from.addr == Addr::Switch(switch.clone())
+                    && let Some(v) = &mut self.volatile
+                {
+                    v.switch_reports.insert(switch, SwitchReading { at: now, model, ports, mlag_peer });
                 }
             }
             Msg::JoinRequest { token, inventory } => self.on_join(ctx, from, token, inventory),
@@ -291,7 +320,9 @@ impl Actor for CpReplica {
             | Msg::ApiResp { .. }
             | Msg::SyncResp { .. }
             | Msg::JoinResp(_)
-            | Msg::Approved { .. } => {}
+            | Msg::Approved { .. }
+            | Msg::ReportRequest
+            | Msg::SwitchPoll => {}
         }
     }
 
@@ -538,5 +569,101 @@ mod tests {
         rig.advance(CONTROLLER_PERIOD_MS);
         rig.controllers();
         assert_eq!(raises(&rig), 2, "and is retried once the backoff expires");
+    }
+
+    fn host_ep(h: &str, svc: Svc) -> Endpoint {
+        Endpoint::new(Addr::Host(hid(h)), svc)
+    }
+
+    fn observed(link_up: bool) -> Observed {
+        let mut inventory = Inventory::from_profile(ProfileId::MiniPc, 0);
+        inventory.nics[0].link_up = link_up;
+        Observed { lldp: vec![], inventory }
+    }
+
+    fn heartbeat(at: Option<SimTime>, observed: Option<Observed>) -> Msg {
+        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed }
+    }
+
+    #[test]
+    fn leader_files_observations_and_asks_for_the_ones_it_lacks() {
+        let add = Command::AddPendingHost {
+            id: hid("m1"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        };
+        let mut rig = Rig::new(vec![add]);
+        rig.elect();
+        rig.ack();
+        let agent = host_ep("m1", Svc::Agent);
+        let hb = |rig: &mut Rig, m: Msg| {
+            rig.r.on_message(&mut rig.ctx, agent.clone(), m);
+            std::mem::take(&mut rig.ctx.sent)
+        };
+        let ask = [(agent.clone(), Msg::ReportRequest)];
+        assert_eq!(hb(&mut rig, heartbeat(Some(5), None)), ask, "a stamp the leader holds nothing for");
+        assert!(hb(&mut rig, heartbeat(None, None)).is_empty(), "an agent with nothing to report is not asked");
+        assert!(hb(&mut rig, heartbeat(Some(5), Some(observed(true)))).is_empty());
+        assert!(hb(&mut rig, heartbeat(Some(5), None)).is_empty(), "stamp matches the held report");
+        assert_eq!(hb(&mut rig, heartbeat(Some(9), None)), ask, "a newer stamp: the report was lost");
+        let held = &rig.r.volatile.as_ref().unwrap().host_reports[&hid("m1")];
+        assert_eq!((held.observed_at, &held.observed), (5, &observed(true)));
+        hb(&mut rig, heartbeat(Some(9), Some(observed(false))));
+        assert_eq!(rig.r.volatile.as_ref().unwrap().host_reports[&hid("m1")].observed, observed(false));
+
+        // Unknown hosts are neither stored nor asked.
+        let stranger = Msg::Heartbeat { host: hid("zz"), lifecycle_seen: 0, observed_at: Some(1), observed: Some(observed(true)) };
+        assert!(hb(&mut rig, stranger).is_empty());
+        assert!(!rig.r.volatile.as_ref().unwrap().host_reports.contains_key(&hid("zz")));
+        assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")), "still a heartbeat");
+    }
+
+    #[test]
+    fn switch_polls_are_paced_and_reports_only_count_from_their_own_switch() {
+        let mut rig = Rig::new(vec![Command::AddPendingHost {
+            id: hid("m1"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        }]);
+        rig.elect();
+        rig.ack();
+        let sw = |s: &str| Endpoint::new(Addr::Switch(model::SwitchId::from(s)), Svc::Switch);
+        // The leader knows access-1 from the host's LLDP.
+        let lldp = vec![model::network::LldpNeighbor {
+            local_port: model::PortName::from("eth0"),
+            switch: model::SwitchId::from("access-1"),
+            switch_port: model::PortName::from("p1"),
+        }];
+        rig.r.state.apply(0, Command::ObserveHost { id: hid("m1"), lldp, inventory: Inventory::from_profile(ProfileId::MiniPc, 0) }).unwrap();
+        let polls = |rig: &mut Rig| {
+            let sent = std::mem::take(&mut rig.ctx.sent);
+            sent.into_iter().filter(|(_, m)| *m == Msg::SwitchPoll).map(|(to, _)| to).collect::<Vec<_>>()
+        };
+        rig.controllers();
+        assert_eq!(polls(&mut rig), [sw("access-1")]);
+        for _ in 0..29 {
+            rig.advance(CONTROLLER_PERIOD_MS);
+            rig.controllers();
+        }
+        assert!(polls(&mut rig).is_empty(), "not again within 30 s");
+        rig.advance(CONTROLLER_PERIOD_MS);
+        rig.controllers();
+        assert_eq!(polls(&mut rig), [sw("access-1")], "30 s after the last poll");
+
+        let report = |switch: &str| Msg::SwitchReport {
+            switch: model::SwitchId::from(switch),
+            model: "m".into(),
+            ports: vec![],
+            mlag_peer: None,
+        };
+        rig.r.on_message(&mut rig.ctx, sw("access-2"), report("access-1"));
+        assert!(rig.r.volatile.as_ref().unwrap().switch_reports.is_empty(), "access-2 cannot speak for access-1");
+        rig.r.on_message(&mut rig.ctx, host_ep("m1", Svc::Agent), report("access-1"));
+        assert!(rig.r.volatile.as_ref().unwrap().switch_reports.is_empty(), "nor can a host");
+        rig.r.on_message(&mut rig.ctx, sw("access-1"), report("access-1"));
+        let now = rig.ctx.now;
+        assert_eq!(rig.r.volatile.as_ref().unwrap().switch_reports[&model::SwitchId::from("access-1")].at, now);
     }
 }

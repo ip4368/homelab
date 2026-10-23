@@ -10,11 +10,13 @@
 
 pub mod health;
 pub mod join;
+pub mod observe;
 
-use crate::proto::{MetricSample, Msg};
-use crate::runtime::{Endpoint, SimTime};
+use crate::proto::{MetricSample, Msg, Observed};
+use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command};
-use model::{HostId, NetworkId};
+use model::network::ObservedSwitchPort;
+use model::{HostId, NetworkId, SwitchId};
 use std::collections::BTreeMap;
 
 /// A controller command that applied with an error is not proposed again for this long.
@@ -48,6 +50,24 @@ pub struct PendingJoin {
     pub term: u64,
 }
 
+/// The latest observation a host's agent sent this leader.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HostReport {
+    /// The agent's stamp for it, echoed in its heartbeats.
+    pub observed_at: SimTime,
+    pub observed: Observed,
+}
+
+/// What the leader's latest poll of a switch showed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SwitchReading {
+    /// When the report arrived.
+    pub at: SimTime,
+    pub model: String,
+    pub ports: Vec<ObservedSwitchPort>,
+    pub mlag_peer: Option<SwitchId>,
+}
+
 /// The leader's memory outside the log. Rebuilt from nothing by every new
 /// leader, by design.
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +80,10 @@ pub struct Volatile {
     pub caught_up: bool,
     pub last_heartbeat: BTreeMap<HostId, SimTime>,
     pub metrics: BTreeMap<HostId, MetricSample>,
+    pub host_reports: BTreeMap<HostId, HostReport>,
+    pub switch_reports: BTreeMap<SwitchId, SwitchReading>,
+    /// When each switch was last sent a poll.
+    pub switch_polled_at: BTreeMap<SwitchId, SimTime>,
     /// Client requests by log index.
     pub pending: BTreeMap<u64, PendingApi>,
     /// Joins by log index.
@@ -80,6 +104,9 @@ impl Volatile {
             caught_up: false,
             last_heartbeat: BTreeMap::new(),
             metrics: BTreeMap::new(),
+            host_reports: BTreeMap::new(),
+            switch_reports: BTreeMap::new(),
+            switch_polled_at: BTreeMap::new(),
             pending: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
             join_rejected_at: BTreeMap::new(),
@@ -102,10 +129,25 @@ impl Volatile {
     pub fn last_seen(&self, host: &HostId) -> SimTime {
         self.last_heartbeat.get(host).copied().unwrap_or(self.elected_at)
     }
+
+    /// When the leader last heard from switch `id`. As with hosts, a switch
+    /// not heard from since the election counts as seen at the election.
+    pub fn switch_last_seen(&self, id: &SwitchId) -> SimTime {
+        self.switch_reports.get(id).map_or(self.elected_at, |r| r.at)
+    }
+
+    /// Records that the replica sent `msg` to `to`, for controllers that pace
+    /// themselves by when they last sent something.
+    pub fn note_sent(&mut self, to: &Endpoint, msg: &Msg, now: SimTime) {
+        if let (Addr::Switch(id), Msg::SwitchPoll) = (&to.addr, msg) {
+            self.switch_polled_at.insert(id.clone(), now);
+        }
+    }
 }
 
 pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<Action> {
     let mut out = health::run(state, volatile, now);
     out.extend(join::run(state, volatile));
+    out.extend(observe::run(state, volatile, now));
     out
 }

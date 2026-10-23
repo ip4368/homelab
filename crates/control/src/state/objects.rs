@@ -4,7 +4,8 @@
 //! simulated time and versions stay far below 2^53.
 
 use crate::runtime::SimTime;
-use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkTemplate, ProfileId, Role};
+use model::network::{LldpNeighbor, ObservedSwitchPort};
+use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkTemplate, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -57,6 +58,8 @@ pub struct HostObj {
     pub profile: HardwareProfile,
     pub inventory: Inventory,
     pub location: String,
+    /// The cabling the host's agent last reported over LLDP.
+    pub lldp: Vec<LldpNeighbor>,
     pub lifecycle: Lifecycle,
     pub roles: BTreeSet<Role>,
     pub labels: BTreeMap<String, String>,
@@ -92,6 +95,10 @@ pub struct AutoApproveRule {
     pub version: u64,
 }
 
+/// The NIC every host's mgmt network rides on: its bootstrap link, and the
+/// port whose LLDP neighbour is the host's access switch.
+pub const MGMT_NIC: &str = "eth0";
+
 /// A logical network with the state version at which it last changed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -110,6 +117,23 @@ pub struct TemplateObj {
     #[serde(flatten)]
     #[ts(flatten)]
     pub template: NetworkTemplate,
+    #[ts(type = "number")]
+    pub version: u64,
+}
+
+/// A switch as the control plane observed it by polling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SwitchObj {
+    pub id: SwitchId,
+    pub model: String,
+    /// Every port, in port-name order.
+    pub ports: Vec<ObservedSwitchPort>,
+    pub mlag_peer: Option<SwitchId>,
+    /// When the switch last answered a poll, as far as the log knows: only
+    /// written when the report changes or this value is a minute old.
+    #[ts(type = "number")]
+    pub last_seen: SimTime,
     #[ts(type = "number")]
     pub version: u64,
 }
@@ -181,6 +205,7 @@ pub enum ObjectKind {
     Cp,
     Network,
     Template,
+    Switch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -200,6 +225,9 @@ impl ObjectRef {
     pub fn rule(id: &str) -> Self {
         Self { kind: ObjectKind::Rule, id: id.into() }
     }
+    pub fn switch(id: &SwitchId) -> Self {
+        Self { kind: ObjectKind::Switch, id: id.to_string() }
+    }
     pub fn cp() -> Self {
         Self { kind: ObjectKind::Cp, id: "cp".into() }
     }
@@ -217,6 +245,7 @@ pub enum Object {
     Cp(CpInfo),
     Network(NetworkObj),
     Template(TemplateObj),
+    Switch(SwitchObj),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

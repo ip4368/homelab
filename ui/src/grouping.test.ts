@@ -3,8 +3,19 @@ import type { HostObj } from './gen/HostObj'
 import type { Role } from './gen/Role'
 import { groupHosts } from './grouping'
 
-const host = (id: string, profile: HostObj['profile']['id'], roles: Role[] = [], location = 'rack-0') =>
-  ({ id, profile: { id: profile }, roles, location }) as HostObj
+const host = (
+  id: string,
+  profile: HostObj['profile']['id'],
+  roles: Role[] = [],
+  location = 'rack-0',
+  lldp: HostObj['lldp'] = [],
+) => ({ id, profile: { id: profile }, roles, location, lldp }) as HostObj
+
+const neighbor = (local_port: string, sw: string): HostObj['lldp'][number] => ({
+  local_port,
+  switch: sw,
+  switch_port: 'p1',
+})
 
 describe('groupHosts', () => {
   it('groups by profile sorted', () => {
@@ -31,10 +42,27 @@ describe('groupHosts', () => {
     expect(groups.map((g) => g.key)).toEqual(['rack-2', 'rack-10'])
   })
 
-  it('switch grouping is unknown until LLDP data exists', () => {
-    const groups = groupHosts([host('b', 'Pi5'), host('a', 'Ms01')], 'switch')
-    expect(groups).toHaveLength(1)
-    expect(groups[0].key).toBe('unknown')
-    expect(groups[0].hosts.map((h) => h.id)).toEqual(['a', 'b'])
+  it('groups by the switch the mgmt port is cabled to, from LLDP', () => {
+    const hosts = [
+      host('ms', 'Ms01', [], 'rack-0', [neighbor('sfp0', 'core-1'), neighbor('eth0', 'access-1')]),
+      host('pi', 'Pi5', [], 'rack-2', [neighbor('eth0', 'access-2')]),
+      host('mini', 'MiniPc', [], 'rack-1', [neighbor('eth0', 'access-1')]),
+    ]
+    const groups = groupHosts(hosts, 'switch')
+    expect(groups.map((g) => [g.key, g.hosts.map((h) => h.id)])).toEqual([
+      ['access-1', ['mini', 'ms']],
+      ['access-2', ['pi']],
+    ])
+  })
+
+  it('switch grouping is unknown until a host reports its mgmt neighbour', () => {
+    const hosts = [
+      host('b', 'Pi5'),
+      host('a', 'Ms01', [], 'rack-0', [neighbor('sfp0', 'core-1')]),
+      host('c', 'Pi5', [], 'rack-1', [neighbor('eth0', 'access-1')]),
+    ]
+    const groups = groupHosts(hosts, 'switch')
+    expect(groups.map((g) => g.key)).toEqual(['access-1', 'unknown'])
+    expect(groups[1].hosts.map((h) => h.id)).toEqual(['a', 'b'])
   })
 })

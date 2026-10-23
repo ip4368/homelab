@@ -5,7 +5,7 @@
 use crate::proto::{mgmt, ApiOp, ApiResult, MetricSample, Msg};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{Changes, ClusterState, Object, ObjectKind, ObjectRef, EVENT_RING};
-use model::{HostId, NetworkId};
+use model::{HostId, NetworkId, SwitchId};
 use std::collections::BTreeMap;
 
 /// Where the simulator runs the client.
@@ -71,6 +71,10 @@ impl ClusterView {
                     s.revive(ObjectKind::Template, &o.template.id);
                     s.templates.insert(o.template.id.clone(), o);
                 }
+                Object::Switch(o) => {
+                    s.revive(ObjectKind::Switch, o.id.as_str());
+                    s.switches.insert(o.id.clone(), o);
+                }
             }
         }
         for ObjectRef { kind, id } in changes.removed {
@@ -100,6 +104,9 @@ impl ClusterView {
                 }
                 ObjectKind::Template => {
                     s.templates.remove(&id);
+                }
+                ObjectKind::Switch => {
+                    s.switches.remove(&SwitchId::new(id));
                 }
             }
         }

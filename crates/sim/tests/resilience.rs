@@ -381,8 +381,10 @@ fn add_hosts_join_through_the_seed_rules() {
     for h in &added {
         let obj = &e.client_view().state.hosts[h];
         assert_eq!(obj.roles, [Role::Transcode, Role::Compute].into());
-        assert_eq!(obj.location, "unknown");
     }
+    // The join path knows no location; the agents' LLDP says they hang off access-2.
+    let located = |e: &Engine| added.iter().all(|h| e.client_view().state.hosts[h].location == "rack-2");
+    assert!(e.run_until(e.now() + 15_000, located), "locations: {:?}", added.map(|h| e.client_view().state.hosts[&h].location.clone()));
 }
 
 #[test]

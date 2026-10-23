@@ -8,7 +8,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use control::proto::MetricSample;
-use control::state::{Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, Object, ObjectRef};
+use control::state::{Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, Object, ObjectRef, SwitchObj};
 use model::HostId;
 use serde::Serialize;
 use sim::truth::GroundTruth;
@@ -29,6 +29,7 @@ pub struct ViewSnapshot {
     pub hosts: Vec<HostObj>,
     pub tokens: Vec<JoinToken>,
     pub rules: Vec<AutoApproveRule>,
+    pub switches: Vec<SwitchObj>,
     pub alerts: Vec<Alert>,
     pub events: Vec<Event>,
     pub cp: CpInfo,
@@ -47,6 +48,7 @@ impl ViewSnapshot {
             hosts: s.hosts.values().cloned().collect(),
             tokens: s.tokens.values().cloned().collect(),
             rules: s.rules.values().cloned().collect(),
+            switches: s.switches.values().cloned().collect(),
             alerts: s.alerts.values().cloned().collect(),
             events: s.events.values().cloned().collect(),
             cp: s.cp.clone(),
@@ -239,6 +241,29 @@ mod tests {
         // The removal is not repeated.
         let ServerMsg::Delta { removed, upserts, .. } = conn.next(&published(&view, 40)) else { panic!() };
         assert!(removed.is_empty() && upserts.is_empty());
+    }
+
+    #[test]
+    fn switches_travel_in_snapshots_and_deltas() {
+        let observe = |last_seen| Command::ObserveSwitch {
+            id: model::SwitchId::from("access-1"),
+            model: "m".into(),
+            ports: vec![],
+            mlag_peer: None,
+            last_seen,
+        };
+        let mut leader = ClusterState::new();
+        let mut view = ClusterView::default();
+        leader.apply(1, observe(1)).unwrap();
+        view.merge(leader.changes_since(0));
+        let (mut conn, first) = Connection::open(&published(&view, 10));
+        let ServerMsg::Snapshot { view: snap, .. } = first else { panic!("{first:?}") };
+        assert_eq!(snap.switches.len(), 1);
+
+        leader.apply(2, observe(61_000)).unwrap();
+        view.merge(leader.changes_since(view.version));
+        let ServerMsg::Delta { upserts, .. } = conn.next(&published(&view, 20)) else { panic!() };
+        assert!(matches!(upserts.as_slice(), [Object::Switch(s)] if s.last_seen == 61_000), "{upserts:?}");
     }
 
     #[test]

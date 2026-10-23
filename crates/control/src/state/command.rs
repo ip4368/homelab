@@ -1,7 +1,9 @@
 //! Commands replicated through the Raft log, and the errors `apply` can return.
 
 use super::objects::{CpMode, Lifecycle, ObjectRef, Severity};
-use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId, Role};
+use model::network::{LldpNeighbor, ObservedSwitchPort};
+use model::{HardwareProfile, HostId, HostNetworkConfig, Inventory, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId, Role, SwitchId};
+use crate::runtime::SimTime;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -41,6 +43,18 @@ pub enum Command {
     DeleteTemplate { id: String },
     /// Sets (or with `None` clears) a host's hand-written network configuration.
     SetHostOverride { host: HostId, config: Option<HostNetworkConfig> },
+    /// What a host's agent observed: replaces its LLDP neighbours and
+    /// inventory. A host whose location is still unknown learns it from them.
+    ObserveHost { id: HostId, lldp: Vec<LldpNeighbor>, inventory: Inventory },
+    /// What polling a switch showed; `last_seen` is when it answered.
+    /// Creates or replaces the switch object.
+    ObserveSwitch {
+        id: SwitchId,
+        model: String,
+        ports: Vec<ObservedSwitchPort>,
+        mlag_peer: Option<SwitchId>,
+        last_seen: SimTime,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

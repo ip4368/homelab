@@ -11,6 +11,14 @@ export interface HostGroup {
 
 const byText = (a: string, b: string) => a.localeCompare(b, 'en', { numeric: true })
 
+/** The NIC a host's mgmt network rides on, whose LLDP neighbour is its access switch. */
+const MGMT_NIC = 'eth0'
+
+/** The switch the host's mgmt port is cabled to, from its LLDP report; 'unknown' until it reports. */
+function mgmtSwitch(h: HostObj): string {
+  return h.lldp?.find((n) => n.local_port === MGMT_NIC)?.switch ?? 'unknown'
+}
+
 /** The groups a host belongs to; a host with several roles is in each role group. */
 function keysOf(h: HostObj, by: GroupBy): string[] {
   switch (by) {
@@ -21,8 +29,7 @@ function keysOf(h: HostObj, by: GroupBy): string[] {
     case 'role':
       return h.roles.length > 0 ? h.roles : ['none']
     case 'switch':
-      // The host-to-switch cabling arrives with LLDP data (Task 13).
-      return ['unknown']
+      return [mgmtSwitch(h)]
   }
 }
 

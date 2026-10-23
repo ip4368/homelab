@@ -4,7 +4,8 @@
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
 use crate::state::{Changes, Command};
-use model::{HostId, Inventory, NetworkId, ProfileId, Role};
+use model::network::{LldpNeighbor, ObservedSwitchPort};
+use model::{HostId, Inventory, NetworkId, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -21,6 +22,14 @@ pub fn mgmt() -> NetworkId {
 pub struct LogCmd {
     pub at: SimTime,
     pub cmd: Command,
+}
+
+/// What a host's agent observes about its own machine: the cabling it hears
+/// over LLDP and its hardware inventory.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Observed {
+    pub lldp: Vec<LldpNeighbor>,
+    pub inventory: Inventory,
 }
 
 /// One host's resource sample, sent by its agent every metrics interval.
@@ -76,7 +85,13 @@ pub enum Msg {
     /// Between CP replicas, addressed to `Endpoint { Host(peer), Cp }`.
     Raft(RaftMsg<LogCmd>),
     /// Agent to the VIP. `lifecycle_seen` is the host-object version the agent last saw.
-    Heartbeat { host: HostId, lifecycle_seen: u64 },
+    /// `observed_at` is when the agent last saw its observation change (`None` if
+    /// it has none); `observed` carries it only on the first heartbeat, after a
+    /// change, or when the leader asked ([`Msg::ReportRequest`]).
+    Heartbeat { host: HostId, lifecycle_seen: u64, observed_at: Option<SimTime>, observed: Option<Observed> },
+    /// Leader to agent: send your observation, I don't have the one stamped
+    /// in your last heartbeat.
+    ReportRequest,
     /// Unjoined agent to the VIP, retried until answered `Ok`.
     JoinRequest { token: String, inventory: Inventory },
     /// Leader to agent: `Ok` once the host object exists.
@@ -85,6 +100,10 @@ pub enum Msg {
     Approved { roles: BTreeSet<Role> },
     /// Agent to the VIP, every metrics interval.
     Metrics { host: HostId, sample: MetricSample },
+    /// Leader to a switch's management interface, every poll interval.
+    SwitchPoll,
+    /// Switch to the leader: its own configuration.
+    SwitchReport { switch: SwitchId, model: String, ports: Vec<ObservedSwitchPort>, mlag_peer: Option<SwitchId> },
     /// Client to the VIP; `req` is the client's id for matching the reply.
     Api { req: u64, op: ApiOp },
     ApiResp { req: u64, result: ApiResult },

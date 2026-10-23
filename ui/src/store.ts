@@ -11,6 +11,7 @@ import type { Object as ClusterObject } from './gen/Object'
 import type { ObjectRef } from './gen/ObjectRef'
 import type { ServerMsg } from './gen/ServerMsg'
 import type { SimInfo } from './gen/SimInfo'
+import type { SwitchObj } from './gen/SwitchObj'
 
 /** The server's wire message, as sent over `/api/ws`. */
 export type WsMessage = ServerMsg
@@ -30,6 +31,8 @@ export interface View {
   hosts: Record<string, HostObj>
   tokens: Record<string, JoinToken>
   rules: Record<string, AutoApproveRule>
+  /** As observed by the control plane polling them; Task 17 renders them. */
+  switches: Record<string, SwitchObj>
   alerts: Record<string, Alert>
   /** Oldest first, at most EVENT_CAP. */
   events: ClusterEvent[]
@@ -71,6 +74,7 @@ function initialState(): UiState {
       hosts: {},
       tokens: {},
       rules: {},
+      switches: {},
       alerts: {},
       events: [],
       cp: { voters: [], mode: 'Suggest', version: 0 },
@@ -109,6 +113,7 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
     hosts: byKey(s.hosts, (h) => h.id),
     tokens: byKey(s.tokens, (t) => t.token),
     rules: byKey(s.rules, (r) => r.id),
+    switches: byKey(s.switches, (sw) => sw.id),
     alerts: byKey(s.alerts, (a) => a.id),
     events: capEvents([...s.events].sort((a, b) => a.seq - b.seq)),
     cp: s.cp,
@@ -118,7 +123,7 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
 
 /** Applies a delta's upserts and removals, copying only the slices that change. */
 function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
-  let { hosts, tokens, rules, alerts, events, cp, metrics } = view
+  let { hosts, tokens, rules, switches, alerts, events, cp, metrics } = view
   const upsertedEvents = new Map<number, ClusterEvent>()
   const removedEvents = new Set<number>()
   const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
@@ -142,6 +147,10 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
       case 'Rule':
         rules = edit(rules, copied)
         rules[o.id] = withoutTag(o)
+        break
+      case 'Switch':
+        switches = edit(switches, copied)
+        switches[o.id] = withoutTag(o)
         break
       case 'Alert':
         alerts = edit(alerts, copied)
@@ -172,6 +181,10 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
         rules = edit(rules, copied)
         delete rules[r.id]
         break
+      case 'Switch':
+        switches = edit(switches, copied)
+        delete switches[r.id]
+        break
       case 'Alert':
         alerts = edit(alerts, copied)
         delete alerts[r.id]
@@ -201,6 +214,7 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
     hosts,
     tokens,
     rules,
+    switches,
     alerts,
     events,
     cp,

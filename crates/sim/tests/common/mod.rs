@@ -44,7 +44,7 @@ impl Actor for HeartbeatStub {
     }
     fn on_message(&mut self, _: &mut dyn Ctx, _: Endpoint, _: Msg) {}
     fn on_timer(&mut self, ctx: &mut dyn Ctx, _: u64) {
-        let hb = Msg::Heartbeat { host: self.host.clone(), lifecycle_seen: 0 };
+        let hb = Msg::Heartbeat { host: self.host.clone(), lifecycle_seen: 0, observed_at: None, observed: None };
         ctx.send(Endpoint::new(Addr::Vip, Svc::Cp), mgmt(), hb);
         ctx.set_timer(HEARTBEAT_MS, 0);
     }

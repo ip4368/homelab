@@ -8,9 +8,9 @@ use control::client::{ClientActor, ClusterView, CLIENT};
 use control::proto::{ApiOp, ApiResult, LogCmd, Msg};
 use control::raft::{Durable, DurableOp};
 use control::replica::CpReplica;
-use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, Svc, SimTime};
-use model::network::HostNetworkConfig;
-use model::{HostId, Inventory, NetworkId};
+use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, SimTime, SwitchConfig, SwitchOs, Svc};
+use model::network::{HostNetworkConfig, LldpNeighbor};
+use model::{HostId, Inventory, NetworkId, SwitchId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::any::Any;
@@ -147,6 +147,10 @@ impl Ctx for EngineCtx<'_> {
         // Only actors on a host the world knows have an OS to talk to.
         if self.hw().is_some() { Some(self) } else { None }
     }
+    fn switch(&mut self) -> Option<&mut dyn SwitchOs> {
+        // Only the actor on a switch the world knows can read its configuration.
+        if self.switch_id().is_some() { Some(self) } else { None }
+    }
 }
 
 /// The world's host `me` runs on, if the fabric is installed and knows it.
@@ -155,6 +159,7 @@ fn host_hw<'d>(deliver: &'d mut dyn Deliver, me: &Endpoint) -> Option<&'d mut Ho
     (deliver as &mut dyn Any).downcast_mut::<Fabric>()?.host_mut(h)
 }
 
+const NO_SWITCH: &str = "Ctx::switch only hands out the OS of a switch the world knows";
 const NO_HOST: &str = "Ctx::host only hands out the OS of a host the world knows";
 
 impl EngineCtx<'_> {
@@ -165,6 +170,12 @@ impl EngineCtx<'_> {
     fn hw(&self) -> Option<&HostHw> {
         let Addr::Host(h) = &self.me.addr else { return None };
         self.fabric()?.world().hosts.get(h)
+    }
+
+    /// The switch `me` runs on, if the fabric is installed and knows it.
+    fn switch_id(&self) -> Option<&SwitchId> {
+        let Addr::Switch(s) = &self.me.addr else { return None };
+        self.fabric()?.world().topology.switches.contains_key(s).then_some(s)
     }
 
     fn hw_mut(&mut self) -> &mut HostHw {
@@ -180,6 +191,9 @@ impl HostOs for EngineCtx<'_> {
     }
     fn inventory(&self) -> Inventory {
         self.fabric().and_then(|f| f.world().inventory(&self.host_id())).expect(NO_HOST)
+    }
+    fn lldp(&self) -> Vec<LldpNeighbor> {
+        self.fabric().expect(NO_HOST).world().lldp(&self.host_id())
     }
     fn apply_network(&mut self, cfg: HostNetworkConfig) {
         self.hw_mut().applied_net = cfg;
@@ -204,6 +218,17 @@ impl HostOs for EngineCtx<'_> {
     }
     fn mark_joined(&mut self) {
         self.hw_mut().mark_joined();
+    }
+}
+
+/// The management interface of the switch `me` runs on: its own configuration.
+impl SwitchOs for EngineCtx<'_> {
+    fn switch_id(&self) -> SwitchId {
+        EngineCtx::switch_id(self).expect(NO_SWITCH).clone()
+    }
+    fn config(&self) -> SwitchConfig {
+        let id = EngineCtx::switch_id(self).expect(NO_SWITCH);
+        self.fabric().and_then(|f| f.world().switch_config(id)).expect(NO_SWITCH)
     }
 }
 

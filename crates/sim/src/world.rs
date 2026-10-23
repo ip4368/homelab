@@ -5,9 +5,11 @@
 use crate::topology::{Node, Topology};
 use control::proto::LogCmd;
 use control::raft::Durable;
-use control::runtime::HostUsage;
-use model::network::{HostNetworkConfig, LogicalNetwork, bootstrap_config, seed_networks};
-use model::{DiskState, HardwareProfile, HostId, Inventory, NetworkId, NicState, PortName, ProfileId, profile};
+use control::runtime::{HostUsage, SwitchConfig};
+use model::network::{
+    HostNetworkConfig, LldpNeighbor, LogicalNetwork, ObservedSwitchPort, bootstrap_config, seed_networks,
+};
+use model::{DiskState, HardwareProfile, HostId, Inventory, NetworkId, NicState, PortName, ProfileId, SwitchId, profile};
 use rand::Rng;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -109,6 +111,44 @@ impl World {
             failed: hw.failed_disks.contains(&d.name),
         });
         Some(Inventory { profile: hw.profile.id, variant: hw.variant, nics: nics.collect(), disks: disks.collect() })
+    }
+
+    /// What `host`'s LLDP daemon hears: for each NIC (in profile order) whose
+    /// link is up and whose cable ends in a switch port, that switch port.
+    /// Partitions do not matter: LLDP never leaves the cable.
+    pub fn lldp(&self, host: &HostId) -> Vec<LldpNeighbor> {
+        let Some(hw) = self.hosts.get(host).filter(|hw| hw.powered) else { return vec![] };
+        hw.profile
+            .nics
+            .iter()
+            .filter_map(|nic| {
+                let local_port = PortName::new(&nic.name);
+                let end = Node::HostPort(host.clone(), local_port.clone());
+                match self.topology.peer(&end) {
+                    Some(Node::SwitchPort(switch, switch_port)) if self.link_up(&end) => {
+                        Some(LldpNeighbor { local_port, switch: switch.clone(), switch_port: switch_port.clone() })
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// A switch's own configuration, which is what its management interface
+    /// reports. `None` for an unknown switch.
+    pub fn switch_config(&self, id: &SwitchId) -> Option<SwitchConfig> {
+        let sw = self.topology.switches.get(id)?;
+        let ports = sw
+            .ports
+            .iter()
+            .map(|(port, (_, cfg))| ObservedSwitchPort {
+                switch: id.clone(),
+                port: port.clone(),
+                cfg: cfg.clone(),
+                mlag_peer: sw.mlag_peer.clone(),
+            })
+            .collect();
+        Some(SwitchConfig { model: sw.model.clone(), ports, mlag_peer: sw.mlag_peer.clone() })
     }
 
     /// Whether the port at `end` has carrier: cabled, the cable plugged in,
@@ -217,5 +257,53 @@ mod tests {
             assert_eq!(u.disk_pct, [("nvme0".to_string(), IDLE_DISK_PCT)].into());
             assert!(u.port_bps.is_empty());
         }
+    }
+
+    fn lldp_of(w: &World) -> Vec<(String, String, String)> {
+        w.lldp(&hid("h")).into_iter().map(|n| (n.local_port.to_string(), n.switch.to_string(), n.switch_port.to_string())).collect()
+    }
+
+    #[test]
+    fn lldp_lists_the_switch_port_at_the_far_end_of_every_live_cable() {
+        let w = world();
+        let n = |l: &str, p: &str| (l.to_string(), "sw".to_string(), p.to_string());
+        assert_eq!(lldp_of(&w), [n("sfp0", "p1"), n("eth0", "p2")], "in NIC order; uncabled NICs hear nothing");
+        assert!(w.lldp(&hid("nope")).is_empty());
+
+        let cases: [(&str, Toggle); 4] = [
+            ("unplug", |w, up| w.topology.set_cable_up(&sp("p1"), up)),
+            ("port admin down", |w, up| {
+                let mut cfg = w.topology.switches[&SwitchId::from("sw")].port(&PortName::from("p1")).unwrap().clone();
+                cfg.admin_up = up;
+                w.topology.set_port(&SwitchId::from("sw"), &PortName::from("p1"), cfg);
+            }),
+            ("switch down", |w, up| w.topology.set_switch_up(&SwitchId::from("sw"), up)),
+            ("power off", |w, up| w.hosts.get_mut(&hid("h")).unwrap().powered = up),
+        ];
+        for (what, set) in cases {
+            let mut w = world();
+            set(&mut w, false);
+            assert!(!lldp_of(&w).iter().any(|(l, _, _)| l == "sfp0"), "{what}: sfp0 still has a neighbour");
+            set(&mut w, true);
+            assert_eq!(lldp_of(&w).len(), 2, "{what}: neighbour did not come back");
+        }
+        // Re-cabling sfp0 into eth0's old port changes its neighbour and leaves eth0 uncabled.
+        let mut w = world();
+        w.topology.connect(Node::HostPort(hid("h"), PortName::from("sfp0")), sp("p2"));
+        assert_eq!(lldp_of(&w), [n("sfp0", "p2")]);
+    }
+
+    #[test]
+    fn switch_config_is_the_switchs_own_ground_truth() {
+        let mut w = world();
+        let sw = SwitchId::from("sw");
+        let c = w.switch_config(&sw).unwrap();
+        assert_eq!((c.model.as_str(), c.mlag_peer.clone()), ("t", None));
+        assert_eq!(c.ports.iter().map(|p| p.port.as_str()).collect::<Vec<_>>(), ["p1", "p2"]);
+        assert!(c.ports.iter().all(|p| p.switch == sw && p.cfg.mode == PortMode::Access(1)));
+        let changed = SwitchPortCfg { mode: PortMode::Access(20), ..c.ports[0].cfg.clone() };
+        w.topology.set_port(&sw, &PortName::from("p1"), changed.clone());
+        assert_eq!(w.switch_config(&sw).unwrap().ports[0].cfg, changed);
+        assert!(w.switch_config(&SwitchId::from("nope")).is_none());
     }
 }
