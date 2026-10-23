@@ -898,3 +898,108 @@ fn migration_fails_when_vlan30_blocked() {
     assert!(events.values().any(|ev| ev.entity == ObjectRef::vm(&vm) && ev.message.contains("failed")), "no event for the failure");
     assert!(e.truth().split_brain_vms.is_empty());
 }
+
+/// The hosts `volume`'s status lists, in order.
+fn replica_hosts(e: &Engine, volume: &str) -> Vec<HostId> {
+    e.client_view().state.volume_status[volume].status.replicas.iter().map(|r| r.host.clone()).collect()
+}
+
+#[test]
+fn a_rebuild_copies_from_a_replica_that_can_carry_storage() {
+    // A replica's host loses VLAN 20 (its storage role is held), then another replica's host dies:
+    // the rebuild must come from the third replica, which can send on storage.
+    let mut e = fleet_with_volume(77, FleetSpec { ms01: 6, minipc: 0, pi5: 0, rk3588: 0 }, 20);
+    let hosts = replica_hosts(&e, "data");
+    let (bad, dead, good) = (hosts[0].clone(), hosts[1].clone(), hosts[2].clone());
+    block_vlan(&mut e, &bad, 20);
+    let held = |e: &Engine| e.client_view().state.hosts[&bad].net.held_roles.contains_key(&Role::Storage);
+    let deadline = e.now() + 90_000;
+    assert!(e.run_until(deadline, held), "{bad}'s storage role never held");
+
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: dead.clone() }).unwrap();
+    let mut sources = BTreeSet::new();
+    let each = |e: &Engine| {
+        let w = e.fabric().world();
+        sources.extend(w.traffic.flows().filter(|f| f.kind == FlowKind::Rebuild).map(|f| f.src.clone()));
+    };
+    // Not ready after 40 s, lost 60 s later; 20 GB at 2000 Mbit/s is 80 s.
+    let healed = run_checking(&mut e, killed + 40_000 + 60_000 + 120_000, each, |e| healthy_without(e, &["data".to_string()], &dead));
+    assert!(healed, "not rebuilt off {dead}: {:?}", e.client_view().state.volume_status["data"]);
+    assert!(sources.contains(&FlowEnd::Host(good)), "{sources:?}");
+}
+
+#[test]
+fn a_returning_hosts_complete_copy_is_kept_while_the_only_healthy_replica_is_on_a_dead_host() {
+    let mut e = volume_off_voters(78, 100);
+    let hosts = replica_hosts(&e, "data");
+    let (a, b, c) = (hosts[0].clone(), hosts[1].clone(), hosts[2].clone());
+
+    // b and c die; once both are stale, copies run from a. Then a dies too.
+    e.fault(Fault::KillHost { host: b.clone() }).unwrap();
+    e.fault(Fault::KillHost { host: c.clone() }).unwrap();
+    let stale = |e: &Engine, h: &HostId| e.client_view().state.volume_status["data"].status.replicas.iter().any(|r| r.host == *h && r.state == ReplicaState::Stale);
+    let copying_from_a = |e: &Engine| {
+        stale(e, &b) && stale(e, &c) && e.fabric().world().traffic.flows().any(|f| f.kind == FlowKind::Rebuild && f.src == FlowEnd::Host(a.clone()))
+    };
+    let deadline = e.now() + 150_000;
+    assert!(e.run_until(deadline, copying_from_a), "{:?}", e.client_view().state.volume_status["data"]);
+    let killed = e.now();
+    e.fault(Fault::KillHost { host: a.clone() }).unwrap();
+    e.run_for(20_000);
+    e.fault(Fault::RestoreHost { host: b.clone() }).unwrap();
+
+    // b's complete copy is the only one left once a is lost: it must survive and be salvaged.
+    let mut deleted = false;
+    let each = |e: &Engine| deleted |= !e.fabric().world().hosts[&b].replicas.contains_key("data");
+    let salvaged = |e: &Engine| {
+        e.client_view().state.volume_status["data"].status.replicas.iter().any(|r| r.host == b && r.state == ReplicaState::Healthy)
+    };
+    let ok = run_checking(&mut e, killed + 40_000 + 60_000 + 30_000, each, salvaged);
+    assert!(!deleted, "{b}'s complete copy was deleted");
+    assert!(ok, "{b}'s copy never salvaged: {:?}", e.client_view().state.volume_status["data"]);
+}
+
+/// Seven MS-01s with volume `data` (`size_gb`) healthy on three hosts that are not CP voters,
+/// so that killing or cutting off its hosts keeps quorum.
+fn volume_off_voters(seed: u64, size_gb: u32) -> Engine {
+    let mut e = Engine::new(seed);
+    e.load_fleet(&FleetSpec { ms01: 7, minipc: 0, pi5: 0, rk3588: 0 }, 3);
+    assert!(e.run_until(15_000, |e| e.client_view().leader.is_some()), "no leader");
+    let voters: Vec<HostId> = e.client_view().state.cp.voters.iter().cloned().collect();
+    api_all(&mut e, voters.iter().map(|h| ApiOp::Cordon { id: h.clone() }).collect());
+    api_all(&mut e, vec![ApiOp::CreateVolume { volume: Volume::new("data", size_gb) }]);
+    let deadline = e.now() + 30_000;
+    let healthy = |e: &Engine| e.client_view().state.volume_status.get("data").is_some_and(|v| v.status.health == VolumeHealth::Healthy);
+    assert!(e.run_until(deadline, healthy), "volume never healthy");
+    api_all(&mut e, voters.iter().map(|h| ApiOp::Uncordon { id: h.clone() }).collect());
+    let hosts = replica_hosts(&e, "data");
+    assert!(hosts.iter().all(|h| !voters.contains(h)), "{hosts:?} {voters:?}");
+    e
+}
+
+#[test]
+fn a_stalled_rebuild_moves_to_another_source_instead_of_abandoning_its_target() {
+    let mut e = volume_off_voters(79, 20);
+    let hosts = replica_hosts(&e, "data");
+    let dead = hosts[1].clone();
+    e.fault(Fault::KillHost { host: dead.clone() }).unwrap();
+    let deadline = e.now() + 150_000;
+    let copying = |e: &Engine| rebuild_target(e, "data").and_then(|t| copy_source(e, &t, "data"));
+    assert!(e.run_until(deadline, |e| copying(e).is_some()), "no copy started");
+    let t = rebuild_target(&e, "data").unwrap();
+    let Some(FlowEnd::Host(source)) = copying(&e) else { panic!("copy from no host") };
+    // The source is cut off just as the copy starts: the copy stalls.
+    e.fault(Fault::Partition { nodes: vec![PartitionMember::Host(source.clone())] }).unwrap();
+    let mut abandoned = false;
+    let each = |e: &Engine| {
+        let st = &e.client_view().state.volume_status["data"].status;
+        abandoned |= st.replicas.iter().any(|r| r.host == t && r.state == ReplicaState::Stale);
+    };
+    let done = |e: &Engine| e.client_view().state.volume_status["data"].status.replicas.iter().any(|r| r.host == t && r.state == ReplicaState::Healthy);
+    // 60 s stalled, then 20 GB at 2000 Mbit/s is 80 s.
+    let deadline = e.now() + 60_000 + 120_000;
+    let healed = run_checking(&mut e, deadline, each, done);
+    assert!(!abandoned, "{t} was abandoned though another healthy source was there");
+    assert!(healed, "{t} never completed: {:?}", e.client_view().state.volume_status["data"]);
+}

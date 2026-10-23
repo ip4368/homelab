@@ -171,7 +171,7 @@ impl CpReplica {
                     if !v.may_propose(&cmd, now) {
                         continue;
                     }
-                    v.note_proposed(&self.state, &cmd);
+                    v.note_proposed(&self.state, &cmd, now);
                     if let Ok(index) = raft.propose(now, LogCmd { at: now, cmd: cmd.clone() }) {
                         v.in_flight.insert(index, cmd);
                     }

@@ -14,12 +14,19 @@
 //!   written in steps of [`PROGRESS_STEP_PCT`], and `Healthy` once complete.
 //!   A copy its target reports interrupted is sent again, with a healthy
 //!   source, so it resumes.
+//! * **Sources.** A copy comes from the best healthy replica (`sources`):
+//!   preferring one on a `Ready` host whose storage role is not held, and
+//!   one this volume's copies have not stalled from. A copy whose progress
+//!   has not moved for [`REBUILD_STALL_MS`] moves to another healthy source
+//!   it has not stalled from, remembered by the leader
+//!   ([`Volatile::failed_sources`]).
 //! * **Loss.** A replica whose host is lost (`NotReady` for more than
 //!   [`FAILOVER_GRACE_MS`](super::failover::FAILOVER_GRACE_MS), or gone) or whose disk its host reports failed is
-//!   marked `Stale`, and so is a copy whose progress has not moved for
-//!   [`REBUILD_STALL_MS`] (abandoned). Stale entries stay in the status, so
+//!   marked `Stale`, and so is a stalled copy with no other source to try,
+//!   or whose own host cannot carry storage traffic (abandoned). Stale entries stay in the status, so
 //!   their hosts are not picked again and the volume keeps the mark of
-//!   having held data, until all the replicas it asks for are healthy again.
+//!   having held data, until all the replicas it asks for are healthy
+//!   again, counting only replicas that can be relied on now (`usable`).
 //!   Only when no other host can take a replica may the host of a stale
 //!   entry be picked again, once it has dropped its old copy. A volume left
 //!   with no healthy replica salvages a stale one whose host is back with it
@@ -27,7 +34,7 @@
 //! * **Drains.** A replica on a host being drained ([`evacuating`]) gets a
 //!   replacement placed as if it were missing, but stays (and stays a copy
 //!   source) until the volume has all the replicas it asks for healthy
-//!   without it; then it is dropped, and so deleted. A copy onto such a host
+//!   (`usable`) without it; then it is dropped, and so deleted. A copy onto such a host
 //!   is given up at once.
 //! * **Cleanup.** A replica a host reports that its volume's status does not
 //!   list as live, or whose volume is gone, gets `DeleteReplica` (at most
@@ -47,7 +54,7 @@ use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg, ReplicaReport};
 use crate::runtime::SimTime;
 use crate::state::{Alert, ClusterState, Command, Lifecycle, ObjectKind, ObjectRef};
-use model::{place_replicas, DiskView, HostId, ReplicaRef, ReplicaState, StorageHostView, VolumeHealth};
+use model::{place_replicas, DiskView, HostId, ReplicaRef, ReplicaState, Role, StorageHostView, VolumeHealth};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const INSUFFICIENT_STORAGE_HOSTS: &str = "InsufficientStorageHosts";
@@ -55,8 +62,13 @@ pub const VOLUME_DEGRADED: &str = "VolumeDegraded";
 pub const VOLUME_FAULTED: &str = "VolumeFaulted";
 /// Copy progress is written to the volume status in steps of this many percent.
 pub const PROGRESS_STEP_PCT: u8 = 10;
-/// A copy whose reported progress has not moved for this long is abandoned.
+/// A copy whose reported progress has not moved for this long is moved to
+/// another source, or abandoned.
 pub const REBUILD_STALL_MS: u64 = 60_000;
+/// A host not heard from for this long (three heartbeats missed) may be
+/// dead before it is marked `NotReady`: its replicas are not relied on to
+/// make others unneeded.
+pub const UNHEARD_MS: u64 = 15_000;
 
 /// Each volume alert's kind and the start of its ids.
 const ALERTS: [(&str, &str); 3] = [
@@ -158,8 +170,9 @@ fn plan(
 ) -> (Vec<ReplicaRef>, bool) {
     let mut replicas = committed.to_vec();
     for r in replicas.iter_mut() {
+        let abandoned = stalled(v, now, volume, r) && next_source(state, v, volume, &r.host, committed).is_none();
         progress(v, volume, r);
-        if r.state != ReplicaState::Stale && (lost(state, now, r) || stalled(v, now, volume, r)) {
+        if r.state != ReplicaState::Stale && (lost(state, now, r) || abandoned) {
             r.state = ReplicaState::Stale;
         }
     }
@@ -171,11 +184,12 @@ fn plan(
             salvage(state, v, volume, r);
         }
     }
-    if healthy(&replicas) >= want {
+    // Only replicas that can be relied on now (see `usable`) make others unneeded.
+    if replicas.iter().filter(|r| usable(state, v, now, r)).count() >= want {
         replicas.retain(|r| r.state != ReplicaState::Stale);
     }
     let staying = |r: &&ReplicaRef| !leaving.contains(&r.host);
-    if replicas.iter().filter(staying).filter(|r| r.state == ReplicaState::Healthy).count() >= want {
+    if replicas.iter().filter(staying).filter(|r| usable(state, v, now, r)).count() >= want {
         replicas.retain(|r| !leaving.contains(&r.host));
     }
     let live = replicas.iter().filter(|r| r.state != ReplicaState::Stale).count();
@@ -272,6 +286,54 @@ fn stalled(v: &Volatile, now: SimTime, volume: &str, r: &ReplicaRef) -> bool {
             .is_some_and(|(_, since)| now.saturating_sub(*since) > REBUILD_STALL_MS)
 }
 
+/// Whether `r` is healthy on a host that exists, is not `NotReady` and was
+/// heard from within [`UNHEARD_MS`]. A replica on a host that stopped
+/// heartbeating stays `Healthy` until the host is lost, but may be gone, so
+/// it never makes another replica unneeded.
+fn usable(state: &ClusterState, v: &Volatile, now: SimTime, r: &ReplicaRef) -> bool {
+    r.state == ReplicaState::Healthy
+        && state.hosts.get(&r.host).is_some_and(|h| h.lifecycle != Lifecycle::NotReady)
+        && now.saturating_sub(v.last_seen(&r.host)) <= UNHEARD_MS
+}
+
+/// Whether `host`'s storage role is held: as far as the control plane
+/// knows, it cannot carry storage traffic.
+fn storage_held(state: &ClusterState, host: &HostId) -> bool {
+    state.hosts.get(host).is_some_and(|h| h.net.held_roles.contains_key(&Role::Storage))
+}
+
+/// The healthy replicas a copy of `volume` onto `target` could come from,
+/// best first: those this copy has not stalled from before
+/// ([`Volatile::failed_sources`]), then those on `Ready` hosts, then those
+/// whose host can carry storage traffic, then those the volume's other
+/// copies stalled from least often, then in list order.
+fn sources<'a>(state: &ClusterState, v: &Volatile, volume: &str, target: &HostId, replicas: &'a [ReplicaRef]) -> Vec<&'a HostId> {
+    let failed = |key: &(String, HostId), h: &HostId| v.failed_sources.get(key).is_some_and(|s| s.contains(h));
+    let here = (volume.to_string(), target.clone());
+    let failures = |h: &HostId| v.failed_sources.iter().filter(|((vol, _), s)| vol == volume && s.contains(h)).count();
+    let ready = |h: &HostId| state.hosts.get(h).is_some_and(|h| h.lifecycle == Lifecycle::Ready);
+    let mut out: Vec<&HostId> = replicas.iter().filter(|r| r.state == ReplicaState::Healthy && r.host != *target).map(|r| &r.host).collect();
+    // A stable sort keeps list order among equals.
+    out.sort_by_key(|h| (failed(&here, h), !ready(h), storage_held(state, h), failures(h)));
+    out
+}
+
+/// Where a copy onto `target` that stalled should go on from: the best
+/// healthy source it has not stalled from and is not using; `None` (the
+/// copy is abandoned) if there is none, or if `target` itself cannot carry
+/// storage traffic, so the fault is its own.
+fn next_source(state: &ClusterState, v: &Volatile, volume: &str, target: &HostId, replicas: &[ReplicaRef]) -> Option<HostId> {
+    if storage_held(state, target) {
+        return None;
+    }
+    let key = (volume.to_string(), target.clone());
+    let (current, failed) = (v.copy_source.get(&key), v.failed_sources.get(&key));
+    sources(state, v, volume, target, replicas)
+        .into_iter()
+        .find(|h| Some(*h) != current && !failed.is_some_and(|f| f.contains(*h)))
+        .cloned()
+}
+
 /// Makes stale replica `r` healthy again if its host is back (not
 /// `NotReady`) and reports it complete.
 fn salvage(state: &ClusterState, v: &Volatile, volume: &str, r: &mut ReplicaRef) {
@@ -307,21 +369,26 @@ fn health(replicas: &[ReplicaRef], want: usize) -> VolumeHealth {
 /// `CreateReplica` to each host the committed status has seeding or
 /// copying a replica that its heartbeat does not list, or lists incomplete
 /// with no copy running (interrupted), at most every [`RESEND_MS`]. The copy
-/// comes from a healthy replica, one on a `Ready` host if there is one. Only
-/// a replica placed as `Seeding` is created empty, and only while the volume
-/// has no healthy replica; a copy with no healthy source waits.
+/// comes from the best of the healthy replicas (`sources`). A copy that
+/// stalled is sent again with the [`next_source`], which the host switches
+/// to. Only a replica placed as `Seeding` is created empty, and only while
+/// the volume has no healthy replica; a copy with no healthy source waits.
 fn create_replicas(state: &ClusterState, v: &Volatile, now: SimTime, volume: &str, size_gb: u32, replicas: &[ReplicaRef]) -> Vec<Action> {
-    let healthy = || replicas.iter().filter(|r| r.state == ReplicaState::Healthy);
-    let ready = |r: &&ReplicaRef| state.hosts.get(&r.host).is_some_and(|h| h.lifecycle == Lifecycle::Ready);
-    let healthy_source = healthy().find(ready).or_else(|| healthy().next()).map(|r| r.host.clone());
     let mut out = vec![];
     for r in replicas {
-        let source = match (&r.state, &healthy_source) {
-            (ReplicaState::Seeding | ReplicaState::Rebuilding { .. }, Some(s)) => Some(s.clone()),
-            (ReplicaState::Seeding, None) => None,
-            _ => continue,
+        let (source, wanted) = if stalled(v, now, volume, r) {
+            // With no other source `plan` abandons the copy.
+            let Some(next) = next_source(state, v, volume, &r.host, replicas) else { continue };
+            (Some(next), true)
+        } else {
+            let best = sources(state, v, volume, &r.host, replicas).first().map(|h| (*h).clone());
+            let source = match (&r.state, best) {
+                (ReplicaState::Seeding | ReplicaState::Rebuilding { .. }, Some(s)) => Some(s),
+                (ReplicaState::Seeding, None) => None,
+                _ => continue,
+            };
+            (source, report(v, &r.host, volume).is_none_or(|rep| rep.pct < 100 && !rep.copying))
         };
-        let wanted = report(v, &r.host, volume).is_none_or(|rep| rep.pct < 100 && !rep.copying);
         let recent = v.replica_created.get(&(volume.to_string(), r.host.clone())).is_some_and(|at| now < at + RESEND_MS);
         if wanted && !recent {
             let msg = Msg::CreateReplica { volume: volume.into(), size_gb, source };
@@ -390,7 +457,7 @@ fn alert(
 /// `DeleteReplica` for each replica a host reports that its volume does
 /// not want there: the volume is gone, or its committed status does not
 /// list the host as live. A stale replica is kept while the volume has no
-/// healthy one, for salvage. A `NotReady` host's report is old news; it is
+/// healthy one on a host that is not `NotReady` (`usable`), for salvage. A `NotReady` host's report is old news; it is
 /// cleaned up once it is back.
 fn delete_unwanted(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     let mut out = vec![];
@@ -399,7 +466,7 @@ fn delete_unwanted(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Acti
         for rep in reports {
             let keep = state.volume_status.get(&rep.volume).is_some_and(|st| {
                 let replicas = &st.status.replicas;
-                let healthy = replicas.iter().any(|r| r.state == ReplicaState::Healthy);
+                let healthy = replicas.iter().any(|r| usable(state, v, now, r));
                 replicas.iter().any(|r| r.host == *host && (r.state != ReplicaState::Stale || !healthy))
             });
             let recent = v.replica_deleted.get(&(rep.volume.clone(), host.clone())).is_some_and(|at| now < at + RESEND_MS);
@@ -418,7 +485,7 @@ mod tests {
     };
     use super::super::failover::FAILOVER_GRACE_MS;
     use super::*;
-    use model::{ProfileId, Role, Volume};
+    use model::{ProfileId, Volume};
 
     /// A leader of `term` that has heard from every host of `s`, which holds no replicas.
     fn heard_from(s: &ClusterState, term: u64) -> Volatile {
@@ -426,7 +493,15 @@ mod tests {
         for h in s.hosts.keys() {
             v.replicas.insert(h.clone(), vec![]);
         }
+        heard_throughout(&mut v, s);
         v
+    }
+
+    /// Marks every host of `s` as heard from whenever the controller runs.
+    fn heard_throughout(v: &mut Volatile, s: &ClusterState) {
+        for h in s.hosts.keys() {
+            v.last_heartbeat.insert(h.clone(), SimTime::MAX);
+        }
     }
 
     /// The actions, less alert raises.
@@ -608,6 +683,7 @@ mod tests {
             v.replicas.insert(hid(h), vec![]);
         }
         report_all(&mut v, &s, "d", 100);
+        heard_throughout(&mut v, &s);
         (s, v)
     }
 
@@ -663,11 +739,14 @@ mod tests {
     }
 
     #[test]
-    fn a_copy_without_progress_for_60_s_is_abandoned_and_placed_elsewhere() {
+    fn a_copy_without_progress_for_60_s_from_every_source_is_abandoned_and_placed_elsewhere() {
         let (mut s, mut v) = whole(5);
         let st = vec![healthy("m1"), healthy("m2"), rebuilding("m3", 10)];
         s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
         v.replicas.insert(hid("m3"), vec![rep("d", "nvme0", 12, true)]);
+        // The copy runs from m1, and already stalled from m2.
+        v.copy_source.insert(("d".into(), hid("m3")), hid("m1"));
+        v.failed_sources.insert(("d".into(), hid("m3")), [hid("m2")].into());
         v.copy_progress.insert(("d".into(), hid("m3")), (12_000_000, 1000));
         assert!(statuses(&run(&s, &v, 1000 + REBUILD_STALL_MS)).is_empty(), "not yet");
         let out = run(&s, &v, 1001 + REBUILD_STALL_MS);
@@ -715,7 +794,7 @@ mod tests {
             replicas: vec![stale("m1"), healthy("m2"), healthy("m3"), rebuilding("m4", 0)],
             health: VolumeHealth::Rebuilding,
         };
-        v.note_proposed(&s, &cmd);
+        v.note_proposed(&s, &cmd, 0);
         assert_eq!(v.copy_progress.keys().cloned().collect::<Vec<_>>(), [key("m2")], "m1 went stale, m4 is a new target");
         // A status that only moves an existing copy on keeps its clock.
         let mut s = s;
@@ -726,7 +805,7 @@ mod tests {
             replicas: vec![stale("m1"), healthy("m2"), healthy("m3"), rebuilding("m4", 10)],
             health: VolumeHealth::Rebuilding,
         };
-        v.note_proposed(&s, &progress);
+        v.note_proposed(&s, &progress, 0);
         assert!(v.copy_progress.contains_key(&key("m4")));
     }
 
@@ -781,6 +860,115 @@ mod tests {
         out.sort();
         let del = |h: &str, vol: &str| (hid(h), vol.to_string());
         assert_eq!(out, [del("m4", "d"), del("m4", "e"), del("m4", "gone")], "unlisted for its volume, or the volume is gone");
+    }
+
+    /// The `CreateReplica`s sent: (target, source).
+    fn creates(actions: &[Action]) -> Vec<(HostId, Option<HostId>)> {
+        sends(actions).into_iter().filter_map(|(h, m)| if let Msg::CreateReplica { source, .. } = m { Some((h, source)) } else { None }).collect()
+    }
+
+    fn hold_storage(s: &mut ClusterState, host: &str) {
+        s.hosts.get_mut(&hid(host)).unwrap().net.held_roles.insert(Role::Storage, model::NetworkId::from("storage"));
+    }
+
+    fn copy_to(source: &str) -> Msg {
+        Msg::CreateReplica { volume: "d".into(), size_gb: 40, source: Some(hid(source)) }
+    }
+
+    fn key(host: &str) -> (String, HostId) {
+        ("d".to_string(), hid(host))
+    }
+
+    #[test]
+    fn a_copy_comes_from_a_source_whose_storage_role_is_active() {
+        let (mut s, mut v) = whole(4);
+        let st = vec![healthy("m1"), healthy("m2"), rebuilding("m4", 0)];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
+        v.replicas.insert(hid("m3"), vec![]);
+        hold_storage(&mut s, "m1");
+        assert_eq!(creates(&run(&s, &v, 1000)), [(hid("m4"), Some(hid("m2")))], "m1 cannot send on storage");
+    }
+
+    #[test]
+    fn a_stalled_copy_tries_another_healthy_source_before_its_target_is_abandoned() {
+        let (mut s, mut v) = whole(5);
+        let st = vec![healthy("m1"), healthy("m2"), rebuilding("m3", 10)];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
+        v.replicas.insert(hid("m3"), vec![rep("d", "nvme0", 12, true)]);
+        v.note_sent(&agent(&hid("m3")), &copy_to("m1"), 1000);
+        v.copy_progress.insert(key("m3"), (12_000_000, 1000));
+        let stall = 1001 + REBUILD_STALL_MS;
+        let out = run(&s, &v, stall);
+        assert!(statuses(&out).is_empty(), "not abandoned while another source may do: {out:?}");
+        assert_eq!(creates(&out), [(hid("m3"), Some(hid("m2")))], "moved to the other healthy source");
+        v.note_sent(&agent(&hid("m3")), &copy_to("m2"), stall);
+        assert_eq!(v.failed_sources[&key("m3")], [hid("m1")].into(), "m1 is remembered as failing m3");
+        assert!(no_alerts(run(&s, &v, stall + REBUILD_STALL_MS)).is_empty(), "the new source gets its own 60 s");
+        let out = run(&s, &v, stall + REBUILD_STALL_MS + 1);
+        let placed = vec![healthy("m1"), healthy("m2"), stale("m3"), rebuilding("m5", 0)];
+        assert_eq!(statuses(&out), [(placed, VolumeHealth::Rebuilding)], "every source stalled: the target is abandoned");
+        let staled = proposals(&out).into_iter().find(|c| matches!(c, Command::SetVolumeStatus { .. })).unwrap();
+        v.note_proposed(&s, &staled, stall + REBUILD_STALL_MS + 1);
+        assert_eq!(v.failed_sources[&key("m3")], [hid("m1"), hid("m2")].into());
+    }
+
+    #[test]
+    fn a_new_target_avoids_sources_that_stalled_before() {
+        let (mut s, mut v) = whole(5);
+        let st = vec![healthy("m1"), healthy("m2"), stale("m3"), rebuilding("m5", 0)];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
+        v.replicas.insert(hid("m3"), vec![]);
+        v.failed_sources.insert(key("m3"), [hid("m1")].into());
+        assert_eq!(creates(&run(&s, &v, 1000)), [(hid("m5"), Some(hid("m2")))]);
+    }
+
+    #[test]
+    fn a_stalled_copy_onto_a_host_that_cannot_carry_storage_is_abandoned_at_once() {
+        let (mut s, mut v) = whole(5);
+        let st = vec![healthy("m1"), healthy("m2"), rebuilding("m3", 10)];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Rebuilding }).unwrap();
+        hold_storage(&mut s, "m3");
+        v.replicas.insert(hid("m3"), vec![rep("d", "nvme0", 12, true)]);
+        v.note_sent(&agent(&hid("m3")), &copy_to("m1"), 1000);
+        v.copy_progress.insert(key("m3"), (12_000_000, 1000));
+        let out = run(&s, &v, 1001 + REBUILD_STALL_MS);
+        let placed = vec![healthy("m1"), healthy("m2"), stale("m3"), rebuilding("m5", 0)];
+        assert_eq!(statuses(&out), [(placed, VolumeHealth::Rebuilding)], "the target is at fault, not the source");
+    }
+
+    #[test]
+    fn healthy_replicas_on_not_ready_hosts_do_not_count_towards_dropping_others() {
+        // m1 just went NotReady (within the grace period); m4 holds a stale but complete copy.
+        let (mut s, mut v) = whole(4);
+        let st = vec![healthy("m1"), healthy("m2"), healthy("m3"), stale("m4")];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Healthy }).unwrap();
+        s.apply(10_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
+        v.replicas.insert(hid("m4"), vec![rep("d", "nvme0", 100, false)]);
+        assert!(statuses(&run(&s, &v, 20_000)).is_empty(), "the stale entry stays: only two healthy replicas can be relied on");
+        // So with m1 back but m2 unheard for longer than UNHEARD_MS: it may be dead, not yet NotReady.
+        s.apply(20_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::Ready }).unwrap();
+        v.last_heartbeat.insert(hid("m2"), 20_000);
+        assert!(statuses(&run(&s, &v, 20_000 + UNHEARD_MS + 1)).is_empty(), "m2 is not relied on either");
+        assert_eq!(statuses(&run(&s, &v, 20_000 + UNHEARD_MS))[0].0.len(), 3, "heard recently: whole, so the stale entry goes");
+        s.apply(20_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
+        v.last_heartbeat.insert(hid("m2"), SimTime::MAX);
+        // With m1 the only healthy one, m4's copy may be all that is left: it is kept for salvage.
+        let st = vec![healthy("m1"), stale("m4")];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Degraded }).unwrap();
+        let out = run(&s, &v, 20_000);
+        assert!(!deletes(&out).contains(&(hid("m4"), "d".to_string())), "{out:?}");
+
+        // Likewise a draining host's replica stays while a "staying" healthy one is on a NotReady host.
+        let (mut s, mut v) = whole(4);
+        let st = vec![healthy("m1"), healthy("m2"), healthy("m3"), healthy("m4")];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Healthy }).unwrap();
+        report_all(&mut v, &s, "d", 100);
+        for lifecycle in [Lifecycle::Cordoned, Lifecycle::Draining] {
+            s.apply(0, Command::SetLifecycle { id: hid("m2"), lifecycle }).unwrap();
+        }
+        s.apply(10_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
+        let out = run(&s, &v, 20_000);
+        assert!(deletes(&out).is_empty() && statuses(&out).is_empty(), "m2 is still needed: {out:?}");
     }
 
     #[test]

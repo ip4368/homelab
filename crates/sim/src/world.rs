@@ -410,7 +410,8 @@ impl World {
     /// for it: empty and complete when `source` is `None`, else copied from
     /// `source` by a [`REBUILD_MBPS`] rebuild flow on `storage`. A volume the
     /// host holds keeps its replica; if that is incomplete with no copy
-    /// running (interrupted), the copy resumes from `source`. A copy only
+    /// running (interrupted), or with one running from another host, the
+    /// copy resumes from `source`, keeping what it got across. A copy only
     /// starts from another powered host that holds a complete replica of
     /// the volume; with any other source (the host itself included) the replica waits, not copying, for a
     /// better one. The replica's disk, or `None` if no disk has room.
@@ -428,6 +429,12 @@ impl World {
         };
         let hw = self.hosts.get_mut(host).expect("checked above");
         if let Some(r) = hw.replicas.get_mut(volume) {
+            // A copy running from another host than a valid `source` moves to `source`.
+            let from = |s: &HostId| FlowEnd::Host(s.clone());
+            let elsewhere = r.flow.and_then(|f| self.traffic.flow(f)).is_some_and(|f| copy_from.as_ref().is_some_and(|s| f.src != from(s)));
+            if r.pct < 100 && elsewhere {
+                r.interrupt(&mut self.traffic);
+            }
             if r.pct < 100 && r.flow.is_none() {
                 r.flow = start(&mut self.traffic);
             }
@@ -1045,6 +1052,34 @@ mod tests {
             f.tick(now);
         }
         assert_eq!(report(&f, "w").pct, 100);
+    }
+
+    #[test]
+    fn a_copy_asked_for_from_another_source_moves_to_it() {
+        use crate::engine::Deliver;
+        let mut w = storage_pair();
+        // c holds v complete but is cabled to nothing: a copy from it carries nothing.
+        let net = w.hosts[&hid("a")].applied_net.clone();
+        w.hosts.insert(hid("c"), HostHw::running(ProfileId::Ms01, 0, net));
+        w.create_replica(&hid("c"), "v", 1, None);
+        let mut f = crate::fabric::Fabric::new(w, 1);
+        let (a, b, c) = (hid("a"), hid("b"), hid("c"));
+        let src = |f: &crate::fabric::Fabric| {
+            let flow = f.world().hosts[&b].replicas["v"].flow?;
+            f.world().traffic.flow(flow).map(|x| x.src.clone())
+        };
+        f.create_replica(&b, "v", 1, Some(c.clone()));
+        f.tick(1000);
+        assert_eq!((src(&f), f.world().replicas(&b)[0].pct), (Some(FlowEnd::Host(c.clone())), 0), "stalled");
+        f.create_replica(&b, "v", 1, Some(c.clone()));
+        assert_eq!(f.world().traffic.flows().count(), 1, "the same source: left alone");
+        f.create_replica(&b, "v", 1, Some(a.clone()));
+        assert_eq!(src(&f), Some(FlowEnd::Host(a.clone())), "moved to a");
+        assert_eq!(f.world().traffic.flows().count(), 1, "the stalled flow is gone");
+        f.tick(2000);
+        assert_eq!(f.world().replicas(&b)[0].pct, 25);
+        f.create_replica(&b, "v", 1, Some(hid("nope")));
+        assert_eq!(src(&f), Some(FlowEnd::Host(a)), "no copy can come from a host without the volume: the running one goes on");
     }
 
     fn lldp_of(w: &World) -> Vec<(String, String, String)> {

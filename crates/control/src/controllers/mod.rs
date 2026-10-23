@@ -25,7 +25,7 @@ use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
-use model::{HostId, NetworkId, PortName, ReplicaState, SwitchId};
+use model::{HostId, NetworkId, PortName, ReplicaState, SwitchId, VolumeHealth};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A controller command that applied with an error is not proposed again for this long.
@@ -128,6 +128,13 @@ pub struct Volatile {
     /// first `CreateReplica` with a source is sent; dropped once complete,
     /// and when a status placing that target afresh or marking it stale is proposed.
     pub copy_progress: BTreeMap<(String, HostId), (u64, SimTime)>,
+    /// The source each copy onto a host, by (volume, host), was last sent `CreateReplica` with.
+    pub copy_source: BTreeMap<(String, HostId), HostId>,
+    /// The sources a copy onto a host, by (volume, host), stalled from: the
+    /// storage controller tries the other healthy replicas first, for that
+    /// copy and (less strongly) for the volume's other copies. Forgotten
+    /// once the volume is proposed healthy.
+    pub failed_sources: BTreeMap<(String, HostId), BTreeSet<HostId>>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -160,6 +167,8 @@ impl Volatile {
             instance_stopped: BTreeMap::new(),
             replica_deleted: BTreeMap::new(),
             copy_progress: BTreeMap::new(),
+            copy_source: BTreeMap::new(),
+            failed_sources: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -209,6 +218,7 @@ impl Volatile {
             let key = (r.volume.clone(), host.clone());
             if r.pct >= 100 {
                 self.copy_progress.remove(&key);
+                self.copy_source.remove(&key);
             } else if self.copy_progress.get(&key).is_none_or(|(bytes, _)| *bytes != r.copied_bytes) {
                 self.copy_progress.insert(key, (r.copied_bytes, now));
             }
@@ -218,18 +228,37 @@ impl Volatile {
 
     /// Notes a controller proposal about to be made on `state`: a volume
     /// status that places a copy on a host afresh, or marks a replica stale,
-    /// forgets that copy's progress, so an earlier copy's clock never makes
-    /// a new one look stalled.
-    pub fn note_proposed(&mut self, state: &ClusterState, cmd: &Command) {
-        let Command::SetVolumeStatus { id, replicas, .. } = cmd else { return };
+    /// forgets that copy's progress and source, so an earlier copy's clock
+    /// never makes a new one look stalled; a copy marked stale while stalled
+    /// counts against its source ([`Volatile::failed_sources`]). A status
+    /// that makes the volume healthy forgets its failed sources.
+    pub fn note_proposed(&mut self, state: &ClusterState, cmd: &Command, now: SimTime) {
+        let Command::SetVolumeStatus { id, replicas, health } = cmd else { return };
         let before = state.volume_status.get(id).map_or(&[][..], |s| &s.status.replicas[..]);
         for r in replicas {
             let was_live = before.iter().any(|b| b.host == r.host && b.state != ReplicaState::Stale);
             let placed = matches!(r.state, ReplicaState::Seeding | ReplicaState::Rebuilding { .. }) && !was_live;
             let staled = r.state == ReplicaState::Stale && was_live;
-            if placed || staled {
-                self.copy_progress.remove(&(id.clone(), r.host.clone()));
+            let key = (id.clone(), r.host.clone());
+            if staled {
+                self.note_source_failed(&key, now);
             }
+            if placed || staled {
+                self.copy_progress.remove(&key);
+                self.copy_source.remove(&key);
+            }
+        }
+        if *health == VolumeHealth::Healthy {
+            self.failed_sources.retain(|(volume, _), _| volume != id);
+        }
+    }
+
+    /// Counts the copy `key` (volume, target) against its source if it has
+    /// stalled ([`storage::REBUILD_STALL_MS`] without progress).
+    fn note_source_failed(&mut self, key: &(String, HostId), now: SimTime) {
+        let stalled = self.copy_progress.get(key).is_some_and(|(_, since)| now.saturating_sub(*since) > storage::REBUILD_STALL_MS);
+        if let Some(source) = self.copy_source.get(key).filter(|_| stalled) {
+            self.failed_sources.entry(key.clone()).or_default().insert(source.clone());
         }
     }
 
@@ -247,9 +276,19 @@ impl Volatile {
                 self.instance_started.insert(spec.id.clone(), (id.clone(), now));
             }
             (Addr::Host(id), Msg::CreateReplica { volume, source, .. }) => {
-                self.replica_created.insert((volume.clone(), id.clone()), now);
-                if source.is_some() {
-                    self.copy_progress.entry((volume.clone(), id.clone())).or_insert((0, now));
+                let key = (volume.clone(), id.clone());
+                self.replica_created.insert(key.clone(), now);
+                if let Some(source) = source {
+                    // A copy moved to another source counts against the old
+                    // one if it stalled there, and gets a fresh stall clock.
+                    if self.copy_source.get(&key).is_some_and(|old| old != source) {
+                        self.note_source_failed(&key, now);
+                        if let Some((_, since)) = self.copy_progress.get_mut(&key) {
+                            *since = now;
+                        }
+                    }
+                    self.copy_source.insert(key.clone(), source.clone());
+                    self.copy_progress.entry(key).or_insert((0, now));
                 }
             }
             (Addr::Host(id), Msg::StopInstance(instance)) => {
@@ -258,6 +297,7 @@ impl Volatile {
             (Addr::Host(id), Msg::DeleteReplica { volume }) => {
                 self.replica_deleted.insert((volume.clone(), id.clone()), now);
                 self.copy_progress.remove(&(volume.clone(), id.clone()));
+                self.copy_source.remove(&(volume.clone(), id.clone()));
             }
             _ => {}
         }
