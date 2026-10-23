@@ -201,6 +201,9 @@ impl HostOs for EngineCtx<'_> {
     fn applied_network(&self) -> HostNetworkConfig {
         self.hw().expect(NO_HOST).applied_net.clone()
     }
+    fn persist_network(&mut self) {
+        self.hw_mut().persist_network();
+    }
     fn usage(&mut self) -> HostUsage {
         let core = &mut *self.core;
         host_hw(core.deliver.as_mut(), &self.me).expect(NO_HOST).usage(&mut core.rng)

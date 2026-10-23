@@ -148,7 +148,7 @@ pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors)
         for i in 0..count {
             let id = host_id(profile, i + 1);
             let ips = allocate_ips(&template.config, |n| w.networks.get(n), &mut taken);
-            let hw = HostHw { applied_net: render(template, None, &ips), ..HostHw::new(profile, (i % 2) as u8) };
+            let hw = HostHw::running(profile, (i % 2) as u8, render(template, None, &ips));
             w.hosts.insert(id.clone(), hw);
             let cabled = cable_host(&mut w, &id, profile).expect("the fleet's switches have room for it");
             hosts.push((id, cabled.location));

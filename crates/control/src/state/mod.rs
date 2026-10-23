@@ -286,6 +286,7 @@ impl ClusterState {
                 (net.state, net.error) = match result {
                     NetworkResult::Applied => {
                         net.applied_generation = generation;
+                        net.applied = net.desired.clone();
                         (NetState::Applied, None)
                     }
                     NetworkResult::Failed(reason) => (NetState::Failed, Some(reason)),
@@ -295,12 +296,13 @@ impl ClusterState {
                 };
                 host.version = v;
             }
-            Command::AssessNetwork { id, issues, held_roles, drift } => {
+            Command::AssessNetwork { id, issues, fixes, held_roles, drift } => {
                 let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
-                if host.net.issues != issues {
+                if host.net.issues != issues || host.net.fixes != fixes {
                     host.net.issues_since = at;
                 }
                 host.net.issues = issues;
+                host.net.fixes = fixes;
                 host.net.held_roles = held_roles;
                 host.net.drift = drift;
                 host.version = v;
@@ -1035,6 +1037,7 @@ mod tests {
         s.apply(4, result(1, NetworkResult::Applied)).unwrap();
         let net = &s.hosts[&hid("h1")].net;
         assert_eq!((net.applied_generation, net.state, &net.error), (1, NetState::Applied, &None));
+        assert_eq!(net.applied.as_ref(), Some(&cfg), "what the host now runs");
 
         let mut mtu = cfg.clone();
         mtu.links[0].mtu = 1400;
@@ -1043,6 +1046,7 @@ mod tests {
         s.apply(6, result(2, NetworkResult::Reverted)).unwrap();
         let net = &s.hosts[&hid("h1")].net;
         assert_eq!((net.desired_generation, net.applied_generation, net.state), (2, 1, NetState::Reverted), "still runs generation 1");
+        assert_eq!(net.applied.as_ref(), Some(&cfg), "and its config");
         assert!(net.error.as_deref().is_some_and(|e| e.contains("reverted")), "{net:?}");
 
         s.apply(7, Command::SetDesiredNetwork { id: hid("h1"), config: cfg }).unwrap();
@@ -1061,6 +1065,7 @@ mod tests {
         let assess = |issues: &Vec<Issue>, drift| Command::AssessNetwork {
             id: hid("h1"),
             issues: issues.clone(),
+            fixes: issues.iter().map(|i| format!("{i:?}")).collect(),
             held_roles: if issues.is_empty() { BTreeMap::new() } else { held.clone() },
             drift,
         };
@@ -1069,6 +1074,15 @@ mod tests {
         assert_eq!((&net.issues, &net.held_roles, net.issues_since, net.drift), (&missing, &held, 10, false));
         s.apply(20, assess(&missing, true)).unwrap();
         assert_eq!((s.hosts[&hid("h1")].net.issues_since, s.hosts[&hid("h1")].net.drift), (10, true), "same issues, same incident");
+        let reworded = Command::AssessNetwork {
+            id: hid("h1"),
+            issues: missing.clone(),
+            fixes: vec!["reworded".into()],
+            held_roles: held.clone(),
+            drift: true,
+        };
+        s.apply(25, reworded).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].net.issues_since, 25, "a new fix for the same issues is a new incident");
         s.apply(30, assess(&vec![], true)).unwrap();
         let net = &s.hosts[&hid("h1")].net;
         assert_eq!((net.issues.is_empty(), net.held_roles.is_empty(), net.issues_since), (true, true, 30));

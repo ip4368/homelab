@@ -68,6 +68,9 @@ pub trait HostOs {
     fn apply_network(&mut self, cfg: HostNetworkConfig);
     /// The network config the OS is running; empty if none was ever applied.
     fn applied_network(&self) -> HostNetworkConfig;
+    /// Writes the running network config as the one the host boots with
+    /// (until then, a reboot brings back the previous one).
+    fn persist_network(&mut self);
     fn usage(&mut self) -> HostUsage;
     /// The CP replica state on this host's disk, if a replica ever ran here.
     fn load_cp(&self) -> Option<Durable<LogCmd>>;

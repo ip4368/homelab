@@ -316,6 +316,11 @@ fn mgmt_breaking_override_reverts() {
     assert!(e.run_until(start + 35_000, reverted), "not Reverted 35 s after the override: {:?}", host_obj(&e, &h).map(|o| o.net));
     let o = host_obj(&e, &h).unwrap();
     assert_eq!(o.net.desired_generation, before.net.desired_generation + 1);
+    let cleared = |e: &Engine| {
+        host_obj(e, &h).is_some_and(|o| o.net.held_roles.is_empty() && o.net.issues.is_empty())
+            && open_alerts(e, NETWORK_MISMATCH, &h).is_empty()
+    };
+    assert!(e.run_until(e.now() + 3000, cleared), "the config it went back to is fine: {:?}", host_obj(&e, &h).map(|o| o.net));
     assert_eq!(o.net.applied_generation, before.net.desired_generation, "still on the old generation");
     assert!(o.net.drift, "an override that differs from the template is drift");
     assert_eq!(e.fabric().world().hosts[&h].applied_net, running, "the agent put the old config back");
@@ -336,4 +341,32 @@ fn mgmt_breaking_override_reverts() {
     let healed = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.net.state == NetState::Applied && !o.net.drift)
         && open_alerts(e, NETWORK_APPLY_FAILED, &h).is_empty();
     assert!(e.run_until(e.now() + 15_000, healed), "{:?}", host_obj(&e, &h).map(|o| o.net));
+}
+
+#[test]
+fn a_host_rebooted_during_a_trial_boots_its_last_confirmed_config() {
+    let mut e = settled_fleet(44);
+    let h = hid("pi5-02");
+    let running = e.fabric().world().hosts[&h].applied_net.clone();
+    let mut broken = running.clone();
+    broken.attachments[0].tagged = true;
+    e.api(ApiOp::SetHostOverride { id: h.clone(), config: Some(broken.clone()) });
+    let on_trial = |e: &Engine| e.fabric().world().hosts[&h].applied_net == broken;
+    assert!(e.run_until(e.now() + 5000, on_trial), "the agent never applied the override");
+
+    // Power-cycled before the trial runs out: the unconfirmed config was never written for boot.
+    e.fault(Fault::KillHost { host: h.clone() }).unwrap();
+    e.run_for(5000);
+    e.fault(Fault::RestoreHost { host: h.clone() }).unwrap();
+    assert_eq!(e.fabric().world().hosts[&h].applied_net, running, "booted the last confirmed config");
+    let mgmt = e.fabric().world().networks[&NetworkId::from("mgmt")].clone();
+    let eth0 = Node::HostPort(h.clone(), PortName::from("eth0"));
+    assert!(e.fabric().reachable(&eth0, &Node::Client, mgmt.vlan, mgmt.mtu), "reachable again");
+
+    // The leader tries the generation again; it reverts again, and the host stays reachable.
+    let reverted = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.net.state == NetState::Reverted);
+    assert!(e.run_until(e.now() + 45_000, reverted), "{:?}", host_obj(&e, &h).map(|o| o.net));
+    assert_eq!(e.fabric().world().hosts[&h].applied_net, running);
+    let ready = |e: &Engine| host_obj(e, &h).is_some_and(|o| o.lifecycle == Lifecycle::Ready);
+    assert!(e.run_until(e.now() + 15_000, ready), "{:?}", host_obj(&e, &h).map(|o| o.lifecycle));
 }

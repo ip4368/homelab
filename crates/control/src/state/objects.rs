@@ -123,13 +123,19 @@ pub struct HostNet {
     /// The last generation the agent confirmed applying.
     #[ts(type = "number")]
     pub applied_generation: u64,
+    /// The config of `applied_generation`: what the host runs as far as the
+    /// control plane knows. `None` until a generation applied.
+    pub applied: Option<HostNetworkConfig>,
     pub state: NetState,
     /// Why the desired generation `Failed` or was `Reverted`.
     pub error: Option<String>,
-    /// What validating the desired config against the observed cabling and
-    /// switch ports found.
+    /// What validating the host's config against the observed cabling and
+    /// switch ports found: the desired config, or while that `Failed` or was
+    /// `Reverted`, the applied one the host went back to.
     pub issues: Vec<Issue>,
-    /// When `issues` last changed: one `NetworkMismatch` incident per value.
+    /// The changes that would fix `issues`, switch-side where possible.
+    pub fixes: Vec<String>,
+    /// When `issues` or `fixes` last changed: one `NetworkMismatch` incident per value.
     #[ts(type = "number")]
     pub issues_since: SimTime,
     /// The host has an override that differs from its template.

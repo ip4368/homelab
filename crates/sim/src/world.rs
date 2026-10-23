@@ -29,6 +29,9 @@ pub struct HostHw {
     pub powered: bool,
     /// The network config the host OS has actually applied.
     pub applied_net: HostNetworkConfig,
+    /// The network config written to disk, which the host boots with: the
+    /// last one its agent confirmed (an unconfirmed trial is not written).
+    pub boot_net: HostNetworkConfig,
     /// Names of failed disks.
     pub failed_disks: BTreeSet<String>,
     /// The CP replica's Raft state on this host's disk; survives power loss.
@@ -40,19 +43,35 @@ pub struct HostHw {
 }
 
 impl HostHw {
-    /// A powered-on catalogue machine running its bootstrap network config.
+    /// A powered-on catalogue machine running (and booting) its bootstrap network config.
     pub fn new(id: ProfileId, variant: u8) -> Self {
         let profile = profile(id, variant);
-        let applied_net = bootstrap_config(&profile);
+        Self::running(id, variant, bootstrap_config(&profile))
+    }
+
+    /// A powered-on catalogue machine running (and booting) `net`.
+    pub fn running(id: ProfileId, variant: u8, net: HostNetworkConfig) -> Self {
         Self {
-            profile,
+            profile: profile(id, variant),
             variant,
             powered: true,
-            applied_net,
+            boot_net: net.clone(),
+            applied_net: net,
             failed_disks: BTreeSet::new(),
             cp_durable: None,
             join_token: None,
         }
+    }
+
+    /// Powers the host on: it boots the network config written to disk.
+    pub fn power_on(&mut self) {
+        self.powered = true;
+        self.applied_net = self.boot_net.clone();
+    }
+
+    /// Writes the running network config as the one to boot with.
+    pub fn persist_network(&mut self) {
+        self.boot_net = self.applied_net.clone();
     }
 
     /// The agent became a cluster member: it never needs the token again.
@@ -305,5 +324,22 @@ mod tests {
         w.topology.set_port(&sw, &PortName::from("p1"), changed.clone());
         assert_eq!(w.switch_config(&sw).unwrap().ports[0].cfg, changed);
         assert!(w.switch_config(&SwitchId::from("nope")).is_none());
+    }
+
+    #[test]
+    fn a_power_cycle_boots_the_persisted_network_config() {
+        let mut hw = HostHw::new(ProfileId::Pi5, 0);
+        let boot = hw.applied_net.clone();
+        let mut trial = boot.clone();
+        trial.links[0].mtu = 1400;
+        hw.applied_net = trial.clone();
+        hw.powered = false;
+        hw.power_on();
+        assert_eq!((hw.powered, &hw.applied_net), (true, &boot), "an unpersisted change is gone");
+        hw.applied_net = trial.clone();
+        hw.persist_network();
+        hw.powered = false;
+        hw.power_on();
+        assert_eq!(hw.applied_net, trial);
     }
 }

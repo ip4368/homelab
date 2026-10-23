@@ -18,8 +18,9 @@ pub enum Fault {
     /// Powers the host off: its agent and CP replica die, its links go dark.
     /// Its disk (stored CP state) survives.
     KillHost { host: HostId },
-    /// Powers a killed host back on: its agent boots as it did originally,
-    /// and its CP replica resumes from disk if one ever ran there.
+    /// Powers a killed host back on: it boots its last confirmed network
+    /// config, its agent boots as it did originally, and its CP replica
+    /// resumes from disk if one ever ran there.
     RestoreHost { host: HostId },
     UnplugPort { host: HostId, port: PortName },
     ReplugPort { host: HostId, port: PortName },
@@ -50,7 +51,7 @@ impl Engine {
                 if hw.powered {
                     return Ok(());
                 }
-                hw.powered = true;
+                hw.power_on();
                 let (token, had_replica) = (hw.join_token.clone(), hw.cp_durable.is_some());
                 if had_replica {
                     // The stored state takes precedence over constructor arguments.

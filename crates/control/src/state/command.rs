@@ -58,7 +58,7 @@ pub enum Command {
     /// The agent's answer for `generation`, which must be the desired one.
     RecordNetworkResult { id: HostId, generation: u64, result: NetworkResult },
     /// The network controller's latest judgement of the host's desired config.
-    AssessNetwork { id: HostId, issues: Vec<Issue>, held_roles: BTreeMap<Role, NetworkId>, drift: bool },
+    AssessNetwork { id: HostId, issues: Vec<Issue>, fixes: Vec<String>, held_roles: BTreeMap<Role, NetworkId>, drift: bool },
     /// What polling a switch showed; `last_seen` is when it answered.
     /// Creates or replaces the switch object.
     ObserveSwitch {

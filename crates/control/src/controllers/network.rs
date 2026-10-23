@@ -11,18 +11,20 @@
 //!    confirms on receipt. A generation that failed or was reverted is not
 //!    pushed again: the next change of the desired config is the next attempt.
 //! 3. **Record** the agent's report for the desired generation.
-//! 4. **Assess** the desired config against the host's LLDP neighbours and
-//!    the observed switch ports: issues, held roles and drift are written
-//!    when they change. A host whose cabling was never observed is not judged.
-//! 5. **Alert**: one `NetworkMismatch` per host while it has issues, with the
-//!    switch-side changes that would fix them (replaced when the issues
-//!    change), and a `NetworkApplyFailed` for a failed or reverted generation.
+//! 4. **Assess** the desired config (or, once that failed or was reverted,
+//!    the applied one the host went back to) against the host's LLDP
+//!    neighbours and the observed switch ports: issues, the changes that
+//!    would fix them, held roles and drift are written when they change. A
+//!    host whose cabling was never observed is not judged.
+//! 5. **Alert**: one `NetworkMismatch` per host while it has issues, listing
+//!    the fixes (replaced when the issues or fixes change), and a
+//!    `NetworkApplyFailed` for a failed or reverted generation.
 
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{Alert, ClusterState, Command, HostObj, Lifecycle, NetState, NetworkResult, ObjectKind, ObjectRef, Severity};
-use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, ObservedSwitchPort};
+use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, ObservedSwitchPort, PortMode};
 use model::{effective_roles, render, unavailable_networks, validate_host, HostId, Issue, NetworkTemplate};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -85,9 +87,10 @@ fn base_template(state: &ClusterState, host: &HostObj) -> NetworkTemplate {
 /// `ApplyNetwork` for the stored desired generation, unless the agent runs
 /// it (as far as its heartbeats, or else the log, say), it failed or was
 /// reverted, or it was pushed less than [`PUSH_RETRY_MS`] ago. A generation
-/// this leader has not seen confirmed is pushed even if the agent runs it:
-/// the agent may be on trial with a report lost to an earlier leader, and
-/// answers again.
+/// is pushed even if the agent runs it while it is unconfirmed: not yet
+/// applied in the log, or pushed by this leader, and with no report here.
+/// The agent may be on trial with its report lost (or sent to an earlier
+/// leader); it answers again and is confirmed before its trial runs out.
 fn push(host: &HostObj, v: &Volatile, now: SimTime) -> Option<Action> {
     let net = &host.net;
     let (generation, config) = (net.desired_generation, net.desired.as_ref()?);
@@ -97,7 +100,8 @@ fn push(host: &HostObj, v: &Volatile, now: SimTime) -> Option<Action> {
         return None;
     }
     let running = v.net_generation.get(&host.id).copied().unwrap_or(net.applied_generation);
-    let unconfirmed = net.state != NetState::Applied && report.is_none();
+    let pushed_here = v.net_pushed.get(&host.id).is_some_and(|&(g, _)| g == generation);
+    let unconfirmed = (net.state != NetState::Applied || pushed_here) && report.is_none();
     let recent = v.net_pushed.get(&host.id).is_some_and(|&(g, at)| g == generation && now < at + PUSH_RETRY_MS);
     ((running < generation || unconfirmed) && !recent).then(|| {
         let agent = Endpoint::new(Addr::Host(host.id.clone()), Svc::Agent);
@@ -129,8 +133,9 @@ fn address_owners(state: &ClusterState) -> BTreeMap<Ipv4Addr, Vec<&HostId>> {
     owners
 }
 
-/// `AssessNetwork` when validating `desired` finds other issues, held roles
-/// or drift than the log has. A host with no LLDP neighbours was never
+/// `AssessNetwork` when validating the host's config finds other issues,
+/// held roles or drift than the log has. The config is `desired`, unless
+/// that failed or was reverted. A host with no LLDP neighbours was never
 /// observed (a host with no cable up cannot report), so its issues are kept.
 fn assess(
     state: &ClusterState,
@@ -140,8 +145,13 @@ fn assess(
     owners: &BTreeMap<Ipv4Addr, Vec<&HostId>>,
 ) -> Option<Action> {
     let net = &host.net;
-    let (issues, held_roles) = if host.lldp.is_empty() {
-        (net.issues.clone(), net.held_roles.clone())
+    // A failed or reverted desired config is not what the host runs: judge
+    // the one it went back to, so a host-side mistake holds no roles and
+    // suggests no switch-side change.
+    let failed = matches!(net.state, NetState::Failed | NetState::Reverted);
+    let running = if failed { net.applied.as_ref().unwrap_or(desired) } else { desired };
+    let (issues, fixes, held_roles) = if host.lldp.is_empty() {
+        (net.issues.clone(), net.fixes.clone(), net.held_roles.clone())
     } else {
         let ports: Vec<ObservedSwitchPort> = host
             .lldp
@@ -149,7 +159,7 @@ fn assess(
             .filter_map(|n| state.switches.get(&n.switch)?.ports.iter().find(|p| p.port == n.switch_port).cloned())
             .collect();
         // Addresses this config uses that another host holds.
-        let in_use: BTreeMap<Ipv4Addr, HostId> = desired
+        let in_use: BTreeMap<Ipv4Addr, HostId> = running
             .attachments
             .iter()
             .filter_map(|a| {
@@ -158,14 +168,19 @@ fn assess(
                 Some((ip, (*other).clone()))
             })
             .collect();
-        let issues = validate_host(desired, &host.roles, networks, &host.lldp, &ports, &in_use);
+        let issues = validate_host(running, &host.roles, networks, &host.lldp, &ports, &in_use);
         let (_, held) = effective_roles(&host.roles, &unavailable_networks(&issues));
-        (issues, held)
+        let mut fixes: Vec<String> = vec![];
+        for fix in issues.iter().map(|i| suggestion(state, &host.id, i)) {
+            if !fixes.contains(&fix) {
+                fixes.push(fix);
+            }
+        }
+        (issues, fixes, held)
     };
     let drift = host.override_.as_ref().is_some_and(|o| *o != base_template(state, host).config);
-    (net.issues != issues || net.held_roles != held_roles || net.drift != drift).then(|| {
-        Action::Propose(Command::AssessNetwork { id: host.id.clone(), issues, held_roles, drift })
-    })
+    let changed = net.issues != issues || net.fixes != fixes || net.held_roles != held_roles || net.drift != drift;
+    changed.then(|| Action::Propose(Command::AssessNetwork { id: host.id.clone(), issues, fixes, held_roles, drift }))
 }
 
 /// Open `NetworkMismatch` and `NetworkApplyFailed` alerts, by host.
@@ -181,20 +196,14 @@ fn open_alerts(state: &ClusterState) -> BTreeMap<HostId, Vec<&Alert>> {
 }
 
 /// Brings the host's alerts in line with the log: the `NetworkMismatch` of
-/// its current issues (one incident per `issues_since`) and the
+/// its current issues and fixes (one incident per `issues_since`) and the
 /// `NetworkApplyFailed` of a failed desired generation, raised if missing;
 /// any other open one is resolved.
 fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> {
     let net = &host.net;
     let id = &host.id;
     let mismatch = (!net.issues.is_empty()).then(|| {
-        let mut fixes: Vec<String> = vec![];
-        for s in net.issues.iter().map(|i| suggestion(id, i)) {
-            if !fixes.contains(&s) {
-                fixes.push(s);
-            }
-        }
-        (format!("netmismatch-{id}-{}", net.issues_since), NETWORK_MISMATCH, format!("{id}: {}", fixes.join("; ")))
+        (format!("netmismatch-{id}-{}", net.issues_since), NETWORK_MISMATCH, format!("{id}: {}", net.fixes.join("; ")))
     });
     let failure = matches!(net.state, NetState::Failed | NetState::Reverted).then(|| {
         let why = net.error.as_deref().unwrap_or("unknown");
@@ -223,10 +232,20 @@ fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> 
 }
 
 /// The change that would fix `issue` on `host`, switch-side where it can be:
-/// e.g. `access-1 p7: add VLAN 20 to trunk allowed`.
-pub fn suggestion(host: &HostId, issue: &Issue) -> String {
+/// e.g. `access-1 p7: add VLAN 20 to trunk allowed`. A VLAN missing on a
+/// port is phrased for the port's observed mode.
+pub fn suggestion(state: &ClusterState, host: &HostId, issue: &Issue) -> String {
     match issue {
-        Issue::VlanNotAllowed { switch, switch_port, vlan, .. } => format!("{switch} {switch_port}: add VLAN {vlan} to trunk allowed"),
+        Issue::VlanNotAllowed { switch, switch_port, vlan, .. } => {
+            let mode = state.switches.get(switch).and_then(|s| s.ports.iter().find(|p| p.port == *switch_port)).map(|p| &p.cfg.mode);
+            match mode {
+                Some(PortMode::Trunk { .. }) => format!("{switch} {switch_port}: add VLAN {vlan} to trunk allowed"),
+                Some(PortMode::Access(access)) => {
+                    format!("{switch} {switch_port}: convert to a trunk (native VLAN {access}) allowing VLAN {vlan}")
+                }
+                None => format!("{switch} {switch_port}: allow VLAN {vlan} tagged"),
+            }
+        }
         Issue::NativeVlanMismatch { switch, switch_port, vlan, native, .. } => {
             let is = native.map_or("none".to_string(), |n| n.to_string());
             format!("{switch} {switch_port}: set untagged VLAN to {vlan} (is {is})")
@@ -491,6 +510,7 @@ mod tests {
         assert!(proposals(&out).contains(&Command::AssessNetwork {
             id: hid("m"),
             issues: vec![issue],
+            fixes: vec!["access-1 p7: add VLAN 20 to trunk allowed".into()],
             held_roles: [(Role::Storage, nid("storage"))].into(),
             drift: false,
         }));
@@ -574,9 +594,19 @@ mod tests {
     fn suggestions_name_the_fix() {
         let h = hid("h");
         let sw = || SwitchId::from("access-1");
-        let p = PortName::from;
+        let p = |s: &str| PortName::from(s);
+        // access-1 p7 is a trunk, p8 an access port on VLAN 1; p9 was never observed.
+        let mut s = ClusterState::new();
+        let port = |name: &str, cfg| ObservedSwitchPort { switch: sw(), port: p(name), cfg, mlag_peer: None };
+        let access = SwitchPortCfg { mode: PortMode::Access(1), ..trunk(&[1], 9216) };
+        let ports = vec![port("p7", trunk(&[1], 9216)), port("p8", access)];
+        s.apply(0, Command::ObserveSwitch { id: sw(), model: "m".into(), ports, mlag_peer: None, last_seen: 0 }).unwrap();
+        let vlan = |port: &str, vlan| Issue::VlanNotAllowed { network: nid("storage"), host_port: p("eth0"), switch: sw(), switch_port: p(port), vlan };
         let cases = [
-            (Issue::VlanNotAllowed { network: nid("storage"), host_port: p("eth0"), switch: sw(), switch_port: p("p7"), vlan: 20 }, "access-1 p7: add VLAN 20 to trunk allowed"),
+            (vlan("p7", 20), "access-1 p7: add VLAN 20 to trunk allowed"),
+            (vlan("p8", 20), "access-1 p8: convert to a trunk (native VLAN 1) allowing VLAN 20"),
+            (vlan("p8", 1), "access-1 p8: convert to a trunk (native VLAN 1) allowing VLAN 1"),
+            (vlan("p9", 20), "access-1 p9: allow VLAN 20 tagged"),
             (Issue::NativeVlanMismatch { network: nid("mgmt"), host_port: p("eth0"), switch: sw(), switch_port: p("p7"), vlan: 1, native: Some(20) }, "access-1 p7: set untagged VLAN to 1 (is 20)"),
             (Issue::NativeVlanMismatch { network: nid("mgmt"), host_port: p("eth0"), switch: sw(), switch_port: p("p7"), vlan: 1, native: None }, "access-1 p7: set untagged VLAN to 1 (is none)"),
             (Issue::MtuTooSmall { network: nid("storage"), where_: "access-1 p7".into(), have: 1500, need: 9000 }, "access-1 p7: raise MTU to 9000 (is 1500)"),
@@ -589,7 +619,7 @@ mod tests {
             (Issue::MissingRequiredNetwork { role: Role::Storage, network: nid("storage") }, "h: role Storage needs network storage"),
         ];
         for (issue, want) in cases {
-            assert_eq!(suggestion(&h, &issue), want);
+            assert_eq!(suggestion(&s, &h, &issue), want);
         }
     }
 
@@ -598,5 +628,71 @@ mod tests {
         let mut s = state();
         s.apply(0, Command::SetLifecycle { id: hid("m"), lifecycle: Lifecycle::Ready }).unwrap();
         assert!(proposals(&run(&s, &Volatile::new(0, 1), 0)).iter().any(|c| matches!(c, Command::SetDesiredNetwork { .. })));
+    }
+
+    #[test]
+    fn after_a_revert_the_config_the_host_went_back_to_is_judged() {
+        let mut s = state();
+        let mut v = Volatile::new(0, 1);
+        step(&mut s, &mut v, 0);
+        s.apply(0, Command::RecordNetworkResult { id: hid("m"), generation: 1, result: NetworkResult::Applied }).unwrap();
+        // An override with storage untagged: the port's native VLAN is mgmt's, so storage breaks.
+        let mut ov = template("minipc-standard");
+        ov.attachments[1].tagged = false;
+        s.apply(1, Command::SetHostOverride { host: hid("m"), config: Some(ov) }).unwrap();
+        step(&mut s, &mut v, 1000);
+        step(&mut s, &mut v, 2000);
+        assert_eq!(s.hosts[&hid("m")].net.held_roles, [(Role::Storage, nid("storage"))].into(), "judged on the desired config while it applies");
+
+        // The agent reverted to generation 1, which is fine: nothing is held, nothing to fix switch-side.
+        v.net_results.insert(hid("m"), (2, NetworkResult::Reverted));
+        for now in [33_000, 34_000, 35_000] {
+            step(&mut s, &mut v, now);
+        }
+        let net = &s.hosts[&hid("m")].net;
+        assert_eq!(net.state, NetState::Reverted);
+        assert!(net.issues.is_empty() && net.held_roles.is_empty(), "{net:?}");
+        assert!(net.drift, "the override is still there");
+        let open: Vec<_> = s.alerts.values().filter(|a| a.resolved_at.is_none()).map(|a| a.kind.as_str()).collect();
+        assert_eq!(open, [NETWORK_APPLY_FAILED], "the failure is alerted, not a switch mismatch");
+    }
+
+    #[test]
+    fn a_pushed_generation_is_pushed_again_until_this_leader_hears_back() {
+        let mut s = state();
+        let mut v = Volatile::new(0, 1);
+        step(&mut s, &mut v, 0);
+        s.apply(0, Command::RecordNetworkResult { id: hid("m"), generation: 1, result: NetworkResult::Applied }).unwrap();
+        let mut v = Volatile::new(0, 1);
+        v.net_generation.insert(hid("m"), 0);
+        assert_eq!(pushes(&step(&mut s, &mut v, 1000)), [(hid("m"), 1)], "the agent restarted");
+        // It runs generation 1 on trial, but its report was lost: ask again before its trial runs out.
+        v.net_generation.insert(hid("m"), 1);
+        assert_eq!(pushes(&step(&mut s, &mut v, 1000 + PUSH_RETRY_MS)), [(hid("m"), 1)]);
+        v.net_results.insert(hid("m"), (1, NetworkResult::Applied));
+        assert!(pushes(&step(&mut s, &mut v, 1000 + 2 * PUSH_RETRY_MS)).is_empty(), "heard back");
+    }
+
+    #[test]
+    fn a_new_suggestion_for_the_same_issues_is_a_new_alert() {
+        // The technician's port change is not polled yet: the port still shows access VLAN 1.
+        let mut s = state();
+        let access = SwitchPortCfg { mode: PortMode::Access(1), ..trunk(&[1], 9216) };
+        s.apply(0, observe_switch(access)).unwrap();
+        let mut v = Volatile::new(0, 1);
+        step(&mut s, &mut v, 0);
+        step(&mut s, &mut v, 1000);
+        let message = |s: &ClusterState| {
+            let open: Vec<_> = s.alerts.values().filter(|a| a.kind == NETWORK_MISMATCH && a.resolved_at.is_none()).collect();
+            assert_eq!(open.len(), 1, "{open:?}");
+            open[0].message.clone()
+        };
+        assert_eq!(message(&s), "m: access-1 p7: convert to a trunk (native VLAN 1) allowing VLAN 20");
+        // Polled: a trunk without VLAN 20. The issue is the same; the fix is not.
+        s.apply(10_000, observe_switch(trunk(&[1], 9216))).unwrap();
+        step(&mut s, &mut v, 10_000);
+        assert_eq!(s.hosts[&hid("m")].net.fixes, ["access-1 p7: add VLAN 20 to trunk allowed"]);
+        step(&mut s, &mut v, 11_000);
+        assert_eq!(message(&s), "m: access-1 p7: add VLAN 20 to trunk allowed");
     }
 }

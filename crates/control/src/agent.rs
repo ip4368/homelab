@@ -3,7 +3,8 @@
 //! VIP) to join with a token until it is accepted. A joined agent heartbeats,
 //! reports metrics, and applies the network configs the leader pushes, like
 //! `netplan try`: a config that is not confirmed within [`REVERT_MS`] (because
-//! it cut the host off from the control plane) is rolled back.
+//! it cut the host off from the control plane) is rolled back, and only a
+//! confirmed one is written for the next boot.
 
 use crate::proto::{mgmt, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
@@ -205,7 +206,12 @@ impl Actor for HostAgent {
                 self.apply(ctx, generation, config);
             }
             Msg::ConfirmNetwork { generation } => {
-                self.trial.take_if(|t| t.generation == generation);
+                // Like `netplan try` accepted: only now is the config written for the next boot.
+                if self.trial.take_if(|t| t.generation == generation).is_some()
+                    && let Some(os) = ctx.host()
+                {
+                    os.persist_network();
+                }
             }
             Msg::ReportRequest if self.token.is_none() => self.send_heartbeat(ctx, true),
             _ => {}
@@ -244,6 +250,8 @@ mod tests {
 
     struct FakeOs {
         net: HostNetworkConfig,
+        /// What the host boots with.
+        boot: HostNetworkConfig,
         joined: bool,
         lldp: Vec<LldpNeighbor>,
         inventory: Inventory,
@@ -264,6 +272,9 @@ mod tests {
         }
         fn applied_network(&self) -> HostNetworkConfig {
             self.net.clone()
+        }
+        fn persist_network(&mut self) {
+            self.boot = self.net.clone();
         }
         fn usage(&mut self) -> HostUsage {
             HostUsage {
@@ -293,7 +304,7 @@ mod tests {
 
     impl FakeCtx {
         fn new(net: HostNetworkConfig) -> Self {
-            let os = FakeOs { net, joined: false, lldp: vec![neighbor("sw-1", "p1")], inventory: Inventory::from_profile(ProfileId::Pi5, 1) };
+            let os = FakeOs { boot: net.clone(), net, joined: false, lldp: vec![neighbor("sw-1", "p1")], inventory: Inventory::from_profile(ProfileId::Pi5, 1) };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
 
@@ -456,7 +467,9 @@ mod tests {
         assert_eq!(a.net_generation(), 1);
         ctx.advance(&mut a, 5000);
         assert_eq!(ctx.take_heartbeats(), [heartbeat_at_generation(0, 1)], "heartbeats carry the generation");
+        assert_eq!(ctx.os.boot, bootstrap_config(&profile(ProfileId::Pi5, 1)), "on trial: a reboot goes back");
         a.on_message(&mut ctx, VIP, Msg::ConfirmNetwork { generation: 1 });
+        assert_eq!(ctx.os.boot, sbc_config(), "confirmed: written for the next boot");
         ctx.advance(&mut a, 60_000);
         assert_eq!(ctx.os.net, sbc_config(), "confirmed: no revert");
         assert!(!ctx.take().iter().any(|m| matches!(m, Msg::NetworkStatus { .. })));
@@ -475,6 +488,7 @@ mod tests {
         ctx.take();
         ctx.advance(&mut a, 1000 + REVERT_MS);
         assert_eq!(ctx.os.net, previous, "the previous config is back");
+        assert_eq!(ctx.os.boot, previous, "and never was written for boot");
         assert_eq!(ctx.take(), [status(1, NetworkResult::Reverted)], "reported over the restored config");
         assert_eq!(a.net_generation(), 0);
         a.on_message(&mut ctx, VIP, Msg::ConfirmNetwork { generation: 1 });
