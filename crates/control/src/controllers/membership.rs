@@ -43,7 +43,8 @@ pub struct RaftMembers {
     pub learners: BTreeSet<HostId>,
     /// A config change is appended but not committed.
     pub pending: bool,
-    /// The learners close enough to the leader's log to be promoted.
+    /// The learners close enough to the leader's log, and heard from
+    /// recently enough, to be promoted.
     pub caught_up: BTreeSet<HostId>,
 }
 
@@ -53,7 +54,7 @@ impl RaftMembers {
             voters: raft.voters().clone(),
             learners: raft.learners().clone(),
             pending: raft.config_pending(),
-            caught_up: raft.learners().iter().filter(|l| raft.caught_up(l)).cloned().collect(),
+            caught_up: raft.learners().iter().filter(|l| raft.caught_up(l) && raft.responsive(l)).cloned().collect(),
         }
     }
 

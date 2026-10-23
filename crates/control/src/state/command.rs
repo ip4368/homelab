@@ -132,6 +132,8 @@ pub enum ApplyError {
     InvalidBatchPct(u8),
     /// The object refers to this one, which does not exist.
     MissingDependency(ObjectRef),
+    /// A control-plane voter's host cannot be removed; replace the member first.
+    CpVoter,
 }
 
 impl fmt::Display for ApplyError {
@@ -152,6 +154,7 @@ impl fmt::Display for ApplyError {
             Self::MissingDependency(r) => {
                 write!(f, "needs {} {}, which does not exist", format!("{:?}", r.kind).to_lowercase(), r.id)
             }
+            Self::CpVoter => f.write_str("host is a control-plane voter; replace it first"),
         }
     }
 }

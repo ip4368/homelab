@@ -200,6 +200,9 @@ impl ClusterState {
                 host.version = v;
             }
             Command::RemoveHost { id } => {
+                if self.cp.voters.contains(&id) {
+                    return Err(ApplyError::CpVoter);
+                }
                 if self.hosts.remove(&id).is_none() {
                     return Err(ApplyError::NotFound);
                 }
@@ -734,6 +737,20 @@ mod tests {
         // clients that already saw the removal are not told again
         assert!(s.changes_since(s.version).removed.is_empty());
         assert_eq!(s.apply(3, Command::RemoveHost { id: hid("h1") }), Err(ApplyError::NotFound));
+    }
+
+    #[test]
+    fn a_control_plane_voter_cannot_be_removed() {
+        let mut s = ClusterState::new();
+        s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        s.apply_membership([hid("h1")].into());
+        let v = s.version;
+        let err = s.apply(2, Command::RemoveHost { id: hid("h1") }).unwrap_err();
+        assert_eq!(err, ApplyError::CpVoter);
+        assert_eq!(err.to_string(), "host is a control-plane voter; replace it first");
+        assert!(s.hosts.contains_key(&hid("h1")) && s.version == v, "nothing changed");
+        s.apply_membership(BTreeSet::new());
+        s.apply(3, Command::RemoveHost { id: hid("h1") }).unwrap();
     }
 
     #[test]

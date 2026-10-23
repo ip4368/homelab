@@ -65,6 +65,8 @@ pub struct RaftNode<T> {
     taken_index: u64,
     /// Outputs produced by `propose`, returned by the next `tick`/`step`.
     out: Vec<RaftOut<T>>,
+    /// The latest time supplied by `tick`/`step`/`propose`.
+    clock: SimTime,
 }
 
 impl<T: Clone> RaftNode<T> {
@@ -86,12 +88,14 @@ impl<T: Clone> RaftNode<T> {
             commit_index: 0,
             taken_index: 0,
             out: Vec::new(),
+            clock: 0,
         };
         node.recompute_voters();
         node
     }
 
     pub fn tick(&mut self, now: SimTime) -> Vec<RaftOut<T>> {
+        self.clock = self.clock.max(now);
         if matches!(self.role, Role::Leader(_)) {
             self.leader_tick(now);
         } else {
@@ -103,6 +107,7 @@ impl<T: Clone> RaftNode<T> {
     }
 
     pub fn step(&mut self, now: SimTime, from: HostId, m: RaftMsg<T>) -> Vec<RaftOut<T>> {
+        self.clock = self.clock.max(now);
         self.election_deadline(now); // arm the timer if this is the first call
         let term = msg_term(&m);
         if term > self.term() {
@@ -134,7 +139,8 @@ impl<T: Clone> RaftNode<T> {
 
     /// Appends `t` to the leader's log and returns its index. The resulting
     /// `Persist` and `Send`s come out of the next `tick`/`step`.
-    pub fn propose(&mut self, _now: SimTime, t: T) -> Result<u64, NotLeader> {
+    pub fn propose(&mut self, now: SimTime, t: T) -> Result<u64, NotLeader> {
+        self.clock = self.clock.max(now);
         if !self.is_leader() {
             return Err(NotLeader { leader_hint: self.leader.clone() });
         }
@@ -568,6 +574,19 @@ impl<T: Clone> RaftNode<T> {
     }
 
     /// Whether this node has committed an entry of its current term.
+    /// Whether this leader heard from peer `id` within the check-quorum
+    /// window, as of the latest time it was given.
+    pub(super) fn acked_recently(&self, id: &HostId) -> bool {
+        let Role::Leader(p) = &self.role else { return false };
+        p.last_ack.get(id).is_some_and(|&t| self.clock.saturating_sub(t) <= self.cfg.election_min_ms)
+    }
+
+    /// The voters this leader knows to be up: itself, if it votes, and every
+    /// voter that answered within the check-quorum window.
+    pub(super) fn responsive_voters(&self) -> usize {
+        self.voters.iter().filter(|v| **v == self.me || self.acked_recently(v)).count()
+    }
+
     pub(super) fn committed_in_term(&self) -> bool {
         self.term_at(self.commit_index) == self.durable.term
     }

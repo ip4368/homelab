@@ -34,6 +34,11 @@ pub enum MembershipError {
     NotCaughtUp,
     /// The only voter cannot be removed.
     LastVoter,
+    /// The learner has not answered within the check-quorum window.
+    Unresponsive,
+    /// The voters known to be up plus the learner would not make a quorum
+    /// of the larger voter set.
+    WouldLoseQuorum,
 }
 
 impl fmt::Display for MembershipError {
@@ -46,6 +51,8 @@ impl fmt::Display for MembershipError {
             MembershipError::NotLearner => "not a learner",
             MembershipError::NotCaughtUp => "the learner has not caught up",
             MembershipError::LastVoter => "the last voter cannot be removed",
+            MembershipError::Unresponsive => "the learner has not answered recently",
+            MembershipError::WouldLoseQuorum => "too few voters are up to grow the voter set safely",
         };
         f.write_str(s)
     }
@@ -82,7 +89,11 @@ impl<T: Clone> RaftNode<T> {
         Ok(self.append_config(voters, learners))
     }
 
-    /// Appends a config that makes learner `id` a voter, once it caught up.
+    /// Appends a config that makes learner `id` a voter. The learner must
+    /// have caught up and answered within the check-quorum window, and the
+    /// voters known to be up plus the learner must make a quorum of the new
+    /// voter set (as etcd's strict reconfiguration check): promoting a
+    /// learner that has since died must not leave the cluster without one.
     pub fn promote(&mut self, id: HostId) -> Result<u64, MembershipError> {
         self.may_change()?;
         if !self.learners().contains(&id) {
@@ -90,6 +101,12 @@ impl<T: Clone> RaftNode<T> {
         }
         if !self.caught_up(&id) {
             return Err(MembershipError::NotCaughtUp);
+        }
+        if !self.acked_recently(&id) {
+            return Err(MembershipError::Unresponsive);
+        }
+        if self.responsive_voters() + 1 < (self.voters().len() + 1) / 2 + 1 {
+            return Err(MembershipError::WouldLoseQuorum);
         }
         let (mut voters, mut learners) = (self.voters().clone(), self.learners().clone());
         learners.remove(&id);
@@ -118,9 +135,15 @@ impl<T: Clone> RaftNode<T> {
     }
 
     /// Whether this leader holds `id`'s log as at most [`CATCH_UP_ENTRIES`]
-    /// behind its own. Always false on a follower.
+    /// behind its own. Always false on a follower. Promotion also needs the
+    /// learner to be responsive ([`RaftNode::responsive`]).
     pub fn caught_up(&self, id: &HostId) -> bool {
         self.match_index_of(id).is_some_and(|m| m + CATCH_UP_ENTRIES >= self.last_log_index())
+    }
+
+    /// Whether this leader heard from `id` within the check-quorum window.
+    pub fn responsive(&self, id: &HostId) -> bool {
+        self.acked_recently(id)
     }
 
     fn may_change(&self) -> Result<(), MembershipError> {
@@ -140,6 +163,9 @@ mod tests {
     use crate::raft::node::tests::{hid, Cluster};
     use crate::raft::RaftOut;
     use std::collections::BTreeSet;
+
+    /// The harness's time step.
+    const STEP: u64 = 10;
 
     fn set(ids: &[usize]) -> BTreeSet<HostId> {
         ids.iter().map(|&i| hid(i)).collect()
@@ -263,6 +289,48 @@ mod tests {
         c.heal();
         assert!(c.run_until(2000, |c| c.nodes[l].caught_up(&hid(n))));
         assert!(c.nodes[l].promote(hid(n)).is_ok());
+    }
+
+    #[test]
+    fn a_caught_up_learner_that_went_silent_is_not_promoted() {
+        let (mut c, l, n) = with_caught_up_learner();
+        c.frozen.insert(n);
+        c.run_for(1500 + 2 * STEP);
+        assert!(c.nodes[l].caught_up(&hid(n)), "its log still matches");
+        assert!(!c.nodes[l].responsive(&hid(n)));
+        assert_eq!(c.nodes[l].promote(hid(n)), Err(MembershipError::Unresponsive));
+        c.frozen.remove(&n);
+        assert!(c.run_until(1000, |c| c.nodes[l].responsive(&hid(n))));
+        assert!(c.nodes[l].promote(hid(n)).is_ok());
+    }
+
+    #[test]
+    fn promotion_is_refused_unless_the_live_voters_and_learner_make_the_new_quorum() {
+        use crate::raft::{Durable, RaftConfig, RaftMsg};
+        use crate::runtime::SimTime;
+        let ack = |n: &mut RaftNode<u64>, now: SimTime, from: usize, match_index: u64| {
+            n.step(now, hid(from), RaftMsg::AppendResp { term: 1, success: true, match_index, conflict_index: 0 });
+        };
+        // Leader n0 of {n0, n1, n2} with caught-up learner n3.
+        let mut n = RaftNode::<u64>::new(hid(0), Durable::new(set(&[0, 1, 2])), RaftConfig::default(), 1);
+        n.tick(0);
+        n.tick(RaftConfig::default().election_max_ms);
+        n.step(3000, hid(1), RaftMsg::VoteResp { term: 1, granted: true, pre_vote: true });
+        n.step(3000, hid(1), RaftMsg::VoteResp { term: 1, granted: true, pre_vote: false });
+        ack(&mut n, 3001, 1, 1);
+        assert_eq!(n.add_learner(hid(3)), Ok(2));
+        ack(&mut n, 3002, 1, 2);
+        ack(&mut n, 3003, 3, 2);
+        assert!(n.caught_up(&hid(3)) && n.responsive(&hid(3)));
+
+        // 1.6 s on only the learner has answered: the leader alone plus the
+        // learner are no quorum of four voters.
+        ack(&mut n, 4600, 3, 2);
+        assert!(n.is_leader(), "check-quorum only runs on the next tick");
+        assert_eq!(n.promote(hid(3)), Err(MembershipError::WouldLoseQuorum));
+        // With n1 answering again, n0 + n1 + n3 make the quorum of four.
+        ack(&mut n, 4601, 1, 2);
+        assert_eq!(n.promote(hid(3)), Ok(3));
     }
 
     #[test]
