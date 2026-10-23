@@ -306,6 +306,8 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> H
         ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
+        ApiOp::DeleteNetwork { id } => Command::DeleteNetwork { id },
+        ApiOp::DeleteTemplate { id } => Command::DeleteTemplate { id },
     };
     Handling::Propose(cmd, serde_json::Value::Null)
 }

@@ -66,6 +66,10 @@ pub enum ApiOp {
     SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
     UpsertRule { id: String, profile: ProfileId, roles: BTreeSet<Role>, template: Option<String> },
     DeleteRule { id: String },
+    /// Refused with the objects using it while a template names it.
+    DeleteNetwork { id: NetworkId },
+    /// Refused with the rules and hosts using it.
+    DeleteTemplate { id: String },
     /// What `change` would do; changes nothing. The result is a `Preview`.
     PreviewChange { change: Change },
     /// Applies `change` and rolls it out to the affected hosts in batches of

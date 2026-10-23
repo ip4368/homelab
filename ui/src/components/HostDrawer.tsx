@@ -3,6 +3,7 @@ import { op } from '../api'
 import type { HostObj } from '../gen/HostObj'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
+import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
 
@@ -91,7 +92,7 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
     )
 
   return (
-    <aside className="drawer" aria-label={`host ${host.id}`}>
+    <aside className="drawer host-drawer" aria-label={`host ${host.id}`}>
       <div className="drawer-head">
         <h3>{host.id}</h3>
         <span className={`lifecycle lc-${host.lifecycle}`}>{host.lifecycle}</span>
@@ -104,6 +105,8 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
       <Inventory host={host} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
       <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} disabled={paused} />
+      {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
+      <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
       <div className="section">
         <h4>Lifecycle</h4>
         <div className="actions">

@@ -2,14 +2,16 @@ import { useEffect, useState } from 'react'
 import { FaultPanel } from './components/FaultPanel'
 import { FleetGrid } from './components/FleetGrid'
 import { HostDrawer } from './components/HostDrawer'
+import { NetworksPage } from './components/NetworksPage'
 import { RightRail } from './components/RightRail'
 import { SwitchDrawer } from './components/SwitchDrawer'
 import { TopBar } from './components/TopBar'
 import { Topology } from './components/Topology'
 import { useStore } from './store'
 
-const VIEWS = ['fleet', 'topology'] as const
+const VIEWS = ['fleet', 'topology', 'networks'] as const
 type ViewName = (typeof VIEWS)[number]
+const LABELS: Record<ViewName, string> = { fleet: 'Fleet', topology: 'Topology', networks: 'Networks' }
 
 /** The view named by the URL hash (`#topology`), so a link can open it directly. */
 function viewFromHash(hash: string): ViewName {
@@ -57,7 +59,7 @@ export default function App() {
           <nav className="view-switch" aria-label="view">
             {VIEWS.map((v) => (
               <button key={v} className={v === view ? 'active' : ''} onClick={() => (location.hash = v)}>
-                {v === 'fleet' ? 'Fleet' : 'Topology'}
+                {LABELS[v]}
               </button>
             ))}
           </nav>
@@ -65,6 +67,8 @@ export default function App() {
             <main className="grid-area">
               {view === 'fleet' ? (
                 <FleetGrid selected={host} onSelect={selectHost} />
+              ) : view === 'networks' ? (
+                <NetworksPage />
               ) : (
                 <Topology selectedSwitch={sw} selectedHost={host} onSelectSwitch={selectSwitch} onSelectHost={selectHost} />
               )}

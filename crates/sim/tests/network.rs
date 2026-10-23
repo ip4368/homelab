@@ -421,6 +421,16 @@ fn applied_with_mtu(e: &Engine, mtu: u16) -> Vec<HostId> {
 }
 
 #[test]
+fn deleting_a_network_or_template_in_use_is_refused_with_its_users() {
+    let mut e = settled_fleet(53);
+    let ApiResult::Err(msg) = api_answer(&mut e, ApiOp::DeleteNetwork { id: NetworkId::from("storage") }) else { panic!("storage is in use") };
+    assert!(msg.starts_with("in use by ") && msg.contains("template "), "{msg}");
+    let ApiResult::Err(msg) = api_answer(&mut e, ApiOp::DeleteTemplate { id: "minipc-standard".into() }) else { panic!("in use") };
+    assert!(msg.starts_with("in use by "), "{msg}");
+    assert!(matches!(api_answer(&mut e, ApiOp::DeleteTemplate { id: "nope".into() }), ApiResult::Err(_)));
+}
+
+#[test]
 fn preview_counts_affected() {
     let mut e = settled_fleet(50);
     let mut t = seed_template(&e, "ms01-standard");

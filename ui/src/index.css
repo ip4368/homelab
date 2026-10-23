@@ -597,3 +597,143 @@ label.inline {
   padding-left: 18px;
   font-size: 13px;
 }
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(16, 24, 40, 0.4);
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 6vh;
+  z-index: 10;
+}
+
+.modal {
+  width: min(720px, 94vw);
+  max-height: 86vh;
+  overflow: auto;
+  background: var(--panel);
+  border-radius: 6px;
+  padding: 12px 18px 16px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.25);
+}
+
+.modal-sub {
+  margin: 16px 0 2px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.form-grid.wide {
+  grid-template-columns: 110px 1fr;
+  margin: 8px 0;
+}
+
+.rollouts li.highlight {
+  background: #eef2fb;
+}
+
+.panel {
+  margin-top: 12px;
+  padding: 4px 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--panel);
+  max-width: 760px;
+}
+
+.networks-page {
+  max-width: 1000px;
+}
+
+.inline-tabs {
+  border: none;
+  gap: 4px;
+}
+
+.inline-tabs button {
+  flex: none;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+
+.inline-tabs button.active {
+  border-color: var(--accent);
+}
+
+table.data {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  font-size: 13px;
+}
+
+table.data th,
+table.data td {
+  padding: 5px 10px;
+  text-align: left;
+}
+
+.row-actions {
+  white-space: nowrap;
+  text-align: right;
+}
+
+.refusal {
+  font-size: 13px;
+}
+
+.config-form h5 {
+  margin: 10px 0 2px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+ul.plain {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 13px;
+}
+
+ul.plain li {
+  padding: 2px 0;
+}
+
+.bond-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin-top: 6px;
+  font-size: 13px;
+}
+
+ul.problems {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 13px;
+}
+
+.network-editor table.ports td {
+  vertical-align: middle;
+}
+
+.host-drawer {
+  width: 460px;
+}
+
+.network-editor,
+.panel,
+.modal {
+  font-size: 13px;
+}
+
+.refusal ul {
+  max-height: 160px;
+  overflow: auto;
+}
