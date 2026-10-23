@@ -1,7 +1,7 @@
 //! The runtime interface: what an [`Actor`] can see and do. The simulator
 //! implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{LogCmd, Msg};
+use crate::proto::{InstanceSpec, LogCmd, Msg, ReplicaReport};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -81,6 +81,21 @@ pub trait HostOs {
     /// Records on disk that this host joined the cluster, so its agent boots
     /// as a member from now on instead of joining with a token.
     fn mark_joined(&mut self);
+    /// Runs `spec`: its resource usage shows in [`HostOs::usage`] and its flows
+    /// go on the wire. Starting an instance that runs with the same spec
+    /// changes nothing; a different spec replaces it.
+    fn start_instance(&mut self, spec: InstanceSpec);
+    fn stop_instance(&mut self, id: &str);
+    /// The ids of the instances running now.
+    fn instances(&self) -> Vec<String>;
+    /// Starts holding a replica of `volume` on the disk with most room for
+    /// it, copied over the storage network from `source`'s replica, or empty
+    /// (complete at once) when `None`. A volume the host already holds keeps
+    /// its replica. The disk the replica is on, or `None` if no disk can hold it.
+    fn create_replica(&mut self, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String>;
+    /// Every replica the host holds, with how much of it is copied.
+    fn replicas(&self) -> Vec<ReplicaReport>;
+    fn delete_replica(&mut self, volume: &str);
 }
 
 /// A switch's own configuration, as its management interface reports it.

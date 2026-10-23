@@ -4,7 +4,9 @@
 //! reports metrics, and applies the network configs the leader pushes, like
 //! `netplan try`: a config that is not confirmed within [`REVERT_MS`] (because
 //! it cut the host off from the control plane) is rolled back, and only a
-//! confirmed one is written for the next boot.
+//! confirmed one is written for the next boot. A member also runs the
+//! instances and holds the volume replicas the leader asks for, and lists
+//! them in every heartbeat.
 
 use crate::proto::{mgmt, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
@@ -81,7 +83,10 @@ impl HostAgent {
     fn send_heartbeat(&mut self, ctx: &mut dyn Ctx, report: bool) {
         let Addr::Host(host) = ctx.me().addr else { return };
         let now = ctx.now();
-        let current = ctx.host().map(|os| Observed { lldp: os.lldp(), inventory: os.inventory() });
+        let (current, instances, replicas) = match ctx.host() {
+            Some(os) => (Some(Observed { lldp: os.lldp(), inventory: os.inventory() }), os.instances(), os.replicas()),
+            None => (None, vec![], vec![]),
+        };
         let mut report = report;
         if let Some(current) = current
             && self.observed.as_ref().is_none_or(|(_, seen)| *seen != current)
@@ -94,13 +99,14 @@ impl HostAgent {
             None => (None, None),
         };
         let net_generation = self.net_generation;
-        ctx.send(VIP, mgmt(), Msg::Heartbeat { host, lifecycle_seen: 0, observed_at, observed, net_generation });
+        let hb = Msg::Heartbeat { host, lifecycle_seen: 0, observed_at, observed, net_generation, instances, replicas };
+        ctx.send(VIP, mgmt(), hb);
     }
 
     fn send_metrics(&self, ctx: &mut dyn Ctx) {
         let now = ctx.now();
         let Some(os) = ctx.host() else { return };
-        let (host, usage) = (os.host_id(), os.usage());
+        let (host, usage, instances) = (os.host_id(), os.usage(), os.instances().len());
         let sample = MetricSample {
             at: now,
             cpu_pct: usage.cpu_pct,
@@ -109,7 +115,7 @@ impl HostAgent {
             disk_pct: usage.disk_pct,
             port_rx_bps: usage.port_bps.iter().map(|(p, &(rx, _))| (p.clone(), rx)).collect(),
             port_tx_bps: usage.port_bps.into_iter().map(|(p, (_, tx))| (p, tx)).collect(),
-            instances: 0,
+            instances: u32::try_from(instances).unwrap_or(u32::MAX),
         };
         ctx.send(VIP, mgmt(), Msg::Metrics { host, sample });
     }
@@ -214,6 +220,27 @@ impl Actor for HostAgent {
                 }
             }
             Msg::ReportRequest if self.token.is_none() => self.send_heartbeat(ctx, true),
+            // Workloads are only ever placed on members.
+            Msg::StartInstance(spec) if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.start_instance(spec);
+                }
+            }
+            Msg::StopInstance(id) if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.stop_instance(&id);
+                }
+            }
+            Msg::CreateReplica { volume, size_gb, source } if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.create_replica(&volume, size_gb, source);
+                }
+            }
+            Msg::DeleteReplica { volume } if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.delete_replica(&volume);
+                }
+            }
             _ => {}
         }
     }
@@ -241,7 +268,7 @@ impl Actor for HostAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::LogCmd;
+    use crate::proto::{FlowEnd, FlowKind, FlowSpec, InstanceSpec, LogCmd, ReplicaReport, UsageProfile};
     use crate::raft::{Durable, DurableOp};
     use crate::runtime::{HostOs, HostUsage, SimTime};
     use crate::state::NetworkResult;
@@ -255,6 +282,8 @@ mod tests {
         joined: bool,
         lldp: Vec<LldpNeighbor>,
         inventory: Inventory,
+        instances: Vec<InstanceSpec>,
+        replicas: Vec<ReplicaReport>,
     }
 
     impl HostOs for FakeOs {
@@ -292,6 +321,27 @@ mod tests {
         fn mark_joined(&mut self) {
             self.joined = true;
         }
+        fn start_instance(&mut self, spec: InstanceSpec) {
+            self.instances.retain(|i| i.id != spec.id);
+            self.instances.push(spec);
+        }
+        fn stop_instance(&mut self, id: &str) {
+            self.instances.retain(|i| i.id != id);
+        }
+        fn instances(&self) -> Vec<String> {
+            self.instances.iter().map(|i| i.id.clone()).collect()
+        }
+        fn create_replica(&mut self, volume: &str, _: u32, source: Option<HostId>) -> Option<String> {
+            let pct = if source.is_some() { 0 } else { 100 };
+            self.replicas.push((volume.into(), "nvme0".into(), pct));
+            Some("nvme0".into())
+        }
+        fn replicas(&self) -> Vec<ReplicaReport> {
+            self.replicas.clone()
+        }
+        fn delete_replica(&mut self, volume: &str) {
+            self.replicas.retain(|r| r.0 != volume);
+        }
     }
 
     /// Records what the agent sends; timers fire when the test advances time.
@@ -304,7 +354,15 @@ mod tests {
 
     impl FakeCtx {
         fn new(net: HostNetworkConfig) -> Self {
-            let os = FakeOs { boot: net.clone(), net, joined: false, lldp: vec![neighbor("sw-1", "p1")], inventory: Inventory::from_profile(ProfileId::Pi5, 1) };
+            let os = FakeOs {
+                boot: net.clone(),
+                net,
+                joined: false,
+                lldp: vec![neighbor("sw-1", "p1")],
+                inventory: Inventory::from_profile(ProfileId::Pi5, 1),
+                instances: vec![],
+                replicas: vec![],
+            };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
 
@@ -372,7 +430,15 @@ mod tests {
 
     /// As [`heartbeat`], from a host running network config `generation`.
     fn heartbeat_at_generation(at: SimTime, generation: u64) -> Msg {
-        Msg::Heartbeat { host: HostId::from("m1"), lifecycle_seen: 0, observed_at: Some(at), observed: None, net_generation: generation }
+        Msg::Heartbeat {
+            host: HostId::from("m1"),
+            lifecycle_seen: 0,
+            observed_at: Some(at),
+            observed: None,
+            net_generation: generation,
+            instances: vec![],
+            replicas: vec![],
+        }
     }
 
     /// A heartbeat carrying the observation, which is `os`'s.
@@ -383,6 +449,8 @@ mod tests {
             observed_at: Some(at),
             observed: Some(observed(os)),
             net_generation: 0,
+            instances: vec![],
+            replicas: vec![],
         }
     }
 
@@ -603,6 +671,43 @@ mod tests {
         ctx.now = 40_000;
         restarted.on_start(&mut ctx);
         assert_eq!(ctx.take_heartbeats(), [reporting(40_000, &ctx.os)]);
+    }
+
+    fn spec(id: &str) -> InstanceSpec {
+        let flow = FlowSpec { kind: FlowKind::Pod, to: FlowEnd::Router, network: NetworkId::from("mgmt"), min_mbps: 1.0, max_mbps: 10.0 };
+        InstanceSpec { id: id.into(), cpu_m: 250, ram_mb: 256, usage: UsageProfile { base_pct: 20.0, noise_pct: 10.0, burst_every_s: 0 }, flows: vec![flow] }
+    }
+
+    #[test]
+    fn workload_messages_reach_the_host_and_heartbeats_report_what_it_runs() {
+        let (mut a, mut ctx) = member();
+        a.on_message(&mut ctx, VIP, Msg::StartInstance(spec("pod/web/0")));
+        a.on_message(&mut ctx, VIP, Msg::StartInstance(spec("vm/vm1")));
+        a.on_message(&mut ctx, VIP, Msg::StopInstance("pod/web/0".into()));
+        a.on_message(&mut ctx, VIP, Msg::CreateReplica { volume: "disk1".into(), size_gb: 40, source: None });
+        a.on_message(&mut ctx, VIP, Msg::CreateReplica { volume: "disk2".into(), size_gb: 40, source: Some(HostId::from("m2")) });
+        a.on_message(&mut ctx, VIP, Msg::DeleteReplica { volume: "disk1".into() });
+        assert!(ctx.take().is_empty(), "nothing is answered: heartbeats tell");
+        assert_eq!(ctx.os.instances, [spec("vm/vm1")]);
+        ctx.advance(&mut a, 10_000);
+        let sent = ctx.take();
+        let Some(Msg::Heartbeat { instances, replicas, .. }) = sent.iter().find(|m| matches!(m, Msg::Heartbeat { .. })) else {
+            panic!("no heartbeat: {sent:?}")
+        };
+        assert_eq!(instances, &["vm/vm1".to_string()]);
+        assert_eq!(replicas, &[("disk2".to_string(), "nvme0".to_string(), 0)]);
+        let Some(Msg::Metrics { sample, .. }) = sent.iter().find(|m| matches!(m, Msg::Metrics { .. })) else { panic!("no metrics") };
+        assert_eq!(sample.instances, 1);
+    }
+
+    #[test]
+    fn an_unjoined_agent_runs_no_workloads() {
+        let mut ctx = FakeCtx::new(HostNetworkConfig::default());
+        let mut a = HostAgent::new(Some("tok".into()));
+        a.on_start(&mut ctx);
+        a.on_message(&mut ctx, VIP, Msg::StartInstance(spec("vm/vm1")));
+        a.on_message(&mut ctx, VIP, Msg::CreateReplica { volume: "disk1".into(), size_gb: 40, source: None });
+        assert!(ctx.os.instances.is_empty() && ctx.os.replicas.is_empty());
     }
 
     #[test]

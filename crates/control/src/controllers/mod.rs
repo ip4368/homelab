@@ -14,13 +14,14 @@ pub mod join;
 pub mod network;
 pub mod observe;
 pub mod rollout;
+pub mod scheduler;
 
-use crate::proto::{MetricSample, Msg, Observed};
+use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
 use model::{HostId, NetworkId, SwitchId};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A controller command that applied with an error is not proposed again for this long.
 pub const FAILED_BACKOFF_MS: u64 = 30_000;
@@ -99,6 +100,14 @@ pub struct Volatile {
     pub pending_joins: BTreeMap<u64, PendingJoin>,
     /// When a "join rejected" event was last recorded, per host.
     pub join_rejected_at: BTreeMap<HostId, SimTime>,
+    /// The instances each host's agent last said it runs.
+    pub instances: BTreeMap<HostId, BTreeSet<String>>,
+    /// The volume replicas each host's agent last said it holds.
+    pub replicas: BTreeMap<HostId, Vec<ReplicaReport>>,
+    /// The host each instance was last sent `StartInstance` to, and when.
+    pub instance_started: BTreeMap<String, (HostId, SimTime)>,
+    /// When each (volume, host) was last sent `CreateReplica`.
+    pub replica_created: BTreeMap<(String, HostId), SimTime>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -122,6 +131,10 @@ impl Volatile {
             pending: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
             join_rejected_at: BTreeMap::new(),
+            instances: BTreeMap::new(),
+            replicas: BTreeMap::new(),
+            instance_started: BTreeMap::new(),
+            replica_created: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -158,6 +171,12 @@ impl Volatile {
             (Addr::Host(id), Msg::ApplyNetwork { generation, .. }) => {
                 self.net_pushed.insert(id.clone(), (*generation, now));
             }
+            (Addr::Host(id), Msg::StartInstance(spec)) => {
+                self.instance_started.insert(spec.id.clone(), (id.clone(), now));
+            }
+            (Addr::Host(id), Msg::CreateReplica { volume, .. }) => {
+                self.replica_created.insert((volume.clone(), id.clone()), now);
+            }
             _ => {}
         }
     }
@@ -170,5 +189,6 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(observe::run(state, volatile, now));
     out.extend(alerts::run(state, volatile));
     out.extend(rollout::run(state, now));
+    out.extend(scheduler::run(state, volatile, now));
     out
 }

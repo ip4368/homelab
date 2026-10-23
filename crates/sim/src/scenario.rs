@@ -1,5 +1,6 @@
 //! Scenarios: the simulator playing a human, e.g. a technician racking new
-//! hosts. Unlike faults they may run the simulation while they work.
+//! hosts or a user creating workloads. Unlike faults they may run the
+//! simulation while they work.
 
 use crate::engine::Engine;
 use crate::presets::{cable_host, capacity, host_id, profile_prefix};
@@ -10,12 +11,20 @@ use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::{Addr, Endpoint, Svc};
-use model::{HostId, NetworkId, ProfileId};
+use model::{Deployment, HostId, NetworkId, ProfileId, Selector, Vm, Volume, TRANSCODE_CAPABILITY_PREFIX};
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
 /// How long [`Scenario::AddHosts`] waits for the control plane to hand out a join token.
 pub const TOKEN_WAIT_MS: u64 = 5000;
+/// How long [`Scenario::SeedWorkloads`] waits for the answers to each batch of creations.
+pub const SEED_WAIT_MS: u64 = 10_000;
+/// The seed workloads' transcode deployment.
+pub const TRANSCODE_DEPLOYMENT: &str = "transcode";
+/// The seed workloads' general deployments (per 60 hosts; more get a numeric suffix).
+const GENERAL_DEPLOYMENTS: [&str; 6] = ["web", "api", "cache", "queue", "metrics", "auth"];
 /// The port MTU [`Misconfig::MtuTooSmall`] leaves: too small for jumbo networks.
 pub const TOO_SMALL_MTU: u16 = 1500;
 
@@ -65,6 +74,12 @@ pub enum Scenario {
         #[serde(default = "one_stream")]
         streams: u32,
     },
+    /// Creates a homelab's workloads through the client, per 60 hosts: 30
+    /// VMs (2-4 vCPU, 4-8 GB RAM, a 40-80 GB volume each, on vm-lan or
+    /// vm-iot), and 6 general deployments of 3 pods; plus one transcode
+    /// deployment with a pod per two SBCs. Volumes are created first, then
+    /// the VMs on them, then the deployments.
+    SeedWorkloads,
 }
 
 fn one_stream() -> u32 {
@@ -79,7 +94,87 @@ impl Engine {
             Scenario::Iperf { from, to, network, mbps, duration_s, streams } => {
                 self.iperf(from, to, network, mbps, duration_s, streams)
             }
+            Scenario::SeedWorkloads => self.seed_workloads(),
         }
+    }
+
+    fn seed_workloads(&mut self) -> Result<(), String> {
+        if self.actor::<ClientActor>(&CLIENT).is_none() {
+            return Err("no client to create workloads with".into());
+        }
+        let w = self.fabric().world();
+        let hosts = u32::try_from(w.hosts.len()).unwrap_or(u32::MAX);
+        let sbcs = w.hosts.values().filter(|hw| matches!(hw.profile.id, ProfileId::Pi5 | ProfileId::Rk3588)).count();
+        let per_60 = |n: u32| (n * hosts).div_ceil(60);
+        let mut rng = ChaCha8Rng::seed_from_u64(self.seed() ^ 0x5EED);
+        let (mut volumes, mut vms) = (vec![], vec![]);
+        for n in 1..=per_60(30) {
+            let id = format!("vm-{n:02}");
+            let disk_gb = rng.random_range(40..=80);
+            let volume = Volume::new(format!("{id}-disk"), disk_gb);
+            let network = if rng.random_bool(0.5) { "vm-lan" } else { "vm-iot" };
+            let vm = Vm {
+                id,
+                vcpu: rng.random_range(2..=4),
+                ram_mb: rng.random_range(4..=8) * 1024,
+                disk_gb,
+                networks: vec![NetworkId::from(network)],
+                volume: volume.id.clone(),
+            };
+            volumes.push(ApiOp::CreateVolume { volume });
+            vms.push(ApiOp::CreateVm { vm });
+        }
+        let mut deployments = vec![];
+        let transcode = u32::try_from(sbcs / 2).unwrap_or(u32::MAX);
+        if transcode > 0 {
+            let selector = Selector { roles: Default::default(), capability_prefix: Some(TRANSCODE_CAPABILITY_PREFIX.into()) };
+            let deployment = Deployment {
+                id: TRANSCODE_DEPLOYMENT.into(),
+                image: "jellyfin-transcode".into(),
+                replicas: transcode,
+                cpu_m: 1000,
+                ram_mb: 1024,
+                selector,
+            };
+            deployments.push(ApiOp::CreateDeployment { deployment });
+        }
+        for n in 0..per_60(6) {
+            let name = GENERAL_DEPLOYMENTS[n as usize % GENERAL_DEPLOYMENTS.len()];
+            let round = n as usize / GENERAL_DEPLOYMENTS.len();
+            let id = if round == 0 { name.to_string() } else { format!("{name}-{}", round + 1) };
+            let deployment = Deployment {
+                id,
+                image: format!("{name}:latest"),
+                replicas: 3,
+                cpu_m: rng.random_range(1..=4) * 125,
+                ram_mb: rng.random_range(1..=4) * 128,
+                selector: Selector::default(),
+            };
+            deployments.push(ApiOp::CreateDeployment { deployment });
+        }
+        for batch in [volumes, vms, deployments] {
+            self.api_batch(batch)?;
+        }
+        Ok(())
+    }
+
+    /// Submits every op through the client and runs the simulation until all
+    /// are answered (or [`SEED_WAIT_MS`] passes); fails listing what did not succeed.
+    fn api_batch(&mut self, ops: Vec<ApiOp>) -> Result<(), String> {
+        let reqs: Vec<(u64, ApiOp)> = ops.into_iter().map(|op| (self.api(op.clone()), op)).collect();
+        let deadline = self.now() + SEED_WAIT_MS;
+        self.run_until(deadline, |e| {
+            let client = e.actor::<ClientActor>(&CLIENT).expect("checked above");
+            reqs.iter().all(|(r, _)| client.result(*r).is_some())
+        });
+        let mut failed = vec![];
+        for (req, op) in reqs {
+            match self.take_api_result(req) {
+                Some(ApiResult::Ok(_)) => {}
+                other => failed.push(format!("{op:?}: {other:?}")),
+            }
+        }
+        if failed.is_empty() { Ok(()) } else { Err(format!("could not create {}", failed.join("; "))) }
     }
 
     fn iperf(&mut self, from: HostId, to: FlowEnd, network: NetworkId, mbps: u32, duration_s: u32, streams: u32) -> Result<(), String> {
@@ -279,6 +374,23 @@ mod tests {
     }
 
     #[test]
+    fn seed_workloads_creates_them_through_the_client() {
+        let mut e = Engine::new(5);
+        e.load_fleet(&FleetSpec { ms01: 3, minipc: 0, pi5: 2, rk3588: 1 }, 3);
+        e.run_for(8000);
+        e.scenario(Scenario::SeedWorkloads).unwrap();
+        e.run_for(1000);
+        let s = &e.client_view().state;
+        // 6 hosts: ceil(30 x 6 / 60) = 3 VMs, ceil(6 x 6 / 60) = 1 general deployment, 3 SBCs / 2 = 1 transcode pod.
+        assert_eq!(s.vms.keys().collect::<Vec<_>>(), ["vm-01", "vm-02", "vm-03"]);
+        assert_eq!(s.volumes.keys().collect::<Vec<_>>(), ["vm-01-disk", "vm-02-disk", "vm-03-disk"]);
+        assert_eq!(s.deployments.keys().collect::<Vec<_>>(), ["transcode", "web"]);
+        assert_eq!((s.deployments["transcode"].deployment.replicas, s.deployments["web"].deployment.replicas), (1, 3));
+        let err = e.scenario(Scenario::SeedWorkloads).unwrap_err();
+        assert!(err.contains("already exists"), "seeding twice: {err}");
+    }
+
+    #[test]
     fn scenarios_are_plain_json() {
         let s = Scenario::AddHosts { profile: ProfileId::MiniPc, count: 1, misconfigure: Some(Misconfig::MissingVlan(20)) };
         let json = serde_json::to_value(&s).unwrap();
@@ -290,5 +402,6 @@ mod tests {
         let iperf = serde_json::json!({"Iperf": {"from": "ms01-01", "to": "Router", "network": "storage", "mbps": 10, "duration_s": 5}});
         let Scenario::Iperf { streams, .. } = serde_json::from_value(iperf).unwrap() else { panic!("an iperf") };
         assert_eq!(streams, 1, "one stream unless asked");
+        assert_eq!(serde_json::to_value(Scenario::SeedWorkloads).unwrap(), serde_json::json!("SeedWorkloads"));
     }
 }

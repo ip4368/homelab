@@ -10,6 +10,11 @@ use ts_rs::TS;
 /// Volumes keep this many replicas unless told otherwise.
 pub const DEFAULT_VOLUME_REPLICAS: u8 = 3;
 
+/// The most pods a deployment may ask for.
+pub const MAX_DEPLOYMENT_REPLICAS: u32 = 1000;
+/// The most replicas a volume may ask for.
+pub const MAX_VOLUME_REPLICAS: u8 = 5;
+
 /// A deployment whose `capability_prefix` starts with this needs a transcode host.
 pub const TRANSCODE_CAPABILITY_PREFIX: &str = "hw-transcode:";
 
@@ -44,6 +49,14 @@ impl Deployment {
         }
         roles
     }
+
+    /// Whether the deployment may be created: 1 to [`MAX_DEPLOYMENT_REPLICAS`] pods.
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_DEPLOYMENT_REPLICAS).contains(&self.replicas) {
+            return Err(format!("replicas must be 1 to {MAX_DEPLOYMENT_REPLICAS}, not {}", self.replicas));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -70,6 +83,17 @@ impl Volume {
     /// A volume with the default number of replicas.
     pub fn new(id: impl Into<String>, size_gb: u32) -> Self {
         Self { id: id.into(), size_gb, replicas: DEFAULT_VOLUME_REPLICAS }
+    }
+
+    /// Whether the volume may be created: at least 1 GB, 1 to [`MAX_VOLUME_REPLICAS`] replicas.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.size_gb == 0 {
+            return Err("size_gb must be at least 1".into());
+        }
+        if !(1..=MAX_VOLUME_REPLICAS).contains(&self.replicas) {
+            return Err(format!("replicas must be 1 to {MAX_VOLUME_REPLICAS}, not {}", self.replicas));
+        }
+        Ok(())
     }
 }
 
@@ -172,6 +196,27 @@ mod tests {
         assert_eq!(deployment(Some("hw-transcode:"), &[]).required_roles(), [Role::Compute, Role::Transcode].into());
         assert_eq!(deployment(Some("hw-transcode:quicksync"), &[]).required_roles(), [Role::Compute, Role::Transcode].into());
         assert_eq!(deployment(Some("gpu:"), &[Role::Storage]).required_roles(), [Role::Compute, Role::Storage].into());
+    }
+
+    #[test]
+    fn deployments_need_one_to_a_thousand_replicas() {
+        let mut d = deployment(None, &[]);
+        assert_eq!(d.validate(), Ok(()));
+        for (n, ok) in [(0, false), (1, true), (1000, true), (1001, false)] {
+            d.replicas = n;
+            assert_eq!(d.validate().is_ok(), ok, "{n}");
+        }
+        d.replicas = 0;
+        assert_eq!(d.validate().unwrap_err(), "replicas must be 1 to 1000, not 0");
+    }
+
+    #[test]
+    fn volumes_need_a_size_and_one_to_five_replicas() {
+        assert_eq!(Volume::new("v", 1).validate(), Ok(()));
+        assert_eq!(Volume::new("v", 0).validate().unwrap_err(), "size_gb must be at least 1");
+        for (n, ok) in [(0, false), (1, true), (5, true), (6, false)] {
+            assert_eq!(Volume { replicas: n, ..Volume::new("v", 10) }.validate().is_ok(), ok, "{n}");
+        }
     }
 
     #[test]

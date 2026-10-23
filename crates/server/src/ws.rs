@@ -8,7 +8,10 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use control::proto::MetricSample;
-use control::state::{Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, NetworkObj, Object, ObjectRef, Rollout, SwitchObj, TemplateObj};
+use control::state::{
+    Alert, AutoApproveRule, CpInfo, DeploymentObj, Event, HostObj, JoinToken, NetworkObj, Object, ObjectRef, PodObj, Rollout,
+    SwitchObj, TemplateObj, VmObj, VmStatusObj, VolumeObj, VolumeStatusObj,
+};
 use model::HostId;
 use serde::Serialize;
 use sim::truth::GroundTruth;
@@ -33,6 +36,12 @@ pub struct ViewSnapshot {
     pub networks: Vec<NetworkObj>,
     pub templates: Vec<TemplateObj>,
     pub rollouts: Vec<Rollout>,
+    pub deployments: Vec<DeploymentObj>,
+    pub pods: Vec<PodObj>,
+    pub vms: Vec<VmObj>,
+    pub vm_status: Vec<VmStatusObj>,
+    pub volumes: Vec<VolumeObj>,
+    pub volume_status: Vec<VolumeStatusObj>,
     pub alerts: Vec<Alert>,
     pub events: Vec<Event>,
     pub cp: CpInfo,
@@ -55,6 +64,12 @@ impl ViewSnapshot {
             networks: s.networks.values().cloned().collect(),
             templates: s.templates.values().cloned().collect(),
             rollouts: s.rollouts.values().cloned().collect(),
+            deployments: s.deployments.values().cloned().collect(),
+            pods: s.pods.values().cloned().collect(),
+            vms: s.vms.values().cloned().collect(),
+            vm_status: s.vm_status.values().cloned().collect(),
+            volumes: s.volumes.values().cloned().collect(),
+            volume_status: s.volume_status.values().cloned().collect(),
             alerts: s.alerts.values().cloned().collect(),
             events: s.events.values().cloned().collect(),
             cp: s.cp.clone(),
@@ -288,6 +303,27 @@ mod tests {
         let (_, first) = Connection::open(&published(&view, 10));
         let ServerMsg::Snapshot { view: snap, .. } = first else { panic!("{first:?}") };
         assert_eq!((snap.networks.len(), snap.templates.len(), snap.rollouts.len()), (5, 3, 0));
+    }
+
+    #[test]
+    fn workloads_travel_in_snapshots() {
+        let mut leader = ClusterState::new();
+        let mut view = ClusterView::default();
+        let vm = model::Vm { id: "vm1".into(), vcpu: 2, ram_mb: 4096, disk_gb: 40, networks: vec![], volume: "d".into() };
+        let deployment =
+            model::Deployment { id: "web".into(), image: "nginx".into(), replicas: 2, cpu_m: 100, ram_mb: 128, selector: Default::default() };
+        for cmd in [
+            Command::CreateVolume { volume: model::Volume::new("d", 40) },
+            Command::CreateVm { vm },
+            Command::CreateDeployment { deployment },
+        ] {
+            leader.apply(1, cmd).unwrap();
+        }
+        view.merge(leader.changes_since(0));
+        let (_, first) = Connection::open(&published(&view, 10));
+        let ServerMsg::Snapshot { view: snap, .. } = first else { panic!("{first:?}") };
+        assert_eq!((snap.deployments.len(), snap.pods.len()), (1, 2));
+        assert_eq!((snap.vms.len(), snap.vm_status.len(), snap.volumes.len(), snap.volume_status.len()), (1, 1, 1, 1));
     }
 
     #[test]

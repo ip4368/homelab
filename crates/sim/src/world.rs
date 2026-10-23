@@ -1,26 +1,53 @@
 //! Simulator ground truth: topology, logical networks and host hardware,
 //! plus what each host's OS sees of it (the engine exposes this to the
-//! actors on a host as their `HostOs`).
+//! actors on a host as their `HostOs`), including the workload instances it
+//! runs and the volume replicas on its disks.
 
 use crate::topology::{Node, Topology};
-use crate::traffic::Traffic;
-use control::proto::LogCmd;
+use crate::traffic::{FlowEnd, FlowKind, Traffic};
+use control::proto::{InstanceSpec, LogCmd, ReplicaReport, UsageProfile};
 use control::raft::Durable;
-use control::runtime::{HostUsage, SwitchConfig};
+use control::runtime::{HostUsage, SimTime, SwitchConfig};
 use model::network::{
     HostNetworkConfig, LldpNeighbor, LldpPeer, LogicalNetwork, ObservedSwitchPort, bootstrap_config, seed_networks,
 };
-use model::{DiskState, HardwareProfile, HostId, Inventory, NetworkId, NicState, PortName, ProfileId, SwitchId, profile};
-use rand::Rng;
+use model::{
+    DiskKind, DiskState, HardwareProfile, HostId, Inventory, NetworkId, NicState, PortName, ProfileId, SwitchId, profile,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Synthetic idle usage until workloads exist (Task 20): a baseline plus up
-/// to the noise on top, re-drawn per reading.
-const IDLE_CPU_PCT: f32 = 3.0;
-const CPU_NOISE_PCT: f32 = 2.0;
-const IDLE_RAM_PCT: f32 = 10.0;
-const RAM_NOISE_PCT: f32 = 1.0;
+/// CPU and RAM every powered host uses on top of its instances, in percent.
+pub const BASELINE_PCT: f32 = 3.0;
+/// How full a disk is before any replica lands on it (OS, logs).
 const IDLE_DISK_PCT: f32 = 5.0;
+/// A replica is copied from its source at up to this rate, on `storage`.
+pub const REBUILD_MBPS: f64 = 2000.0;
+/// Usage and demand curves move between seeded knots this far apart.
+const CURVE_PERIOD_MS: u64 = 30_000;
+/// A usage burst lasts this long and adds this much.
+const BURST_MS: u64 = 20_000;
+const BURST_PCT: f32 = 40.0;
+
+/// A workload instance running on a host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Instance {
+    pub spec: InstanceSpec,
+    /// Seeds its usage and demand curves.
+    pub seed: u64,
+    /// The flow started for each of `spec.flows`, in order.
+    pub flows: Vec<u64>,
+}
+
+/// A volume replica on one of a host's disks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Replica {
+    pub disk: String,
+    pub size_gb: u32,
+    /// How much of it is copied, 0 to 100.
+    pub pct: u8,
+    /// The rebuild flow copying it from its source, while it copies.
+    pub flow: Option<u64>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostHw {
@@ -43,6 +70,10 @@ pub struct HostHw {
     /// member ([`HostHw::mark_joined`]); `None` for a member. A restored host
     /// boots its agent with whatever is stored here.
     pub join_token: Option<String>,
+    /// What runs on the host, by instance id; gone when it loses power.
+    pub instances: BTreeMap<String, Instance>,
+    /// Volume replicas on its disks, by volume; they survive power loss.
+    pub replicas: BTreeMap<String, Replica>,
 }
 
 impl HostHw {
@@ -64,6 +95,8 @@ impl HostHw {
             degraded_nics: BTreeMap::new(),
             cp_durable: None,
             join_token: None,
+            instances: BTreeMap::new(),
+            replicas: BTreeMap::new(),
         }
     }
 
@@ -83,22 +116,86 @@ impl HostHw {
         self.join_token = None;
     }
 
-    /// What the OS measures now: idle usage with seeded noise, every healthy
-    /// disk at a fixed fill. Port rates are the world's to fill ([`World::usage`]).
-    pub fn usage(&self, rng: &mut impl Rng) -> HostUsage {
+    /// The disk a new `size_gb` replica goes on: of the disks that are not
+    /// SD or eMMC, not failed and have room for it, the one with most room
+    /// (then the lowest name).
+    fn disk_for(&self, size_gb: u32) -> Option<String> {
+        self.profile
+            .disks
+            .iter()
+            .filter(|d| !matches!(d.kind, DiskKind::Sd | DiskKind::Emmc) && !self.failed_disks.contains(&d.name))
+            .map(|d| (d.size_gb.saturating_sub(self.replica_gb(&d.name)), &d.name))
+            .filter(|(free, _)| *free >= size_gb)
+            .min_by_key(|(free, name)| (std::cmp::Reverse(*free), *name))
+            .map(|(_, name)| name.clone())
+    }
+
+    /// The space the replicas on `disk` take.
+    fn replica_gb(&self, disk: &str) -> u32 {
+        self.replicas.values().filter(|r| r.disk == disk).map(|r| r.size_gb).sum()
+    }
+
+    /// What the OS measures now: the baseline plus each instance's usage
+    /// curve as a share of the machine, and every healthy disk filled by the
+    /// copied part of its replicas. Port rates are the world's to fill ([`World::usage`]).
+    pub fn usage(&self, now: SimTime) -> HostUsage {
+        let cpu_m = f64::from(self.profile.cpu_threads) * 1000.0;
+        let ram_mb = f64::from(self.profile.ram_gb) * 1024.0;
+        let (mut cpu_pct, mut ram_pct) = (f64::from(BASELINE_PCT), f64::from(BASELINE_PCT));
+        for i in self.instances.values() {
+            let (cpu, ram) = (usage_pct(&i.spec.usage, i.seed, now), usage_pct(&i.spec.usage, !i.seed, now));
+            cpu_pct += f64::from(i.spec.cpu_m) * f64::from(cpu) / cpu_m;
+            ram_pct += f64::from(i.spec.ram_mb) * f64::from(ram) / ram_mb;
+        }
+        let disk_pct = self
+            .profile
+            .disks
+            .iter()
+            .filter(|d| !self.failed_disks.contains(&d.name))
+            .map(|d| {
+                let copied: f64 = self.replicas.values().filter(|r| r.disk == d.name).map(|r| f64::from(r.size_gb) * f64::from(r.pct) / 100.0).sum();
+                (d.name.clone(), IDLE_DISK_PCT + (100.0 * copied / f64::from(d.size_gb.max(1))) as f32)
+            })
+            .collect();
         HostUsage {
-            cpu_pct: IDLE_CPU_PCT + CPU_NOISE_PCT * rng.random::<f32>(),
-            ram_pct: IDLE_RAM_PCT + RAM_NOISE_PCT * rng.random::<f32>(),
-            disk_pct: self
-                .profile
-                .disks
-                .iter()
-                .filter(|d| !self.failed_disks.contains(&d.name))
-                .map(|d| (d.name.clone(), IDLE_DISK_PCT))
-                .collect(),
+            cpu_pct: cpu_pct.min(100.0) as f32,
+            ram_pct: ram_pct.min(100.0) as f32,
+            disk_pct,
             port_bps: BTreeMap::new(),
         }
     }
+}
+
+/// Where an instance's usage is at `now`, as a percentage of what it asked
+/// for: its base, smooth noise up to `noise_pct`, and a burst of
+/// [`BURST_PCT`] for [`BURST_MS`] at a seeded moment of every `burst_every_s`.
+fn usage_pct(p: &UsageProfile, seed: u64, now: SimTime) -> f32 {
+    let mut pct = p.base_pct + p.noise_pct * curve(seed, now) as f32;
+    if p.burst_every_s > 0 {
+        let period = u64::from(p.burst_every_s) * 1000;
+        let start = mix(seed ^ 0xB0B5, now / period) % period.saturating_sub(BURST_MS).max(1);
+        if (start..start + BURST_MS).contains(&(now % period)) {
+            pct += BURST_PCT;
+        }
+    }
+    pct.clamp(0.0, 100.0)
+}
+
+/// A smooth deterministic curve in [0, 1): seeded values every
+/// [`CURVE_PERIOD_MS`], joined by straight lines.
+fn curve(seed: u64, now: SimTime) -> f64 {
+    let (knot, into) = (now / CURVE_PERIOD_MS, now % CURVE_PERIOD_MS);
+    let unit = |k: u64| (mix(seed, k) >> 11) as f64 / (1u64 << 53) as f64;
+    let (a, b) = (unit(knot), unit(knot + 1));
+    a + (b - a) * into as f64 / CURVE_PERIOD_MS as f64
+}
+
+/// SplitMix64 of `seed` and `k`: a well-spread hash.
+fn mix(seed: u64, k: u64) -> u64 {
+    let mut z = seed ^ k.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -136,11 +233,11 @@ impl World {
         Some(far.map_or(own, |f| f.min(own)))
     }
 
-    /// What `host`'s OS measures now ([`HostHw::usage`]), with every NIC's
-    /// (rx, tx) from the latest traffic tick.
-    pub fn usage(&self, host: &HostId, rng: &mut impl Rng) -> Option<HostUsage> {
+    /// What `host`'s OS measures at `now` ([`HostHw::usage`]), with every
+    /// NIC's (rx, tx) from the latest traffic tick.
+    pub fn usage(&self, host: &HostId, now: SimTime) -> Option<HostUsage> {
         let hw = self.hosts.get(host)?;
-        let mut usage = hw.usage(rng);
+        let mut usage = hw.usage(now);
         let ports = &self.traffic.last().port_bps;
         usage.port_bps = hw
             .profile
@@ -152,6 +249,108 @@ impl World {
             })
             .collect();
         Some(usage)
+    }
+
+    /// Runs `spec` on `host` (if it is powered) with curves seeded by `seed`,
+    /// putting its flows on the wire. The same spec again changes nothing; a
+    /// different one replaces the instance.
+    pub fn start_instance(&mut self, host: &HostId, spec: InstanceSpec, seed: u64) {
+        let Some(hw) = self.hosts.get_mut(host).filter(|hw| hw.powered) else { return };
+        if hw.instances.get(&spec.id).is_some_and(|i| i.spec == spec) {
+            return;
+        }
+        for flow in hw.instances.remove(&spec.id).into_iter().flat_map(|i| i.flows) {
+            self.traffic.stop(flow);
+        }
+        let src = FlowEnd::Host(host.clone());
+        // Demands follow their curves from the next traffic tick on.
+        let flows = spec.flows.iter().map(|f| self.traffic.start(src.clone(), f.to.clone(), f.network.clone(), f.min_mbps, f.kind, None)).collect();
+        hw.instances.insert(spec.id.clone(), Instance { spec, seed, flows });
+    }
+
+    /// Stops instance `id` on `host`, taking its flows off the wire.
+    pub fn stop_instance(&mut self, host: &HostId, id: &str) {
+        let Some(i) = self.hosts.get_mut(host).and_then(|hw| hw.instances.remove(id)) else { return };
+        for flow in i.flows {
+            self.traffic.stop(flow);
+        }
+    }
+
+    /// The instances running on `host`.
+    pub fn instances(&self, host: &HostId) -> Vec<String> {
+        self.hosts.get(host).map(|hw| hw.instances.keys().cloned().collect()).unwrap_or_default()
+    }
+
+    /// Puts a replica of `volume` on the disk of powered `host` with most room
+    /// for it: empty and complete when `source` is `None`, else copied from
+    /// `source` by a [`REBUILD_MBPS`] rebuild flow on `storage`. A volume the
+    /// host holds keeps its replica. The replica's disk, or `None` if no disk
+    /// has room.
+    pub fn create_replica(&mut self, host: &HostId, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
+        let hw = self.hosts.get_mut(host).filter(|hw| hw.powered)?;
+        if let Some(r) = hw.replicas.get(volume) {
+            return Some(r.disk.clone());
+        }
+        let disk = hw.disk_for(size_gb)?;
+        let flow = source.filter(|s| s != host).map(|s| {
+            let storage = NetworkId::from("storage");
+            self.traffic.start(FlowEnd::Host(s), FlowEnd::Host(host.clone()), storage, REBUILD_MBPS, FlowKind::Rebuild, None)
+        });
+        let pct = if flow.is_some() { 0 } else { 100 };
+        hw.replicas.insert(volume.into(), Replica { disk: disk.clone(), size_gb, pct, flow });
+        Some(disk)
+    }
+
+    /// Drops `host`'s replica of `volume`, ending its copy if one runs.
+    pub fn delete_replica(&mut self, host: &HostId, volume: &str) {
+        let Some(r) = self.hosts.get_mut(host).and_then(|hw| hw.replicas.remove(volume)) else { return };
+        if let Some(flow) = r.flow {
+            self.traffic.stop(flow);
+        }
+    }
+
+    /// The replicas on `host`: (volume, disk, pct copied).
+    pub fn replicas(&self, host: &HostId) -> Vec<ReplicaReport> {
+        let Some(hw) = self.hosts.get(host) else { return vec![] };
+        hw.replicas.iter().map(|(v, r)| (v.clone(), r.disk.clone(), r.pct)).collect()
+    }
+
+    /// Moves every instance flow's demand to where its curve is at `now`.
+    pub fn update_demands(&mut self, now: SimTime) {
+        for i in self.hosts.values().flat_map(|hw| hw.instances.values()) {
+            for (n, (&flow, f)) in (1..).zip(i.flows.iter().zip(&i.spec.flows)) {
+                let at = curve(mix(i.seed, n), now);
+                self.traffic.set_demand(flow, f.min_mbps + (f.max_mbps - f.min_mbps) * at);
+            }
+        }
+    }
+
+    /// Advances each copying replica by the bytes its rebuild flow has
+    /// carried (`size_gb` × 8e9 bits is all of it); a complete one ends its flow.
+    pub fn advance_copies(&mut self) {
+        for r in self.hosts.values_mut().flat_map(|hw| hw.replicas.values_mut()) {
+            let Some(flow) = r.flow else { continue };
+            let (copied, total) = (self.traffic.carried_bytes(flow), f64::from(r.size_gb) * 1e9);
+            if copied >= total {
+                r.pct = 100;
+                r.flow = None;
+                self.traffic.stop(flow);
+            } else {
+                r.pct = (100.0 * copied / total).floor() as u8;
+            }
+        }
+    }
+
+    /// Cuts `host`'s power: its instances and the copies onto it end (their
+    /// flows leave the wire); its disks, replicas included, keep what they hold.
+    pub fn power_off(&mut self, host: &HostId) {
+        let Some(hw) = self.hosts.get_mut(host) else { return };
+        hw.powered = false;
+        let flows = std::mem::take(&mut hw.instances).into_values().flat_map(|i| i.flows);
+        let copies: Vec<u64> = hw.replicas.values_mut().filter_map(|r| r.flow.take()).collect();
+        for flow in flows.chain(copies) {
+            self.traffic.stop(flow);
+        }
     }
 
     /// What `host`'s OS discovers about its hardware: the profile's NICs and
@@ -258,9 +457,8 @@ impl Default for World {
 mod tests {
     use super::*;
     use crate::topology::{PortMode, Switch, SwitchPortCfg};
+    use control::proto::FlowSpec;
     use model::SwitchId;
-    use rand::SeedableRng;
-    use rand_chacha::ChaCha8Rng;
 
     fn hid(s: &str) -> HostId {
         HostId::from(s)
@@ -338,19 +536,148 @@ mod tests {
         assert_eq!(w.nic_speed(&hid("h"), "eth9"), None);
     }
 
+    fn spec(id: &str, cpu_m: u32, flows: Vec<FlowSpec>) -> InstanceSpec {
+        InstanceSpec { id: id.into(), cpu_m, ram_mb: 4096, usage: UsageProfile { base_pct: 50.0, noise_pct: 0.0, burst_every_s: 0 }, flows }
+    }
+
+    fn to_router(min_mbps: f64, max_mbps: f64) -> FlowSpec {
+        FlowSpec { kind: FlowKind::VmClient, to: FlowEnd::Router, network: NetworkId::from("vm-lan"), min_mbps, max_mbps }
+    }
+
     #[test]
-    fn idle_usage_is_noisy_around_a_baseline_and_skips_failed_disks() {
-        let mut hw = HostHw::new(ProfileId::Ms01, 0);
-        hw.failed_disks.insert("nvme1".into());
-        let mut rng = ChaCha8Rng::seed_from_u64(1);
-        let (a, b) = (hw.usage(&mut rng), hw.usage(&mut rng));
-        assert_ne!(a.cpu_pct, b.cpu_pct, "re-drawn per reading");
-        for u in [&a, &b] {
-            assert!((IDLE_CPU_PCT..IDLE_CPU_PCT + CPU_NOISE_PCT).contains(&u.cpu_pct), "{u:?}");
-            assert!((IDLE_RAM_PCT..IDLE_RAM_PCT + RAM_NOISE_PCT).contains(&u.ram_pct), "{u:?}");
-            assert_eq!(u.disk_pct, [("nvme0".to_string(), IDLE_DISK_PCT)].into());
-            assert!(u.port_bps.is_empty());
+    fn usage_is_a_baseline_plus_the_instances_and_skips_failed_disks() {
+        let mut w = world();
+        let h = hid("h");
+        w.hosts.get_mut(&h).unwrap().failed_disks.insert("nvme1".into());
+        let idle = w.usage(&h, 0).unwrap();
+        assert_eq!((idle.cpu_pct, idle.ram_pct), (BASELINE_PCT, BASELINE_PCT));
+        assert_eq!(idle.disk_pct, [("nvme0".to_string(), IDLE_DISK_PCT)].into());
+        // 4000 m at 50% of a 20-thread machine is 10%; 4 GB at 50% of 64 GB is 3.125%.
+        w.start_instance(&h, spec("vm/a", 4000, vec![]), 7);
+        let busy = w.usage(&h, 0).unwrap();
+        assert!((busy.cpu_pct - 13.0).abs() < 1e-4, "{busy:?}");
+        assert!((busy.ram_pct - (BASELINE_PCT + 3.125)).abs() < 1e-4, "{busy:?}");
+        assert!(w.usage(&hid("nope"), 0).is_none());
+    }
+
+    #[test]
+    fn usage_curves_are_seeded_smooth_and_burst() {
+        let p = UsageProfile { base_pct: 20.0, noise_pct: 30.0, burst_every_s: 120 };
+        let samples: Vec<f32> = (0..600).map(|s| usage_pct(&p, 9, s * 1000)).collect();
+        assert_eq!(samples, (0..600).map(|s| usage_pct(&p, 9, s * 1000)).collect::<Vec<_>>(), "deterministic");
+        assert_ne!(samples, (0..600).map(|s| usage_pct(&p, 10, s * 1000)).collect::<Vec<_>>(), "seeded");
+        let calm = UsageProfile { burst_every_s: 0, ..p };
+        for s in 0..600 {
+            let v = usage_pct(&calm, 9, s * 1000);
+            assert!((20.0..50.0).contains(&v), "{v}");
+            assert!((v - usage_pct(&calm, 9, s * 1000 + 1000)).abs() <= 1.0, "smooth: at most 30% per 30 s");
         }
+        let bursting = (0..600).filter(|&s| samples[s as usize] > usage_pct(&calm, 9, s * 1000)).count();
+        assert_eq!(bursting, 5 * 20, "a 20 s burst every 2 minutes");
+    }
+
+    #[test]
+    fn instances_put_their_flows_on_the_wire_until_stopped() {
+        let mut w = world();
+        let h = hid("h");
+        w.start_instance(&h, spec("vm/a", 1000, vec![to_router(5.0, 50.0), to_router(5.0, 50.0)]), 7);
+        assert_eq!(w.instances(&h), ["vm/a"]);
+        let flows: Vec<u64> = w.hosts[&h].instances["vm/a"].flows.clone();
+        assert_eq!(flows.len(), 2);
+        for id in &flows {
+            let f = w.traffic.flow(*id).unwrap();
+            assert_eq!((&f.src, &f.dst, f.kind), (&FlowEnd::Host(h.clone()), &FlowEnd::Router, FlowKind::VmClient));
+        }
+        w.start_instance(&h, spec("vm/a", 1000, vec![to_router(5.0, 50.0), to_router(5.0, 50.0)]), 8);
+        assert_eq!(w.hosts[&h].instances["vm/a"].flows, flows, "the same spec again changes nothing");
+        w.start_instance(&h, spec("vm/a", 1000, vec![to_router(5.0, 50.0)]), 8);
+        assert_eq!(w.traffic.flows().count(), 1, "a new spec replaces the instance and its flows");
+
+        // Demands move along their curves within their range.
+        let mut demands = BTreeSet::new();
+        for s in 0..300 {
+            w.update_demands(s * 1000);
+            let d = w.traffic.flows().next().unwrap().demand_mbps;
+            assert!((5.0..=50.0).contains(&d), "{d}");
+            demands.insert(d.to_bits());
+        }
+        assert!(demands.len() > 100);
+
+        w.stop_instance(&h, "vm/a");
+        assert!(w.instances(&h).is_empty() && w.traffic.flows().count() == 0);
+        w.hosts.get_mut(&h).unwrap().powered = false;
+        w.start_instance(&h, spec("vm/b", 1000, vec![]), 1);
+        assert!(w.instances(&h).is_empty(), "a powered-off host runs nothing");
+    }
+
+    #[test]
+    fn replicas_go_on_the_disk_with_most_room_and_fill_it() {
+        let mut w = world();
+        let h = hid("h");
+        assert_eq!(w.create_replica(&h, "a", 1500, None), Some("nvme0".into()));
+        assert_eq!(w.create_replica(&h, "b", 100, None), Some("nvme1".into()), "nvme1 has more room now");
+        assert_eq!(w.create_replica(&h, "a", 1500, None), Some("nvme0".into()), "a held volume keeps its replica");
+        assert_eq!(w.create_replica(&h, "c", 1950, None), None, "no disk has room");
+        assert_eq!(w.replicas(&h), [("a".to_string(), "nvme0".to_string(), 100), ("b".to_string(), "nvme1".to_string(), 100)]);
+        let u = w.usage(&h, 0).unwrap();
+        assert_eq!(u.disk_pct["nvme0"], IDLE_DISK_PCT + 75.0);
+        w.delete_replica(&h, "a");
+        assert_eq!(w.replicas(&h).len(), 1);
+        let mut pi = World::new();
+        pi.hosts.insert(hid("pi"), HostHw::new(ProfileId::Pi5, 0));
+        assert_eq!(pi.create_replica(&hid("pi"), "a", 1, None), None, "never on an SD card");
+    }
+
+    /// Two MS-01s whose sfp0 (storage tagged, MTU 9000) is cabled to a jumbo trunk on `sw`.
+    fn storage_pair() -> World {
+        use model::network::{Attachment, Link, LinkKind};
+        let mut w = World::new();
+        let cfg = SwitchPortCfg { mode: PortMode::Trunk { native: None, allowed: [20].into() }, mtu: 9216, lacp_group: None, admin_up: true };
+        let ports = ["p1", "p2"].map(|p| (PortName::from(p), (10_000, cfg.clone()))).into();
+        w.topology.add_switch(Switch { id: SwitchId::from("sw"), model: "t".into(), ports, mlag_peer: None, up: true });
+        for (h, p) in [("a", "p1"), ("b", "p2")] {
+            let net = HostNetworkConfig {
+                links: vec![Link { name: "data".into(), kind: LinkKind::Single(PortName::from("sfp0")), mtu: 9000 }],
+                attachments: vec![Attachment { network: NetworkId::from("storage"), link: "data".into(), tagged: true, ip: None }],
+            };
+            w.hosts.insert(hid(h), HostHw::running(ProfileId::Ms01, 0, net));
+            w.topology.connect(Node::HostPort(hid(h), PortName::from("sfp0")), sp(p));
+        }
+        w
+    }
+
+    #[test]
+    fn a_copy_advances_by_the_bytes_its_rebuild_flow_carries() {
+        use crate::engine::Deliver;
+        let mut w = storage_pair();
+        assert_eq!(w.create_replica(&hid("b"), "v", 1, Some(hid("a"))), Some("nvme0".into()));
+        let flow = w.hosts[&hid("b")].replicas["v"].flow.unwrap();
+        let f = w.traffic.flow(flow).unwrap().clone();
+        assert_eq!((f.src, f.dst, f.network.as_str(), f.demand_mbps, f.kind), (FlowEnd::Host(hid("a")), FlowEnd::Host(hid("b")), "storage", REBUILD_MBPS, FlowKind::Rebuild));
+        let mut fabric = crate::fabric::Fabric::new(w, 1);
+        // 1 GB at 2000 Mbit/s is 4 s.
+        let pct = |f: &crate::fabric::Fabric| f.world().replicas(&hid("b"))[0].2;
+        fabric.tick(1000);
+        assert_eq!(pct(&fabric), 25);
+        fabric.tick(2000);
+        fabric.tick(3000);
+        assert_eq!(pct(&fabric), 75);
+        fabric.tick(4000);
+        assert_eq!(pct(&fabric), 100);
+        assert!(fabric.world().hosts[&hid("b")].replicas["v"].flow.is_none() && fabric.world().traffic.flow(flow).is_none(), "done: the flow ends");
+    }
+
+    #[test]
+    fn power_off_ends_instances_and_copies_but_keeps_replicas() {
+        let mut w = storage_pair();
+        w.start_instance(&hid("b"), spec("vm/a", 1000, vec![to_router(5.0, 50.0)]), 7);
+        w.create_replica(&hid("b"), "v", 1, Some(hid("a")));
+        w.create_replica(&hid("b"), "u", 1, None);
+        w.power_off(&hid("b"));
+        let hw = &w.hosts[&hid("b")];
+        assert!(!hw.powered && hw.instances.is_empty());
+        assert_eq!(w.traffic.flows().count(), 0);
+        assert_eq!(w.replicas(&hid("b")), [("u".to_string(), "nvme1".to_string(), 100), ("v".to_string(), "nvme0".to_string(), 0)]);
     }
 
     fn lldp_of(w: &World) -> Vec<(String, String, String)> {

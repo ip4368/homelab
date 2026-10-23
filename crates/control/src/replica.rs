@@ -5,7 +5,7 @@
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::rollout;
 use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
-use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
+use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle, NetworkResult};
@@ -211,9 +211,11 @@ impl CpReplica {
         self.handle(ctx, outs);
     }
 
-    /// Notes the heartbeat and the host's network generation, files the
-    /// host's observation if it came with one, and asks for it if the one held
-    /// here is not the one the agent stamped (`None` means the agent has none).
+    /// Notes the heartbeat, the host's network generation and what it runs
+    /// and holds, files the host's observation if it came with one, and asks
+    /// for it if the one held here is not the one the agent stamped (`None`
+    /// means the agent has none).
+    #[allow(clippy::too_many_arguments)]
     fn on_heartbeat(
         &mut self,
         ctx: &mut dyn Ctx,
@@ -222,6 +224,8 @@ impl CpReplica {
         observed_at: Option<SimTime>,
         observed: Option<Observed>,
         net_generation: u64,
+        instances: Vec<String>,
+        replicas: Vec<ReplicaReport>,
     ) {
         let now = ctx.now();
         let Some(v) = &mut self.volatile else { return };
@@ -230,6 +234,8 @@ impl CpReplica {
             return;
         }
         v.net_generation.insert(host.clone(), net_generation);
+        v.instances.insert(host.clone(), instances.into_iter().collect());
+        v.replicas.insert(host.clone(), replicas);
         match observed {
             Some(observed) => {
                 let observed_at = observed_at.unwrap_or(now);
@@ -308,6 +314,18 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, term: u64, op: ApiOp) -> H
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
         ApiOp::DeleteNetwork { id } => Command::DeleteNetwork { id },
         ApiOp::DeleteTemplate { id } => Command::DeleteTemplate { id },
+        ApiOp::CreateDeployment { deployment } => match deployment.validate() {
+            Ok(()) => Command::CreateDeployment { deployment },
+            Err(e) => return Handling::Answer(ApiResult::Err(e)),
+        },
+        ApiOp::DeleteDeployment { id } => Command::DeleteDeployment { id },
+        ApiOp::CreateVm { vm } => Command::CreateVm { vm },
+        ApiOp::DeleteVm { id } => Command::DeleteVm { id },
+        ApiOp::CreateVolume { volume } => match volume.validate() {
+            Ok(()) => Command::CreateVolume { volume },
+            Err(e) => return Handling::Answer(ApiResult::Err(e)),
+        },
+        ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
     };
     Handling::Propose(cmd, serde_json::Value::Null)
 }
@@ -348,8 +366,8 @@ impl Actor for CpReplica {
                 let outs = self.raft().step(now, peer, m);
                 self.handle(ctx, outs);
             }
-            Msg::Heartbeat { host, observed_at, observed, net_generation, .. } => {
-                self.on_heartbeat(ctx, from, host, observed_at, observed, net_generation)
+            Msg::Heartbeat { host, observed_at, observed, net_generation, instances, replicas, .. } => {
+                self.on_heartbeat(ctx, from, host, observed_at, observed, net_generation, instances, replicas)
             }
             Msg::NetworkStatus { generation, result } => self.on_network_status(ctx, from, generation, result),
             Msg::SwitchReport { switch, model, ports, mlag_peer } => {
@@ -378,7 +396,11 @@ impl Actor for CpReplica {
             | Msg::ApplyNetwork { .. }
             | Msg::ConfirmNetwork { .. }
             | Msg::ReportRequest
-            | Msg::SwitchPoll => {}
+            | Msg::SwitchPoll
+            | Msg::StartInstance(_)
+            | Msg::StopInstance(_)
+            | Msg::CreateReplica { .. }
+            | Msg::DeleteReplica { .. } => {}
         }
     }
 
@@ -638,7 +660,7 @@ mod tests {
     }
 
     fn heartbeat(at: Option<SimTime>, observed: Option<Observed>) -> Msg {
-        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed, net_generation: 0 }
+        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed, net_generation: 0, instances: vec![], replicas: vec![] }
     }
 
     #[test]
@@ -669,9 +691,18 @@ mod tests {
         assert_eq!(rig.r.volatile.as_ref().unwrap().host_reports[&hid("m1")].observed, observed(false));
 
         // Unknown hosts are neither stored nor asked.
-        let stranger = Msg::Heartbeat { host: hid("zz"), lifecycle_seen: 0, observed_at: Some(1), observed: Some(observed(true)), net_generation: 0 };
+        let stranger = Msg::Heartbeat {
+            host: hid("zz"),
+            lifecycle_seen: 0,
+            observed_at: Some(1),
+            observed: Some(observed(true)),
+            net_generation: 0,
+            instances: vec!["vm/x".into()],
+            replicas: vec![],
+        };
         assert!(hb(&mut rig, stranger).is_empty());
         assert!(!rig.r.volatile.as_ref().unwrap().host_reports.contains_key(&hid("zz")));
+        assert!(!rig.r.volatile.as_ref().unwrap().instances.contains_key(&hid("zz")));
         assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")), "still a heartbeat");
     }
 
@@ -749,8 +780,19 @@ mod tests {
         assert!(rig.ctx.sent.is_empty());
         assert_eq!(rig.r.volatile.as_ref().unwrap().net_results.len(), 1);
 
-        let hb = Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 7 };
+        let hb = Msg::Heartbeat {
+            host: hid("m1"),
+            lifecycle_seen: 0,
+            observed_at: None,
+            observed: None,
+            net_generation: 7,
+            instances: vec!["vm/vm1".into(), "pod/web/0".into()],
+            replicas: vec![("disk1".into(), "nvme0".into(), 40)],
+        };
         rig.r.on_message(&mut rig.ctx, agent, hb);
-        assert_eq!(rig.r.volatile.as_ref().unwrap().net_generation[&hid("m1")], 7, "heartbeats carry the running generation");
+        let v = rig.r.volatile.as_ref().unwrap();
+        assert_eq!(v.net_generation[&hid("m1")], 7, "heartbeats carry the running generation");
+        assert_eq!(v.instances[&hid("m1")], ["pod/web/0".to_string(), "vm/vm1".to_string()].into(), "and what the host runs");
+        assert_eq!(v.replicas[&hid("m1")], [("disk1".to_string(), "nvme0".to_string(), 40)], "and holds");
     }
 }

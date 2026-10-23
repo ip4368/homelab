@@ -5,4 +5,4 @@ import type { Misconfig } from "./Misconfig";
 import type { NetworkId } from "./NetworkId";
 import type { ProfileId } from "./ProfileId";
 
-export type Scenario = { "AddHosts": { profile: ProfileId, count: number, misconfigure: Misconfig | null, } } | { "Iperf": { from: HostId, to: FlowEnd, network: NetworkId, mbps: number, duration_s: number, streams: number, } };
+export type Scenario = { "AddHosts": { profile: ProfileId, count: number, misconfigure: Misconfig | null, } } | { "Iperf": { from: HostId, to: FlowEnd, network: NetworkId, mbps: number, duration_s: number, streams: number, } } | "SeedWorkloads";

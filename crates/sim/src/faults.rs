@@ -15,8 +15,8 @@ use ts_rs::TS;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub enum Fault {
-    /// Powers the host off: its agent and CP replica die, its links go dark.
-    /// Its disk (stored CP state) survives.
+    /// Powers the host off: its agent, CP replica and workload instances
+    /// die, its links go dark. Its disks (stored CP state, volume replicas) survive.
     KillHost { host: HostId },
     /// Powers a killed host back on: it boots its last confirmed network
     /// config, its agent boots as it did originally, and its CP replica
@@ -44,7 +44,8 @@ impl Engine {
     pub fn fault(&mut self, f: Fault) -> Result<(), String> {
         match f {
             Fault::KillHost { host } => {
-                self.host_hw(&host)?.powered = false;
+                self.host_hw(&host)?;
+                self.fabric_mut().workloads_mut().power_off(&host);
                 self.kill(&agent(&host));
                 self.kill(&cp(&host));
             }

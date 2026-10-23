@@ -26,31 +26,11 @@ use crate::topology::Node;
 use crate::world::World;
 use control::runtime::SimTime;
 use model::{BondMode, HostId, LinkKind, LogicalNetwork, NetworkId, PortName};
-use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
-use ts_rs::TS;
 
-/// Where a flow starts or ends.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub enum FlowEnd {
-    Host(HostId),
-    /// The upstream router: VM client traffic and transcode streams end here.
-    Router,
-}
-
-/// What generates a flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FlowKind {
-    Iperf,
-    ReplicaWrite,
-    Rebuild,
-    Migration,
-    VmClient,
-    Transcode,
-    Pod,
-}
+// Defined in `control` (instances name their flows); kept importable from here.
+pub use control::proto::{FlowEnd, FlowKind};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Flow {
@@ -82,6 +62,8 @@ pub struct Traffic {
     next_id: u64,
     /// Bytes each flow has carried so far.
     carried: BTreeMap<u64, f64>,
+    /// The flows the latest [`Traffic::expire`] ended, with their final byte counts.
+    finished: BTreeMap<u64, f64>,
     last: TickResult,
 }
 
@@ -103,9 +85,17 @@ impl Traffic {
         id
     }
 
-    pub fn stop(&mut self, id: u64) -> Option<Flow> {
-        self.carried.remove(&id);
-        self.flows.remove(&id)
+    /// Ends flow `id`, returning it with the bytes it carried.
+    pub fn stop(&mut self, id: u64) -> Option<(Flow, f64)> {
+        let bytes = self.carried.remove(&id).unwrap_or(0.0);
+        Some((self.flows.remove(&id)?, bytes))
+    }
+
+    /// Sets what flow `id` asks for from the next tick on.
+    pub fn set_demand(&mut self, id: u64, mbps: f64) {
+        if let Some(f) = self.flows.get_mut(&id) {
+            f.demand_mbps = mbps;
+        }
     }
 
     pub fn flows(&self) -> impl Iterator<Item = &Flow> {
@@ -116,9 +106,10 @@ impl Traffic {
         self.flows.get(&id)
     }
 
-    /// Bytes flow `id` has carried since it started (0 for an unknown flow).
+    /// Bytes flow `id` has carried since it started: its final count if the
+    /// latest [`Traffic::expire`] ended it, 0 for an unknown flow.
     pub fn carried_bytes(&self, id: u64) -> f64 {
-        self.carried.get(&id).copied().unwrap_or(0.0)
+        self.carried.get(&id).or_else(|| self.finished.get(&id)).copied().unwrap_or(0.0)
     }
 
     /// The latest tick's result.
@@ -126,12 +117,15 @@ impl Traffic {
         &self.last
     }
 
-    /// Stops every flow whose time is up at `now`.
-    pub fn expire(&mut self, now: SimTime) {
+    /// Stops every flow whose time is up at `now`, returning each with its
+    /// final byte count; [`Traffic::carried_bytes`] keeps reporting those
+    /// until the next call. Run it after the tick that accounts the last
+    /// interval, so a flow carries its whole lifetime.
+    pub fn expire(&mut self, now: SimTime) -> Vec<(Flow, f64)> {
         let done: Vec<u64> = self.flows.values().filter(|f| f.until.is_some_and(|u| u <= now)).map(|f| f.id).collect();
-        for id in done {
-            self.stop(id);
-        }
+        let ended: Vec<(Flow, f64)> = done.into_iter().filter_map(|id| self.stop(id)).collect();
+        self.finished = ended.iter().map(|(f, bytes)| (f.id, *bytes)).collect();
+        ended
     }
 
     /// Routes every flow over `fabric` as it is now, shares the capacity out
@@ -543,17 +537,16 @@ mod tests {
 
     #[test]
     fn usage_reports_every_nic_from_the_latest_tick() {
-        use rand::SeedableRng;
         let f = Fabric::new(two_singles(), 1);
         let mut t = Traffic::default();
         host_flow(&mut t, "h1", "h2", 2500.0);
         t.tick(&f);
         let mut w = f.world().clone();
         w.traffic = t;
-        let u = w.usage(&h("h1"), &mut rand_chacha::ChaCha8Rng::seed_from_u64(1)).unwrap();
+        let u = w.usage(&h("h1"), 0).unwrap();
         let zero = (0.0, 0.0);
         assert_eq!(u.port_bps, [("sfp0".into(), (0.0, 2.5e9)), ("sfp1".into(), zero), ("eth0".into(), zero), ("eth1".into(), zero)].into());
-        assert!(w.usage(&h("nope"), &mut rand_chacha::ChaCha8Rng::seed_from_u64(1)).is_none());
+        assert!(w.usage(&h("nope"), 0).is_none());
     }
 
     #[test]
@@ -566,11 +559,29 @@ mod tests {
         t.tick(&f);
         // 800 Mbit/s for two 1 s ticks is 200 MB.
         assert_eq!(t.carried_bytes(id), 200e6);
-        t.expire(4999);
+        assert!(t.expire(4999).is_empty());
         assert!(t.flow(id).is_some());
-        t.expire(5000);
-        assert!(t.flow(id).is_none() && t.carried_bytes(id) == 0.0);
+        let ended = t.expire(5000);
+        assert_eq!(ended.iter().map(|(f, bytes)| (f.id, *bytes)).collect::<Vec<_>>(), [(id, 200e6)], "with its final count");
+        assert!(t.flow(id).is_none());
+        assert_eq!(t.carried_bytes(id), 200e6, "still readable after it ended");
+        t.expire(6000);
+        assert_eq!(t.carried_bytes(id), 0.0, "until the next expiry");
         assert_eq!(t.flows().map(|f| f.id).collect::<Vec<_>>(), [other]);
         assert!(other > id, "ids are not reused");
+        let (flow, bytes) = t.stop(other).unwrap();
+        assert_eq!((flow.id, bytes), (other, 200e6), "a stopped flow hands back what it carried");
+        assert!(t.stop(other).is_none());
+    }
+
+    #[test]
+    fn demand_can_change_while_a_flow_runs() {
+        let f = Fabric::new(two_singles(), 1);
+        let mut t = Traffic::default();
+        let id = host_flow(&mut t, "h1", "h2", 800.0);
+        assert_eq!(t.tick(&f).rate[&id], 800.0);
+        t.set_demand(id, 300.0);
+        assert_eq!(t.flow(id).unwrap().demand_mbps, 300.0);
+        assert_eq!(t.tick(&f).rate[&id], 300.0);
     }
 }

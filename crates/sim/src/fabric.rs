@@ -126,6 +126,14 @@ impl Fabric {
         &mut self.world.traffic
     }
 
+    /// The world, for running workloads on its hosts: instances and replicas
+    /// live on the hosts and their flows in the traffic, neither of which
+    /// feeds the cached switch graphs, so this keeps them. Topology changes
+    /// go through [`Fabric::world_mut`].
+    pub fn workloads_mut(&mut self) -> &mut World {
+        &mut self.world
+    }
+
     /// Which host each switch currently believes owns the VIP.
     pub fn vip_arp(&self) -> &BTreeMap<SwitchId, HostId> {
         &self.arp
@@ -374,12 +382,16 @@ impl Deliver for Fabric {
         self.record_vip_claim(host);
     }
 
-    /// Ends the flows whose time is up and routes the rest as the world is now.
+    /// Moves instance demands along their curves, routes every flow as the
+    /// world is now and accounts the interval just ended, then ends the flows
+    /// whose time is up and advances replica copies by what they carried.
     fn tick(&mut self, now: SimTime) {
+        self.world.update_demands(now);
         let mut traffic = std::mem::take(&mut self.world.traffic);
-        traffic.expire(now);
         traffic.tick(self);
+        traffic.expire(now);
         self.world.traffic = traffic;
+        self.world.advance_copies();
     }
 }
 
@@ -469,6 +481,21 @@ mod tests {
 
     fn h1_h2(f: &Fabric, vlan: u16, mtu: u16) -> bool {
         f.reachable(&hp(H1, "eth0"), &hp(H2, "eth0"), vlan, mtu)
+    }
+
+    #[test]
+    fn a_flow_carries_its_last_interval_before_it_expires() {
+        use crate::traffic::{FlowEnd, FlowKind};
+        let mut f = fabric(fixture());
+        let mgmt = NetworkId::from("mgmt");
+        let id = f.traffic_mut().start(FlowEnd::Host(h(H1)), FlowEnd::Host(h(H2)), mgmt, 800.0, FlowKind::Iperf, Some(5000));
+        for now in [1000, 2000, 3000, 4000, 5000] {
+            f.tick(now);
+        }
+        let t = &f.world().traffic;
+        assert!(t.flow(id).is_none(), "its time is up");
+        // 800 Mbit/s for 5 s: the tick at 5000 accounts the fifth second before the flow ends.
+        assert_eq!(t.carried_bytes(id), 500e6);
     }
 
     #[test]

@@ -4,9 +4,9 @@
 //! order, so runs are fully deterministic per seed.
 
 use crate::fabric::Fabric;
-use crate::world::HostHw;
+use crate::world::{HostHw, World};
 use control::client::{ClientActor, ClusterView, CLIENT};
-use control::proto::{ApiOp, ApiResult, LogCmd, Msg};
+use control::proto::{ApiOp, ApiResult, InstanceSpec, LogCmd, Msg, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, SimTime, SwitchConfig, SwitchOs, Svc};
@@ -191,6 +191,16 @@ impl EngineCtx<'_> {
     fn hw_mut(&mut self) -> &mut HostHw {
         host_hw(self.core.deliver.as_mut(), &self.me).expect(NO_HOST)
     }
+
+    fn world(&self) -> &World {
+        self.fabric().expect(NO_HOST).world()
+    }
+
+    /// The world, to run workloads on this host.
+    fn workloads(&mut self) -> &mut World {
+        let fabric: Option<&mut Fabric> = (self.core.deliver.as_mut() as &mut dyn Any).downcast_mut();
+        fabric.expect(NO_HOST).workloads_mut()
+    }
 }
 
 /// The OS of the host an actor runs on: a view of that host in the world.
@@ -215,10 +225,7 @@ impl HostOs for EngineCtx<'_> {
         self.hw_mut().persist_network();
     }
     fn usage(&mut self) -> HostUsage {
-        let host = self.host_id();
-        let core = &mut *self.core;
-        let fabric: Option<&Fabric> = (core.deliver.as_ref() as &dyn Any).downcast_ref();
-        fabric.and_then(|f| f.world().usage(&host, &mut core.rng)).expect(NO_HOST)
+        self.world().usage(&self.host_id(), self.core.now).expect(NO_HOST)
     }
     fn load_cp(&self) -> Option<Durable<LogCmd>> {
         self.hw().expect(NO_HOST).cp_durable.clone()
@@ -233,6 +240,28 @@ impl HostOs for EngineCtx<'_> {
     }
     fn mark_joined(&mut self) {
         self.hw_mut().mark_joined();
+    }
+    fn start_instance(&mut self, spec: InstanceSpec) {
+        let (host, seed) = (self.host_id(), self.core.rng.next_u64());
+        self.workloads().start_instance(&host, spec, seed);
+    }
+    fn stop_instance(&mut self, id: &str) {
+        let host = self.host_id();
+        self.workloads().stop_instance(&host, id);
+    }
+    fn instances(&self) -> Vec<String> {
+        self.world().instances(&self.host_id())
+    }
+    fn create_replica(&mut self, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String> {
+        let host = self.host_id();
+        self.workloads().create_replica(&host, volume, size_gb, source)
+    }
+    fn replicas(&self) -> Vec<ReplicaReport> {
+        self.world().replicas(&self.host_id())
+    }
+    fn delete_replica(&mut self, volume: &str) {
+        let host = self.host_id();
+        self.workloads().delete_replica(&host, volume);
     }
 }
 
