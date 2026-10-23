@@ -47,6 +47,13 @@ impl CpReplica {
         self.raft.as_ref().is_some_and(|r| r.is_leader())
     }
 
+    /// Whether this replica leads and has applied an entry of its own term,
+    /// so its state includes everything earlier leaders committed: only then
+    /// does it answer the API and syncs.
+    pub fn caught_up(&self) -> bool {
+        self.volatile.as_ref().is_some_and(|v| v.caught_up)
+    }
+
     /// `None` until the replica has started.
     pub fn raft_role(&self) -> Option<RaftRole> {
         self.raft.as_ref().map(RaftNode::role)
@@ -158,6 +165,10 @@ impl CpReplica {
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
+        // What a removed host last ran and held is no business of the controllers any more.
+        let hosts = &self.state.hosts;
+        v.instances.retain(|h, _| hosts.contains_key(h));
+        v.replicas.retain(|h, _| hosts.contains_key(h));
         let mut actions = controllers::run_all(&self.state, v, now);
         let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
         actions.extend(plan.actions);
@@ -193,11 +204,13 @@ impl CpReplica {
         if !raft.is_leader() {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::NotLeader });
         }
-        if !raft.has_quorum(now) {
+        let v = self.volatile.as_ref().expect("leader has volatile state");
+        // Without quorum, or before its no-op applied (its state may lag what
+        // earlier leaders committed), the leader cannot answer safely.
+        if !raft.has_quorum(now) || !v.caught_up {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Unavailable });
         }
         let term = raft.term();
-        let v = self.volatile.as_ref().expect("leader has volatile state");
         let (index, ok) = match handle_op(ctx, &self.state, v, term, op) {
             Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
             Handling::Propose(cmd, ok) => (raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
@@ -316,8 +329,8 @@ impl CpReplica {
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
         let now = ctx.now();
         let raft = self.raft.as_ref().expect("on_start runs before anything else");
-        // A leader cut off from its quorum may hold a stale view; stay silent.
-        let Some(v) = self.volatile.as_ref().filter(|_| raft.has_quorum(now)) else { return };
+        // A leader cut off from its quorum, or not caught up yet, may hold a stale view; stay silent.
+        let Some(v) = self.volatile.as_ref().filter(|v| v.caught_up && raft.has_quorum(now)) else { return };
         let metrics = v.metrics.iter().map(|(h, m)| (h.clone(), m.clone())).collect();
         let changes = self.state.changes_since(since);
         ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics });
@@ -668,6 +681,49 @@ mod tests {
         assert_eq!(rig.r.commit_index(), 1, "the no-op committed");
         rig.controllers();
         assert_eq!(rig.proposed(), [Command::ResolveAlert { id: "hostdown-h9-0-0".into() }]);
+    }
+
+    #[test]
+    fn api_and_syncs_wait_for_the_leaders_noop_to_apply() {
+        let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
+        rig.elect();
+        assert!(rig.r.raft().has_quorum(rig.ctx.now), "a fresh leader has quorum");
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        let cordon = |req| Msg::Api { req, op: ApiOp::Cordon { id: hid("h9") } };
+        rig.r.on_message(&mut rig.ctx, client.clone(), cordon(1));
+        assert_eq!(std::mem::take(&mut rig.ctx.sent), [(client.clone(), Msg::ApiResp { req: 1, result: ApiResult::Unavailable })], "its state may lag");
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Sync { since: 0 });
+        assert!(rig.ctx.sent.is_empty(), "no sync from a state that may lag: {:?}", rig.ctx.sent);
+        assert!(rig.proposed().is_empty());
+
+        rig.ack();
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Sync { since: 0 });
+        assert!(matches!(rig.ctx.sent.pop(), Some((_, Msg::SyncResp { .. }))));
+        rig.r.on_message(&mut rig.ctx, client.clone(), cordon(2));
+        assert!(matches!(rig.proposed().as_slice(), [Command::SetLifecycle { .. }]), "{:?}", rig.proposed());
+    }
+
+    #[test]
+    fn a_removed_hosts_instances_and_replicas_are_forgotten() {
+        let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
+        rig.elect();
+        rig.ack();
+        let replicas = vec![ReplicaReport { volume: "gone".into(), disk: "nvme0".into(), pct: 100, copied_bytes: 0, copying: false }];
+        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0, instances: vec!["vm/x".into()], replicas };
+        rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), hb);
+        let stops = |rig: &mut Rig| {
+            rig.controllers();
+            let sent = std::mem::take(&mut rig.ctx.sent);
+            sent.into_iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && matches!(m, Msg::StopInstance(_) | Msg::DeleteReplica { .. })).count()
+        };
+        assert_eq!(stops(&mut rig), 2, "h9 runs an instance and holds a replica nothing wants");
+        rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
+        for _ in 0..3 {
+            rig.advance(crate::controllers::scheduler::RESEND_MS);
+            assert_eq!(stops(&mut rig), 0, "h9 is no member: nothing is sent to it");
+        }
+        let v = rig.r.volatile.as_ref().unwrap();
+        assert!(!v.instances.contains_key(&hid("h9")) && !v.replicas.contains_key(&hid("h9")));
     }
 
     #[test]

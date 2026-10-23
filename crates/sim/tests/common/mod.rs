@@ -126,10 +126,12 @@ pub fn vip_leader(e: &Engine) -> Option<HostId> {
     HOSTS.iter().all(|h| e.fabric().resolve_vip(&hid(h)).as_ref() == Some(&l)).then_some(l)
 }
 
-/// Runs until a leader holds the VIP everywhere; panics after `within_ms`.
+/// Runs until a leader holds the VIP everywhere and has caught up (it
+/// answers the API); panics after `within_ms`.
 pub fn elect(e: &mut Engine, within_ms: u64) -> HostId {
     let deadline = e.now() + within_ms;
-    assert!(e.run_until(deadline, |e| vip_leader(e).is_some()), "no leader with the VIP by t={deadline}");
+    let ready = |e: &Engine| vip_leader(e).is_some_and(|l| e.actor::<CpReplica>(&cp(&l)).is_some_and(CpReplica::caught_up));
+    assert!(e.run_until(deadline, ready), "no caught-up leader with the VIP by t={deadline}");
     vip_leader(e).unwrap()
 }
 
