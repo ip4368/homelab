@@ -339,6 +339,10 @@ pub struct Alert {
     pub resolved_at: Option<SimTime>,
     /// Set when the alert matches an injected fault; lets the UI score detection.
     pub ground_truth: bool,
+    /// An operation the UI offers as a button on the alert.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub action: Option<crate::proto::ApiOp>,
     #[ts(type = "number")]
     pub version: u64,
 }

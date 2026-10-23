@@ -4,8 +4,10 @@
 //! (sending, persisting, leadership changes) is returned as a [`RaftOut`] for
 //! the caller to carry out.
 
+mod membership;
 mod node;
 
+pub use membership::{MemberChange, MembershipError, CATCH_UP_ENTRIES};
 pub use node::RaftNode;
 
 use model::HostId;
@@ -41,8 +43,10 @@ pub enum RaftRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntryPayload<T> {
     Normal(T),
-    /// The voter set from this entry onwards.
-    Config(BTreeSet<HostId>),
+    /// The membership from this entry onwards: it takes effect as soon as it
+    /// is appended, not when it commits (Ongaro §4.1). Learners are sent the
+    /// log but never vote and never count towards a quorum.
+    Config { voters: BTreeSet<HostId>, learners: BTreeSet<HostId> },
     /// Appended by every new leader so it can commit entries from earlier terms.
     Noop,
 }

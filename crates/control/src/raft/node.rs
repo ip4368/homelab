@@ -9,6 +9,11 @@
 //!   rejoining node cannot depose a healthy leader.
 //! - **Check-quorum:** a leader that has not heard from a quorum (counting
 //!   itself) within `election_min_ms` steps down.
+//!
+//! Membership comes from the latest `Config` entry in the log (the changes
+//! are in `membership.rs`). Quorums and commitment count the current voters
+//! only; the leader tracks progress for every voter and learner, kept in
+//! step with each config it appends.
 
 use super::{Durable, DurableOp, Entry, EntryPayload, NotLeader, RaftConfig, RaftMsg, RaftOut, RaftRole};
 use crate::runtime::SimTime;
@@ -26,7 +31,7 @@ enum Role {
     Leader(Progress),
 }
 
-/// Leader-side view of each peer.
+/// Leader-side view of each peer (every voter and learner but itself).
 #[derive(Debug)]
 struct Progress {
     next_index: BTreeMap<HostId, u64>,
@@ -45,6 +50,10 @@ pub struct RaftNode<T> {
     durable: Durable<T>,
     /// From the latest `Config` entry in the log, else `durable.voters`.
     voters: BTreeSet<HostId>,
+    /// From the latest `Config` entry in the log, else none.
+    learners: BTreeSet<HostId>,
+    /// Index of the latest `Config` entry in the log; 0 if there is none.
+    config_index: u64,
     role: Role,
     leader: Option<HostId>,
     /// When we last accepted an `Append` from the current leader.
@@ -67,6 +76,8 @@ impl<T: Clone> RaftNode<T> {
             cfg,
             rng: ChaCha8Rng::seed_from_u64(rand_seed),
             voters: BTreeSet::new(),
+            learners: BTreeSet::new(),
+            config_index: 0,
             durable,
             role: Role::Follower,
             leader: None,
@@ -168,8 +179,22 @@ impl<T: Clone> RaftNode<T> {
     pub fn has_quorum(&self, now: SimTime) -> bool {
         let Role::Leader(p) = &self.role else { return false };
         let window = self.cfg.election_min_ms;
-        let fresh = 1 + p.last_ack.values().filter(|&&t| now.saturating_sub(t) <= window).count();
-        fresh >= self.quorum()
+        let fresh = |v: &&HostId| match p.last_ack.get(*v) {
+            Some(&t) => now.saturating_sub(t) <= window,
+            // A leader that is removing itself does not count itself.
+            None => **v == self.me,
+        };
+        self.voters.iter().filter(fresh).count() >= self.quorum()
+    }
+
+    /// The voters as of the latest config in the log.
+    pub fn voters(&self) -> &BTreeSet<HostId> {
+        &self.voters
+    }
+
+    /// The learners as of the latest config in the log.
+    pub fn learners(&self) -> &BTreeSet<HostId> {
+        &self.learners
     }
 
     pub fn term(&self) -> u64 {
@@ -211,8 +236,14 @@ impl<T: Clone> RaftNode<T> {
         self.voters.len() / 2 + 1
     }
 
-    fn peers(&self) -> Vec<HostId> {
+    /// Who votes, other than this node.
+    fn voting_peers(&self) -> Vec<HostId> {
         self.voters.iter().filter(|v| **v != self.me).cloned().collect()
+    }
+
+    /// Who is sent the log: every voter and learner but this node.
+    fn peers(&self) -> Vec<HostId> {
+        self.voters.union(&self.learners).filter(|v| **v != self.me).cloned().collect()
     }
 
     fn become_follower(&mut self, now: SimTime, term: u64, leader: Option<HostId>) {
@@ -248,7 +279,7 @@ impl<T: Clone> RaftNode<T> {
     fn request_votes(&mut self, pre_vote: bool) {
         let term = if pre_vote { self.durable.term + 1 } else { self.durable.term };
         let (last_log_index, last_log_term) = (self.last_index(), self.last_term());
-        for peer in self.peers() {
+        for peer in self.voting_peers() {
             let m = RaftMsg::RequestVote { term, last_log_index, last_log_term, pre_vote };
             self.out.push(RaftOut::Send(peer, m));
         }
@@ -257,7 +288,9 @@ impl<T: Clone> RaftNode<T> {
     /// Advances a (pre-)candidate that has a quorum of votes.
     fn check_votes(&mut self, now: SimTime) {
         let won = match &self.role {
-            Role::PreCandidate { votes } | Role::Candidate { votes } => votes.len() >= self.quorum(),
+            Role::PreCandidate { votes } | Role::Candidate { votes } => {
+                votes.intersection(&self.voters).count() >= self.quorum()
+            }
             _ => false,
         };
         match self.role {
@@ -285,7 +318,13 @@ impl<T: Clone> RaftNode<T> {
     }
 
     fn leader_tick(&mut self, now: SimTime) {
-        if !self.has_quorum(now) {
+        // A leader that removed itself steps down once the removal commits,
+        // telling its peers the commit index on the way out.
+        let removed = !self.voters.contains(&self.me) && self.commit_index >= self.config_index;
+        if removed {
+            self.broadcast_append();
+        }
+        if removed || !self.has_quorum(now) {
             self.become_follower(now, self.durable.term, None);
             return;
         }
@@ -455,11 +494,12 @@ impl<T: Clone> RaftNode<T> {
         self.out.push(RaftOut::Send(peer.clone(), m));
     }
 
-    /// Commits the highest current-term index held by a quorum (§5.4.2).
+    /// Commits the highest current-term index held by a quorum of the
+    /// current voters (§5.4.2).
     fn advance_commit(&mut self) {
         let Role::Leader(p) = &self.role else { return };
-        let mut matched: Vec<u64> = p.match_index.values().copied().collect();
-        matched.push(self.last_index());
+        let held = |v: &HostId| if *v == self.me { self.last_index() } else { p.match_index.get(v).copied().unwrap_or(0) };
+        let mut matched: Vec<u64> = self.voters.iter().map(held).collect();
         matched.sort_unstable_by(|a, b| b.cmp(a));
         let Some(&candidate) = matched.get(self.quorum() - 1) else { return };
         if candidate > self.commit_index && self.term_at(candidate) == self.durable.term {
@@ -471,7 +511,7 @@ impl<T: Clone> RaftNode<T> {
 
     fn persist(&mut self, op: DurableOp<T>) {
         let voters_changed = match &op {
-            DurableOp::Append(es) => es.iter().any(|e| matches!(e.payload, EntryPayload::Config(_))),
+            DurableOp::Append(es) => es.iter().any(|e| matches!(e.payload, EntryPayload::Config { .. })),
             DurableOp::TruncateFrom(_) => true,
             DurableOp::SetHardState { .. } => false,
         };
@@ -482,17 +522,54 @@ impl<T: Clone> RaftNode<T> {
         self.out.push(RaftOut::Persist(op));
     }
 
+    /// Takes the membership from the latest config in the log and, on a
+    /// leader, tracks exactly its peers: new ones start probing from the end
+    /// of the log with no ack yet, and removed ones are dropped.
     fn recompute_voters(&mut self) {
-        self.voters = self
-            .durable
-            .log
-            .iter()
-            .rev()
-            .find_map(|e| match &e.payload {
-                EntryPayload::Config(v) => Some(v.clone()),
-                _ => None,
-            })
-            .unwrap_or_else(|| self.durable.voters.clone());
+        let latest = self.durable.log.iter().rev().find_map(|e| match &e.payload {
+            EntryPayload::Config { voters, learners } => Some((e.index, voters.clone(), learners.clone())),
+            _ => None,
+        });
+        (self.config_index, self.voters, self.learners) =
+            latest.unwrap_or_else(|| (0, self.durable.voters.clone(), BTreeSet::new()));
+        let (peers, next) = (self.peers(), self.last_index() + 1);
+        let Role::Leader(p) = &mut self.role else { return };
+        p.next_index.retain(|h, _| peers.contains(h));
+        p.match_index.retain(|h, _| peers.contains(h));
+        p.last_ack.retain(|h, _| peers.contains(h));
+        for h in peers {
+            p.next_index.entry(h.clone()).or_insert(next);
+            p.match_index.entry(h).or_insert(0);
+        }
+    }
+
+    // ---- membership plumbing (the policy is in `membership.rs`) ----
+
+    /// Appends a config entry as leader and sends it out; returns its index.
+    pub(super) fn append_config(&mut self, voters: BTreeSet<HostId>, learners: BTreeSet<HostId>) -> u64 {
+        let index = self.append_local(EntryPayload::Config { voters, learners });
+        self.broadcast_append();
+        self.advance_commit();
+        index
+    }
+
+    pub(super) fn config_index(&self) -> u64 {
+        self.config_index
+    }
+
+    pub(super) fn last_log_index(&self) -> u64 {
+        self.last_index()
+    }
+
+    /// The leader's match index for peer `id`; `None` on a follower or for a non-peer.
+    pub(super) fn match_index_of(&self, id: &HostId) -> Option<u64> {
+        let Role::Leader(p) = &self.role else { return None };
+        p.match_index.get(id).copied()
+    }
+
+    /// Whether this node has committed an entry of its current term.
+    pub(super) fn committed_in_term(&self) -> bool {
+        self.term_at(self.commit_index) == self.durable.term
     }
 }
 
@@ -506,14 +583,14 @@ fn msg_term<T>(m: &RaftMsg<T>) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::raft::{DurableOp, EntryPayload, RaftConfig, RaftMsg, RaftOut};
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     const STEP_MS: u64 = 10;
 
-    fn hid(i: usize) -> HostId {
+    pub(in crate::raft) fn hid(i: usize) -> HostId {
         HostId::new(format!("n{i}"))
     }
 
@@ -523,24 +600,24 @@ mod tests {
 
     /// Nodes exchanging messages instantly through a queue, with manual
     /// time, cuttable links and frozen (crashed or paused) nodes.
-    struct Cluster {
-        nodes: Vec<RaftNode<u64>>,
-        voters: BTreeSet<HostId>,
-        now: SimTime,
-        cut: BTreeSet<(usize, usize)>,
+    pub(in crate::raft) struct Cluster {
+        pub nodes: Vec<RaftNode<u64>>,
+        pub voters: BTreeSet<HostId>,
+        pub now: SimTime,
+        pub cut: BTreeSet<(usize, usize)>,
         /// Frozen nodes neither tick nor send nor receive.
-        frozen: BTreeSet<usize>,
-        queue: VecDeque<(usize, usize, RaftMsg<u64>)>,
-        persisted: Vec<Vec<DurableOp<u64>>>,
+        pub frozen: BTreeSet<usize>,
+        pub queue: VecDeque<(usize, usize, RaftMsg<u64>)>,
+        pub persisted: Vec<Vec<DurableOp<u64>>>,
         /// Normal payloads each node has taken as committed since it (re)started.
-        committed: Vec<Vec<u64>>,
+        pub committed: Vec<Vec<u64>>,
         /// BecameLeader / SteppedDown outputs, with when and who.
-        events: Vec<(SimTime, usize, RaftOut<u64>)>,
-        leader_of_term: BTreeMap<u64, usize>,
+        pub events: Vec<(SimTime, usize, RaftOut<u64>)>,
+        pub leader_of_term: BTreeMap<u64, usize>,
     }
 
     impl Cluster {
-        fn new(n: usize) -> Self {
+        pub fn new(n: usize) -> Self {
             let voters: BTreeSet<HostId> = (0..n).map(hid).collect();
             let nodes = (0..n)
                 .map(|i| RaftNode::new(hid(i), Durable::new(voters.clone()), RaftConfig::default(), i as u64))
@@ -559,12 +636,23 @@ mod tests {
             }
         }
 
-        fn cut(&mut self, a: usize, b: usize) {
+        /// Starts an empty node knowing the bootstrap voters, as a new
+        /// replica does, and returns its index. It votes only once a config
+        /// makes it a voter.
+        pub fn add_node(&mut self) -> usize {
+            let i = self.nodes.len();
+            self.nodes.push(RaftNode::new(hid(i), Durable::new(self.voters.clone()), RaftConfig::default(), i as u64));
+            self.persisted.push(Vec::new());
+            self.committed.push(Vec::new());
+            i
+        }
+
+        pub fn cut(&mut self, a: usize, b: usize) {
             self.cut.insert((a.min(b), a.max(b)));
         }
 
         /// Cut every link between `group` and the rest.
-        fn isolate(&mut self, group: &[usize]) {
+        pub fn isolate(&mut self, group: &[usize]) {
             for &g in group {
                 for o in (0..self.nodes.len()).filter(|o| !group.contains(o)) {
                     self.cut(g, o);
@@ -572,15 +660,15 @@ mod tests {
             }
         }
 
-        fn heal(&mut self) {
+        pub fn heal(&mut self) {
             self.cut.clear();
         }
 
-        fn linked(&self, a: usize, b: usize) -> bool {
+        pub fn linked(&self, a: usize, b: usize) -> bool {
             !self.cut.contains(&(a.min(b), a.max(b))) && !self.frozen.contains(&a) && !self.frozen.contains(&b)
         }
 
-        fn handle(&mut self, i: usize, outs: Vec<RaftOut<u64>>) {
+        pub fn handle(&mut self, i: usize, outs: Vec<RaftOut<u64>>) {
             for out in outs {
                 match out {
                     RaftOut::Send(to, m) => self.queue.push_back((i, idx(&to), m)),
@@ -600,7 +688,7 @@ mod tests {
             }
         }
 
-        fn deliver_all(&mut self) {
+        pub fn deliver_all(&mut self) {
             while let Some((from, to, m)) = self.queue.pop_front() {
                 if self.linked(from, to) {
                     let outs = self.nodes[to].step(self.now, hid(from), m);
@@ -609,7 +697,7 @@ mod tests {
             }
         }
 
-        fn advance(&mut self) {
+        pub fn advance(&mut self) {
             self.now += STEP_MS;
             for i in 0..self.nodes.len() {
                 if !self.frozen.contains(&i) {
@@ -621,7 +709,7 @@ mod tests {
             self.assert_committed_consistent();
         }
 
-        fn run_for(&mut self, ms: u64) {
+        pub fn run_for(&mut self, ms: u64) {
             let end = self.now + ms;
             while self.now < end {
                 self.advance();
@@ -629,7 +717,7 @@ mod tests {
         }
 
         /// Advances until `pred` holds (true) or `ms` elapse (false).
-        fn run_until(&mut self, ms: u64, pred: impl Fn(&Cluster) -> bool) -> bool {
+        pub fn run_until(&mut self, ms: u64, pred: impl Fn(&Cluster) -> bool) -> bool {
             let end = self.now + ms;
             while self.now < end {
                 self.advance();
@@ -640,25 +728,25 @@ mod tests {
             false
         }
 
-        fn leaders(&self) -> Vec<usize> {
+        pub fn leaders(&self) -> Vec<usize> {
             (0..self.nodes.len()).filter(|&i| self.nodes[i].is_leader()).collect()
         }
 
-        fn elect(&mut self) -> usize {
+        pub fn elect(&mut self) -> usize {
             assert!(self.run_until(6000, |c| c.leaders().len() == 1), "no single leader within 6000 ms");
             self.leaders()[0]
         }
 
-        fn propose(&mut self, i: usize, v: u64) -> u64 {
+        pub fn propose(&mut self, i: usize, v: u64) -> u64 {
             self.nodes[i].propose(self.now, v).expect("proposer is leader")
         }
 
-        fn ever_committed(&self, v: u64) -> bool {
+        pub fn ever_committed(&self, v: u64) -> bool {
             self.committed.iter().any(|c| c.contains(&v))
         }
 
         /// Raft's state-machine safety: committed sequences never diverge.
-        fn assert_committed_consistent(&self) {
+        pub fn assert_committed_consistent(&self) {
             for a in &self.committed {
                 for b in &self.committed {
                     let n = a.len().min(b.len());

@@ -16,7 +16,7 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::any::Any;
 use std::cmp::{Ordering, Reverse};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BTreeSet, BinaryHeap, HashMap};
 
 /// How often the installed [`Deliver`] is ticked (the fabric moves its
 /// traffic model forward), counted from engine creation or the last reset.
@@ -103,6 +103,8 @@ struct Core {
     queue: BinaryHeap<Reverse<Scheduled>>,
     rng: ChaCha8Rng,
     deliver: Box<dyn Deliver>,
+    /// Actors an actor callback asked for, spawned once the callback returns.
+    spawns: Vec<(Endpoint, Box<dyn Actor>)>,
 }
 
 impl Core {
@@ -263,6 +265,15 @@ impl HostOs for EngineCtx<'_> {
         let host = self.host_id();
         self.workloads().delete_replica(&host, volume);
     }
+    fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
+        if self.hw().expect(NO_HOST).cp_durable.is_some() {
+            return;
+        }
+        let host = self.host_id();
+        self.hw_mut().cp_durable = Some(Durable::new(voters.clone()));
+        let replica = CpReplica::new(host.clone(), None, voters);
+        self.core.spawns.push((Endpoint::new(Addr::Host(host), Svc::Cp), Box::new(replica)));
+    }
 }
 
 /// The management interface of the switch `me` runs on: its own configuration.
@@ -293,6 +304,7 @@ impl Engine {
                 queue: BinaryHeap::new(),
                 rng: ChaCha8Rng::seed_from_u64(seed),
                 deliver: Box::new(AlwaysDeliver::default()),
+                spawns: Vec::new(),
             },
             actors: HashMap::new(),
             next_actor: 0,
@@ -455,6 +467,9 @@ impl Engine {
         let mut ctx = EngineCtx { core: &mut self.core, me: at.clone(), actor: slot.id };
         let r = f(slot.actor.as_mut(), &mut ctx);
         self.actors.insert(at.clone(), slot);
+        for (at, actor) in std::mem::take(&mut self.core.spawns) {
+            self.spawn(at, actor);
+        }
         Some(r)
     }
 }
@@ -770,6 +785,33 @@ mod tests {
         e.reset(Box::new(Ticks(vec![])));
         e.run_for(2000);
         assert_eq!(e.deliver::<Ticks>().unwrap().0, [4500, 5500], "counted from the reset");
+    }
+
+    /// Asks its host to start a CP replica knowing `voters`, on start.
+    struct SpawnsReplica(BTreeSet<HostId>);
+    impl Actor for SpawnsReplica {
+        fn on_start(&mut self, ctx: &mut dyn Ctx) {
+            ctx.host().expect("runs on a host").spawn_cp_replica(self.0.clone());
+        }
+        fn on_message(&mut self, _: &mut dyn Ctx, _: Endpoint, _: Msg) {}
+        fn on_timer(&mut self, _: &mut dyn Ctx, _: u64) {}
+    }
+
+    #[test]
+    fn a_host_starts_an_empty_cp_replica_once() {
+        let mut e = Engine::new(1);
+        e.load_fleet(&crate::presets::FleetSpec { ms01: 2, minipc: 0, pi5: 0, rk3588: 0 }, 1);
+        let (h, voters) = (HostId::from("ms01-02"), BTreeSet::from([HostId::from("ms01-01")]));
+        let cp = Endpoint::new(Addr::Host(h.clone()), Svc::Cp);
+        e.spawn(Endpoint::new(Addr::Host(h.clone()), Svc::Agent), Box::new(SpawnsReplica(voters.clone())));
+        let replica = e.actor::<CpReplica>(&cp).expect("a replica runs on the host");
+        assert_eq!((replica.durable().log.len(), &replica.durable().voters), (0, &voters));
+        assert_eq!(e.fabric().world().hosts[&h].cp_durable.as_ref().map(|d| d.voters.clone()), Some(voters.clone()));
+
+        // Once it holds CP state, the host keeps its replica.
+        e.spawn(Endpoint::new(Addr::Host(h.clone()), Svc::Agent), Box::new(SpawnsReplica(BTreeSet::new())));
+        assert_eq!(e.actor::<CpReplica>(&cp).unwrap().durable().voters, voters, "the running replica was replaced");
+        assert_eq!(e.fabric().world().hosts[&h].cp_durable.as_ref().map(|d| d.voters.clone()), Some(voters));
     }
 
     struct DropAll;

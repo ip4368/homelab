@@ -40,6 +40,10 @@ pub enum Command {
     Event { entity: ObjectRef, message: String },
     /// Replaces control-plane membership and replacement mode.
     SetCp { voters: BTreeSet<HostId>, mode: CpMode },
+    SetCpMode { mode: CpMode },
+    /// Raises a `CpReplacementSuggested` alert on `dead` whose button
+    /// replaces it with `with`.
+    SuggestCpReplacement { id: String, dead: HostId, with: HostId },
     /// Creates or replaces a network. Changing the VLAN or MTU of one in use
     /// is allowed; the network controller rolls the change out.
     UpsertNetwork { network: LogicalNetwork },

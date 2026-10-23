@@ -4,7 +4,7 @@
 use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
 use crate::controllers::rollout::{DEFAULT_BATCH_PCT, DEFAULT_SOAK_S};
-use crate::state::{Change, Changes, Command, NetworkResult};
+use crate::state::{Change, Changes, Command, CpMode, NetworkResult};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{Deployment, HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId, Vm, Volume};
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,7 @@ pub fn pod_instance(deployment: &str, idx: u32) -> String {
 pub type ReplicaReport = (String, String, u8);
 
 /// A user operation, as submitted through the API.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub enum ApiOp {
     /// The leader picks the token and its expiry; the result is the token string.
@@ -163,6 +163,12 @@ pub enum ApiOp {
     CreateVolume { volume: Volume },
     /// Refused while a VM uses the volume.
     DeleteVolume { id: String },
+    /// How dead control-plane members are replaced: suggested or automatic.
+    SetCpMode { mode: CpMode },
+    /// Replaces down CP voter `dead` with eligible host `with`: `with` joins
+    /// as a learner, is promoted once caught up, then `dead` is removed.
+    /// Answered once `with` is a learner.
+    ReplaceCpMember { dead: HostId, with: HostId },
 }
 
 fn default_batch_pct() -> u8 {
@@ -232,6 +238,10 @@ pub enum Msg {
     /// replica the host holds changes nothing.
     CreateReplica { volume: String, size_gb: u32, source: Option<HostId> },
     DeleteReplica { volume: String },
+    /// Leader to agent: start a CP replica on this host, empty and knowing
+    /// the current `voters`, to catch up as a learner. A host that already
+    /// runs one keeps it.
+    StartCpReplica { voters: BTreeSet<HostId> },
     /// Agent to the VIP, every metrics interval.
     Metrics { host: HostId, sample: MetricSample },
     /// Leader to a switch's management interface, every poll interval.
