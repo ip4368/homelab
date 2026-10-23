@@ -5,7 +5,7 @@ use crate::ws::ws_handler;
 use axum::extract::{Json, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::Router;
 use control::proto::{ApiOp, ApiResult};
 use serde::Deserialize;
@@ -26,6 +26,8 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/sim/fault", post(inject_fault))
         .route("/api/sim/scenario", post(run_scenario))
         .route("/api/ws", get(ws_handler))
+        .route("/api", any(unknown_api))
+        .route("/api/{*path}", any(unknown_api))
         .with_state(driver)
 }
 
@@ -47,6 +49,11 @@ impl IntoResponse for DriverGone {
     }
 }
 
+/// Keeps unknown API paths from falling through to the UI's `index.html`.
+async fn unknown_api() -> Response {
+    error(StatusCode::NOT_FOUND, "no such endpoint")
+}
+
 fn ok() -> Response {
     Json(json!({ "ok": true })).into_response()
 }
@@ -65,16 +72,13 @@ async fn submit_op(State(driver): State<DriverHandle>, Json(op): Json<ApiOp>) ->
     }
 }
 
-#[derive(Deserialize)]
-struct SpeedBody {
-    speed: u32,
-}
-
-async fn set_speed(State(driver): State<DriverHandle>, Json(body): Json<SpeedBody>) -> Response {
-    if !SPEEDS.contains(&body.speed) {
+/// Takes any JSON so that a wrong type is a 400 like a wrong value, not axum's 422.
+async fn set_speed(State(driver): State<DriverHandle>, Json(body): Json<serde_json::Value>) -> Response {
+    let speed = body["speed"].as_u64().and_then(|s| u32::try_from(s).ok()).filter(|s| SPEEDS.contains(s));
+    let Some(speed) = speed else {
         return error(StatusCode::BAD_REQUEST, &format!("speed must be one of {SPEEDS:?}"));
-    }
-    match driver.speed(body.speed).await {
+    };
+    match driver.speed(speed).await {
         Ok(()) => ok(),
         Err(gone) => gone.into_response(),
     }
@@ -240,9 +244,11 @@ mod tests {
         for speed in [0, 1, 5, 20, 60] {
             assert_eq!(post_json(&app, "/api/sim/speed", json!({ "speed": speed })).await.0, StatusCode::OK);
         }
-        for speed in [2, 100] {
-            assert_eq!(post_json(&app, "/api/sim/speed", json!({ "speed": speed })).await.0, StatusCode::BAD_REQUEST);
+        for speed in [json!(2), json!(100), json!(-1), json!(5.5), json!("20"), json!(null), json!(4_294_967_297u64)] {
+            let (status, _) = post_json(&app, "/api/sim/speed", json!({ "speed": speed })).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "speed {speed}");
         }
+        assert_eq!(post_json(&app, "/api/sim/speed", json!({})).await.0, StatusCode::BAD_REQUEST);
         let mut rx = driver.subscribe();
         let sim = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -296,5 +302,35 @@ mod tests {
         .expect("the 500-host fleet is published");
         assert_eq!(hosts, 500);
         assert_eq!(post_json(&app, "/api/sim/scenario", json!({"preset": "huge"})).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[tokio::test]
+    async fn ops_in_flight_when_the_sim_pauses_get_409_at_once() {
+        let driver = start();
+        let truth = wait_for_leader(&driver).await.truth.clone();
+        let app = app(driver);
+        // Without a quorum the op stays pending; at 1x its 5 sim second timeout is far off.
+        for h in truth.hosts.iter().filter(|h| h.cp_role.is_some()).take(2) {
+            post_json(&app, "/api/sim/fault", serde_json::to_value(Fault::KillHost { host: h.id.clone() }).unwrap()).await;
+        }
+        post_json(&app, "/api/sim/speed", json!({"speed": 1})).await;
+        let pending = tokio::spawn({
+            let app = app.clone();
+            async move { post_json(&app, "/api/ops", op(ApiOp::CreateJoinToken)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!pending.is_finished(), "the op is waiting on the control plane");
+        post_json(&app, "/api/sim/speed", json!({"speed": 0})).await;
+        let (status, body) = tokio::time::timeout(Duration::from_secs(1), pending).await.expect("answered at once").unwrap();
+        assert_eq!((status, body), (StatusCode::CONFLICT, json!({"error": "simulation paused"})));
+    }
+
+    #[tokio::test]
+    async fn unknown_api_paths_are_404_not_the_ui() {
+        let app = app(start());
+        for path in ["/api", "/api/nope", "/api/sim/nope"] {
+            let res = app.clone().oneshot(Request::get(path).body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 }

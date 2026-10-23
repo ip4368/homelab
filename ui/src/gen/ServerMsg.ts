@@ -7,7 +7,7 @@ import type { ObjectRef } from "./ObjectRef";
 import type { SimInfo } from "./SimInfo";
 import type { ViewSnapshot } from "./ViewSnapshot";
 
-export type ServerMsg = { "type": "snapshot", view: ViewSnapshot, truth: GroundTruth, sim: SimInfo, } | { "type": "delta", version: number, leader: HostId | null, term: number, upserts: Array<Object>, removed: Array<ObjectRef>, 
+export type ServerMsg = { "type": "snapshot", view: ViewSnapshot, truth: GroundTruth, sim: SimInfo, } | { "type": "delta", version: number, leader: HostId | null, term: number, last_sync_at: number | null, upserts: Array<Object>, removed: Array<ObjectRef>, 
 /**
  * Samples newer than the last ones sent.
  */

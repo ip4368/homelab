@@ -68,6 +68,8 @@ pub enum ServerMsg {
         leader: Option<HostId>,
         #[ts(type = "number")]
         term: u64,
+        #[ts(type = "number | null")]
+        last_sync_at: Option<u64>,
         upserts: Vec<Object>,
         removed: Vec<ObjectRef>,
         /// Samples newer than the last ones sent.
@@ -79,6 +81,7 @@ pub enum ServerMsg {
 
 /// What one connection has been sent so far.
 pub struct Connection {
+    epoch: u64,
     version: u64,
     /// When each host's latest sample was taken, as last sent.
     metrics_sent: BTreeMap<HostId, u64>,
@@ -87,21 +90,23 @@ pub struct Connection {
 impl Connection {
     /// Starts a connection with its snapshot of `p`.
     pub fn open(p: &Published) -> (Self, ServerMsg) {
-        let mut c = Self { version: 0, metrics_sent: BTreeMap::new() };
+        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new() };
         let msg = c.snapshot(p);
         (c, msg)
     }
 
     fn snapshot(&mut self, p: &Published) -> ServerMsg {
+        self.epoch = p.epoch;
         self.version = p.view.version;
         self.metrics_sent = p.view.metrics.iter().map(|(h, m)| (h.clone(), m.at)).collect();
         ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), sim: p.sim }
     }
 
     /// The message that brings this connection up to `p`: a delta, or a fresh
-    /// snapshot if the view went back in time (a new preset was loaded).
+    /// snapshot if a new fleet was loaded. The epoch says so; a view that went
+    /// back in time is taken as a sign of it too.
     pub fn next(&mut self, p: &Published) -> ServerMsg {
-        if p.view.version < self.version {
+        if p.epoch != self.epoch || p.view.version < self.version {
             return self.snapshot(p);
         }
         let changes = p.view.state.changes_since(self.version);
@@ -120,6 +125,7 @@ impl Connection {
             version: changes.version,
             leader: p.view.leader.clone(),
             term: p.view.term,
+            last_sync_at: p.view.last_sync_at,
             upserts: changes.upserts,
             removed: changes.removed,
             metrics,
@@ -190,7 +196,7 @@ mod tests {
             split_brain_vms: vec![],
             sim_time: now,
         };
-        Published { view: view.clone(), truth, sim: SimInfo { now, speed: 1, paused: false } }
+        Published { epoch: 0, view: view.clone(), truth, sim: SimInfo { now, speed: 1, paused: false } }
     }
 
     fn sample(at: u64) -> MetricSample {
@@ -271,5 +277,38 @@ mod tests {
         let ServerMsg::Snapshot { view: snap, .. } = conn.next(&published(&new_view, 20)) else { panic!("expected a snapshot") };
         assert_eq!(snap.hosts.len(), 1);
         assert!(matches!(conn.next(&published(&new_view, 30)), ServerMsg::Delta { .. }));
+    }
+
+    #[test]
+    fn a_new_epoch_is_a_new_snapshot_even_if_the_view_looks_newer() {
+        let mut leader = ClusterState::new();
+        let mut view = ClusterView::default();
+        add(&mut leader, "h1");
+        view.merge(leader.changes_since(0));
+        let (mut conn, _) = Connection::open(&published(&view, 10));
+
+        // The reloaded fleet's view is already past the old version by the time it is published.
+        let mut fresh = ClusterState::new();
+        for id in ["x1", "x2", "x3"] {
+            add(&mut fresh, id);
+        }
+        let mut new_view = ClusterView::default();
+        new_view.merge(fresh.changes_since(0));
+        assert!(new_view.version > view.version);
+        let p = Published { epoch: 1, ..published(&new_view, 20) };
+        let ServerMsg::Snapshot { view: snap, .. } = conn.next(&p) else { panic!("expected a snapshot") };
+        assert_eq!(snap.hosts.len(), 3);
+        assert!(matches!(conn.next(&p), ServerMsg::Delta { .. }), "one snapshot per epoch");
+    }
+
+    #[test]
+    fn deltas_carry_the_sync_state() {
+        let mut view = ClusterView::default();
+        let (mut conn, _) = Connection::open(&published(&view, 10));
+        view.last_sync_at = Some(7);
+        view.term = 3;
+        view.leader = Some(HostId::from("h1"));
+        let ServerMsg::Delta { last_sync_at, term, leader, .. } = conn.next(&published(&view, 20)) else { panic!() };
+        assert_eq!((last_sync_at, term, leader), (Some(7), 3, Some(HostId::from("h1"))));
     }
 }

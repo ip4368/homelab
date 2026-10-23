@@ -40,6 +40,9 @@ pub struct SimInfo {
 /// Everything the UI is shown, as of one moment.
 #[derive(Debug, Clone)]
 pub struct Published {
+    /// Counts fleet reloads. A view from a different epoch shares nothing with the previous one,
+    /// whatever its version says.
+    pub epoch: u64,
     pub view: ClusterView,
     pub truth: GroundTruth,
     pub sim: SimInfo,
@@ -126,6 +129,7 @@ impl DriverHandle {
 struct Driver {
     engine: Engine,
     speed: u32,
+    epoch: u64,
     /// Requests submitted to the engine and not yet answered.
     pending: HashMap<u64, oneshot::Sender<OpOutcome>>,
 }
@@ -134,11 +138,12 @@ impl Driver {
     fn new(preset: Preset, speed: u32) -> Self {
         let mut engine = Engine::new(SEED);
         engine.load_preset(preset);
-        Self { engine, speed, pending: HashMap::new() }
+        Self { engine, speed, epoch: 0, pending: HashMap::new() }
     }
 
     fn snapshot(&self) -> Published {
         Published {
+            epoch: self.epoch,
             view: self.engine.client_view().clone(),
             truth: self.engine.truth(),
             sim: SimInfo { now: self.engine.now(), speed: self.speed, paused: self.speed == 0 },
@@ -196,6 +201,7 @@ impl Driver {
             }
             EngineCmd::Preset { preset, reply } => {
                 self.engine.load_preset(preset);
+                self.epoch += 1;
                 // The new client never heard of these requests.
                 for (_, reply) in self.pending.drain() {
                     let _ = reply.send(OpOutcome::Done(ApiResult::Unavailable));
@@ -204,6 +210,13 @@ impl Driver {
             }
             EngineCmd::Speed { speed, reply } => {
                 self.speed = speed;
+                if speed == 0 {
+                    // Nobody should wait on a clock that has stopped. (An op already
+                    // submitted may still commit once the simulation resumes.)
+                    for (_, reply) in self.pending.drain() {
+                        let _ = reply.send(OpOutcome::Paused);
+                    }
+                }
                 let _ = reply.send(());
             }
         }

@@ -12,7 +12,16 @@ use sim::presets::Preset;
 use std::path::{Path, PathBuf};
 use tower_http::services::{ServeDir, ServeFile};
 
-const ADDR: &str = "127.0.0.1:8080";
+const DEFAULT_PORT: u16 = 8080;
+
+/// The port to listen on: `$PORT`, else 8080. The server is a local tool, so it only listens on loopback.
+fn listen_addr(port: Option<&str>) -> Result<(std::net::Ipv4Addr, u16), String> {
+    let port = match port {
+        None => DEFAULT_PORT,
+        Some(p) => p.parse().map_err(|_| format!("PORT must be a port number, got {p:?}"))?,
+    };
+    Ok((std::net::Ipv4Addr::LOCALHOST, port))
+}
 
 /// Where `npm run build` leaves the UI: `ui/dist` at the workspace root.
 fn dist_dir() -> PathBuf {
@@ -34,8 +43,10 @@ fn with_ui(router: Router, dist: &Path) -> Router {
 async fn main() -> std::io::Result<()> {
     let driver = DriverHandle::spawn(Preset::Default, 1);
     let app = with_ui(api::app(driver), &dist_dir());
-    let listener = tokio::net::TcpListener::bind(ADDR).await?;
-    println!("homelab cluster manager on http://{ADDR}");
+    let addr = listen_addr(std::env::var("PORT").ok().as_deref())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    println!("homelab cluster manager on http://{}", listener.local_addr()?);
     axum::serve(listener, app).await
 }
 
@@ -58,6 +69,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn the_port_comes_from_the_environment() {
+        let lo = std::net::Ipv4Addr::LOCALHOST;
+        assert_eq!(listen_addr(None), Ok((lo, 8080)));
+        assert_eq!(listen_addr(Some("9123")), Ok((lo, 9123)));
+        assert!(listen_addr(Some("http")).is_err());
+        assert!(listen_addr(Some("70000")).is_err());
     }
 
     #[tokio::test]
