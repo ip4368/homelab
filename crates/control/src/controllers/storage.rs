@@ -36,6 +36,9 @@
 //!   source) until the volume has all the replicas it asks for healthy
 //!   (`usable`) without it; then it is dropped, and so deleted. A copy onto such a host
 //!   is given up at once.
+//! * **Surplus.** A volume with more replicas than it asks for (a drain
+//!   cancelled after its replacement completed) drops the newest, once every
+//!   one is healthy on a `Ready` host.
 //! * **Cleanup.** A replica a host reports that its volume's status does not
 //!   list as live, or whose volume is gone, gets `DeleteReplica` (at most
 //!   every [`RESEND_MS`]), except a stale one while its volume has no healthy
@@ -191,6 +194,12 @@ fn plan(
     let staying = |r: &&ReplicaRef| !leaving.contains(&r.host);
     if replicas.iter().filter(staying).filter(|r| usable(state, v, now, r)).count() >= want {
         replicas.retain(|r| !leaving.contains(&r.host));
+    }
+    // More than it asks for (a drain cancelled after its replacement completed):
+    // the newest go, only while every replica is healthy on a Ready host.
+    let settled = |r: &ReplicaRef| usable(state, v, now, r) && state.hosts.get(&r.host).is_some_and(|h| h.lifecycle == Lifecycle::Ready);
+    if replicas.len() > want && replicas.iter().all(settled) {
+        replicas.truncate(want);
     }
     let live = replicas.iter().filter(|r| r.state != ReplicaState::Stale).count();
     let live_staying = replicas.iter().filter(staying).filter(|r| r.state != ReplicaState::Stale).count();
@@ -969,6 +978,28 @@ mod tests {
         s.apply(10_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
         let out = run(&s, &v, 20_000);
         assert!(deletes(&out).is_empty() && statuses(&out).is_empty(), "m2 is still needed: {out:?}");
+    }
+
+    #[test]
+    fn a_surplus_replica_is_trimmed_once_every_other_is_healthy_on_a_ready_host() {
+        // A drain cancelled after its replacement copy completed leaves four replicas of three.
+        let (mut s, mut v) = whole(4);
+        let four = vec![healthy("m1"), healthy("m2"), healthy("m3"), healthy("m4")];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: four.clone(), health: VolumeHealth::Healthy }).unwrap();
+        report_all(&mut v, &s, "d", 100);
+        let out = run(&s, &v, 1000);
+        assert_eq!(statuses(&out), [(four[..3].to_vec(), VolumeHealth::Healthy)], "the newest goes");
+        apply(&mut s, proposals(&out));
+        assert_eq!(deletes(&run(&s, &v, 2000)), [(hid("m4"), "d".to_string())]);
+
+        // Not while any replica it would keep is not healthy on a Ready host.
+        for lifecycle in [Lifecycle::Cordoned, Lifecycle::NotReady] {
+            let (mut s, mut v) = whole(4);
+            s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: four.clone(), health: VolumeHealth::Healthy }).unwrap();
+            report_all(&mut v, &s, "d", 100);
+            s.apply(0, Command::SetLifecycle { id: hid("m2"), lifecycle }).unwrap();
+            assert!(statuses(&run(&s, &v, 1000)).is_empty(), "m2 is {lifecycle:?}");
+        }
     }
 
     #[test]
