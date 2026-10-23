@@ -61,6 +61,8 @@ const emptyTruth: GroundTruth = {
   vip_owner_by_switch: {},
   partitions: [],
   split_brain_vms: [],
+  ports: [],
+  flows: [],
   sim_time: 0,
 }
 

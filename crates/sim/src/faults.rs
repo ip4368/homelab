@@ -24,6 +24,8 @@ pub enum Fault {
     RestoreHost { host: HostId },
     UnplugPort { host: HostId, port: PortName },
     ReplugPort { host: HostId, port: PortName },
+    /// The NIC negotiates `mbps` (e.g. a bad cable); its own speed restores it.
+    DegradePort { host: HostId, port: PortName, mbps: u32 },
     KillSwitch { switch: SwitchId },
     RestoreSwitch { switch: SwitchId },
     /// Cuts the listed switches and hosts off from everything else (see
@@ -61,6 +63,20 @@ impl Engine {
             }
             Fault::UnplugPort { host, port } => self.set_cable(&host, &port, false)?,
             Fault::ReplugPort { host, port } => self.set_cable(&host, &port, true)?,
+            Fault::DegradePort { host, port, mbps } => {
+                let hw = self.host_hw(&host)?;
+                let Some(full) = hw.profile.nics.iter().find(|n| n.name == port.as_str()).map(|n| n.speed_mbps) else {
+                    return Err(format!("{host} has no NIC {port}"));
+                };
+                if !(1..=full).contains(&mbps) {
+                    return Err(format!("{host} {port} runs at 1 to {full} Mbps, not {mbps}"));
+                }
+                if mbps == full {
+                    hw.degraded_nics.remove(port.as_str());
+                } else {
+                    hw.degraded_nics.insert(port.to_string(), mbps);
+                }
+            }
             Fault::KillSwitch { switch } => self.set_switch_up(&switch, false)?,
             Fault::RestoreSwitch { switch } => self.set_switch_up(&switch, true)?,
             Fault::Partition { nodes } => {
@@ -235,6 +251,18 @@ mod tests {
     }
 
     #[test]
+    fn degrade_port_sets_the_negotiated_speed_until_set_back() {
+        let mut e = engine();
+        let h = hid("ms01-01");
+        let speed = |e: &Engine| world(e).inventory(&h).unwrap().nics.iter().find(|n| n.name == "sfp0").unwrap().speed_mbps;
+        e.fault(Fault::DegradePort { host: h.clone(), port: pn("sfp0"), mbps: 1000 }).unwrap();
+        assert_eq!(speed(&e), 1000);
+        e.fault(Fault::DegradePort { host: h.clone(), port: pn("sfp0"), mbps: 10_000 }).unwrap();
+        assert_eq!(speed(&e), 10_000);
+        assert!(world(&e).hosts[&h].degraded_nics.is_empty(), "full speed is no degradation");
+    }
+
+    #[test]
     fn bad_targets_are_rejected_without_changes() {
         let mut e = engine();
         let before = world(&e).clone();
@@ -248,6 +276,10 @@ mod tests {
             Fault::Partition { nodes: vec![PartitionMember::Host(hid("nope"))] },
             Fault::SetSwitchPort { switch: sw("access-1"), port: pn("p99"), cfg: crate::presets::host_port_cfg() },
             Fault::MoveClient { switch: sw("access-1"), port: pn("p1") },
+            Fault::DegradePort { host: hid("nope"), port: pn("eth0"), mbps: 100 },
+            Fault::DegradePort { host: hid("ms01-01"), port: pn("eth9"), mbps: 100 },
+            Fault::DegradePort { host: hid("ms01-01"), port: pn("sfp0"), mbps: 0 },
+            Fault::DegradePort { host: hid("ms01-01"), port: pn("sfp0"), mbps: 25_000 },
         ];
         for f in bad {
             assert!(e.fault(f.clone()).is_err(), "{f:?} accepted");

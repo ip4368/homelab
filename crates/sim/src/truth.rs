@@ -3,11 +3,12 @@
 //! Control logic never reads this.
 
 use crate::engine::Engine;
-use crate::topology::PartitionMember;
+use crate::topology::{Node, PartitionMember};
+use crate::traffic::FlowEnd;
 use control::raft::RaftRole;
 use control::replica::CpReplica;
 use control::runtime::{Addr, Endpoint, SimTime, Svc};
-use model::{HostId, SwitchId};
+use model::{HostId, NetworkId, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use ts_rs::TS;
@@ -21,7 +22,28 @@ pub struct HostTruth {
     pub cp_role: Option<RaftRole>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+/// Throughput through one port at the latest traffic tick, in bits per second.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct PortLoad {
+    pub port: Node,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+}
+
+/// A flow on the wire and the rate it got at the latest traffic tick.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct FlowTruth {
+    #[ts(type = "number")]
+    pub id: u64,
+    pub src: FlowEnd,
+    pub dst: FlowEnd,
+    pub network: NetworkId,
+    pub rate_mbps: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct GroundTruth {
     pub hosts: Vec<HostTruth>,
@@ -31,6 +53,9 @@ pub struct GroundTruth {
     pub partitions: Vec<Vec<PartitionMember>>,
     /// VMs running on more than one powered host at once (Task 21).
     pub split_brain_vms: Vec<String>,
+    /// Ports that carried traffic at the latest traffic tick.
+    pub ports: Vec<PortLoad>,
+    pub flows: Vec<FlowTruth>,
     #[ts(type = "number")]
     pub sim_time: SimTime,
 }
@@ -43,8 +68,20 @@ impl Engine {
             .iter()
             .map(|(id, hw)| HostTruth { id: id.clone(), powered: hw.powered, cp_role: self.replica(id).and_then(CpReplica::raft_role) })
             .collect();
+        let traffic = &w.traffic;
+        let last = traffic.last();
+        let ports = last.port_bps.iter().map(|(port, &(rx_bps, tx_bps))| PortLoad { port: port.clone(), rx_bps, tx_bps });
+        let flows = traffic.flows().map(|f| FlowTruth {
+            id: f.id,
+            src: f.src.clone(),
+            dst: f.dst.clone(),
+            network: f.network.clone(),
+            rate_mbps: last.rate.get(&f.id).copied().unwrap_or(0.0),
+        });
         GroundTruth {
             hosts,
+            ports: ports.collect(),
+            flows: flows.collect(),
             vip_owner_by_switch: self.fabric().vip_arp().clone(),
             partitions: w.topology.partitions.iter().map(|g| g.iter().cloned().collect()).collect(),
             split_brain_vms: vec![],
@@ -102,6 +139,7 @@ mod tests {
         assert_eq!(switches, ["access-1", "core-1", "core-2"]);
         assert!(t.vip_owner_by_switch.values().all(|h| *h == leader));
         assert!(t.partitions.is_empty() && t.split_brain_vms.is_empty());
+        assert!(t.ports.is_empty() && t.flows.is_empty(), "no traffic yet");
 
         let group = vec![PartitionMember::Host(hid("minipc-01"))];
         e.fault(Fault::Partition { nodes: group.clone() }).unwrap();

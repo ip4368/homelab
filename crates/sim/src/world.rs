@@ -3,6 +3,7 @@
 //! actors on a host as their `HostOs`).
 
 use crate::topology::{Node, Topology};
+use crate::traffic::Traffic;
 use control::proto::LogCmd;
 use control::raft::Durable;
 use control::runtime::{HostUsage, SwitchConfig};
@@ -34,6 +35,8 @@ pub struct HostHw {
     pub boot_net: HostNetworkConfig,
     /// Names of failed disks.
     pub failed_disks: BTreeSet<String>,
+    /// NICs that negotiate below their own speed (e.g. a bad cable), by name, in Mbit/s.
+    pub degraded_nics: BTreeMap<String, u32>,
     /// The CP replica's Raft state on this host's disk; survives power loss.
     pub cp_durable: Option<Durable<LogCmd>>,
     /// The token the host's agent joins with, until the agent becomes a
@@ -58,6 +61,7 @@ impl HostHw {
             boot_net: net.clone(),
             applied_net: net,
             failed_disks: BTreeSet::new(),
+            degraded_nics: BTreeMap::new(),
             cp_durable: None,
             join_token: None,
         }
@@ -80,7 +84,7 @@ impl HostHw {
     }
 
     /// What the OS measures now: idle usage with seeded noise, every healthy
-    /// disk at a fixed fill. Port rates stay empty until traffic is modelled (Task 16).
+    /// disk at a fixed fill. Port rates are the world's to fill ([`World::usage`]).
     pub fn usage(&self, rng: &mut impl Rng) -> HostUsage {
         HostUsage {
             cpu_pct: IDLE_CPU_PCT + CPU_NOISE_PCT * rng.random::<f32>(),
@@ -103,25 +107,61 @@ pub struct World {
     /// VLAN and MTU per network, used to place host attachments on the wire.
     pub networks: BTreeMap<NetworkId, LogicalNetwork>,
     pub hosts: BTreeMap<HostId, HostHw>,
+    /// The flows on the wire and what the last traffic tick made of them.
+    pub traffic: Traffic,
 }
 
 impl World {
-    /// Empty topology, no hosts, the seed networks.
+    /// Empty topology, no hosts, the seed networks, no traffic.
     pub fn new() -> Self {
         Self {
             topology: Topology::new(),
             networks: seed_networks().into_iter().map(|n| (n.id.clone(), n)).collect(),
             hosts: BTreeMap::new(),
+            traffic: Traffic::default(),
         }
     }
 
+    /// The speed `host`'s NIC `port` negotiates, in Mbit/s: its own (or the
+    /// degraded speed it is stuck at), capped by the switch port it is cabled
+    /// to. `None` for an unknown host or NIC.
+    pub fn nic_speed(&self, host: &HostId, port: &str) -> Option<u32> {
+        let hw = self.hosts.get(host)?;
+        let own = hw.profile.nics.iter().find(|n| n.name == port)?.speed_mbps;
+        let own = hw.degraded_nics.get(port).map_or(own, |&d| d.min(own));
+        let far = match self.topology.peer(&Node::HostPort(host.clone(), PortName::new(port))) {
+            Some(Node::SwitchPort(s, p)) => self.topology.switches.get(s).and_then(|sw| sw.ports.get(p)).map(|(mbps, _)| *mbps),
+            _ => None,
+        };
+        Some(far.map_or(own, |f| f.min(own)))
+    }
+
+    /// What `host`'s OS measures now ([`HostHw::usage`]), with every NIC's
+    /// (rx, tx) from the latest traffic tick.
+    pub fn usage(&self, host: &HostId, rng: &mut impl Rng) -> Option<HostUsage> {
+        let hw = self.hosts.get(host)?;
+        let mut usage = hw.usage(rng);
+        let ports = &self.traffic.last().port_bps;
+        usage.port_bps = hw
+            .profile
+            .nics
+            .iter()
+            .map(|n| {
+                let node = Node::HostPort(host.clone(), PortName::new(&n.name));
+                (n.name.clone(), ports.get(&node).copied().unwrap_or((0.0, 0.0)))
+            })
+            .collect();
+        Some(usage)
+    }
+
     /// What `host`'s OS discovers about its hardware: the profile's NICs and
-    /// disks, each NIC's link state and which disks failed.
+    /// disks, each NIC's link state and negotiated speed, and which disks failed.
     pub fn inventory(&self, host: &HostId) -> Option<Inventory> {
         let hw = self.hosts.get(host)?;
         let nics = hw.profile.nics.iter().map(|n| {
             let port = Node::HostPort(host.clone(), PortName::new(&n.name));
-            NicState { name: n.name.clone(), speed_mbps: n.speed_mbps, link_up: hw.powered && self.link_up(&port) }
+            let speed_mbps = self.nic_speed(host, &n.name).unwrap_or(n.speed_mbps);
+            NicState { name: n.name.clone(), speed_mbps, link_up: hw.powered && self.link_up(&port) }
         });
         let disks = hw.profile.disks.iter().map(|d| DiskState {
             name: d.name.clone(),
@@ -171,8 +211,9 @@ impl World {
     }
 
     /// Whether the port at `end` has carrier: cabled, the cable plugged in,
-    /// and a far-end switch that is up with the port admin-up.
-    fn link_up(&self, end: &Node) -> bool {
+    /// and a far-end switch that is up with the port admin-up. Partitions do
+    /// not matter: they cut traffic, not carrier.
+    pub fn link_up(&self, end: &Node) -> bool {
         let Some(peer) = self.topology.peer(end) else { return false };
         if !self.topology.is_cable_up(end, peer) {
             return false;
@@ -261,6 +302,19 @@ mod tests {
             set(&mut w, true);
             assert!(links_up(&w)[0].1, "{what}: sfp0 did not come back");
         }
+    }
+
+    #[test]
+    fn nics_negotiate_down_to_the_slower_end_or_a_degraded_speed() {
+        let mut w = world();
+        let speeds = |w: &World| w.inventory(&hid("h")).unwrap().nics.into_iter().map(|n| n.speed_mbps).collect::<Vec<_>>();
+        assert_eq!(speeds(&w), [10_000, 10_000, 2_500, 2_500], "eth0 is a 2.5G NIC on a 10G port");
+        w.hosts.get_mut(&hid("h")).unwrap().degraded_nics.insert("sfp0".into(), 1_000);
+        assert_eq!(speeds(&w)[0], 1_000);
+        w.hosts.get_mut(&hid("h")).unwrap().degraded_nics.clear();
+        w.topology.switches.get_mut(&SwitchId::from("sw")).unwrap().ports.get_mut(&PortName::from("p1")).unwrap().0 = 2_500;
+        assert_eq!(speeds(&w)[0], 2_500, "a 10G NIC on a 2.5G port");
+        assert_eq!(w.nic_speed(&hid("h"), "eth9"), None);
     }
 
     #[test]

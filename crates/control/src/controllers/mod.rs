@@ -8,6 +8,7 @@
 //! has applied an entry of its own term, so they never act on a state that
 //! lags what earlier leaders committed.
 
+pub mod alerts;
 pub mod health;
 pub mod join;
 pub mod network;
@@ -167,6 +168,7 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(join::run(state, volatile));
     out.extend(network::run(state, volatile, now));
     out.extend(observe::run(state, volatile, now));
+    out.extend(alerts::run(state, volatile));
     out.extend(rollout::run(state, now));
     out
 }

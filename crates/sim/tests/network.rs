@@ -3,6 +3,7 @@
 //! Tests may read ground truth to inject faults and to check the log.
 
 use control::agent::HostAgent;
+use control::controllers::alerts::{BOND_DEGRADED, PORT_DOWN};
 use control::controllers::network::{NETWORK_APPLY_FAILED, NETWORK_MISMATCH};
 use control::controllers::rollout::Preview;
 use control::proto::{ApiOp, ApiResult, LogCmd};
@@ -17,6 +18,7 @@ use sim::faults::Fault;
 use sim::presets::Preset;
 use sim::scenario::{Misconfig, Scenario};
 use sim::topology::Node;
+use sim::traffic::FlowEnd;
 use std::collections::BTreeSet;
 
 fn hid(s: &str) -> HostId {
@@ -602,4 +604,128 @@ fn a_dead_host_in_the_batch_pauses_the_rollout() {
     let soaking = |e: &Engine| matches!(rollout(e, &id).state, RolloutState::Soaking { .. });
     assert!(e.run_until(e.now() + 10_000, soaking), "{:?}", rollout(&e, &id));
     assert_eq!(rollout(&e, &id).skipped, [dead]);
+}
+
+// ---- traffic: bonds and VLAN blackholes (criterion 5) ----
+
+/// Starts a storage iperf from ms01-01 to ms01-02 with `streams` streams of
+/// 10 Gbit/s each, runs past the next traffic tick, and returns the flow ids.
+fn storage_iperf(e: &mut Engine, streams: u32) -> Vec<u64> {
+    let iperf = Scenario::Iperf {
+        from: hid("ms01-01"),
+        to: FlowEnd::Host(hid("ms01-02")),
+        network: NetworkId::from("storage"),
+        mbps: 10_000,
+        duration_s: 600,
+        streams,
+    };
+    e.scenario(iperf).unwrap();
+    let ids: Vec<u64> = e.fabric().world().traffic.flows().map(|f| f.id).collect();
+    assert_eq!(ids.len(), streams as usize);
+    e.run_for(2000);
+    ids
+}
+
+/// The rate of each flow at the latest traffic tick, in Mbit/s.
+fn rates(e: &Engine, ids: &[u64]) -> Vec<f64> {
+    let last = e.fabric().world().traffic.last();
+    ids.iter().map(|id| last.rate.get(id).copied().unwrap_or(0.0)).collect()
+}
+
+/// The port each flow leaves its source host by, at the latest tick.
+fn source_ports(e: &Engine, ids: &[u64]) -> Vec<Option<Node>> {
+    let last = e.fabric().world().traffic.last();
+    ids.iter().map(|id| last.paths.get(id).and_then(|p| p.first()).map(|hop| hop.from.clone())).collect()
+}
+
+#[test]
+fn criterion_5_bond_member_unplug() {
+    let mut e = settled_fleet(60);
+    let ids = storage_iperf(&mut e, 8);
+    let sfp = |p: &str| Some(Node::HostPort(hid("ms01-01"), PortName::from(p)));
+    let used: BTreeSet<Option<Node>> = source_ports(&e, &ids).into_iter().collect();
+    assert_eq!(used, [sfp("sfp0"), sfp("sfp1")].into(), "LACP spreads the streams over both members");
+    let total: f64 = rates(&e, &ids).iter().sum();
+    assert!(total > 10_000.0, "both 10G members carry traffic: {total} Mbit/s");
+
+    e.fault(Fault::UnplugPort { host: hid("ms01-01"), port: PortName::from("sfp0") }).unwrap();
+    let unplugged = e.now();
+    e.run_for(2000);
+    assert!(source_ports(&e, &ids).iter().all(|p| *p == sfp("sfp1")), "{:?}", source_ports(&e, &ids));
+    let total: f64 = rates(&e, &ids).iter().sum();
+    assert!(total > 0.0 && total <= 10_000.0, "{total} Mbit/s over the remaining member");
+
+    let h = hid("ms01-01");
+    let degraded = |e: &Engine| !open_alerts(e, BOND_DEGRADED, &h).is_empty();
+    assert!(e.run_until(unplugged + 15_000, degraded), "no BondDegraded 15 s after the unplug");
+    assert_eq!(open_alerts(&e, BOND_DEGRADED, &h).len(), 1);
+    assert!(open_alerts(&e, PORT_DOWN, &h).iter().any(|a| a.message.contains("sfp0")), "{:?}", open_alerts(&e, PORT_DOWN, &h));
+
+    // The host's own metrics show the traffic moved to sfp1.
+    let moved = |e: &Engine| {
+        e.client_view().metrics.get(&h).is_some_and(|m| {
+            m.at > unplugged && m.port_tx_bps.get("sfp1").is_some_and(|&b| b > 0.0) && m.port_tx_bps.get("sfp0") == Some(&0.0)
+        })
+    };
+    assert!(e.run_until(e.now() + 15_000, moved), "{:?}", e.client_view().metrics.get(&h));
+
+    // Plugged back in: both members carry traffic again and the alerts resolve.
+    e.fault(Fault::ReplugPort { host: h.clone(), port: PortName::from("sfp0") }).unwrap();
+    let healed = |e: &Engine| open_alerts(e, BOND_DEGRADED, &h).is_empty() && open_alerts(e, PORT_DOWN, &h).is_empty();
+    assert!(e.run_until(e.now() + 15_000, healed), "alerts still open after the replug");
+    assert!(rates(&e, &ids).iter().sum::<f64>() > 10_000.0);
+}
+
+#[test]
+fn criterion_5_vlan_removed() {
+    let mut e = settled_fleet(61);
+    let ids = storage_iperf(&mut e, 8);
+    assert!(rates(&e, &ids).iter().all(|&r| r > 0.0), "{:?}", rates(&e, &ids));
+    let h = hid("ms01-01");
+    let removed = e.now();
+    for switch in ["core-1", "core-2"] {
+        let (switch, port) = (sid(switch), PortName::from("p1"));
+        let mut cfg = e.fabric().world().topology.switches[&switch].port(&port).unwrap().clone();
+        let PortMode::Trunk { allowed, .. } = &mut cfg.mode else { panic!("an MS-01 bond port is a trunk") };
+        assert!(allowed.remove(&20));
+        e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
+    }
+    e.run_for(2000);
+    assert!(rates(&e, &ids).iter().all(|&r| r == 0.0), "storage still flows: {:?}", rates(&e, &ids));
+    let mismatch = |e: &Engine| open_alerts(e, NETWORK_MISMATCH, &h).iter().any(|a| a.message.contains("VLAN 20"));
+    assert!(e.run_until(removed + 35_000, mismatch), "{:?}", open_alerts(&e, NETWORK_MISMATCH, &h));
+}
+
+#[test]
+fn a_degraded_port_raises_link_speed_low() {
+    let mut e = settled_fleet(62);
+    let ids = storage_iperf(&mut e, 2);
+    let h = hid("ms01-01");
+    e.fault(Fault::DegradePort { host: h.clone(), port: PortName::from("sfp1"), mbps: 1000 }).unwrap();
+    let speed_low = |e: &Engine| open_alerts(e, "LinkSpeedLow", &h).iter().any(|a| a.message.contains("sfp1"));
+    assert!(e.run_until(e.now() + 15_000, speed_low), "no LinkSpeedLow");
+    let nic = e.client_view().state.hosts[&h].inventory.nics.iter().find(|n| n.name == "sfp1").unwrap().clone();
+    assert_eq!(nic.speed_mbps, 1000, "the inventory reports the negotiated speed");
+    let slow = rates(&e, &ids).into_iter().zip(source_ports(&e, &ids)).find(|(_, p)| *p == Some(Node::HostPort(h.clone(), PortName::from("sfp1"))));
+    assert_eq!(slow.map(|(r, _)| r), Some(1000.0), "the flow on sfp1 is capped at its speed");
+
+    e.fault(Fault::DegradePort { host: h.clone(), port: PortName::from("sfp1"), mbps: 10_000 }).unwrap();
+    let cleared = |e: &Engine| open_alerts(e, "LinkSpeedLow", &h).is_empty();
+    assert!(e.run_until(e.now() + 15_000, cleared), "LinkSpeedLow not resolved");
+}
+
+#[test]
+fn iperf_flows_end_after_their_duration() {
+    let mut e = settled_fleet(63);
+    let iperf = Scenario::Iperf { from: hid("pi5-01"), to: FlowEnd::Router, network: NetworkId::from("mgmt"), mbps: 400, duration_s: 5, streams: 1 };
+    e.scenario(iperf).unwrap();
+    e.run_for(2000);
+    let id = e.fabric().world().traffic.flows().next().expect("the stream runs").id;
+    assert_eq!(rates(&e, &[id]), [400.0]);
+    let truth = e.truth();
+    assert!(truth.flows.iter().any(|f| f.id == id && f.rate_mbps == 400.0), "{:?}", truth.flows);
+    assert!(truth.ports.iter().any(|p| p.port == Node::Router && p.rx_bps == 400e6), "{:?}", truth.ports);
+    e.run_for(4000);
+    assert_eq!(e.fabric().world().traffic.flows().count(), 0, "done after 5 s");
+    assert!(e.truth().flows.is_empty());
 }

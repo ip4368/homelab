@@ -4,12 +4,13 @@
 use crate::engine::Engine;
 use crate::presets::{cable_host, capacity, host_id, profile_prefix};
 use crate::topology::{PortMode, SwitchPortCfg};
+use crate::traffic::{FlowEnd, FlowKind};
 use crate::world::HostHw;
 use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::{Addr, Endpoint, Svc};
-use model::ProfileId;
+use model::{HostId, NetworkId, ProfileId};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -53,6 +54,21 @@ pub enum Scenario {
     /// profile's template (with `misconfigure`'s mistake, if any) and boots
     /// its agent with the token. Hosts are numbered after the profile's existing ones.
     AddHosts { profile: ProfileId, count: u32, misconfigure: Option<Misconfig> },
+    /// An iperf run: `streams` parallel flows from `from` to `to` on
+    /// `network`, each asking for `mbps`, for `duration_s` seconds.
+    Iperf {
+        from: HostId,
+        to: FlowEnd,
+        network: NetworkId,
+        mbps: u32,
+        duration_s: u32,
+        #[serde(default = "one_stream")]
+        streams: u32,
+    },
+}
+
+fn one_stream() -> u32 {
+    1
 }
 
 impl Engine {
@@ -60,7 +76,36 @@ impl Engine {
     pub fn scenario(&mut self, s: Scenario) -> Result<(), String> {
         match s {
             Scenario::AddHosts { profile, count, misconfigure } => self.add_hosts(profile, count, misconfigure),
+            Scenario::Iperf { from, to, network, mbps, duration_s, streams } => {
+                self.iperf(from, to, network, mbps, duration_s, streams)
+            }
         }
+    }
+
+    fn iperf(&mut self, from: HostId, to: FlowEnd, network: NetworkId, mbps: u32, duration_s: u32, streams: u32) -> Result<(), String> {
+        let w = self.fabric().world();
+        let to_host = match &to {
+            FlowEnd::Host(h) => Some(h),
+            FlowEnd::Router => None,
+        };
+        if let Some(h) = std::iter::once(&from).chain(to_host).find(|h| !w.hosts.contains_key(*h)) {
+            return Err(format!("unknown host {h}"));
+        }
+        if to == FlowEnd::Host(from.clone()) {
+            return Err(format!("{from} cannot iperf itself"));
+        }
+        if !w.networks.contains_key(&network) {
+            return Err(format!("unknown network {network}"));
+        }
+        if streams == 0 {
+            return Err("an iperf needs at least one stream".into());
+        }
+        let until = self.now() + u64::from(duration_s) * 1000;
+        let traffic = self.fabric_mut().traffic_mut();
+        for _ in 0..streams {
+            traffic.start(FlowEnd::Host(from.clone()), to.clone(), network.clone(), f64::from(mbps), FlowKind::Iperf, Some(until));
+        }
+        Ok(())
     }
 
     fn add_hosts(&mut self, profile: ProfileId, count: u32, misconfigure: Option<Misconfig>) -> Result<(), String> {
@@ -113,7 +158,9 @@ mod tests {
     use super::*;
     use crate::presets::{host_port_cfg, FleetSpec};
     use crate::topology::Node;
-    use model::{HostId, PortName, SwitchId};
+    use crate::traffic::{Flow, FlowKind};
+    use model::{HostId, NetworkId, PortName, SwitchId};
+    use std::collections::BTreeSet;
 
     #[test]
     fn misconfigs_break_what_they_name() {
@@ -199,6 +246,39 @@ mod tests {
     }
 
     #[test]
+    fn iperf_starts_one_flow_per_stream() {
+        let mut e = engine();
+        let (h, storage) = (HostId::from("ms01-01"), NetworkId::from("storage"));
+        let iperf = |from: &str, to: FlowEnd, network: &str, streams| Scenario::Iperf {
+            from: HostId::from(from),
+            to,
+            network: NetworkId::from(network),
+            mbps: 100,
+            duration_s: 10,
+            streams,
+        };
+        e.scenario(iperf("ms01-01", FlowEnd::Router, "storage", 3)).unwrap();
+        let now = e.now();
+        let flows: Vec<Flow> = e.fabric().world().traffic.flows().cloned().collect();
+        assert_eq!(flows.len(), 3);
+        assert_eq!(flows.iter().map(|f| f.id).collect::<BTreeSet<_>>().len(), 3, "distinct ids");
+        for f in &flows {
+            assert_eq!((&f.src, &f.dst, &f.network, f.demand_mbps), (&FlowEnd::Host(h.clone()), &FlowEnd::Router, &storage, 100.0));
+            assert_eq!((f.kind, f.until), (FlowKind::Iperf, Some(now + 10_000)));
+        }
+        for bad in [
+            iperf("nope", FlowEnd::Router, "storage", 1),
+            iperf("ms01-01", FlowEnd::Host(HostId::from("nope")), "storage", 1),
+            iperf("ms01-01", FlowEnd::Host(h.clone()), "storage", 1),
+            iperf("ms01-01", FlowEnd::Router, "nope", 1),
+            iperf("ms01-01", FlowEnd::Router, "storage", 0),
+        ] {
+            assert!(e.scenario(bad.clone()).is_err(), "{bad:?} accepted");
+        }
+        assert_eq!(e.fabric().world().traffic.flows().count(), 3);
+    }
+
+    #[test]
     fn scenarios_are_plain_json() {
         let s = Scenario::AddHosts { profile: ProfileId::MiniPc, count: 1, misconfigure: Some(Misconfig::MissingVlan(20)) };
         let json = serde_json::to_value(&s).unwrap();
@@ -207,5 +287,8 @@ mod tests {
             serde_json::json!({"AddHosts": {"profile": "MiniPc", "count": 1, "misconfigure": {"MissingVlan": 20}}})
         );
         assert_eq!(serde_json::from_value::<Scenario>(json).unwrap(), s);
+        let iperf = serde_json::json!({"Iperf": {"from": "ms01-01", "to": "Router", "network": "storage", "mbps": 10, "duration_s": 5}});
+        let Scenario::Iperf { streams, .. } = serde_json::from_value(iperf).unwrap() else { panic!("an iperf") };
+        assert_eq!(streams, 1, "one stream unless asked");
     }
 }

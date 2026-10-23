@@ -7,5 +7,6 @@ pub mod presets;
 pub mod scenario;
 pub mod switch_actor;
 pub mod topology;
+pub mod traffic;
 pub mod truth;
 pub mod world;

@@ -196,6 +196,8 @@ mod tests {
             vip_owner_by_switch: BTreeMap::new(),
             partitions: vec![],
             split_brain_vms: vec![],
+            ports: vec![],
+            flows: vec![],
             sim_time: now,
         };
         Published { epoch: 0, view: view.clone(), truth, sim: SimInfo { now, speed: 1, paused: false } }

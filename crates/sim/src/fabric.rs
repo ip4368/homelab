@@ -10,11 +10,15 @@
 //! client and router attachments are evaluated per query, because they also
 //! depend on host power and applied network config, which change without
 //! touching the topology.
+//!
+//! Every engine tick the fabric moves the world's traffic model forward
+//! ([`crate::traffic`]), which routes flows with the same rules.
 
 use crate::engine::Deliver;
 use crate::topology::Node;
+use crate::traffic::Traffic;
 use crate::world::{HostHw, World};
-use control::runtime::{Addr, Endpoint};
+use control::runtime::{Addr, Endpoint, SimTime};
 use model::{HostId, NetworkId, PortName, SwitchId};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -117,6 +121,11 @@ impl Fabric {
         self.world.hosts.get_mut(id)
     }
 
+    /// The world's flows. Traffic never feeds the cached switch graphs, so this keeps them.
+    pub fn traffic_mut(&mut self) -> &mut Traffic {
+        &mut self.world.traffic
+    }
+
     /// Which host each switch currently believes owns the VIP.
     pub fn vip_arp(&self) -> &BTreeMap<SwitchId, HostId> {
         &self.arp
@@ -132,6 +141,21 @@ impl Fabric {
     /// Shortest cable path from `a` to `b` on `vlan`, ignoring MTU.
     pub fn path(&self, a: &Node, b: &Node, vlan: u16) -> Option<Vec<LinkHop>> {
         self.find_path(&Station::of_node(a), &Station::of_node(b), vlan, ANY_MTU)
+    }
+
+    /// The cable a `vlan` frame of `mtu` bytes sent out of `port` (a host
+    /// port, the client or the router; `tagged` or not) crosses onto a
+    /// switch, if that switch takes it: the cable is up and uncut, the
+    /// switch is up, and its port is up, big enough and accepts the frame.
+    pub fn ingress(&self, port: &Node, vlan: u16, tagged: bool, mtu: u16) -> Option<LinkHop> {
+        self.attach_node(port.clone(), vlan, tagged, mtu)?.hop
+    }
+
+    /// Shortest path between two switches over switch-to-switch cables that
+    /// carry `vlan` tagged at `mtu`, ties going to the lowest switch id.
+    /// Empty when `a` is `b`; `None` if either is down or there is no path.
+    pub fn switch_path(&self, a: &SwitchId, b: &SwitchId, vlan: u16, mtu: u16) -> Option<Vec<LinkHop>> {
+        self.find_path(&Station::Switch(a), &Station::Switch(b), vlan, mtu)
     }
 
     /// A gratuitous ARP from `host`: every switch it reaches on mgmt learns it.
@@ -177,7 +201,8 @@ impl Fabric {
     }
 
     /// Multi-source BFS from `a`'s attachments to any of `b`'s, over the
-    /// switch graph. Ties go to the first attachment and lowest switch/port.
+    /// switch graph. Ties go to the first attachment, then the lowest
+    /// neighbour switch and port.
     fn find_path(&self, a: &Station, b: &Station, vlan: u16, mtu: u16) -> Option<Vec<LinkHop>> {
         let src = self.attach(a, vlan, mtu);
         let dst = self.attach(b, vlan, mtu);
@@ -310,6 +335,9 @@ impl Fabric {
                 g.entry(sa.clone()).or_default().push((pa.clone(), sb.clone(), pb.clone()));
             }
         }
+        for next in g.values_mut() {
+            next.sort_by(|(pa, sa, _), (pb, sb, _)| (sa, pa).cmp(&(sb, pb)));
+        }
         g
     }
 }
@@ -344,6 +372,14 @@ impl Deliver for Fabric {
 
     fn claim_vip(&mut self, host: &HostId) {
         self.record_vip_claim(host);
+    }
+
+    /// Ends the flows whose time is up and routes the rest as the world is now.
+    fn tick(&mut self, now: SimTime) {
+        let mut traffic = std::mem::take(&mut self.world.traffic);
+        traffic.expire(now);
+        traffic.tick(self);
+        self.world.traffic = traffic;
     }
 }
 

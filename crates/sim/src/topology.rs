@@ -27,8 +27,9 @@ impl Switch {
     }
 }
 
-/// One end of a cable.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// One end of a cable. Exported to the UI as `CableEnd` (the DOM owns `Node`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+#[ts(export, rename = "CableEnd")]
 pub enum Node {
     HostPort(HostId, PortName),
     SwitchPort(SwitchId, PortName),

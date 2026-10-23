@@ -8,7 +8,7 @@ import type { SimInfo } from './gen/SimInfo'
 import type { ViewSnapshot } from './gen/ViewSnapshot'
 import { EVENT_CAP, STALE_AFTER_MS, createStore } from './store'
 
-const truth: GroundTruth = { hosts: [], vip_owner_by_switch: {}, partitions: [], split_brain_vms: [], sim_time: 0 }
+const truth: GroundTruth = { hosts: [], vip_owner_by_switch: {}, partitions: [], split_brain_vms: [], ports: [], flows: [], sim_time: 0 }
 
 function host(id: string, lifecycle: HostObj['lifecycle'] = 'Ready'): HostObj {
   return {

@@ -1,6 +1,7 @@
 //! Discrete-event engine: a time-ordered queue of message deliveries and
-//! timers, dispatched to actors one at a time. Events at equal time are
-//! delivered in insertion order, so runs are fully deterministic per seed.
+//! timers, dispatched to actors one at a time, plus the [`Deliver`]'s own
+//! tick every [`TICK_MS`]. Events at equal time are delivered in insertion
+//! order, so runs are fully deterministic per seed.
 
 use crate::fabric::Fabric;
 use crate::world::HostHw;
@@ -17,6 +18,10 @@ use std::any::Any;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
+/// How often the installed [`Deliver`] is ticked (the fabric moves its
+/// traffic model forward), counted from engine creation or the last reset.
+pub const TICK_MS: u64 = 1000;
+
 /// Decides whether and when a message arrives, and owns VIP semantics. The
 /// simulator installs the fabric ([`crate::fabric::Fabric`]); tests may use
 /// simpler implementations.
@@ -31,6 +36,9 @@ pub trait Deliver: Any + Send {
 
     /// An actor on `host` claimed the VIP.
     fn claim_vip(&mut self, _host: &HostId) {}
+
+    /// Called every [`TICK_MS`] of sim-time.
+    fn tick(&mut self, _now: SimTime) {}
 }
 
 /// Delivers everything with 1 ms latency. `Addr::Vip` goes to the last host
@@ -59,6 +67,8 @@ enum Event {
     /// `actor` is the incarnation that set the timer; a respawned actor at the
     /// same endpoint must not receive its predecessor's timers.
     Timer { to: Endpoint, actor: u64, token: u64 },
+    /// The recurring [`Deliver::tick`].
+    Tick,
 }
 
 /// Queue entry ordered by (time, seq) only, so equal-time events keep insertion order.
@@ -205,8 +215,10 @@ impl HostOs for EngineCtx<'_> {
         self.hw_mut().persist_network();
     }
     fn usage(&mut self) -> HostUsage {
+        let host = self.host_id();
         let core = &mut *self.core;
-        host_hw(core.deliver.as_mut(), &self.me).expect(NO_HOST).usage(&mut core.rng)
+        let fabric: Option<&Fabric> = (core.deliver.as_ref() as &dyn Any).downcast_ref();
+        fabric.and_then(|f| f.world().usage(&host, &mut core.rng)).expect(NO_HOST)
     }
     fn load_cp(&self) -> Option<Durable<LogCmd>> {
         self.hw().expect(NO_HOST).cp_durable.clone()
@@ -244,7 +256,7 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(seed: u64) -> Self {
-        Self {
+        let mut e = Self {
             seed,
             core: Core {
                 now: 0,
@@ -255,7 +267,9 @@ impl Engine {
             },
             actors: HashMap::new(),
             next_actor: 0,
-        }
+        };
+        e.core.push(TICK_MS, Event::Tick);
+        e
     }
 
     /// The seed the engine was created with; presets seed their fabric from it.
@@ -268,11 +282,13 @@ impl Engine {
     }
 
     /// Starts over on `d`: every actor and every pending event is dropped.
-    /// Time keeps running from `now()`.
+    /// Time keeps running from `now()`; the next tick is [`TICK_MS`] away.
     pub fn reset(&mut self, d: Box<dyn Deliver>) {
         self.actors.clear();
         self.core.queue.clear();
         self.core.deliver = d;
+        let next = self.core.now.saturating_add(TICK_MS);
+        self.core.push(next, Event::Tick);
     }
 
     /// The installed [`Deliver`], if it is a `T`.
@@ -394,6 +410,11 @@ impl Engine {
                 if self.actors.get(&to).is_some_and(|s| s.id == id) {
                     self.with_actor(&to, |actor, ctx| actor.on_timer(ctx, token));
                 }
+            }
+            Event::Tick => {
+                let now = self.core.now;
+                self.core.deliver.tick(now);
+                self.core.push(now.saturating_add(TICK_MS), Event::Tick);
             }
         }
     }
@@ -699,6 +720,27 @@ mod tests {
     fn rng_is_seeded_deterministically() {
         assert_eq!(rolls(42), rolls(42));
         assert_ne!(rolls(42), rolls(43));
+    }
+
+    struct Ticks(Vec<SimTime>);
+    impl Deliver for Ticks {
+        fn route(&mut self, _: &Endpoint, _: &Endpoint, _: &NetworkId) -> Option<(Endpoint, u64)> {
+            None
+        }
+        fn tick(&mut self, now: SimTime) {
+            self.0.push(now);
+        }
+    }
+
+    #[test]
+    fn deliver_ticks_every_second_and_again_after_a_reset() {
+        let mut e = Engine::new(1);
+        e.set_deliver(Box::new(Ticks(vec![])));
+        e.run_for(3500);
+        assert_eq!(e.deliver::<Ticks>().unwrap().0, [1000, 2000, 3000]);
+        e.reset(Box::new(Ticks(vec![])));
+        e.run_for(2000);
+        assert_eq!(e.deliver::<Ticks>().unwrap().0, [4500, 5500], "counted from the reset");
     }
 
     struct DropAll;
