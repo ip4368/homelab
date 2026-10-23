@@ -6,6 +6,7 @@ import {
   filterWorkloads,
   hostWorkloads,
   migrationTargets,
+  removeHostPrompt,
   truthDiff,
   validateDeployment,
   validateVm,
@@ -116,6 +117,17 @@ describe('hostWorkloads', () => {
     expect(hostWorkloads(src, 'b').vms).toEqual(['vm2'])
     expect(hostWorkloads(src, 'b').replicas.map((r) => r.volume)).toEqual(['vol1', 'vol2'])
     expect(hostWorkloads(src, 'zzz')).toEqual({ vms: [], pods: [], replicas: [] })
+  })
+})
+
+describe('removeHostPrompt', () => {
+  it('names what runs on the host and what removal does to it', () => {
+    const w = { vms: ['a', 'b'], pods: ['web/0'], replicas: [{ volume: 'v', disk: 'nvme0', state: 'Healthy' as const }] }
+    const text = removeHostPrompt('ms01-04', w)
+    expect(text).toContain('Remove ms01-04?')
+    expect(text).toContain('2 VMs, 1 pod and 1 volume replica')
+    expect(text).toContain('cannot rejoin')
+    expect(removeHostPrompt('pi5-01', { vms: [], pods: [], replicas: [] })).toContain('Nothing is placed on it')
   })
 })
 

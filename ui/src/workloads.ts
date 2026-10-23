@@ -162,6 +162,25 @@ export function hostWorkloads(src: Pick<WorkloadSource, 'pods' | 'vmStatus' | 'v
   return { vms, pods, replicas }
 }
 
+/** "2 VMs", "1 pod". */
+function count(n: number, what: string): string {
+  return `${n} ${what}${n === 1 ? '' : 's'}`
+}
+
+/** The confirmation asked before removing `host`, naming what is placed on it. */
+export function removeHostPrompt(host: string, w: HostWorkloads): string {
+  const placed = [
+    w.vms.length > 0 && count(w.vms.length, 'VM'),
+    w.pods.length > 0 && count(w.pods.length, 'pod'),
+    w.replicas.length > 0 && count(w.replicas.length, 'volume replica'),
+  ].filter((x): x is string => typeof x === 'string')
+  const what =
+    placed.length === 0
+      ? 'Nothing is placed on it.'
+      : `It has ${placed.length === 1 ? placed[0] : `${placed.slice(0, -1).join(', ')} and ${placed[placed.length - 1]}`}: VMs restart elsewhere (cold), pods are rescheduled and its replicas are dropped and rebuilt elsewhere.`
+  return `Remove ${host}? ${what} The host cannot rejoin until the preset is reloaded.`
+}
+
 /** Hosts a VM may be migrated to: Ready, with the Vm role, and not the host it is on. */
 export function migrationTargets(hosts: Record<string, HostObj>, from: string | null): string[] {
   return Object.values(hosts)

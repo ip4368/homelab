@@ -1,6 +1,8 @@
 import { useMemo, useState } from 'react'
 import { fault, scenario } from '../api'
 import type { Fault } from '../gen/Fault'
+import type { Misconfig } from '../gen/Misconfig'
+import type { PartitionMember } from '../gen/PartitionMember'
 import type { ProfileId } from '../gen/ProfileId'
 import { useStore } from '../store'
 import { useAction } from './useAction'
@@ -78,6 +80,25 @@ function IperfForm({ selected }: { selected: string | null }) {
 
 const PROFILES: ProfileId[] = ['Ms01', 'MiniPc', 'Pi5', 'Rk3588']
 
+/** The switch-port mistakes "Add hosts" can make on the new hosts' ports. */
+export const MISCONFIGS = [
+  { value: 'none', label: 'correctly cabled', misconfig: null },
+  { value: 'MissingVlan20', label: 'VLAN 20 missing', misconfig: { MissingVlan: 20 } },
+  { value: 'MtuTooSmall', label: 'MTU too small', misconfig: 'MtuTooSmall' },
+  { value: 'BondNoLacp', label: 'bond without LACP', misconfig: 'BondNoLacp' },
+] as const satisfies readonly { value: string; label: string; misconfig: Misconfig | null }[]
+
+export function misconfigOf(value: string): Misconfig | null {
+  return MISCONFIGS.find((m) => m.value === value)?.misconfig ?? null
+}
+
+/** One partition group: the switch (if any) and the hosts listed, separated by commas or spaces. */
+export function partitionOf(hosts: string, sw: string): Fault | null {
+  const ids = [...new Set(hosts.split(/[\s,]+/).filter((h) => h !== ''))]
+  const nodes: PartitionMember[] = [...(sw.trim() ? [{ Switch: sw.trim() }] : []), ...ids.map((h) => ({ Host: h }))]
+  return nodes.length > 0 ? { Partition: { nodes } } : null
+}
+
 export function FaultPanel({ selected }: { selected: string | null }) {
   const [open, setOpen] = useState(true)
   const paused = useStore((s) => s.sim.paused)
@@ -85,6 +106,12 @@ export function FaultPanel({ selected }: { selected: string | null }) {
   const [switchId, setSwitchId] = useState('')
   const [profile, setProfile] = useState<ProfileId>('Ms01')
   const [count, setCount] = useState(1)
+  const [misconfig, setMisconfig] = useState('none')
+  const [mbps, setMbps] = useState(100)
+  const [hostSet, setHostSet] = useState('')
+  const [withSwitch, setWithSwitch] = useState(false)
+  const [clientPort, setClientPort] = useState('')
+  const knownSwitches = useStore((s) => s.view.switches)
   const hostAction = useAction()
   const hostNics = useStore((s) => (selected ? s.view.hosts[selected]?.inventory.nics : undefined))
   const hostDisks = useStore((s) => (selected ? s.view.hosts[selected]?.inventory.disks : undefined))
@@ -97,8 +124,10 @@ export function FaultPanel({ selected }: { selected: string | null }) {
   const networkAction = useAction()
   const scenarioAction = useAction()
 
-  // Switch ids are known from the ground truth only while a VIP table lists them; otherwise type one.
-  const switchIds = Object.keys(truth.vip_owner_by_switch)
+  // Switch ids the control plane knows, plus any the ground truth's VIP table lists; or type one.
+  const switchIds = [...new Set([...Object.keys(knownSwitches), ...Object.keys(truth.vip_owner_by_switch)])].sort()
+  const sw = switchId.trim()
+  const group = partitionOf(hostSet, withSwitch ? sw : '')
   const injectHost = (f: Fault) => hostAction.run(() => fault(f))
   const injectNetwork = (f: Fault) => networkAction.run(() => fault(f))
   const needHost = selected === null
@@ -147,6 +176,24 @@ export function FaultPanel({ selected }: { selected: string | null }) {
               <button disabled={needHost || chosenDisk === '' || hostAction.busy} onClick={() => injectHost({ FailDisk: { host: selected!, disk: chosenDisk } })}>
                 Fail disk
               </button>
+              <label className="inline">
+                <input
+                  type="number"
+                  min={1}
+                  value={mbps}
+                  onChange={(e) => setMbps(Math.max(1, Math.floor(Number(e.target.value)) || 1))}
+                  style={{ width: 70 }}
+                  aria-label="degraded port speed"
+                />{' '}
+                Mb/s
+              </label>
+              <button
+                disabled={needHost || chosenPort === '' || hostAction.busy}
+                onClick={() => injectHost({ DegradePort: { host: selected!, port: chosenPort, mbps } })}
+                title="The port negotiates at most this speed (e.g. a bad cable); restore by degrading to its full speed"
+              >
+                Degrade port
+              </button>
             </div>
             {hostAction.error && <div className="bad">{hostAction.error}</div>}
           </div>
@@ -165,11 +212,40 @@ export function FaultPanel({ selected }: { selected: string | null }) {
                   <option key={s} value={s} />
                 ))}
               </datalist>
-              <button
-                disabled={switchId.trim() === '' || networkAction.busy}
-                onClick={() => injectNetwork({ Partition: { nodes: [{ Switch: switchId.trim() }] } })}
-              >
+              <button disabled={sw === '' || networkAction.busy} onClick={() => injectNetwork({ KillSwitch: { switch: sw } })}>
+                Kill switch
+              </button>
+              <button disabled={sw === '' || networkAction.busy} onClick={() => injectNetwork({ RestoreSwitch: { switch: sw } })}>
+                Restore switch
+              </button>
+              <button disabled={sw === '' || networkAction.busy} onClick={() => injectNetwork({ Partition: { nodes: [{ Switch: sw }] } })}>
                 Partition switch
+              </button>
+              <input placeholder="switch port" value={clientPort} onChange={(e) => setClientPort(e.target.value)} style={{ width: 80 }} aria-label="client switch port" />
+              <button
+                disabled={sw === '' || clientPort.trim() === '' || networkAction.busy}
+                onClick={() => injectNetwork({ MoveClient: { switch: sw, port: clientPort.trim() } })}
+                title="Re-cable the UI client's attachment point to this switch port"
+              >
+                Move client
+              </button>
+            </div>
+            <div className="actions">
+              <input
+                placeholder="hosts, e.g. pi5-01 pi5-02"
+                value={hostSet}
+                onChange={(e) => setHostSet(e.target.value)}
+                style={{ width: 200 }}
+                aria-label="partition host set"
+              />
+              <button disabled={needHost} onClick={() => setHostSet(hostSet.trim() ? `${hostSet.trim()} ${selected}` : selected!)}>
+                Add selected
+              </button>
+              <label className="inline">
+                <input type="checkbox" checked={withSwitch} onChange={(e) => setWithSwitch(e.target.checked)} /> with the switch
+              </label>
+              <button disabled={group === null || networkAction.busy} onClick={() => group && injectNetwork(group)}>
+                Partition group
               </button>
               <button disabled={networkAction.busy} onClick={() => injectNetwork('HealPartitions')}>
                 Heal partitions
@@ -195,9 +271,16 @@ export function FaultPanel({ selected }: { selected: string | null }) {
                 aria-label="count"
                 style={{ width: 64 }}
               />
+              <select value={misconfig} onChange={(e) => setMisconfig(e.target.value)} aria-label="switch misconfiguration">
+                {MISCONFIGS.map((m) => (
+                  <option key={m.value} value={m.value}>
+                    {m.label}
+                  </option>
+                ))}
+              </select>
               <button
                 disabled={paused || scenarioAction.busy}
-                onClick={() => scenarioAction.run(() => scenario({ AddHosts: { profile, count, misconfigure: null } }))}
+                onClick={() => scenarioAction.run(() => scenario({ AddHosts: { profile, count, misconfigure: misconfigOf(misconfig) } }))}
               >
                 Add hosts
               </button>

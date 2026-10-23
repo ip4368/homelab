@@ -1,13 +1,30 @@
 import { useMemo, useState } from 'react'
 import { op } from '../api'
+import type { HostNet } from '../gen/HostNet'
 import type { HostObj } from '../gen/HostObj'
+import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
-import { hostWorkloads, replicaStateLabel, type WorkloadRef } from '../workloads'
+import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
 import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
+
+/** The ports some link of the host's applied (else desired) network config uses; `null` with no config known. */
+export function linkPorts(net: Pick<HostNet, 'applied' | 'desired'>): Set<string> | null {
+  const cfg = net.applied ?? net.desired
+  if (!cfg) return null
+  return new Set(cfg.links.flatMap((l) => ('Single' in l.kind ? [l.kind.Single] : l.kind.Bond.members)))
+}
+
+/** How a NIC shows: a port down that no link uses (`used`) is just unused, not a fault. */
+export function nicState(nic: NicState, used: Set<string> | null): 'up' | 'down' | 'unused' {
+  if (nic.link_up) return 'up'
+  return used && !used.has(nic.name) ? 'unused' : 'down'
+}
+
+const NIC_CLASS = { up: '', down: 'bad', unused: 'muted' } as const
 
 function sameRoles(a: Role[], b: Role[]): boolean {
   return a.length === b.length && a.every((r) => b.includes(r))
@@ -15,6 +32,7 @@ function sameRoles(a: Role[], b: Role[]): boolean {
 
 function Inventory({ host }: { host: HostObj }) {
   const { profile, inventory } = host
+  const used = linkPorts(host.net)
   return (
     <dl className="inventory">
       <dt>Profile</dt>
@@ -25,11 +43,14 @@ function Inventory({ host }: { host: HostObj }) {
       <dd>{host.location}</dd>
       <dt>NICs</dt>
       <dd>
-        {inventory.nics.map((n) => (
-          <div key={n.name} className={n.link_up ? '' : 'bad'}>
-            {n.name} {n.speed_mbps} Mb/s {n.link_up ? 'up' : 'down'}
-          </div>
-        ))}
+        {inventory.nics.map((n) => {
+          const state = nicState(n, used)
+          return (
+            <div key={n.name} className={NIC_CLASS[state]}>
+              {n.name} {n.speed_mbps} Mb/s {state}
+            </div>
+          )
+        })}
       </dd>
       <dt>Disks</dt>
       <dd>
@@ -153,8 +174,18 @@ function HostWorkloads({ host, onSelectWorkload }: { host: HostObj; onSelectWork
 export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onClose(): void; onSelectWorkload(ref: WorkloadRef): void }) {
   const host = useStore((s) => s.view.hosts[id])
   const paused = useStore((s) => s.sim.paused)
+  const pods = useStore((s) => s.view.pods)
+  const vmStatus = useStore((s) => s.view.vmStatus)
+  const volumeStatus = useStore((s) => s.view.volumeStatus)
   const { error, busy, run } = useAction()
   if (!host) return null
+
+  const remove = () => {
+    // Removal is permanent for the session: say what it does to what runs here.
+    if (window.confirm(removeHostPrompt(host.id, hostWorkloads({ pods, vmStatus, volumeStatus }, host.id)))) {
+      run(() => op({ RemoveHost: { id: host.id } }))
+    }
+  }
 
   const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0]) =>
     show && (
@@ -188,7 +219,11 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           </button>
           {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
           {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
-          {lifecycleButton('Remove', host.lifecycle !== 'Removed', { RemoveHost: { id: host.id } })}
+          {host.lifecycle !== 'Removed' && (
+            <button onClick={remove} disabled={paused || busy}>
+              Remove
+            </button>
+          )}
         </div>
         {error && <div className="bad">{error}</div>}
       </div>
