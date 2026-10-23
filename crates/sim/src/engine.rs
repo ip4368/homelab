@@ -3,31 +3,48 @@
 //! delivered in insertion order, so runs are fully deterministic per seed.
 
 use control::proto::Msg;
-use control::runtime::{Actor, Ctx, Endpoint, HostOs, SimTime};
-use model::NetworkId;
+use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, SimTime};
+use model::{HostId, NetworkId};
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use std::any::Any;
 use std::cmp::{Ordering, Reverse};
 use std::collections::{BinaryHeap, HashMap};
 
-/// Decides whether and when a message arrives. Task 3 replaces the default
-/// with a fabric that owns world state (links, VLANs, faults).
+/// Decides whether and when a message arrives, and owns VIP semantics. The
+/// simulator installs the fabric ([`crate::fabric::Fabric`]); tests may use
+/// simpler implementations.
 ///
-/// The engine resolves `Addr::Vip` to the current VIP holder before calling
-/// `route`, so the fabric always sees a concrete destination. The returned
-/// endpoint is where the message is actually delivered; a fabric may rewrite it.
-pub trait Deliver: Send {
-    /// Returns the resolved destination and one-way latency in ms, or `None`
-    /// to drop the message.
+/// The engine keeps no VIP state: `Addr::Vip` destinations reach `route`
+/// unresolved, and `Ctx::claim_vip` is forwarded to [`Deliver::claim_vip`].
+pub trait Deliver: Any + Send {
+    /// Returns where the message is actually delivered (a `Vip` destination
+    /// resolved to a host, keeping its `svc`) and the one-way latency in ms,
+    /// or `None` to drop the message.
     fn route(&mut self, from: &Endpoint, to: &Endpoint, net: &NetworkId) -> Option<(Endpoint, u64)>;
+
+    /// An actor on `host` claimed the VIP.
+    fn claim_vip(&mut self, _host: &HostId) {}
 }
 
-/// Delivers everything to the addressed endpoint with 1 ms latency.
-pub struct AlwaysDeliver;
+/// Delivers everything with 1 ms latency. `Addr::Vip` goes to the last host
+/// that claimed it (even if that host has since died), keeping the `svc`.
+#[derive(Debug, Default)]
+pub struct AlwaysDeliver {
+    vip: Option<HostId>,
+}
 
 impl Deliver for AlwaysDeliver {
     fn route(&mut self, _from: &Endpoint, to: &Endpoint, _net: &NetworkId) -> Option<(Endpoint, u64)> {
-        Some((to.clone(), 1))
+        let to = match &to.addr {
+            Addr::Vip => Endpoint::new(Addr::Host(self.vip.clone()?), to.svc),
+            _ => to.clone(),
+        };
+        Some((to, 1))
+    }
+
+    fn claim_vip(&mut self, host: &HostId) {
+        self.vip = Some(host.clone());
     }
 }
 
@@ -70,7 +87,6 @@ struct Core {
     queue: BinaryHeap<Reverse<Scheduled>>,
     rng: ChaCha8Rng,
     deliver: Box<dyn Deliver>,
-    vip_holder: Option<Endpoint>,
 }
 
 impl Core {
@@ -79,14 +95,8 @@ impl Core {
         self.queue.push(Reverse(Scheduled { at, seq: self.seq, event }));
     }
 
-    fn resolve_vip(&self, to: Endpoint) -> Option<Endpoint> {
-        if to.addr == control::runtime::Addr::Vip { self.vip_holder.clone() } else { Some(to) }
-    }
-
     fn send(&mut self, from: Endpoint, to: Endpoint, net: NetworkId, msg: Msg) {
-        let Some(to) = self.resolve_vip(to) else { return };
         let Some((resolved, latency)) = self.deliver.route(&from, &to, &net) else { return };
-        let Some(resolved) = self.resolve_vip(resolved) else { return };
         let at = self.now.saturating_add(latency);
         self.push(at, Event::Deliver { to: resolved, from, msg });
     }
@@ -122,7 +132,10 @@ impl Ctx for EngineCtx<'_> {
         self.core.rng.next_u64()
     }
     fn claim_vip(&mut self) {
-        self.core.vip_holder = Some(self.me.clone());
+        // Only hosts own IP addresses that switches can learn.
+        if let Addr::Host(host) = &self.me.addr {
+            self.core.deliver.claim_vip(host);
+        }
     }
     fn host(&mut self) -> Option<&mut dyn HostOs> {
         // No host OS is modelled yet; later tasks attach one per host.
@@ -144,8 +157,7 @@ impl Engine {
                 seq: 0,
                 queue: BinaryHeap::new(),
                 rng: ChaCha8Rng::seed_from_u64(seed),
-                deliver: Box::new(AlwaysDeliver),
-                vip_holder: None,
+                deliver: Box::new(AlwaysDeliver::default()),
             },
             actors: HashMap::new(),
             next_actor: 0,
@@ -154,6 +166,17 @@ impl Engine {
 
     pub fn set_deliver(&mut self, d: Box<dyn Deliver>) {
         self.core.deliver = d;
+    }
+
+    /// The installed [`Deliver`], if it is a `T`.
+    pub fn deliver<T: Deliver>(&self) -> Option<&T> {
+        (self.core.deliver.as_ref() as &dyn Any).downcast_ref()
+    }
+
+    /// The installed [`Deliver`] mutably, if it is a `T`. This is how world
+    /// state owned by the fabric is changed while the engine runs.
+    pub fn deliver_mut<T: Deliver>(&mut self) -> Option<&mut T> {
+        (self.core.deliver.as_mut() as &mut dyn Any).downcast_mut()
     }
 
     /// Registers `actor` at `at` (replacing any actor already there) and runs
@@ -169,18 +192,10 @@ impl Engine {
     /// dropped when they come due.
     pub fn kill(&mut self, at: &Endpoint) {
         self.actors.remove(at);
-        if self.core.vip_holder.as_ref() == Some(at) {
-            self.core.vip_holder = None;
-        }
     }
 
     pub fn now(&self) -> SimTime {
         self.core.now
-    }
-
-    /// The endpoint that most recently claimed the VIP and is still alive.
-    pub fn vip_holder(&self) -> Option<&Endpoint> {
-        self.core.vip_holder.as_ref()
     }
 
     pub fn run_for(&mut self, ms: u64) {
@@ -418,9 +433,59 @@ mod tests {
         e.spawn(leader.clone(), Box::new(PingActor::new(&lb).claims_vip()));
         e.spawn(ep("a"), Box::new(PingActor::new(&la).pings(vip)));
         e.run_for(10);
-        assert_eq!(e.vip_holder(), Some(&leader));
         assert_eq!(*lb.lock().unwrap(), vec![Seen::Msg { msg: Msg::Ping(7), from: ep("a"), at: 1 }]);
         assert_eq!(la.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn vip_keeps_destination_svc() {
+        // The claim is per host; the message goes to the addressed service there.
+        let (lagent, lcp, la) = (log(), log(), log());
+        let mut e = Engine::new(1);
+        e.spawn(ep("cp-1"), Box::new(PingActor::new(&lagent).claims_vip()));
+        e.spawn(Endpoint::new(Addr::Host(HostId::from("cp-1")), Svc::Cp), Box::new(PingActor::new(&lcp)));
+        e.spawn(ep("a"), Box::new(PingActor::new(&la).pings(Endpoint::new(Addr::Vip, Svc::Cp))));
+        e.run_for(10);
+        assert!(lagent.lock().unwrap().is_empty());
+        assert_eq!(*lcp.lock().unwrap(), vec![Seen::Msg { msg: Msg::Ping(7), from: ep("a"), at: 1 }]);
+    }
+
+    #[test]
+    fn vip_moves_to_latest_claimant_and_killed_claimant_gets_nothing() {
+        let (l1, l2, la) = (log(), log(), log());
+        let mut e = Engine::new(1);
+        let cp = |h: &str| Endpoint::new(Addr::Host(HostId::from(h)), Svc::Cp);
+        e.spawn(cp("cp-1"), Box::new(PingActor::new(&l1).claims_vip()));
+        e.kill(&cp("cp-1"));
+        e.spawn(ep("a"), Box::new(PingActor::new(&la).pings(Endpoint::new(Addr::Vip, Svc::Cp))));
+        e.run_for(10);
+        assert!(l1.lock().unwrap().is_empty(), "dead claimant receives nothing");
+
+        e.spawn(cp("cp-2"), Box::new(PingActor::new(&l2).claims_vip()));
+        e.spawn(ep("b"), Box::new(PingActor::new(&la).pings(Endpoint::new(Addr::Vip, Svc::Cp))));
+        e.run_for(10);
+        assert_eq!(*l2.lock().unwrap(), vec![Seen::Msg { msg: Msg::Ping(7), from: ep("b"), at: 11 }]);
+    }
+
+    struct CountClaims(Vec<HostId>);
+    impl Deliver for CountClaims {
+        fn route(&mut self, _: &Endpoint, _: &Endpoint, _: &NetworkId) -> Option<(Endpoint, u64)> {
+            None
+        }
+        fn claim_vip(&mut self, host: &HostId) {
+            self.0.push(host.clone());
+        }
+    }
+
+    #[test]
+    fn claims_are_forwarded_to_deliver_and_it_is_reachable_by_type() {
+        let mut e = Engine::new(1);
+        e.set_deliver(Box::new(CountClaims(vec![])));
+        e.spawn(ep("cp-1"), Box::new(PingActor::new(&log()).claims_vip()));
+        assert_eq!(e.deliver::<CountClaims>().unwrap().0, [HostId::from("cp-1")]);
+        assert!(e.deliver::<AlwaysDeliver>().is_none());
+        e.deliver_mut::<CountClaims>().unwrap().0.clear();
+        assert!(e.deliver::<CountClaims>().unwrap().0.is_empty());
     }
 
     #[test]

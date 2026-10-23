@@ -1,0 +1,233 @@
+//! Logical networks, host network configuration and switch port
+//! configuration. A host's [`HostNetworkConfig`] says which links it builds
+//! from its NICs and which networks ride on them, tagged or untagged.
+
+use crate::hardware::HardwareProfile;
+use crate::ids::{NetworkId, PortName};
+use ipnet::Ipv4Net;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::net::Ipv4Addr;
+use ts_rs::TS;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum NetworkPurpose {
+    Mgmt,
+    Storage,
+    Migration,
+    Vm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct LogicalNetwork {
+    pub id: NetworkId,
+    pub purpose: NetworkPurpose,
+    pub vlan: u16,
+    #[ts(type = "string")]
+    pub subnet: Ipv4Net,
+    pub mtu: u16,
+}
+
+/// The seed networks every cluster starts with (Global Constraints table).
+pub fn seed_networks() -> Vec<LogicalNetwork> {
+    let net = |id: &str, purpose, vlan, subnet: &str, mtu| LogicalNetwork {
+        id: NetworkId::from(id),
+        purpose,
+        vlan,
+        subnet: subnet.parse().expect("seed subnet is valid"),
+        mtu,
+    };
+    vec![
+        net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500),
+        net("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000),
+        net("migration", NetworkPurpose::Migration, 30, "10.30.0.0/22", 9000),
+        net("vm-lan", NetworkPurpose::Vm, 100, "10.100.0.0/22", 1500),
+        net("vm-iot", NetworkPurpose::Vm, 110, "10.110.0.0/24", 1500),
+    ]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum BondMode {
+    Lacp,
+    ActiveBackup,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum LinkKind {
+    Single(PortName),
+    Bond { members: Vec<PortName>, mode: BondMode },
+}
+
+impl LinkKind {
+    /// The physical ports this link sends frames out of.
+    pub fn ports(&self) -> &[PortName] {
+        match self {
+            LinkKind::Single(p) => std::slice::from_ref(p),
+            LinkKind::Bond { members, .. } => members,
+        }
+    }
+}
+
+/// A host-side L2 link: one NIC, or a bond of several.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Link {
+    pub name: String,
+    pub kind: LinkKind,
+    pub mtu: u16,
+}
+
+/// A logical network carried on a link. Tagged attachments send 802.1Q
+/// frames with the network's VLAN; untagged ones rely on the switch port's
+/// access or native VLAN.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct Attachment {
+    pub network: NetworkId,
+    pub link: String,
+    pub tagged: bool,
+    pub ip: Option<Ipv4Addr>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct HostNetworkConfig {
+    pub links: Vec<Link>,
+    pub attachments: Vec<Attachment>,
+}
+
+impl HostNetworkConfig {
+    pub fn link(&self, name: &str) -> Option<&Link> {
+        self.links.iter().find(|l| l.name == name)
+    }
+}
+
+/// The config a fresh host boots with: `mgmt` untagged on `eth0` at MTU 1500,
+/// address from DHCP. Every catalogue profile has an `eth0`; a profile
+/// without one falls back to its first NIC.
+pub fn bootstrap_config(p: &HardwareProfile) -> HostNetworkConfig {
+    let nic = p.nics.iter().find(|n| n.name == "eth0").or(p.nics.first()).expect("profile has a NIC");
+    HostNetworkConfig {
+        links: vec![Link { name: nic.name.clone(), kind: LinkKind::Single(PortName::new(&nic.name)), mtu: 1500 }],
+        attachments: vec![Attachment {
+            network: NetworkId::from("mgmt"),
+            link: nic.name.clone(),
+            tagged: false,
+            ip: None,
+        }],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum PortMode {
+    /// Untagged frames join this VLAN; tagged frames are dropped.
+    Access(u16),
+    /// Tagged frames are accepted for VLANs in `allowed`; untagged frames
+    /// join `native` (dropped when `None`).
+    Trunk { native: Option<u16>, allowed: BTreeSet<u16> },
+}
+
+/// Configuration of one switch port. This is the switch's ground truth in
+/// the simulator and, from Task 12, what the switch reports when polled.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct SwitchPortCfg {
+    pub mode: PortMode,
+    pub mtu: u16,
+    pub lacp_group: Option<String>,
+    pub admin_up: bool,
+}
+
+impl SwitchPortCfg {
+    /// Whether a frame entering this port lands on `vlan`: a tagged frame
+    /// needs a trunk allowing `vlan`; an untagged one takes the access or
+    /// native VLAN, which must equal `vlan`. Ignores `admin_up` and MTU.
+    pub fn accepts(&self, vlan: u16, tagged: bool) -> bool {
+        match (&self.mode, tagged) {
+            (PortMode::Access(v), false) => *v == vlan,
+            (PortMode::Access(_), true) => false,
+            (PortMode::Trunk { native, .. }, false) => *native == Some(vlan),
+            (PortMode::Trunk { allowed, .. }, true) => allowed.contains(&vlan),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hardware::{ProfileId, profile};
+
+    #[test]
+    fn seed_networks_match_global_constraints() {
+        let got: Vec<_> = seed_networks()
+            .into_iter()
+            .map(|n| (n.id.to_string(), n.purpose, n.vlan, n.subnet.to_string(), n.mtu))
+            .collect();
+        let want = [
+            ("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500),
+            ("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000),
+            ("migration", NetworkPurpose::Migration, 30, "10.30.0.0/22", 9000),
+            ("vm-lan", NetworkPurpose::Vm, 100, "10.100.0.0/22", 1500),
+            ("vm-iot", NetworkPurpose::Vm, 110, "10.110.0.0/24", 1500),
+        ]
+        .map(|(id, p, v, s, m)| (id.to_string(), p, v, s.to_string(), m));
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn bootstrap_is_untagged_mgmt_on_eth0() {
+        for id in [ProfileId::Ms01, ProfileId::MiniPc, ProfileId::Pi5, ProfileId::Rk3588] {
+            let cfg = bootstrap_config(&profile(id, 0));
+            assert_eq!(
+                cfg,
+                HostNetworkConfig {
+                    links: vec![Link {
+                        name: "eth0".into(),
+                        kind: LinkKind::Single(PortName::from("eth0")),
+                        mtu: 1500
+                    }],
+                    attachments: vec![Attachment {
+                        network: NetworkId::from("mgmt"),
+                        link: "eth0".into(),
+                        tagged: false,
+                        ip: None
+                    }],
+                },
+                "{id:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn port_acceptance_rules() {
+        let cfg = |mode| SwitchPortCfg { mode, mtu: 1500, lacp_group: None, admin_up: true };
+        let access = cfg(PortMode::Access(1));
+        assert!(access.accepts(1, false));
+        assert!(!access.accepts(1, true), "access ports drop tagged frames");
+        assert!(!access.accepts(20, false));
+
+        let trunk = cfg(PortMode::Trunk { native: Some(1), allowed: [20, 30].into() });
+        assert!(trunk.accepts(1, false), "untagged joins the native VLAN");
+        assert!(trunk.accepts(20, true));
+        assert!(!trunk.accepts(100, true), "VLAN not in the allowed set");
+        assert!(!trunk.accepts(20, false));
+
+        let no_native = cfg(PortMode::Trunk { native: None, allowed: [1].into() });
+        assert!(!no_native.accepts(1, false), "no native VLAN drops untagged frames");
+        assert!(no_native.accepts(1, true));
+    }
+
+    #[test]
+    fn network_serializes_subnet_as_string() {
+        let json = serde_json::to_value(&seed_networks()[0]).unwrap();
+        assert_eq!(json["subnet"], "10.0.0.0/22");
+        assert_eq!(json["purpose"], "Mgmt");
+        let back: LogicalNetwork = serde_json::from_value(json).unwrap();
+        assert_eq!(back, seed_networks()[0]);
+    }
+}

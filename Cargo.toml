@@ -12,3 +12,4 @@ serde_json = "1"
 ts-rs = "12"
 rand = "0.9"
 rand_chacha = "0.9"
+ipnet = { version = "2", features = ["serde"] }
