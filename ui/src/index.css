@@ -409,3 +409,185 @@ button:disabled:hover {
   gap: 8px 32px;
   padding-bottom: 6px;
 }
+
+.view-switch {
+  display: flex;
+  gap: 4px;
+  padding: 8px 16px 0;
+}
+
+.topo-scroll {
+  overflow: auto;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 4px;
+}
+
+.topo-legend {
+  display: flex;
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 12px;
+}
+
+.topo-legend li {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* Utilisation is magnitude: one blue hue, light to dark (dataviz ordinal ramp, steps 250/450/700). */
+.edge {
+  stroke-width: 2;
+  fill: none;
+}
+
+.edge.low {
+  stroke: #86b6ef;
+}
+
+.edge.mid {
+  stroke: #2a78d6;
+}
+
+.edge.high {
+  stroke: #0d366b;
+  stroke-width: 3;
+}
+
+/* State is reserved for status colour plus a pattern, never colour alone. */
+.edge.mismatch {
+  stroke: var(--bad);
+  stroke-width: 2.5;
+  stroke-dasharray: 7 4;
+}
+
+.edge.down {
+  stroke: #98a2b3;
+  stroke-dasharray: 2 4;
+}
+
+.edge-mark circle {
+  fill: var(--panel);
+  stroke: var(--bad);
+  stroke-width: 2;
+}
+
+.edge-mark text {
+  font-size: 11px;
+  font-weight: 700;
+  fill: var(--bad);
+}
+
+.topo-node {
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.topo-node rect {
+  fill: var(--panel);
+  stroke: var(--muted);
+  stroke-width: 1.5;
+}
+
+.topo-node.core rect,
+.topo-node.access rect {
+  fill: #eef2fb;
+  stroke: var(--accent);
+}
+
+.topo-node.core text,
+.topo-node.access text,
+.topo-node.group text:first-of-type {
+  font-weight: 600;
+}
+
+.topo-node.selected rect {
+  stroke-width: 3;
+}
+
+.topo-node.host.lc-Ready rect {
+  stroke: var(--ok);
+}
+
+.topo-node.host.lc-NotReady rect {
+  stroke: var(--bad);
+  fill: #fdecea;
+}
+
+.topo-node.host.lc-Pending rect,
+.topo-node.host.lc-Approved rect,
+.topo-node.host.lc-Provisioning rect {
+  stroke: var(--warn);
+}
+
+.topo-node.host.lc-Cordoned rect,
+.topo-node.host.lc-Draining rect,
+.topo-node.host.lc-Drained rect {
+  stroke: #7c5cc4;
+}
+
+.topo-node text {
+  fill: var(--text);
+}
+
+.topo-node text.bad {
+  fill: var(--bad);
+}
+
+.topo-node text.muted {
+  fill: var(--muted);
+}
+
+.switch-drawer {
+  width: 520px;
+}
+
+table.ports {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+table.ports th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+}
+
+table.ports td,
+table.ports th {
+  padding: 2px 6px 2px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+table.ports tr.selected {
+  background: #eef2fb;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.form-grid {
+  display: grid;
+  grid-template-columns: 90px 1fr;
+  gap: 6px 8px;
+  align-items: center;
+  font-size: 13px;
+}
+
+label.inline {
+  font-weight: normal;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.fixes {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+}

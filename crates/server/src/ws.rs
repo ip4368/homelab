@@ -8,7 +8,7 @@ use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use control::proto::MetricSample;
-use control::state::{Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, Object, ObjectRef, SwitchObj};
+use control::state::{Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, NetworkObj, Object, ObjectRef, Rollout, SwitchObj, TemplateObj};
 use model::HostId;
 use serde::Serialize;
 use sim::truth::GroundTruth;
@@ -30,6 +30,9 @@ pub struct ViewSnapshot {
     pub tokens: Vec<JoinToken>,
     pub rules: Vec<AutoApproveRule>,
     pub switches: Vec<SwitchObj>,
+    pub networks: Vec<NetworkObj>,
+    pub templates: Vec<TemplateObj>,
+    pub rollouts: Vec<Rollout>,
     pub alerts: Vec<Alert>,
     pub events: Vec<Event>,
     pub cp: CpInfo,
@@ -49,6 +52,9 @@ impl ViewSnapshot {
             tokens: s.tokens.values().cloned().collect(),
             rules: s.rules.values().cloned().collect(),
             switches: s.switches.values().cloned().collect(),
+            networks: s.networks.values().cloned().collect(),
+            templates: s.templates.values().cloned().collect(),
+            rollouts: s.rollouts.values().cloned().collect(),
             alerts: s.alerts.values().cloned().collect(),
             events: s.events.values().cloned().collect(),
             cp: s.cp.clone(),
@@ -266,6 +272,22 @@ mod tests {
         view.merge(leader.changes_since(view.version));
         let ServerMsg::Delta { upserts, .. } = conn.next(&published(&view, 20)) else { panic!() };
         assert!(matches!(upserts.as_slice(), [Object::Switch(s)] if s.last_seen == 61_000), "{upserts:?}");
+    }
+
+    #[test]
+    fn networks_templates_and_rollouts_travel_in_snapshots() {
+        let mut leader = ClusterState::new();
+        let mut view = ClusterView::default();
+        for n in model::seed_networks() {
+            leader.apply(1, Command::UpsertNetwork { network: n }).unwrap();
+        }
+        for t in model::seed_templates() {
+            leader.apply(1, Command::UpsertTemplate { template: t }).unwrap();
+        }
+        view.merge(leader.changes_since(0));
+        let (_, first) = Connection::open(&published(&view, 10));
+        let ServerMsg::Snapshot { view: snap, .. } = first else { panic!("{first:?}") };
+        assert_eq!((snap.networks.len(), snap.templates.len(), snap.rollouts.len()), (5, 3, 0));
     }
 
     #[test]

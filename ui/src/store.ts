@@ -7,11 +7,14 @@ import type { GroundTruth } from './gen/GroundTruth'
 import type { HostObj } from './gen/HostObj'
 import type { JoinToken } from './gen/JoinToken'
 import type { MetricSample } from './gen/MetricSample'
+import type { NetworkObj } from './gen/NetworkObj'
 import type { Object as ClusterObject } from './gen/Object'
 import type { ObjectRef } from './gen/ObjectRef'
+import type { Rollout } from './gen/Rollout'
 import type { ServerMsg } from './gen/ServerMsg'
 import type { SimInfo } from './gen/SimInfo'
 import type { SwitchObj } from './gen/SwitchObj'
+import type { TemplateObj } from './gen/TemplateObj'
 
 /** The server's wire message, as sent over `/api/ws`. */
 export type WsMessage = ServerMsg
@@ -31,8 +34,12 @@ export interface View {
   hosts: Record<string, HostObj>
   tokens: Record<string, JoinToken>
   rules: Record<string, AutoApproveRule>
-  /** As observed by the control plane polling them; Task 17 renders them. */
+  /** As observed by the control plane polling them. */
   switches: Record<string, SwitchObj>
+  networks: Record<string, NetworkObj>
+  templates: Record<string, TemplateObj>
+  /** Every rollout, finished ones included. */
+  rollouts: Record<string, Rollout>
   alerts: Record<string, Alert>
   /** Oldest first, at most EVENT_CAP. */
   events: ClusterEvent[]
@@ -77,6 +84,9 @@ function initialState(): UiState {
       tokens: {},
       rules: {},
       switches: {},
+      networks: {},
+      templates: {},
+      rollouts: {},
       alerts: {},
       events: [],
       cp: { voters: [], mode: 'Suggest', version: 0 },
@@ -116,6 +126,9 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
     tokens: byKey(s.tokens, (t) => t.token),
     rules: byKey(s.rules, (r) => r.id),
     switches: byKey(s.switches, (sw) => sw.id),
+    networks: byKey(s.networks, (n) => n.id),
+    templates: byKey(s.templates, (t) => t.id),
+    rollouts: byKey(s.rollouts, (r) => r.id),
     alerts: byKey(s.alerts, (a) => a.id),
     events: capEvents([...s.events].sort((a, b) => a.seq - b.seq)),
     cp: s.cp,
@@ -125,7 +138,7 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
 
 /** Applies a delta's upserts and removals, copying only the slices that change. */
 function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
-  let { hosts, tokens, rules, switches, alerts, events, cp, metrics } = view
+  let { hosts, tokens, rules, switches, networks, templates, rollouts, alerts, events, cp, metrics } = view
   const upsertedEvents = new Map<number, ClusterEvent>()
   const removedEvents = new Set<number>()
   const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
@@ -153,6 +166,18 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
       case 'Switch':
         switches = edit(switches, copied)
         switches[o.id] = withoutTag(o)
+        break
+      case 'Network':
+        networks = edit(networks, copied)
+        networks[o.id] = withoutTag(o)
+        break
+      case 'Template':
+        templates = edit(templates, copied)
+        templates[o.id] = withoutTag(o)
+        break
+      case 'Rollout':
+        rollouts = edit(rollouts, copied)
+        rollouts[o.id] = withoutTag(o)
         break
       case 'Alert':
         alerts = edit(alerts, copied)
@@ -187,6 +212,18 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
         switches = edit(switches, copied)
         delete switches[r.id]
         break
+      case 'Network':
+        networks = edit(networks, copied)
+        delete networks[r.id]
+        break
+      case 'Template':
+        templates = edit(templates, copied)
+        delete templates[r.id]
+        break
+      case 'Rollout':
+        rollouts = edit(rollouts, copied)
+        delete rollouts[r.id]
+        break
       case 'Alert':
         alerts = edit(alerts, copied)
         delete alerts[r.id]
@@ -217,6 +254,9 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
     tokens,
     rules,
     switches,
+    networks,
+    templates,
+    rollouts,
     alerts,
     events,
     cp,

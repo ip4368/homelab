@@ -7,12 +7,15 @@ import type { HostId } from "./HostId";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
 import type { MetricSample } from "./MetricSample";
+import type { NetworkObj } from "./NetworkObj";
+import type { Rollout } from "./Rollout";
 import type { SwitchObj } from "./SwitchObj";
+import type { TemplateObj } from "./TemplateObj";
 
 /**
  * The client's whole view of the cluster, as lists.
  */
-export type ViewSnapshot = { version: number, leader: HostId | null, term: number, last_sync_at: number | null, hosts: Array<HostObj>, tokens: Array<JoinToken>, rules: Array<AutoApproveRule>, switches: Array<SwitchObj>, alerts: Array<Alert>, events: Array<Event>, cp: CpInfo, 
+export type ViewSnapshot = { version: number, leader: HostId | null, term: number, last_sync_at: number | null, hosts: Array<HostObj>, tokens: Array<JoinToken>, rules: Array<AutoApproveRule>, switches: Array<SwitchObj>, networks: Array<NetworkObj>, templates: Array<TemplateObj>, rollouts: Array<Rollout>, alerts: Array<Alert>, events: Array<Event>, cp: CpInfo, 
 /**
  * Latest sample per host.
  */

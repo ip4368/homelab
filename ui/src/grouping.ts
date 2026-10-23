@@ -12,10 +12,10 @@ export interface HostGroup {
 const byText = (a: string, b: string) => a.localeCompare(b, 'en', { numeric: true })
 
 /** The NIC a host's mgmt network rides on, whose LLDP neighbour is its access switch. */
-const MGMT_NIC = 'eth0'
+export const MGMT_NIC = 'eth0'
 
 /** The switch the host's mgmt port is cabled to, from its LLDP report; 'unknown' until it reports. */
-function mgmtSwitch(h: HostObj): string {
+export function mgmtSwitch(h: HostObj): string {
   return h.lldp?.find((n) => n.local_port === MGMT_NIC)?.switch ?? 'unknown'
 }
 

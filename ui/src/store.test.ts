@@ -37,6 +37,9 @@ function snapshot(over: Partial<ViewSnapshot> = {}, sim: Partial<SimInfo> = {}):
     tokens: [],
     rules: [],
     switches: [],
+    networks: [],
+    templates: [],
+    rollouts: [],
     alerts: [],
     events: [],
     cp: { voters: ['cp-1'], mode: 'Suggest', version: 1 },
@@ -145,6 +148,46 @@ describe('store', () => {
     expect(s.getState().view.switches).toEqual({})
     s.applyMessage(snapshot())
     expect(s.getState().view.switches).toEqual({})
+  })
+
+  it('stores networks, templates and rollouts from snapshots and deltas', () => {
+    const net = (mtu: number) => ({ id: 'storage', purpose: 'Storage', vlan: 20, subnet: '10.20.0.0/22', mtu, version: mtu })
+    const tpl = { id: 'ms01-standard', profile: 'Ms01', role: null, config: { links: [], attachments: [] }, version: 1 }
+    const rollout = { id: 'r1', state: 'Running', hosts: ['a'], version: 1 }
+    const s = createStore()
+    s.applyMessage(snapshot({ networks: [net(1500)] as never }))
+    expect(s.getState().view.networks.storage.mtu).toBe(1500)
+
+    s.applyMessage(
+      delta({
+        upserts: [
+          { type: 'Network', ...net(9000) },
+          { type: 'Template', ...tpl },
+          { type: 'Rollout', ...rollout },
+        ] as never,
+      }),
+    )
+    const v = s.getState().view
+    expect(v.networks.storage.mtu).toBe(9000)
+    expect(v.networks.storage).not.toHaveProperty('type')
+    expect(v.templates['ms01-standard'].profile).toBe('Ms01')
+    expect(v.templates['ms01-standard']).not.toHaveProperty('type')
+    expect(v.rollouts.r1.hosts).toEqual(['a'])
+    expect(v.rollouts.r1).not.toHaveProperty('type')
+
+    s.applyMessage(
+      delta({
+        removed: [
+          { kind: 'Network', id: 'storage' },
+          { kind: 'Template', id: 'ms01-standard' },
+          { kind: 'Rollout', id: 'r1' },
+        ],
+      }),
+    )
+    const after = s.getState().view
+    expect([after.networks, after.templates, after.rollouts].map((r) => Object.keys(r).length)).toEqual([0, 0, 0])
+    s.applyMessage(snapshot())
+    expect(s.getState().view.rollouts).toEqual({})
   })
 
   it('keeps events ordered by seq and capped at the newest EVENT_CAP', () => {
