@@ -11,7 +11,8 @@
 //! * **Stale instances.** An instance that a host's heartbeat lists but the
 //!   state does not assign to that host (its VM or pod moved elsewhere, is
 //!   pending, or was deleted) is stopped with `StopInstance`, at most every
-//!   [`RESEND_MS`]. There is no fencing: until the old host is heard from
+//!   [`RESEND_MS`]; so is everything a removed host still runs, until it
+//!   reports nothing or falls silent. There is no fencing: until the old host is heard from
 //!   again a failed-over VM may run twice (split brain), which only ground
 //!   truth can show.
 

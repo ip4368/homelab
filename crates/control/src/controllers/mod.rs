@@ -113,9 +113,11 @@ pub struct Volatile {
     pub pending_joins: BTreeMap<u64, PendingJoin>,
     /// When a "join rejected" event was last recorded, per host.
     pub join_rejected_at: BTreeMap<HostId, SimTime>,
-    /// The instances each host's agent last said it runs.
+    /// The instances each host's agent last said it runs. A removed host's
+    /// are kept until it reports nothing or falls silent
+    /// ([`Volatile::note_removed_host`], [`Volatile::forget_silent_removed`]).
     pub instances: BTreeMap<HostId, BTreeSet<String>>,
-    /// The volume replicas each host's agent last said it holds.
+    /// The volume replicas each host's agent last said it holds; likewise.
     pub replicas: BTreeMap<HostId, Vec<ReplicaReport>>,
     /// The host each instance was last sent `StartInstance` or `MigrateIn` to, and when.
     pub instance_started: BTreeMap<String, (HostId, SimTime)>,
@@ -263,6 +265,51 @@ impl Volatile {
         if let Some(source) = self.copy_source.get(key).filter(|_| stalled) {
             self.failed_sources.entry(key.clone()).or_default().insert(source.clone());
         }
+    }
+
+    /// Files the heartbeat of a host that was removed: what it still runs and
+    /// holds, for the controllers to stop and delete. Once it reports
+    /// nothing, it is forgotten.
+    pub fn note_removed_host(&mut self, host: HostId, instances: BTreeSet<String>, replicas: Vec<ReplicaReport>) {
+        if instances.is_empty() && replicas.is_empty() {
+            self.forget_host(&host);
+        } else {
+            self.instances.insert(host.clone(), instances);
+            self.replicas.insert(host, replicas);
+        }
+    }
+
+    /// Forgets the hosts no longer in `state` that have not been heard from
+    /// for [`health::NOT_READY_AFTER_MS`] (powered off, or gone for good), so
+    /// they are not sent `StopInstance` and `DeleteReplica` forever.
+    pub fn forget_silent_removed(&mut self, state: &ClusterState, now: SimTime) {
+        let silent: BTreeSet<HostId> = self
+            .instances
+            .keys()
+            .chain(self.replicas.keys())
+            .filter(|h| !state.hosts.contains_key(*h) && now.saturating_sub(self.last_seen(h)) > health::NOT_READY_AFTER_MS)
+            .cloned()
+            .collect();
+        for h in &silent {
+            self.forget_host(h);
+        }
+    }
+
+    /// Drops everything this leader holds about `host`.
+    fn forget_host(&mut self, host: &HostId) {
+        self.last_heartbeat.remove(host);
+        self.metrics.remove(host);
+        self.host_reports.remove(host);
+        self.lldp_seen.remove(host);
+        self.net_generation.remove(host);
+        self.net_results.remove(host);
+        self.net_pushed.remove(host);
+        self.instances.remove(host);
+        self.replicas.remove(host);
+        self.instance_stopped.retain(|(h, _), _| h != host);
+        self.replica_deleted.retain(|(_, h), _| h != host);
+        self.copy_progress.retain(|(_, h), _| h != host);
+        self.copy_source.retain(|(_, h), _| h != host);
     }
 
     /// Records that the replica sent `msg` to `to`, for controllers that pace

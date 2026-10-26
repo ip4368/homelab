@@ -42,7 +42,7 @@
 //! * **Cleanup.** A replica a host reports that its volume's status does not
 //!   list as live, or whose volume is gone, gets `DeleteReplica` (at most
 //!   every [`RESEND_MS`]), except a stale one while its volume has no healthy
-//!   replica: it may yet be salvaged.
+//!   replica: it may yet be salvaged. A removed host's replicas count as unlisted.
 //! * **Alerts**, one per incident and volume: [`INSUFFICIENT_STORAGE_HOSTS`]
 //!   while too few storage hosts can take its replicas, [`VOLUME_DEGRADED`]
 //!   while fewer of them are healthy than it asks for, [`VOLUME_FAULTED`]
@@ -468,10 +468,11 @@ fn alert(
 /// not want there: the volume is gone, or its committed status does not
 /// list the host as live. A stale replica is kept while the volume has no
 /// healthy one on a host that is not `NotReady` (`usable`), for salvage. A `NotReady` host's report is old news; it is
-/// cleaned up once it is back.
+/// cleaned up once it is back. A removed host (gone from the state, but
+/// still reporting) is cleaned up too.
 fn delete_unwanted(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
     let mut out = vec![];
-    let back = |h: &HostId| state.hosts.get(h).is_some_and(|h| h.lifecycle != Lifecycle::NotReady);
+    let back = |h: &HostId| state.hosts.get(h).is_none_or(|h| h.lifecycle != Lifecycle::NotReady);
     for (host, reports) in v.replicas.iter().filter(|(h, _)| back(h)) {
         for rep in reports {
             let keep = state.volume_status.get(&rep.volume).is_some_and(|st| {

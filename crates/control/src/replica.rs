@@ -10,7 +10,7 @@ use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, Swit
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
-use crate::state::{ClusterState, Command, Lifecycle, NetworkResult};
+use crate::state::{ClusterState, Command, Lifecycle, NetworkResult, ObjectKind};
 use model::{HostId, Inventory};
 use std::collections::BTreeSet;
 
@@ -165,6 +165,7 @@ impl CpReplica {
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
+        v.forget_silent_removed(&self.state, now);
         let mut actions = controllers::run_all(&self.state, v, now);
         let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
         v.last_run = Some(now);
@@ -278,6 +279,11 @@ impl CpReplica {
         let Some(v) = &mut self.volatile else { return };
         v.last_heartbeat.insert(host.clone(), now);
         if !self.state.hosts.contains_key(&host) {
+            // A removed host's agent runs on: it is told to stop and delete
+            // what it still runs and holds. A host that never joined is ignored.
+            if self.state.was_removed(ObjectKind::Host, host.as_str()) {
+                v.note_removed_host(host, instances.into_iter().collect(), replicas);
+            }
             return;
         }
         v.net_generation.insert(host.clone(), net_generation);
@@ -705,20 +711,76 @@ mod tests {
         let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
         rig.elect();
         rig.ack();
-        let replicas = vec![ReplicaReport { volume: "gone".into(), disk: "nvme0".into(), pct: 100, copied_bytes: 0, copying: false }];
-        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0, instances: vec!["vm/x".into()], replicas };
-        rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), hb);
-        let stops = |rig: &mut Rig| {
-            rig.controllers();
-            let sent = std::mem::take(&mut rig.ctx.sent);
-            let to_h9 = |want: fn(&Msg) -> bool| sent.iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && want(m)).count();
-            (to_h9(|m| matches!(m, Msg::StopInstance(_))), to_h9(|m| matches!(m, Msg::DeleteReplica { .. })))
-        };
-        assert_eq!(stops(&mut rig), (1, 1), "h9 runs an instance and holds a replica nothing wants");
+        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
+        assert_eq!(sent_to_h9(&mut rig), (1, 1), "h9 runs an instance and holds a replica nothing wants");
         rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
         rig.advance(crate::controllers::scheduler::RESEND_MS);
         // Forgetting what h9 runs would leave its VMs running beside their restarted copies.
-        assert_eq!(stops(&mut rig).0, 1, "a removed host still runs what it ran until told to stop");
+        assert_eq!(sent_to_h9(&mut rig), (1, 1), "a removed host still runs and holds what it did until told otherwise");
+    }
+
+    /// The (StopInstance, DeleteReplica) counts the controllers send h9 in one run.
+    fn sent_to_h9(rig: &mut Rig) -> (usize, usize) {
+        rig.controllers();
+        let sent = std::mem::take(&mut rig.ctx.sent);
+        let to_h9 = |want: fn(&Msg) -> bool| sent.iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && want(m)).count();
+        (to_h9(|m| matches!(m, Msg::StopInstance(_))), to_h9(|m| matches!(m, Msg::DeleteReplica { .. })))
+    }
+
+    fn h9_heartbeat(rig: &mut Rig, instances: &[&str], volumes: &[&str]) {
+        let replicas = volumes.iter().map(|v| ReplicaReport { volume: (*v).into(), disk: "nvme0".into(), pct: 100, copied_bytes: 0, copying: false }).collect();
+        let instances = instances.iter().map(|i| (*i).into()).collect();
+        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0, instances, replicas };
+        rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), hb);
+    }
+
+    fn knows_h9(rig: &Rig) -> bool {
+        let v = rig.r.volatile.as_ref().unwrap();
+        v.instances.contains_key(&hid("h9")) || v.replicas.contains_key(&hid("h9")) || v.last_heartbeat.contains_key(&hid("h9"))
+    }
+
+    #[test]
+    fn a_removed_host_is_cleaned_up_until_it_reports_nothing() {
+        use crate::controllers::scheduler::RESEND_MS;
+        let mut rig = Rig::new(orphaned_alert());
+        rig.elect();
+        rig.ack();
+        // h9 was removed before this leader heard from it: its heartbeats still count.
+        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
+        assert_eq!(sent_to_h9(&mut rig), (1, 1));
+        rig.advance(RESEND_MS);
+        h9_heartbeat(&mut rig, &[], &["gone"]);
+        assert_eq!(sent_to_h9(&mut rig), (0, 1), "the replica is still there");
+        rig.advance(RESEND_MS);
+        h9_heartbeat(&mut rig, &[], &[]);
+        assert_eq!(sent_to_h9(&mut rig), (0, 0));
+        assert!(!knows_h9(&rig), "nothing left on h9: forgotten");
+        rig.advance(RESEND_MS);
+        assert_eq!(sent_to_h9(&mut rig), (0, 0), "and not sent anything again");
+    }
+
+    #[test]
+    fn a_removed_host_that_falls_silent_is_forgotten() {
+        let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
+        rig.elect();
+        rig.ack();
+        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
+        rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
+        assert_eq!(sent_to_h9(&mut rig), (1, 1));
+        rig.advance(NOT_READY_AFTER_MS);
+        assert_eq!(sent_to_h9(&mut rig), (1, 1), "silent for no longer than a member may be before NotReady");
+        rig.advance(1);
+        assert_eq!(sent_to_h9(&mut rig), (0, 0), "silent for longer: powered off, or gone for good");
+        assert!(!knows_h9(&rig));
+    }
+
+    #[test]
+    fn a_host_that_never_joined_is_not_cleaned_up() {
+        let mut rig = Rig::new(vec![]);
+        rig.elect();
+        rig.ack();
+        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
+        assert_eq!(sent_to_h9(&mut rig), (0, 0), "not this cluster's to touch");
     }
 
     #[test]

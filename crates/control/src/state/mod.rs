@@ -460,6 +460,11 @@ impl ClusterState {
         self.tombstones.push((v, ObjectRef { kind, id }));
     }
 
+    /// Whether the object `kind`/`id` was removed and not created again.
+    pub fn was_removed(&self, kind: ObjectKind, id: &str) -> bool {
+        self.tombstones.iter().any(|(_, r)| r.kind == kind && r.id == id)
+    }
+
     /// An object is (re)created: a tombstone for the same ref would contradict
     /// the upsert, so drop it.
     pub(crate) fn revive(&mut self, kind: ObjectKind, id: &str) {
