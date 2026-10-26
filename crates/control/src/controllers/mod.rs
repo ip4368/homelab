@@ -9,6 +9,7 @@
 //! lags what earlier leaders committed.
 
 pub mod alerts;
+pub mod directory;
 pub mod drain;
 pub mod failover;
 pub mod health;
@@ -139,6 +140,8 @@ pub struct Volatile {
     /// copy and (less strongly) for the volume's other copies. Forgotten
     /// once the volume is proposed healthy.
     pub failed_sources: BTreeMap<(String, HostId), BTreeSet<HostId>>,
+    /// The address directory last sent to the agents, and when.
+    pub directory_sent: Option<(directory::Directory, SimTime)>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -174,6 +177,7 @@ impl Volatile {
             copy_progress: BTreeMap::new(),
             copy_source: BTreeMap::new(),
             failed_sources: BTreeMap::new(),
+            directory_sent: None,
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -341,6 +345,12 @@ impl Volatile {
                     self.copy_progress.entry(key).or_insert((0, now));
                 }
             }
+            (Addr::Host(_), Msg::Directory { hosts }) => {
+                // One run sends it to every member: record it once, not once per member.
+                if self.directory_sent.as_ref().is_none_or(|(sent, at)| *at != now || sent != hosts) {
+                    self.directory_sent = Some((hosts.clone(), now));
+                }
+            }
             (Addr::Host(id), Msg::StopInstance(instance)) => {
                 self.instance_stopped.insert((id.clone(), instance.clone()), now);
             }
@@ -364,5 +374,6 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(storage::run(state, volatile, now));
     out.extend(scheduler::run(state, volatile, now));
     out.extend(failover::run(state, volatile, now));
+    out.extend(directory::run(state, volatile, now));
     out
 }

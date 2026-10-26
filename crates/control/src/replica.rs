@@ -78,6 +78,11 @@ impl CpReplica {
         self.raft.as_ref().map(|r| r.learners().clone()).unwrap_or_default()
     }
 
+    /// The cluster state as this replica has applied it (possibly behind the leader's).
+    pub fn state(&self) -> &ClusterState {
+        &self.state
+    }
+
     /// The Raft state this replica has persisted.
     pub fn durable(&self) -> &Durable<LogCmd> {
         match &self.raft {
@@ -483,7 +488,8 @@ impl Actor for CpReplica {
             | Msg::AbortMigration(_)
             | Msg::CreateReplica { .. }
             | Msg::DeleteReplica { .. }
-            | Msg::StartCpReplica { .. } => {}
+            | Msg::StartCpReplica { .. }
+            | Msg::Directory { .. } => {}
         }
     }
 

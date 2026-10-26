@@ -257,7 +257,14 @@ pub enum Msg {
     JoinResp(Result<(), String>),
     /// Leader to agent: run this network config. The agent keeps its previous
     /// one and puts it back unless confirmed within its revert timeout.
-    ApplyNetwork { generation: u64, config: HostNetworkConfig },
+    /// `networks` defines the networks it attaches (VLAN, subnet, MTU), which
+    /// a real host needs to build them.
+    ApplyNetwork {
+        generation: u64,
+        config: HostNetworkConfig,
+        #[serde(default)]
+        networks: Vec<model::LogicalNetwork>,
+    },
     /// Agent to the VIP: what became of `ApplyNetwork { generation }`. An
     /// `Applied` report is sent over the new config, so its arrival proves mgmt works.
     NetworkStatus { generation: u64, result: NetworkResult },
@@ -287,6 +294,10 @@ pub enum Msg {
     /// the current `voters`, to catch up as a learner. A host that already
     /// runs one keeps it.
     StartCpReplica { voters: BTreeSet<HostId> },
+    /// Leader to every member agent: every member host's static addresses,
+    /// by network ([`crate::controllers::directory`]). Control logic ignores
+    /// it; a real host's runtime resolves `Addr::Host` with it.
+    Directory { hosts: BTreeMap<HostId, BTreeMap<NetworkId, std::net::Ipv4Addr>> },
     /// Agent to the VIP, every metrics interval.
     Metrics { host: HostId, sample: MetricSample },
     /// Leader to a switch's management interface, every poll interval.

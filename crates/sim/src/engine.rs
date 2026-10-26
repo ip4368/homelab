@@ -217,7 +217,8 @@ impl HostOs for EngineCtx<'_> {
     fn lldp(&self) -> Vec<LldpNeighbor> {
         self.fabric().expect(NO_HOST).world().lldp(&self.host_id())
     }
-    fn apply_network(&mut self, cfg: HostNetworkConfig) {
+    fn apply_network(&mut self, cfg: HostNetworkConfig, _networks: Vec<model::LogicalNetwork>) {
+        // The simulated fabric carries any network: definitions change nothing.
         self.hw_mut().applied_net = cfg;
     }
     fn applied_network(&self) -> HostNetworkConfig {

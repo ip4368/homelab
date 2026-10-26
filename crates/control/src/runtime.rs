@@ -65,9 +65,16 @@ pub trait HostOs {
     /// What the host's LLDP daemon hears now: the switch port on the far end
     /// of every cable whose link is up, in NIC order.
     fn lldp(&self) -> Vec<LldpNeighbor>;
-    fn apply_network(&mut self, cfg: HostNetworkConfig);
+    /// Runs `cfg`, with `networks` as the definitions (VLAN, subnet, MTU)
+    /// of the networks it attaches, on top of those it knew. A change to
+    /// either is a change to apply.
+    fn apply_network(&mut self, cfg: HostNetworkConfig, networks: Vec<model::LogicalNetwork>);
     /// The network config the OS is running; empty if none was ever applied.
     fn applied_network(&self) -> HostNetworkConfig;
+    /// The network definitions the running config was applied with.
+    fn applied_networks(&self) -> Vec<model::LogicalNetwork> {
+        vec![]
+    }
     /// Writes the running network config as the one the host boots with
     /// (until then, a reboot brings back the previous one).
     fn persist_network(&mut self);

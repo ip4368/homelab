@@ -47,7 +47,7 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         if host.net.desired.as_ref() != Some(&desired) {
             out.push(Action::Propose(Command::SetDesiredNetwork { id: host.id.clone(), config: desired.clone() }));
         } else {
-            out.extend(push(host, v, now));
+            out.extend(push(host, &networks, v, now));
         }
         out.extend(record(host, v));
         out.extend(assess(state, host, &desired, &networks, &owners));
@@ -59,6 +59,11 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         }
     }
     out
+}
+
+/// The definitions of the networks `config` attaches, in `networks` order.
+pub fn attached_networks(config: &HostNetworkConfig, networks: &[LogicalNetwork]) -> Vec<LogicalNetwork> {
+    networks.iter().filter(|n| config.attachments.iter().any(|a| a.network == n.id)).cloned().collect()
 }
 
 /// Hosts the controller manages: provisioned and not removed.
@@ -100,7 +105,8 @@ fn base_template(state: &ClusterState, host: &HostObj) -> NetworkTemplate {
 /// applied in the log, or pushed by this leader, and with no report here.
 /// The agent may be on trial with its report lost (or sent to an earlier
 /// leader); it answers again and is confirmed before its trial runs out.
-fn push(host: &HostObj, v: &Volatile, now: SimTime) -> Option<Action> {
+/// The push carries the definitions of the networks the config attaches.
+fn push(host: &HostObj, networks: &[LogicalNetwork], v: &Volatile, now: SimTime) -> Option<Action> {
     let net = &host.net;
     let (generation, config) = (net.desired_generation, net.desired.as_ref()?);
     let report = v.net_results.get(&host.id).filter(|(g, _)| *g == generation).map(|(_, r)| r);
@@ -114,7 +120,8 @@ fn push(host: &HostObj, v: &Volatile, now: SimTime) -> Option<Action> {
     let recent = v.net_pushed.get(&host.id).is_some_and(|&(g, at)| g == generation && now < at + PUSH_RETRY_MS);
     ((running < generation || unconfirmed) && !recent).then(|| {
         let agent = Endpoint::new(Addr::Host(host.id.clone()), Svc::Agent);
-        Action::Send(agent, mgmt(), Msg::ApplyNetwork { generation, config: config.clone() })
+        let networks = attached_networks(config, networks);
+        Action::Send(agent, mgmt(), Msg::ApplyNetwork { generation, config: config.clone(), networks })
     })
 }
 
@@ -471,8 +478,14 @@ mod tests {
         step(&mut s, &mut v, 0);
         let out = step(&mut s, &mut v, 1000);
         assert_eq!(pushes(&out), [(hid("m"), 1)]);
-        let Some(Action::Send(_, _, Msg::ApplyNetwork { config, .. })) = out.iter().find(|a| matches!(a, Action::Send(..))) else { panic!() };
+        let Some(Action::Send(_, _, Msg::ApplyNetwork { config, networks, .. })) = out.iter().find(|a| matches!(a, Action::Send(..))) else { panic!() };
         assert_eq!(Some(config), s.hosts[&hid("m")].net.desired.as_ref(), "the stored desired config is what is pushed");
+        let mut attached: Vec<_> = config.attachments.iter().map(|a| a.network.clone()).collect();
+        attached.sort();
+        attached.dedup();
+        let defined: Vec<_> = networks.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(defined, attached, "with the definitions of exactly the networks it attaches");
+        assert_eq!(networks.iter().find(|n| n.id.as_str() == "storage").map(|n| n.vlan), Some(20));
         assert!(pushes(&step(&mut s, &mut v, 2000)).is_empty(), "not again right away");
         assert_eq!(pushes(&step(&mut s, &mut v, 1000 + PUSH_RETRY_MS)), [(hid("m"), 1)], "the push may have been lost");
 

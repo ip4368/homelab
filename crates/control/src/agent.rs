@@ -13,7 +13,7 @@
 use crate::proto::{mgmt, InstanceSpec, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::NetworkResult;
-use model::network::{bootstrap_config, HostNetworkConfig};
+use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork};
 use model::{profile, HostId, Inventory};
 use std::collections::BTreeMap;
 
@@ -41,8 +41,9 @@ const MIGRATION: u64 = 4;
 struct Trial {
     generation: u64,
     since: SimTime,
-    /// The last confirmed config and its generation.
+    /// The last confirmed config, the network definitions it ran with, and its generation.
     previous: HostNetworkConfig,
+    previous_networks: Vec<LogicalNetwork>,
     previous_generation: u64,
 }
 
@@ -144,7 +145,7 @@ impl HostAgent {
     /// `ConfirmNetwork` keeps it, silence reverts it ([`Self::revert`]). A
     /// repeat of the running generation is answered again (the report may
     /// have been lost); an older one is ignored.
-    fn apply(&mut self, ctx: &mut dyn Ctx, generation: u64, config: HostNetworkConfig) {
+    fn apply(&mut self, ctx: &mut dyn Ctx, generation: u64, config: HostNetworkConfig, networks: Vec<LogicalNetwork>) {
         if generation < self.net_generation {
             return;
         }
@@ -157,12 +158,12 @@ impl HostAgent {
             return report(ctx, generation, NetworkResult::Failed(reason));
         }
         // A trial superseded before it was confirmed is no fallback: keep the last confirmed config.
-        let (previous, previous_generation) = match self.trial.take() {
-            Some(t) => (t.previous, t.previous_generation),
-            None => (os.applied_network(), self.net_generation),
+        let (previous, previous_networks, previous_generation) = match self.trial.take() {
+            Some(t) => (t.previous, t.previous_networks, t.previous_generation),
+            None => (os.applied_network(), os.applied_networks(), self.net_generation),
         };
-        os.apply_network(config);
-        self.trial = Some(Trial { generation, since: now, previous, previous_generation });
+        os.apply_network(config, networks);
+        self.trial = Some(Trial { generation, since: now, previous, previous_networks, previous_generation });
         self.net_generation = generation;
         report(ctx, generation, NetworkResult::Applied);
         ctx.set_timer(REVERT_MS, REVERT);
@@ -219,7 +220,7 @@ impl HostAgent {
         let now = ctx.now();
         let Some(t) = self.trial.take_if(|t| now >= t.since + REVERT_MS) else { return };
         if let Some(os) = ctx.host() {
-            os.apply_network(t.previous);
+            os.apply_network(t.previous, t.previous_networks);
         }
         self.net_generation = t.previous_generation;
         report(ctx, t.generation, NetworkResult::Reverted);
@@ -248,7 +249,8 @@ impl Actor for HostAgent {
             && os.applied_network().links.is_empty()
         {
             let inv = os.inventory();
-            os.apply_network(bootstrap_config(&profile(inv.profile, inv.variant)));
+            let networks = os.applied_networks();
+            os.apply_network(bootstrap_config(&profile(inv.profile, inv.variant)), networks);
         }
         self.send_join(ctx);
         ctx.set_timer(JOIN_RETRY_MS, JOIN);
@@ -257,12 +259,12 @@ impl Actor for HostAgent {
     fn on_message(&mut self, ctx: &mut dyn Ctx, _from: Endpoint, msg: Msg) {
         match msg {
             Msg::JoinResp(Ok(())) if self.token.is_some() => self.start_member(ctx),
-            Msg::ApplyNetwork { generation, config } => {
+            Msg::ApplyNetwork { generation, config, networks } => {
                 // Only members are told their config: this proves the join, if its answer was lost.
                 if self.token.is_some() {
                     self.start_member(ctx);
                 }
-                self.apply(ctx, generation, config);
+                self.apply(ctx, generation, config, networks);
             }
             Msg::ConfirmNetwork { generation } => {
                 // Like `netplan try` accepted: only now is the config written for the next boot.
@@ -344,6 +346,8 @@ mod tests {
 
     struct FakeOs {
         net: HostNetworkConfig,
+        /// The network definitions `net` was applied with.
+        networks: Vec<LogicalNetwork>,
         /// What the host boots with.
         boot: HostNetworkConfig,
         joined: bool,
@@ -367,11 +371,15 @@ mod tests {
         fn lldp(&self) -> Vec<LldpNeighbor> {
             self.lldp.clone()
         }
-        fn apply_network(&mut self, cfg: HostNetworkConfig) {
+        fn apply_network(&mut self, cfg: HostNetworkConfig, networks: Vec<LogicalNetwork>) {
             self.net = cfg;
+            self.networks = networks;
         }
         fn applied_network(&self) -> HostNetworkConfig {
             self.net.clone()
+        }
+        fn applied_networks(&self) -> Vec<LogicalNetwork> {
+            self.networks.clone()
         }
         fn persist_network(&mut self) {
             self.boot = self.net.clone();
@@ -443,6 +451,7 @@ mod tests {
             let os = FakeOs {
                 boot: net.clone(),
                 net,
+                networks: vec![],
                 joined: false,
                 lldp: vec![neighbor("sw-1", "p1")],
                 inventory: Inventory::from_profile(ProfileId::Pi5, 1),
@@ -598,7 +607,7 @@ mod tests {
     }
 
     fn apply(generation: u64, config: HostNetworkConfig) -> Msg {
-        Msg::ApplyNetwork { generation, config }
+        Msg::ApplyNetwork { generation, config, networks: vec![] }
     }
 
     fn status(generation: u64, result: NetworkResult) -> Msg {
@@ -649,6 +658,26 @@ mod tests {
         assert_eq!(a.net_generation(), 0);
         a.on_message(&mut ctx, VIP, Msg::ConfirmNetwork { generation: 1 });
         assert_eq!(ctx.os.net, previous, "a late confirmation changes nothing");
+    }
+
+    #[test]
+    fn a_change_to_network_definitions_alone_is_tried_and_reverted_with_them() {
+        let (mut a, mut ctx) = member();
+        let before = model::seed_networks();
+        a.on_message(&mut ctx, VIP, Msg::ApplyNetwork { generation: 1, config: sbc_config(), networks: before.clone() });
+        a.on_message(&mut ctx, VIP, Msg::ConfirmNetwork { generation: 1 });
+        ctx.take();
+        let mut after = before.clone();
+        after.iter_mut().find(|n| n.id.as_str() == "storage").unwrap().vlan = 21;
+        ctx.advance(&mut a, 1000);
+        a.on_message(&mut ctx, VIP, Msg::ApplyNetwork { generation: 2, config: sbc_config(), networks: after.clone() });
+        assert_eq!((ctx.os.net.clone(), ctx.os.networks.clone()), (sbc_config(), after), "the same config, on the new definitions");
+        assert_eq!(ctx.take(), [status(2, NetworkResult::Applied)]);
+        ctx.advance(&mut a, 1000 + REVERT_MS);
+        assert_eq!(ctx.os.networks, before, "unconfirmed: back on the definitions it ran with");
+        assert_eq!(ctx.take_statuses(), [status(2, NetworkResult::Reverted)]);
+        a.on_message(&mut ctx, VIP, Msg::ApplyNetwork { generation: 1, config: sbc_config(), networks: vec![] });
+        assert_eq!(ctx.os.networks, before, "a stale push changes no definitions");
     }
 
     #[test]
