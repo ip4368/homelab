@@ -46,7 +46,9 @@ Requirements: Rust (cargo), Node and npm.
 - The first run does a **release** build of the server, which takes a few minutes.
 - `npm ci` runs only when `ui/node_modules` is missing or older than `ui/package-lock.json`, and that
   step needs network access.
-- The server listens on `PORT` (default 8080) and serves the built UI from `ui/dist`.
+- The server listens on `BIND`:`PORT` (default `127.0.0.1:8080`) and serves the built UI from `ui/dist`.
+  `BIND=0.0.0.0` makes it reachable from other machines; the API has no authentication, so prefer an
+  SSH tunnel (`ssh -L 8080:localhost:8080 <host>`).
 - The server starts with the **default** preset at 1×.
 
 ### Presets
