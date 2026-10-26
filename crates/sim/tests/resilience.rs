@@ -8,8 +8,8 @@ use control::agent::HostAgent;
 use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::{EntryPayload, RaftRole};
 use control::replica::CpReplica;
-use control::state::{Alert, CpMode, Lifecycle, ObjectRef, Severity};
-use model::{HostId, ProfileId, Role, SwitchId, Volume};
+use control::state::{Alert, Command, CpMode, Lifecycle, ObjectRef, Severity};
+use model::{Deployment, HostId, ProfileId, Role, Selector, SwitchId, Volume};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
 use sim::faults::Fault;
@@ -306,15 +306,71 @@ fn leader_failover_criterion_3() {
     assert!(commit >= commit_at_kill as usize);
     assert_eq!(new_log[..commit_at_kill as usize], log_at_kill[..commit_at_kill as usize], "a committed entry was lost");
     // No entry was proposed in the gap: between the kill and the new leader catching up, no
-    // controller acted (the unit tests `controllers_wait_for_the_leaders_noop_to_apply`,
-    // `api_and_syncs_wait_for_the_leaders_noop_to_apply` and `minority_leader_stops_controllers`
-    // pin down the gates themselves).
+    // controller acted. The gap is short here; `a_new_leader_that_cannot_catch_up_neither_writes_nor_answers`
+    // holds it open to pin down the gates themselves.
     for entry in &new_log[..commit] {
         if let EntryPayload::Normal(LogCmd { at, ref cmd }) = entry.payload {
             assert!(at <= kill_at || at >= caught_up_at, "entry {} ({cmd:?}) was proposed at {at}, between the kill at {kill_at} and the new leader catching up at {caught_up_at}", entry.index);
         }
     }
     assert!(new_log[..commit].iter().any(|en| en.term == r.durable().term && matches!(en.payload, EntryPayload::Noop)), "the new leader's no-op committed");
+}
+
+/// Criterion 3's gates in the running system. The window between a new
+/// leader's election and its no-op applying is normally one round trip, too
+/// short for a controller run or a client request to land in; here it is held
+/// open. The leader is killed as the followers learn a new deployment
+/// committed, so the new leader's state holds pods to place. The only other
+/// voter is cut off as the new leader wins, so its ack of the no-op never
+/// arrives, while the new leader keeps quorum for a fresh leader's
+/// check-quorum window. Until it catches up it must not write (controllers or
+/// API), answer a write, or answer a sync.
+#[test]
+fn a_new_leader_that_cannot_catch_up_neither_writes_nor_answers() {
+    let mut e = default_fleet(14);
+    let l = settle(&mut e);
+    e.run_for(1000);
+    let followers: Vec<HostId> = replica(&e, &l).voters().iter().filter(|v| **v != l).cloned().collect();
+    let dep = Deployment { id: "web".into(), image: "nginx".into(), replicas: 3, cpu_m: 100, ram_mb: 128, selector: Selector::default() };
+    e.api(ApiOp::CreateDeployment { deployment: dep });
+    let created = |e: &Engine| {
+        let log = &replica(e, &l).durable().log;
+        log.iter().find(|en| matches!(&en.payload, EntryPayload::Normal(LogCmd { cmd: Command::CreateDeployment { .. }, .. }))).map(|en| en.index)
+    };
+    assert!(e.run_until(e.now() + 1000, |e| created(e).is_some()), "the leader never appended the deployment");
+    let idx = created(&e).unwrap();
+    let applied = |e: &Engine| followers.iter().all(|f| replica(e, f).commit_index() >= idx);
+    assert!(e.run_until(e.now() + 1000, applied), "the followers never learned the deployment committed");
+    e.fault(Fault::KillHost { host: l.clone() }).unwrap();
+    let kill_at = e.now();
+
+    assert!(e.run_until(kill_at + 6000, |e| e.true_leader().is_some_and(|n| n != l)), "no new leader within 6 s");
+    let new = e.true_leader().unwrap();
+    let other = followers.iter().find(|f| **f != new).unwrap().clone();
+    e.fault(Fault::Partition { nodes: vec![PartitionMember::Host(other)] }).unwrap();
+    let (elected_at, term, len) = (e.now(), replica(&e, &new).durable().term, replica(&e, &new).log_len());
+    assert!(!replica(&e, &new).caught_up());
+    let r = replica(&e, &new);
+    let placed = r.durable().log[..r.commit_index() as usize].iter().any(|en| matches!(&en.payload, EntryPayload::Normal(LogCmd { cmd: Command::SetPodStatus { .. }, .. })));
+    assert!(!placed, "precondition: the new leader's state holds unplaced pods");
+    let req = e.api(ApiOp::Cordon { id: hid("pi5-01") });
+
+    let stuck = |e: &Engine| replica(e, &new).is_leader() && replica(e, &new).durable().term == term;
+    let mut answers = vec![];
+    while stuck(&e) && e.now() < elected_at + 5000 {
+        e.run_for(50);
+        assert!(!replica(&e, &new).caught_up() || !stuck(&e), "the no-op applied without the other voter");
+        assert_eq!(replica(&e, &new).log_len(), len, "the new leader wrote before catching up");
+        assert_ne!(e.client_view().leader.as_ref(), Some(&new), "a sync was answered before catching up");
+        answers.extend(e.take_api_results());
+    }
+    let led_for = e.now() - elected_at;
+    assert!(led_for > control::replica::CONTROLLER_PERIOD_MS, "the window held for only {led_for} ms: no controller run fell in it");
+    assert!(answers.iter().all(|(r, a)| *r != req || *a == ApiResult::Unavailable), "{answers:?}");
+
+    e.fault(Fault::HealPartitions).unwrap();
+    let deadline = e.now() + 10_000;
+    assert!(e.run_until(deadline, |e| e.true_leader().is_some_and(|n| replica(e, &n).caught_up())), "no leader caught up after healing");
 }
 
 #[test]
