@@ -6,7 +6,8 @@ version.workspace = true
 [dependencies]
 control = { path = "../control" }
 model = { path = "../model" }
-sim = { path = "../sim" }
+lab = { path = "../lab" }
+node = { path = "../node" }
 axum = { version = "0.8", features = ["ws"] }
 tokio = { version = "1", features = ["full"] }
 tower-http = { version = "0.6", features = ["fs"] }

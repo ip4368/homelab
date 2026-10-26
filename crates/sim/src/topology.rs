@@ -29,7 +29,7 @@ impl Switch {
 
 /// One end of a cable. Exported to the UI as `CableEnd` (the DOM owns `Node`).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[ts(export, rename = "CableEnd")]
+#[ts(rename = "CableEnd")]
 pub enum Node {
     HostPort(HostId, PortName),
     SwitchPort(SwitchId, PortName),
@@ -48,7 +48,6 @@ pub fn cable_key(a: &Node, b: &Node) -> CableKey {
 
 /// A member of a partition group. A host member puts all its ports inside.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub enum PartitionMember {
     Host(HostId),
     Switch(SwitchId),

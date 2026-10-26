@@ -1,5 +1,6 @@
-//! The homelab cluster manager's server: one process running the simulated
-//! fleet, its HTTP API and WebSocket, and the built UI.
+//! The homelab cluster manager's server: the UI's client to the control
+//! plane of the real VM lab, the lab itself, the HTTP API and WebSocket, and
+//! the built UI. Runs as root (the lab needs it).
 
 mod api;
 mod driver;
@@ -8,19 +9,26 @@ mod ws;
 use axum::Router;
 use axum::routing::get;
 use driver::DriverHandle;
-use sim::presets::Preset;
+use lab::manager::{Lab, LabConfig};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use tower_http::services::{ServeDir, ServeFile};
 
 const DEFAULT_PORT: u16 = 8080;
 
-/// The port to listen on: `$PORT`, else 8080. The server is a local tool, so it only listens on loopback.
-fn listen_addr(port: Option<&str>) -> Result<(std::net::Ipv4Addr, u16), String> {
+/// Where to listen: `$BIND` (an IP address, default loopback) and `$PORT`
+/// (default 8080). Loopback by default because the API is unauthenticated
+/// and can power off the lab's VMs.
+fn listen_addr(bind: Option<&str>, port: Option<&str>) -> Result<SocketAddr, String> {
+    let ip = match bind {
+        None => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        Some(b) => b.parse().map_err(|_| format!("BIND must be an IP address (e.g. 0.0.0.0), got {b:?}"))?,
+    };
     let port = match port {
         None => DEFAULT_PORT,
         Some(p) => p.parse().map_err(|_| format!("PORT must be a port number, got {p:?}"))?,
     };
-    Ok((std::net::Ipv4Addr::LOCALHOST, port))
+    Ok(SocketAddr::new(ip, port))
 }
 
 /// Where `npm run build` leaves the UI: `ui/dist` at the workspace root.
@@ -41,12 +49,34 @@ fn with_ui(router: Router, dist: &Path) -> Router {
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
-    let driver = DriverHandle::spawn(Preset::Default, 1);
+    let lab = Lab::start(LabConfig::from_env()).await?;
+    let client = lab::client::spawn()?;
+    let driver = DriverHandle::start(client, Some(lab.clone()));
+    let up = driver.clone();
+    tokio::spawn(async move {
+        if let Err(e) = up.bring_up().await {
+            eprintln!("lab: bring-up: {e}");
+        }
+    });
+    let stop = lab.clone();
+    tokio::spawn(async move {
+        // Ctrl-C or a plain `kill`: stop the lab's daemons either way.
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).expect("a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+        stop.stop_services();
+        std::process::exit(0);
+    });
     let app = with_ui(api::app(driver), &dist_dir());
-    let addr = listen_addr(std::env::var("PORT").ok().as_deref())
+    let addr = listen_addr(std::env::var("BIND").ok().as_deref(), std::env::var("PORT").ok().as_deref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("homelab cluster manager on http://{}", listener.local_addr()?);
+    if !addr.ip().is_loopback() {
+        eprintln!("warning: listening beyond loopback; anyone who can reach {addr} can control the lab (there is no authentication)");
+    }
     axum::serve(listener, app).await
 }
 
@@ -72,12 +102,15 @@ mod tests {
     }
 
     #[test]
-    fn the_port_comes_from_the_environment() {
-        let lo = std::net::Ipv4Addr::LOCALHOST;
-        assert_eq!(listen_addr(None), Ok((lo, 8080)));
-        assert_eq!(listen_addr(Some("9123")), Ok((lo, 9123)));
-        assert!(listen_addr(Some("http")).is_err());
-        assert!(listen_addr(Some("70000")).is_err());
+    fn the_address_comes_from_the_environment() {
+        let lo = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        assert_eq!(listen_addr(None, None), Ok(lo(8080)));
+        assert_eq!(listen_addr(None, Some("9123")), Ok(lo(9123)));
+        assert_eq!(listen_addr(Some("0.0.0.0"), Some("18080")), Ok("0.0.0.0:18080".parse().unwrap()));
+        assert_eq!(listen_addr(Some("::"), None), Ok("[::]:8080".parse().unwrap()));
+        assert!(listen_addr(None, Some("http")).is_err());
+        assert!(listen_addr(None, Some("70000")).is_err());
+        assert!(listen_addr(Some("devvm"), None).is_err(), "an address, not a host name");
     }
 
     #[tokio::test]

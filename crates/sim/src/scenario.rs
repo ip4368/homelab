@@ -34,7 +34,6 @@ pub const TOO_SMALL_MTU: u16 = 1500;
 
 /// A technician's mistake on the switch ports a new host lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub enum Misconfig {
     /// The VLAN is left out of the port's trunk allowed list.
     MissingVlan(u16),
@@ -60,7 +59,6 @@ impl Misconfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub enum Scenario {
     /// Racks `count` new hosts: gets a join token through the client, cables
     /// each host to free switch ports, configures those ports for the

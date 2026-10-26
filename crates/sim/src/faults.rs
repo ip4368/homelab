@@ -13,7 +13,6 @@ use std::collections::BTreeSet;
 use ts_rs::TS;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub enum Fault {
     /// Powers the host off: its agent, CP replica and workload instances
     /// die, its links go dark. Its disks (stored CP state, volume replicas) survive.

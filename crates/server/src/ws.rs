@@ -3,7 +3,7 @@
 //! from the view version it was last sent, so a slow reader just gets a
 //! bigger delta, never a stale one.
 
-use crate::driver::{DriverHandle, Published, SimInfo};
+use crate::driver::{ClockInfo, DriverHandle, Published};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -14,7 +14,7 @@ use control::state::{
 };
 use model::HostId;
 use serde::Serialize;
-use sim::truth::GroundTruth;
+use lab::manager::LabTruth;
 use std::collections::BTreeMap;
 use ts_rs::TS;
 
@@ -83,8 +83,8 @@ impl ViewSnapshot {
 #[ts(export)]
 pub enum ServerMsg {
     /// Replaces everything the UI holds.
-    Snapshot { view: ViewSnapshot, truth: GroundTruth, sim: SimInfo },
-    /// What changed since the previous message. `truth` and `sim` are always whole.
+    Snapshot { view: ViewSnapshot, truth: LabTruth, clock: ClockInfo },
+    /// What changed since the previous message. `truth` and `clock` are always whole.
     Delta {
         #[ts(type = "number")]
         version: u64,
@@ -97,8 +97,8 @@ pub enum ServerMsg {
         removed: Vec<ObjectRef>,
         /// Samples newer than the last ones sent.
         metrics: BTreeMap<HostId, MetricSample>,
-        truth: GroundTruth,
-        sim: SimInfo,
+        truth: LabTruth,
+        clock: ClockInfo,
     },
 }
 
@@ -122,11 +122,11 @@ impl Connection {
         self.epoch = p.epoch;
         self.version = p.view.version;
         self.metrics_sent = p.view.metrics.iter().map(|(h, m)| (h.clone(), m.at)).collect();
-        ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), sim: p.sim }
+        ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), clock: p.clock }
     }
 
     /// The message that brings this connection up to `p`: a delta, or a fresh
-    /// snapshot if a new fleet was loaded. The epoch says so; a view that went
+    /// snapshot if the client was replaced. The epoch says so; a view that went
     /// back in time is taken as a sign of it too.
     pub fn next(&mut self, p: &Published) -> ServerMsg {
         if p.epoch != self.epoch || p.view.version < self.version {
@@ -153,7 +153,7 @@ impl Connection {
             removed: changes.removed,
             metrics,
             truth: p.truth.clone(),
-            sim: p.sim,
+            clock: p.clock,
         }
     }
 }
@@ -212,17 +212,8 @@ mod tests {
     }
 
     fn published(view: &ClusterView, now: u64) -> Published {
-        let truth = GroundTruth {
-            hosts: vec![],
-            vip_owner_by_switch: BTreeMap::new(),
-            partitions: vec![],
-            split_brain_vms: vec![],
-            ports: vec![],
-            flows: vec![],
-            alerts: vec![],
-            sim_time: now,
-        };
-        Published { epoch: 0, view: view.clone(), truth, sim: SimInfo { now, speed: 1, paused: false } }
+        let truth = LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], split_brain_vms: vec![], at: now };
+        Published { epoch: 0, view: view.clone(), truth, clock: ClockInfo { now } }
     }
 
     fn sample(at: u64) -> MetricSample {
@@ -246,12 +237,12 @@ mod tests {
         add(&mut leader, "h2");
         view.merge(leader.changes_since(0));
         let (mut conn, first) = Connection::open(&published(&view, 10));
-        let ServerMsg::Snapshot { view: snap, sim, .. } = first else { panic!("{first:?}") };
-        assert_eq!((snap.hosts.len(), snap.version, sim.now), (2, 2, 10));
+        let ServerMsg::Snapshot { view: snap, clock, .. } = first else { panic!("{first:?}") };
+        assert_eq!((snap.hosts.len(), snap.version, clock.now), (2, 2, 10));
 
         // Nothing changed: still a message, so the clock ticks.
-        let ServerMsg::Delta { upserts, removed, sim, .. } = conn.next(&published(&view, 20)) else { panic!() };
-        assert_eq!((upserts.len(), removed.len(), sim.now), (0, 0, 20));
+        let ServerMsg::Delta { upserts, removed, clock, .. } = conn.next(&published(&view, 20)) else { panic!() };
+        assert_eq!((upserts.len(), removed.len(), clock.now), (0, 0, 20));
 
         let labels = [("a".into(), "b".into())].into();
         leader.apply(2, Command::SetLabels { id: HostId::from("h1"), labels }).unwrap();

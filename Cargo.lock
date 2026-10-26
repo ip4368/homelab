@@ -327,6 +327,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "lab"
+version = "0.1.0"
+dependencies = [
+ "control",
+ "ipnet",
+ "libc",
+ "model",
+ "node",
+ "serde",
+ "serde_json",
+ "tokio",
+ "ts-rs",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -394,6 +409,21 @@ dependencies = [
  "serde",
  "serde_json",
  "ts-rs",
+]
+
+[[package]]
+name = "node"
+version = "0.1.0"
+dependencies = [
+ "control",
+ "ipnet",
+ "libc",
+ "model",
+ "rand",
+ "rand_chacha",
+ "serde",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -594,10 +624,11 @@ dependencies = [
  "control",
  "futures-util",
  "http-body-util",
+ "lab",
  "model",
+ "node",
  "serde",
  "serde_json",
- "sim",
  "tokio",
  "tokio-tungstenite",
  "tower",

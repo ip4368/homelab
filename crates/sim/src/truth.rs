@@ -22,7 +22,6 @@ pub const SPLIT_BRAIN: &str = "VmSplitBrain";
 pub const TRUTH_ALERTS_KEPT: usize = 100;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct HostTruth {
     pub id: HostId,
     pub powered: bool,
@@ -32,7 +31,6 @@ pub struct HostTruth {
 
 /// Throughput through one port at the latest traffic tick, in bits per second.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct PortLoad {
     pub port: Node,
     pub rx_bps: f64,
@@ -41,7 +39,6 @@ pub struct PortLoad {
 
 /// A flow on the wire and the rate it got at the latest traffic tick.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct FlowTruth {
     #[ts(type = "number")]
     pub id: u64,
@@ -52,7 +49,6 @@ pub struct FlowTruth {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct GroundTruth {
     pub hosts: Vec<HostTruth>,
     /// Which host each switch's ARP table says holds the VIP.
