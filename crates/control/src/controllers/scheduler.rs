@@ -275,10 +275,11 @@ pub(super) fn volume_ready(state: &ClusterState, volume: &str, now: SimTime) -> 
 pub(super) fn vm_spec(state: &ClusterState, vm: &Vm, host: &HostId) -> InstanceSpec {
     let mut flows: Vec<FlowSpec> = vec![];
     let replicas = state.volume_status.get(&vm.volume).map_or(&[][..], |s| &s.status.replicas[..]);
-    let mut remote: Vec<&HostId> = replicas.iter().filter(|r| r.state != ReplicaState::Stale && r.host != *host).map(|r| &r.host).collect();
-    remote.dedup();
-    for r in remote {
-        flows.push(flow(FlowKind::ReplicaWrite, FlowEnd::Host(r.clone()), NetworkId::from("storage"), REPLICA_WRITE_MBPS));
+    // Once per host, in status order.
+    let mut seen = BTreeSet::new();
+    let remote = replicas.iter().filter(|r| r.state != ReplicaState::Stale && r.host != *host);
+    for r in remote.filter(|r| seen.insert(&r.host)) {
+        flows.push(flow(FlowKind::ReplicaWrite, FlowEnd::Host(r.host.clone()), NetworkId::from("storage"), REPLICA_WRITE_MBPS));
     }
     if let Some(net) = vm.networks.iter().find(|n| n.as_str().starts_with("vm-")) {
         flows.push(flow(FlowKind::VmClient, FlowEnd::Router, net.clone(), VM_CLIENT_MBPS));
@@ -480,6 +481,17 @@ pub(super) mod tests {
         let out = run(&s, &v, 4000);
         assert_eq!(proposals(&out), [Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m1")), phase: VmPhase::Running }]);
         assert!(sends(&out).is_empty());
+    }
+
+    #[test]
+    fn a_vm_writes_once_to_each_other_host_holding_its_volume() {
+        let mut s = three_ms01();
+        s.apply(0, Command::CreateVolume { volume: Volume::new("vm1-disk", 40) }).unwrap();
+        // m2 listed twice, apart: a healthy replica and a copy onto another of its disks.
+        let replicas = vec![healthy("m2"), healthy("m3"), rebuilding("m2", 40)];
+        s.apply(0, Command::SetVolumeStatus { id: "vm1-disk".into(), replicas, health: VolumeHealth::Rebuilding }).unwrap();
+        let writes: Vec<FlowEnd> = vm_spec(&s, &vm("vm1", 2), &hid("m1")).flows.into_iter().filter(|f| f.kind == FlowKind::ReplicaWrite).map(|f| f.to).collect();
+        assert_eq!(writes, [FlowEnd::Host(hid("m2")), FlowEnd::Host(hid("m3"))]);
     }
 
     pub(crate) fn deployment(id: &str, replicas: u32, cpu_m: u32, prefix: Option<&str>) -> Deployment {
