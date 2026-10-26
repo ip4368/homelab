@@ -16,12 +16,13 @@ use crate::world::{HostHw, World};
 use control::agent::HostAgent;
 use control::client::{ClientActor, CLIENT};
 use control::controllers::join::allocate_ips;
+use control::bootstrap::{self, SeedHost};
+pub use control::bootstrap::{profile_prefix, seed_rule_roles, seed_rule_template};
 use control::proto::LogCmd;
-use control::raft::{Durable, Entry, EntryPayload};
+use control::raft::Durable;
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Endpoint, Svc};
-use control::state::{Command, CpMode, Lifecycle, NetworkResult};
-use model::{eligible, render, seed_networks, seed_templates, HostId, PortName, ProfileId, Role, SwitchId};
+use model::{eligible, render, seed_templates, HostId, PortName, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use ts_rs::TS;
@@ -59,7 +60,6 @@ const CORE_RACK: &str = "rack-0";
 
 /// How many hosts of each profile a fleet has.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub struct FleetSpec {
     pub ms01: u32,
     pub minipc: u32,
@@ -84,7 +84,6 @@ impl FleetSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
 pub enum Preset {
     /// 60 hosts.
     Default,
@@ -177,84 +176,19 @@ pub fn build_fleet(spec: &FleetSpec, cp_voters: usize) -> (World, InitialActors)
     (w, actors)
 }
 
-/// The Raft state of a freshly installed cluster: one term-1 log entry per
-/// command, all uncommitted until the first leader's no-op commits them.
-/// The log sets the CP voters, adds the seed networks and templates and the
-/// seed auto-approve rules (each naming its template), and adds every host
-/// at `location`, approved with its rule's roles (plus `ControlPlane` for
-/// voters), provisioned on its rule's template with the addresses of the
-/// config it runs, that config applied as generation 1, and `Ready`.
+/// The Raft state of the installed fleet ([`control::bootstrap::seeded_durable`]):
+/// every host already runs its rule's template, so it is `Ready` from the start.
 pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<HostId>) -> Durable<LogCmd> {
-    let mut cmds = vec![Command::SetCp { voters: voters.clone(), mode: CpMode::Suggest }];
-    cmds.extend(seed_networks().into_iter().map(|network| Command::UpsertNetwork { network }));
-    cmds.extend(seed_templates().into_iter().map(|template| Command::UpsertTemplate { template }));
-    for p in [ProfileId::Ms01, ProfileId::MiniPc, ProfileId::Pi5, ProfileId::Rk3588] {
-        cmds.push(Command::UpsertRule {
-            id: profile_prefix(p).into(),
-            profile: p,
-            roles: seed_rule_roles(p),
-            template: Some(seed_rule_template(p).into()),
-        });
-    }
-    for (id, location) in hosts {
-        let hw = &w.hosts[id];
-        let mut roles: BTreeSet<Role> =
-            seed_rule_roles(hw.profile.id).into_iter().filter(|&r| eligible(&hw.profile, r).is_ok()).collect();
-        if voters.contains(id) {
-            roles.insert(Role::ControlPlane);
-        }
-        let ips = hw.applied_net.attachments.iter().filter_map(|a| Some((a.network.clone(), a.ip?))).collect();
-        cmds.extend([
-            Command::AddPendingHost {
-                id: id.clone(),
-                profile: hw.profile.clone(),
-                inventory: w.inventory(id).expect("the host is in the world"),
-                location: location.clone(),
-            },
-            Command::ApproveHost { id: id.clone(), roles },
-            Command::ProvisionHost { id: id.clone(), template: Some(seed_rule_template(hw.profile.id).into()), ips },
-            Command::SetDesiredNetwork { id: id.clone(), config: hw.applied_net.clone() },
-            Command::RecordNetworkResult { id: id.clone(), generation: 1, result: NetworkResult::Applied },
-            Command::SetLifecycle { id: id.clone(), lifecycle: Lifecycle::Ready },
-        ]);
-    }
-    let mut d = Durable::new(voters.clone());
-    d.term = 1;
-    d.log = cmds
-        .into_iter()
-        .zip(1..)
-        .map(|(cmd, index)| Entry { term: 1, index, payload: EntryPayload::Normal(LogCmd { at: 0, cmd }) })
+    let seeds: Vec<SeedHost> = hosts
+        .iter()
+        .map(|(id, location)| SeedHost {
+            id: id.clone(),
+            inventory: w.inventory(id).expect("the host is in the world"),
+            location: location.clone(),
+            running: Some(w.hosts[id].applied_net.clone()),
+        })
         .collect();
-    d
-}
-
-/// The seed auto-approve rule's roles for a profile.
-pub fn seed_rule_roles(p: ProfileId) -> BTreeSet<Role> {
-    match p {
-        ProfileId::Ms01 => [Role::Storage, Role::Vm, Role::Compute].into(),
-        ProfileId::MiniPc => [Role::Compute, Role::Transcode, Role::Storage].into(),
-        ProfileId::Pi5 | ProfileId::Rk3588 => [Role::Transcode, Role::Compute].into(),
-    }
-}
-
-/// The network template a profile's seed auto-approve rule applies.
-pub fn seed_rule_template(p: ProfileId) -> &'static str {
-    match p {
-        ProfileId::Ms01 => "ms01-standard",
-        ProfileId::MiniPc => "minipc-standard",
-        // `sbc-transcode` is profiled Pi5 but deliberately shared by Rk3588 (same eth0-only NICs).
-        ProfileId::Pi5 | ProfileId::Rk3588 => "sbc-transcode",
-    }
-}
-
-/// Host ids are `<prefix>-<nn>`, e.g. `ms01-01`.
-pub fn profile_prefix(p: ProfileId) -> &'static str {
-    match p {
-        ProfileId::Ms01 => "ms01",
-        ProfileId::MiniPc => "minipc",
-        ProfileId::Pi5 => "pi5",
-        ProfileId::Rk3588 => "rk3588",
-    }
+    bootstrap::seeded_durable(&seeds, voters, 0)
 }
 
 pub fn host_id(p: ProfileId, n: u32) -> HostId {
@@ -402,7 +336,8 @@ fn add_access_switch(w: &mut World, n: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use control::state::{ClusterState, NetState};
+    use control::raft::EntryPayload;
+    use control::state::{ClusterState, Lifecycle, NetState};
     use model::NetworkId;
 
     fn sp(s: &str, p: &str) -> Node {

@@ -3,6 +3,7 @@
 //! through [`runtime::Ctx`] and never reads ground truth.
 
 pub mod agent;
+pub mod bootstrap;
 pub mod client;
 pub mod controllers;
 pub mod metrics;
