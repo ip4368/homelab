@@ -27,6 +27,13 @@ pub struct DiskState {
 pub struct Inventory {
     pub profile: ProfileId,
     pub variant: u8,
+    /// Hardware threads the host has, as discovered; 0 when the host did not
+    /// say (the catalogue's figure stands).
+    #[serde(default)]
+    pub cpu_threads: u32,
+    /// Memory in whole GB, rounded up, as discovered; 0 when the host did not say.
+    #[serde(default)]
+    pub ram_gb: u32,
     pub nics: Vec<NicState>,
     pub disks: Vec<DiskState>,
 }
@@ -38,6 +45,8 @@ impl Inventory {
         Self {
             profile: id,
             variant,
+            cpu_threads: p.cpu_threads,
+            ram_gb: p.ram_gb,
             nics: p
                 .nics
                 .into_iter()
@@ -70,5 +79,13 @@ mod tests {
         let ms01 = Inventory::from_profile(ProfileId::Ms01, 0);
         assert_eq!(ms01.nics.len(), 4);
         assert_eq!(ms01.nics[0].speed_mbps, 10_000);
+        assert_eq!((ms01.cpu_threads, ms01.ram_gb), (20, 96));
+    }
+
+    #[test]
+    fn an_inventory_without_capacity_still_parses() {
+        let json = r#"{"profile":"MiniPc","variant":0,"nics":[],"disks":[]}"#;
+        let inv: Inventory = serde_json::from_str(json).unwrap();
+        assert_eq!((inv.cpu_threads, inv.ram_gb), (0, 0));
     }
 }

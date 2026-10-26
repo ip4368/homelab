@@ -553,7 +553,14 @@ impl World {
             size_gb: d.size_gb,
             failed: hw.failed_disks.contains(&d.name),
         });
-        Some(Inventory { profile: hw.profile.id, variant: hw.variant, nics: nics.collect(), disks: disks.collect() })
+        Some(Inventory {
+            profile: hw.profile.id,
+            variant: hw.variant,
+            cpu_threads: hw.profile.cpu_threads,
+            ram_gb: hw.profile.ram_gb,
+            nics: nics.collect(),
+            disks: disks.collect(),
+        })
     }
 
     /// What `host`'s LLDP daemon hears: for each NIC (in profile order) whose

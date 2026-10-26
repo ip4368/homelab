@@ -129,6 +129,38 @@ pub fn profile(id: ProfileId, variant: u8) -> HardwareProfile {
     }
 }
 
+impl HardwareProfile {
+    /// The catalogue profile `inv` names, corrected by what the host actually
+    /// has: its discovered CPU threads and RAM (where known), its NICs (each
+    /// keeping the catalogue's nominal speed and kind when the catalogue has
+    /// a NIC of that name) and its disks. A real machine, or a VM posing as
+    /// one, is scheduled on what it has, not on what its model usually has.
+    pub fn with_discovered(inv: &crate::Inventory) -> Self {
+        let mut p = profile(inv.profile, inv.variant);
+        if inv.cpu_threads > 0 {
+            p.cpu_threads = inv.cpu_threads;
+        }
+        if inv.ram_gb > 0 {
+            p.ram_gb = inv.ram_gb;
+        }
+        if !inv.nics.is_empty() {
+            let catalogue = std::mem::take(&mut p.nics);
+            p.nics = inv
+                .nics
+                .iter()
+                .map(|n| match catalogue.iter().find(|c| c.name == n.name) {
+                    Some(c) => c.clone(),
+                    None => nic(&n.name, n.speed_mbps, NicKind::Rj45),
+                })
+                .collect();
+        }
+        if !inv.disks.is_empty() {
+            p.disks = inv.disks.iter().map(|d| disk(&d.name, d.kind, d.size_gb)).collect();
+        }
+        p
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -165,5 +197,25 @@ mod tests {
         let r = profile(ProfileId::Rk3588, 0);
         assert_eq!((r.arch, r.cpu_threads, r.ram_gb), (Arch::Arm64, 8, 16));
         assert_eq!(profile(ProfileId::Ms01, 0).cpu_threads, 20);
+    }
+
+    #[test]
+    fn discovered_hardware_overrides_the_catalogue() {
+        let mut inv = crate::Inventory::from_profile(ProfileId::Ms01, 0);
+        assert_eq!(HardwareProfile::with_discovered(&inv), profile(ProfileId::Ms01, 0), "a catalogue machine is its profile");
+        inv.cpu_threads = 8;
+        inv.ram_gb = 16;
+        inv.nics.retain(|n| n.name != "eth1");
+        inv.nics[0].speed_mbps = 1000;
+        inv.disks = vec![crate::DiskState { name: "nvme0".into(), kind: DiskKind::Nvme, size_gb: 64, failed: false }];
+        let p = HardwareProfile::with_discovered(&inv);
+        assert_eq!((p.cpu_threads, p.ram_gb), (8, 16));
+        assert_eq!(
+            p.nics.iter().map(|n| (n.name.as_str(), n.speed_mbps)).collect::<Vec<_>>(),
+            [("sfp0", 10_000), ("sfp1", 10_000), ("eth0", 2_500)],
+            "nominal speeds, not negotiated ones"
+        );
+        assert_eq!(p.disks, vec![disk("nvme0", DiskKind::Nvme, 64)]);
+        assert_eq!(p.capabilities, profile(ProfileId::Ms01, 0).capabilities);
     }
 }

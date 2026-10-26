@@ -10,7 +10,7 @@ use super::{Action, Volatile};
 use crate::runtime::{Addr, SimTime};
 use crate::state::{ClusterState, Command, HostObj, Lifecycle, NetState, ObjectRef};
 use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, NetworkPurpose};
-use model::{allocate, eligible, profile, HostId, Inventory, NetworkId};
+use model::{allocate, eligible, HardwareProfile, HostId, Inventory, NetworkId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
@@ -59,7 +59,7 @@ pub fn on_request(
     }
     JoinOutcome::Add(Command::AddPendingHost {
         id: host.clone(),
-        profile: profile(inventory.profile, inventory.variant),
+        profile: HardwareProfile::with_discovered(&inventory),
         inventory,
         location: UNKNOWN_LOCATION.into(),
     })
@@ -175,7 +175,7 @@ mod tests {
     use crate::controllers::PendingJoin;
     use crate::runtime::{Endpoint, Svc};
     use crate::state::NetworkResult;
-    use model::{seed_networks, seed_templates, NetworkId, ProfileId, Role};
+    use model::{profile, seed_networks, seed_templates, NetworkId, ProfileId, Role};
     use std::collections::BTreeMap;
     use std::net::Ipv4Addr;
 

@@ -19,6 +19,22 @@ pub enum NetworkPurpose {
     Vm,
 }
 
+/// An inclusive range of addresses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct IpRange {
+    #[ts(type = "string")]
+    pub first: Ipv4Addr,
+    #[ts(type = "string")]
+    pub last: Ipv4Addr,
+}
+
+impl IpRange {
+    pub fn contains(&self, ip: Ipv4Addr) -> bool {
+        self.first <= ip && ip <= self.last
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LogicalNetwork {
@@ -28,7 +44,17 @@ pub struct LogicalNetwork {
     #[ts(type = "string")]
     pub subnet: Ipv4Net,
     pub mtu: u16,
+    /// Addresses IPAM never hands out: those something outside the cluster
+    /// uses (a DHCP pool for hosts that have not joined yet, switch
+    /// management interfaces, the control-plane VIP).
+    #[serde(default)]
+    pub reserved: Vec<IpRange>,
 }
+
+/// The `mgmt` block kept out of IPAM: the bootstrap DHCP pool
+/// (10.0.3.100–199), switch management interfaces and the VIP (above 200).
+pub const MGMT_RESERVED: IpRange =
+    IpRange { first: Ipv4Addr::new(10, 0, 3, 100), last: Ipv4Addr::new(10, 0, 3, 255) };
 
 /// The seed networks every cluster starts with (Global Constraints table).
 pub fn seed_networks() -> Vec<LogicalNetwork> {
@@ -38,9 +64,10 @@ pub fn seed_networks() -> Vec<LogicalNetwork> {
         vlan,
         subnet: subnet.parse().expect("seed subnet is valid"),
         mtu,
+        reserved: vec![],
     };
     vec![
-        net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500),
+        LogicalNetwork { reserved: vec![MGMT_RESERVED], ..net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500) },
         net("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000),
         net("migration", NetworkPurpose::Migration, 30, "10.30.0.0/22", 9000),
         net("vm-lan", NetworkPurpose::Vm, 100, "10.100.0.0/22", 1500),

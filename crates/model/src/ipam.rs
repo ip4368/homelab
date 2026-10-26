@@ -5,11 +5,13 @@ use std::collections::BTreeSet;
 use std::net::Ipv4Addr;
 
 /// The lowest address of `net.subnet` not in `used`. The network address,
-/// the gateway (the first host address, `.1`) and the broadcast address are
-/// never handed out. `None` when the subnet is full.
+/// the gateway (the first host address, `.1`), the broadcast address and the
+/// network's reserved ranges are never handed out. `None` when the subnet is full.
 pub fn allocate(net: &LogicalNetwork, used: &BTreeSet<Ipv4Addr>) -> Option<Ipv4Addr> {
     let gateway = Ipv4Addr::from(u32::from(net.subnet.network()).saturating_add(1));
-    net.subnet.hosts().find(|ip| *ip != gateway && !used.contains(ip))
+    net.subnet
+        .hosts()
+        .find(|ip| *ip != gateway && !used.contains(ip) && !net.reserved.iter().any(|r| r.contains(*ip)))
 }
 
 #[cfg(test)]
@@ -50,5 +52,16 @@ mod tests {
         let storage = net("storage"); // 10.20.0.0/22 reaches 10.20.3.254
         let used: BTreeSet<Ipv4Addr> = (2..=255).map(|i| Ipv4Addr::new(10, 20, 0, i)).collect();
         assert_eq!(allocate(&storage, &used), Some(ip("10.20.1.0")));
+    }
+
+    #[test]
+    fn ipam_skips_reserved_ranges() {
+        let mut mgmt = net("mgmt");
+        assert_eq!(mgmt.reserved, vec![crate::network::MGMT_RESERVED]);
+        let first_reserved = ip("10.0.3.100");
+        let used: BTreeSet<Ipv4Addr> = mgmt.subnet.hosts().filter(|a| *a < first_reserved).collect();
+        assert_eq!(allocate(&mgmt, &used), None, "everything below the reserved block is used, the rest is reserved");
+        mgmt.reserved.clear();
+        assert_eq!(allocate(&mgmt, &used), Some(first_reserved));
     }
 }
