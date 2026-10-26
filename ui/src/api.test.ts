@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { fault, op, scenario, setSpeed } from './api'
+import { labFault, op } from './api'
 
 function respond(status: number, body: unknown) {
   const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify(body), { status }))
@@ -16,11 +16,11 @@ describe('api', () => {
     expect(f).toHaveBeenCalledWith('/api/ops', expect.objectContaining({ method: 'POST', body: '"CreateJoinToken"' }))
   })
 
-  it('rejects with the server error string on 409 and 503', async () => {
-    respond(409, { error: 'simulation paused' })
-    await expect(op('CreateJoinToken')).rejects.toBe('simulation paused')
+  it('rejects with the server error string on 503', async () => {
     respond(503, { error: 'control plane unavailable' })
-    await expect(fault('HealPartitions')).rejects.toBe('control plane unavailable')
+    await expect(op('CreateJoinToken')).rejects.toBe('control plane unavailable')
+    respond(503, { error: 'no lab attached' })
+    await expect(labFault('Heal')).rejects.toBe('no lab attached')
   })
 
   it('rejects with the server error string on a rejected op too', async () => {
@@ -30,18 +30,14 @@ describe('api', () => {
 
   it('falls back to the status when the body has no error', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response('bad gateway', { status: 502 })))
-    await expect(setSpeed(5)).rejects.toBe('HTTP 502')
+    await expect(labFault('Heal')).rejects.toBe('HTTP 502')
   })
 
-  it('posts speed, fault and scenario to their endpoints', async () => {
+  it('posts lab faults to their endpoint and returns a racked machine', async () => {
     const f = respond(200, { ok: true })
-    await setSpeed(20)
-    await fault({ KillHost: { host: 'h1' } })
-    await scenario({ preset: 'scale500' })
-    expect(f.mock.calls.map((c) => [c[0], c[1]?.body])).toEqual([
-      ['/api/sim/speed', '{"speed":20}'],
-      ['/api/sim/fault', '{"KillHost":{"host":"h1"}}'],
-      ['/api/sim/scenario', '{"preset":"scale500"}'],
-    ])
+    await expect(labFault({ Freeze: { vm: 'ms01-01' } })).resolves.toBeNull()
+    expect(f.mock.calls.map((c) => [c[0], c[1]?.body])).toEqual([['/api/lab/fault', '{"Freeze":{"vm":"ms01-01"}}']])
+    respond(200, { ok: true, vm: 'ms01-04' })
+    await expect(labFault({ AddVm: { profile: 'Ms01', mistake: null } })).resolves.toBe('ms01-04')
   })
 })

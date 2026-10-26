@@ -2,6 +2,7 @@ import type { Attachment } from './gen/Attachment'
 import type { BondMode } from './gen/BondMode'
 import type { HostNetworkConfig } from './gen/HostNetworkConfig'
 import type { Issue } from './gen/Issue'
+import type { IpRange } from './gen/IpRange'
 import type { Link } from './gen/Link'
 import type { LinkKind } from './gen/LinkKind'
 import type { LogicalNetwork } from './gen/LogicalNetwork'
@@ -195,10 +196,12 @@ export interface NetworkForm {
   vlan: string
   subnet: string
   mtu: string
+  /** Not edited in the form: carried through so an edit keeps the network's reservations. */
+  reserved?: IpRange[]
 }
 
 export function formFromNetwork(n: LogicalNetwork): NetworkForm {
-  return { id: n.id, purpose: n.purpose, vlan: String(n.vlan), subnet: n.subnet, mtu: String(n.mtu) }
+  return { id: n.id, purpose: n.purpose, vlan: String(n.vlan), subnet: n.subnet, mtu: String(n.mtu), reserved: n.reserved }
 }
 
 const CIDR = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
@@ -214,5 +217,5 @@ export function networkFromForm(f: NetworkForm): { network: LogicalNetwork } | {
   if (!m || m.slice(1, 5).some((o) => Number(o) > 255) || Number(m[5]) > 30) return { error: `Subnet: "${f.subnet}" is not an IPv4 CIDR like 10.0.0.0/22` }
   const mtu = Number(f.mtu)
   if (!Number.isInteger(mtu) || mtu < 576 || mtu > 9216) return { error: `MTU: "${f.mtu}" is not between 576 and 9216` }
-  return { network: { id, purpose: f.purpose, vlan, subnet, mtu } }
+  return { network: { id, purpose: f.purpose, vlan, subnet, mtu, reserved: f.reserved ?? [] } }
 }

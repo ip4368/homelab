@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { FaultPanel } from './components/FaultPanel'
+import { LabPanel } from './components/LabPanel'
 import { FleetGrid } from './components/FleetGrid'
 import { HostDrawer } from './components/HostDrawer'
 import { NetworksPage } from './components/NetworksPage'
@@ -109,7 +109,7 @@ export default function App() {
             )}
             {view === 'topology' && sw && <SwitchDrawer key={sw} id={sw} onClose={() => setSwitch(null)} onSelectHost={selectHost} onSelectSwitch={selectSwitch} />}
           </div>
-          <FaultPanel selected={host} />
+          <LabPanel selected={host} />
         </div>
         <RightRail onSelect={selectHost} showTruth={showTruth} />
       </div>

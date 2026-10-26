@@ -36,8 +36,7 @@ function hostList(hosts: string[]): string {
 }
 
 function RolloutRow({ r, highlight }: { r: Rollout; highlight: boolean }) {
-  const now = useStore((s) => s.sim.now)
-  const paused = useStore((s) => s.sim.paused)
+  const now = useStore((s) => s.clock.now)
   const { error, busy, run } = useAction()
   const p = rolloutProgress(r, now)
   const isPaused = typeof r.state === 'object' && 'Paused' in r.state
@@ -55,15 +54,15 @@ function RolloutRow({ r, highlight }: { r: Rollout; highlight: boolean }) {
       {p.active && (
         <div className="actions">
           {isPaused ? (
-            <button disabled={paused || busy} onClick={() => send('ResumeRollout')}>
+            <button disabled={busy} onClick={() => send('ResumeRollout')}>
               Resume
             </button>
           ) : (
-            <button disabled={paused || busy} onClick={() => send('PauseRollout')}>
+            <button disabled={busy} onClick={() => send('PauseRollout')}>
               Pause
             </button>
           )}
-          <button disabled={paused || busy} onClick={() => send('AbortRollout')} title="Gives the rollout up and takes the change back">
+          <button disabled={busy} onClick={() => send('AbortRollout')} title="Gives the rollout up and takes the change back">
             Abort
           </button>
           {error && <span className="bad">{error}</span>}
@@ -144,7 +143,6 @@ interface Props {
 
 /** Preview, then start, a template or network change; shows every rollout's progress. */
 export function RolloutDialog({ change, onClose }: Props) {
-  const paused = useStore((s) => s.sim.paused)
   const [preview, setPreview] = useState<Preview | null>(null)
   const [includeOverridden, setIncludeOverridden] = useState(false)
   const [batchPct, setBatchPct] = useState(10)
@@ -205,12 +203,11 @@ export function RolloutDialog({ change, onClose }: Props) {
               </span>
             </div>
             <div className="actions">
-              <button className="active" disabled={paused || starting.busy || !preview || !valid} onClick={start}>
+              <button className="active" disabled={starting.busy || !preview || !valid} onClick={start}>
                 Start rollout
               </button>
               <button onClick={onClose}>Cancel</button>
               {nothing && <span className="muted">No host is affected; the change still applies.</span>}
-              {paused && <span className="muted">Paused: start needs the simulation running.</span>}
               {starting.error && <span className="bad">{starting.error}</span>}
             </div>
           </>

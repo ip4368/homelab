@@ -1,18 +1,9 @@
 import { useMemo, useState } from 'react'
-import { setSpeed } from '../api'
 import type { CpInfo } from '../gen/CpInfo'
 import type { HostObj } from '../gen/HostObj'
 import { formatClock } from '../clock'
 import { useStore } from '../store'
 import { Charts } from './Charts'
-
-const SPEEDS = [
-  { speed: 0, label: 'Pause' },
-  { speed: 1, label: '1×' },
-  { speed: 5, label: '5×' },
-  { speed: 20, label: '20×' },
-  { speed: 60, label: '60×' },
-]
 
 /** A voter is live when its host is in the view and not NotReady. */
 export function quorumOf(cp: CpInfo, hosts: Record<string, HostObj>): { live: number; voters: number; ok: boolean } {
@@ -36,9 +27,8 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
   const cp = useStore((s) => s.view.cp)
   const leader = useStore((s) => s.view.leader)
   const term = useStore((s) => s.view.term)
-  const sim = useStore((s) => s.sim)
+  const clock = useStore((s) => s.clock)
   const connection = useStore((s) => s.connection)
-  const [error, setError] = useState<string | null>(null)
   const [monitoring, setMonitoring] = useState(false)
 
   const counts = useMemo(() => {
@@ -50,12 +40,6 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
   }, [hosts])
   const activeAlerts = useMemo(() => Object.values(alerts).filter((a) => a.resolved_at === null).length, [alerts])
   const quorum = quorumOf(cp, hosts)
-  const activeSpeed = sim.paused ? 0 : sim.speed
-
-  const choose = (speed: number) => {
-    setError(null)
-    setSpeed(speed).catch((e: unknown) => setError(String(e)))
-  }
 
   return (
     <header className="topbar">
@@ -79,21 +63,13 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
         <button className={monitoring ? 'active' : ''} aria-pressed={monitoring} onClick={() => setMonitoring(!monitoring)}>
           Monitoring
         </button>
-        <label className="inline truth-toggle" title="Overlay what the simulator knows but the control plane does not">
+        <label className="inline truth-toggle" title="Overlay what the lab sees from outside the machines but the control plane does not know">
           <input type="checkbox" checked={showTruth} onChange={(e) => onShowTruth(e.target.checked)} /> Ground truth
         </label>
         {connection === 'connecting' && <span className="muted">connecting…</span>}
-        {error && <span className="bad">{error}</span>}
-        <span className="clock" title="simulated time">
-          {formatClock(sim.now)}
+        <span className="clock" title="lab host time">
+          {clock.now === 0 ? '--:--:--' : formatClock(clock.now)}
         </span>
-        <div className="speeds" role="group" aria-label="simulation speed">
-          {SPEEDS.map(({ speed, label }) => (
-            <button key={speed} className={speed === activeSpeed ? 'active' : ''} onClick={() => choose(speed)}>
-              {label}
-            </button>
-          ))}
-        </div>
       </div>
       {monitoring && (
         <div className="monitoring">

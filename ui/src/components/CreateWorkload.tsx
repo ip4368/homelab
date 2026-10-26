@@ -29,7 +29,7 @@ function NumberField({ label, value, onChange, min, max }: { label: string; valu
 }
 
 /** The submit row shared by the forms: the button, the reason it is disabled, the server's refusal. */
-function Submit({ label, problem, paused, build }: { label: string; problem: string | null; paused: boolean; build(): ApiOp }) {
+function Submit({ label, problem, build }: { label: string; problem: string | null; build(): ApiOp }) {
   const { error, busy, run } = useAction()
   const [created, setCreated] = useState<string | null>(null)
   const submit = () =>
@@ -40,11 +40,10 @@ function Submit({ label, problem, paused, build }: { label: string; problem: str
     })
   return (
     <div className="actions">
-      <button className="active" disabled={paused || busy || problem !== null} onClick={submit}>
+      <button className="active" disabled={busy || problem !== null} onClick={submit}>
         Create
       </button>
       {problem && <span className="muted">{problem}</span>}
-      {paused && <span className="muted">Paused: actions are disabled.</span>}
       {error && (
         <span className="bad" role="alert">
           {error}
@@ -55,7 +54,7 @@ function Submit({ label, problem, paused, build }: { label: string; problem: str
   )
 }
 
-function VolumeForm({ paused }: { paused: boolean }) {
+function VolumeForm() {
   const volumes = useStore((s) => s.view.volumes)
   const [id, setId] = useState('')
   const [sizeGb, setSizeGb] = useState(20)
@@ -69,12 +68,12 @@ function VolumeForm({ paused }: { paused: boolean }) {
         <NumberField label="Size (GB)" value={sizeGb} onChange={setSizeGb} min={1} />
         <NumberField label="Replicas" value={replicas} onChange={setReplicas} min={1} max={MAX_VOLUME_REPLICAS} />
       </div>
-      <Submit label={volume.id} paused={paused} problem={validateVolume(volume, Object.keys(volumes))} build={() => ({ CreateVolume: { volume } })} />
+      <Submit label={volume.id} problem={validateVolume(volume, Object.keys(volumes))} build={() => ({ CreateVolume: { volume } })} />
     </>
   )
 }
 
-function DeploymentForm({ paused }: { paused: boolean }) {
+function DeploymentForm() {
   const deployments = useStore((s) => s.view.deployments)
   const [id, setId] = useState('')
   const [image, setImage] = useState('nginx:1.27')
@@ -119,12 +118,12 @@ function DeploymentForm({ paused }: { paused: boolean }) {
         <label>Capability prefix</label>
         <input value={prefix} onChange={(e) => setPrefix(e.target.value)} placeholder="hw-transcode:" aria-label="capability prefix" size={16} />
       </div>
-      <Submit label={deployment.id} paused={paused} problem={validateDeployment(deployment, Object.keys(deployments))} build={() => ({ CreateDeployment: { deployment } })} />
+      <Submit label={deployment.id} problem={validateDeployment(deployment, Object.keys(deployments))} build={() => ({ CreateDeployment: { deployment } })} />
     </>
   )
 }
 
-function VmForm({ paused }: { paused: boolean }) {
+function VmForm() {
   const vms = useStore((s) => s.view.vms)
   const volumes = useStore((s) => s.view.volumes)
   const networks = useStore((s) => s.view.networks)
@@ -169,14 +168,13 @@ function VmForm({ paused }: { paused: boolean }) {
           ))}
         </span>
       </div>
-      <Submit label={vm.id} paused={paused} problem={validateVm(vm, Object.keys(vms), volumeIds)} build={() => ({ CreateVm: { vm } })} />
+      <Submit label={vm.id} problem={validateVm(vm, Object.keys(vms), volumeIds)} build={() => ({ CreateVm: { vm } })} />
     </>
   )
 }
 
 export function CreateWorkload() {
   const [tab, setTab] = useState<Tab>('VM')
-  const paused = useStore((s) => s.sim.paused)
   return (
     <div className="panel create-workload">
       <div className="tabs inline-tabs" role="tablist">
@@ -186,9 +184,9 @@ export function CreateWorkload() {
           </button>
         ))}
       </div>
-      {tab === 'VM' && <VmForm paused={paused} />}
-      {tab === 'Deployment' && <DeploymentForm paused={paused} />}
-      {tab === 'Volume' && <VolumeForm paused={paused} />}
+      {tab === 'VM' && <VmForm />}
+      {tab === 'Deployment' && <DeploymentForm />}
+      {tab === 'Volume' && <VolumeForm />}
     </div>
   )
 }

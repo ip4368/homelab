@@ -1,5 +1,5 @@
 import type { Deployment } from './gen/Deployment'
-import type { GroundTruth } from './gen/GroundTruth'
+import type { LabTruth } from './gen/LabTruth'
 import type { HostObj } from './gen/HostObj'
 import type { ReplicaState } from './gen/ReplicaState'
 import type { Vm } from './gen/Vm'
@@ -122,17 +122,18 @@ export interface TruthDiffEntry {
 const BELIEVED_UP = new Set<HostObj['lifecycle']>(['Ready', 'Cordoned', 'Draining', 'Drained'])
 
 /**
- * Where the control plane's view and the simulator's truth disagree: hosts the
- * view takes to be up that are powered off, hosts it has as NotReady that are
- * powered (cut off, not dead), and VMs running in more than one place.
+ * Where the control plane's view and the lab's truth disagree: hosts the view
+ * takes to be up that are powered off or frozen, hosts it has as NotReady that
+ * are running (cut off, not dead), and VMs running in more than one place.
  */
-export function truthDiff(view: Pick<View, 'hosts'>, truth: Pick<GroundTruth, 'hosts' | 'split_brain_vms'>): TruthDiffEntry[] {
+export function truthDiff(view: Pick<View, 'hosts'>, truth: Pick<LabTruth, 'vms' | 'split_brain_vms'>): TruthDiffEntry[] {
   const out: TruthDiffEntry[] = []
-  for (const t of truth.hosts) {
+  for (const t of truth.vms) {
     const h = view.hosts[t.id]
     if (!h) continue
-    if (BELIEVED_UP.has(h.lifecycle) && !t.powered) out.push({ hostId: t.id, believed: h.lifecycle, actual: 'powered off' })
-    else if (h.lifecycle === 'NotReady' && t.powered) out.push({ hostId: t.id, believed: h.lifecycle, actual: 'powered on' })
+    if (BELIEVED_UP.has(h.lifecycle) && t.power === 'Off') out.push({ hostId: t.id, believed: h.lifecycle, actual: 'powered off' })
+    else if (BELIEVED_UP.has(h.lifecycle) && t.power === 'Paused') out.push({ hostId: t.id, believed: h.lifecycle, actual: 'frozen' })
+    else if (h.lifecycle === 'NotReady' && t.power === 'Running') out.push({ hostId: t.id, believed: h.lifecycle, actual: 'running' })
   }
   for (const vm of truth.split_brain_vms) {
     out.push({ hostId: `vm:${vm}`, believed: 'runs on one host', actual: 'split brain: running on several hosts' })

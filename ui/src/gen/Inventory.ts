@@ -3,4 +3,13 @@ import type { DiskState } from "./DiskState";
 import type { NicState } from "./NicState";
 import type { ProfileId } from "./ProfileId";
 
-export type Inventory = { profile: ProfileId, variant: number, nics: Array<NicState>, disks: Array<DiskState>, };
+export type Inventory = { profile: ProfileId, variant: number, 
+/**
+ * Hardware threads the host has, as discovered; 0 when the host did not
+ * say (the catalogue's figure stands).
+ */
+cpu_threads: number, 
+/**
+ * Memory in whole GB, rounded up, as discovered; 0 when the host did not say.
+ */
+ram_gb: number, nics: Array<NicState>, disks: Array<DiskState>, };

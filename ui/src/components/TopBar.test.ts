@@ -6,10 +6,10 @@ import { quorumOf } from './TopBar'
 const host = (lifecycle: HostObj['lifecycle']) => ({ lifecycle }) as HostObj
 
 describe('TopBar helpers', () => {
-  it('formats the sim clock as hh:mm:ss, past 24 hours too', () => {
-    expect(formatClock(0)).toBe('00:00:00')
-    expect(formatClock(3_725_999)).toBe('01:02:05')
-    expect(formatClock(100 * 3_600_000)).toBe('100:00:00')
+  it('formats wall-clock milliseconds as local hh:mm:ss', () => {
+    expect(formatClock(new Date(2026, 9, 26, 0, 0, 0).getTime())).toBe('00:00:00')
+    expect(formatClock(new Date(2026, 9, 26, 1, 2, 5, 999).getTime())).toBe('01:02:05')
+    expect(formatClock(new Date(2026, 9, 26, 23, 59, 59).getTime())).toBe('23:59:59')
   })
 
   it('counts live voters: present in the view and not NotReady', () => {

@@ -2,7 +2,7 @@ import type { Alert } from './gen/Alert'
 import type { HostObj } from './gen/HostObj'
 import type { Issue } from './gen/Issue'
 import type { LldpNeighbor } from './gen/LldpNeighbor'
-import type { PortLoad } from './gen/PortLoad'
+import type { PortTruth } from './gen/PortTruth'
 import type { SwitchObj } from './gen/SwitchObj'
 import { MGMT_NIC } from './grouping'
 
@@ -42,7 +42,7 @@ export interface LayoutOpts {
   /** An access switch with more hosts than this is drawn as one group node. */
   collapseOver?: number
   /** Latest per-port throughput, from the ground truth. */
-  ports?: PortLoad[]
+  ports?: PortTruth[]
   /** Switches the control plane cannot reach (open `SwitchUnreachable` alert): their links are down. */
   unreachable?: ReadonlySet<string>
 }
@@ -77,12 +77,13 @@ export function utilisationBand(u: number): Band {
 
 const portKey = (kind: 'h' | 's', node: string, port: string) => `${kind}:${node}/${port}`
 
-function indexLoads(ports: PortLoad[]): Map<string, number> {
+/** The busier direction of every switch port, keyed by the port and by the host NIC cabled to it. */
+function indexLoads(ports: PortTruth[]): Map<string, number> {
   const busiest = new Map<string, number>()
-  for (const { port, rx_bps, tx_bps } of ports) {
-    if (typeof port === 'string') continue
-    const key = 'HostPort' in port ? portKey('h', ...port.HostPort) : portKey('s', ...port.SwitchPort)
-    busiest.set(key, Math.max(rx_bps, tx_bps))
+  for (const p of ports) {
+    const bps = Math.max(p.rx_bps, p.tx_bps)
+    busiest.set(portKey('s', p.switch, p.port), bps)
+    if (p.host !== null && p.nic !== null) busiest.set(portKey('h', p.host, p.nic), bps)
   }
   return busiest
 }

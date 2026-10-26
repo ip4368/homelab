@@ -1,12 +1,13 @@
 import { useSyncExternalStore } from 'react'
 import type { Alert } from './gen/Alert'
 import type { AutoApproveRule } from './gen/AutoApproveRule'
+import type { ClockInfo } from './gen/ClockInfo'
 import type { CpInfo } from './gen/CpInfo'
 import type { DeploymentObj } from './gen/DeploymentObj'
 import type { Event as ClusterEvent } from './gen/Event'
-import type { GroundTruth } from './gen/GroundTruth'
 import type { HostObj } from './gen/HostObj'
 import type { JoinToken } from './gen/JoinToken'
+import type { LabTruth } from './gen/LabTruth'
 import type { MetricSample } from './gen/MetricSample'
 import type { NetworkObj } from './gen/NetworkObj'
 import type { Object as ClusterObject } from './gen/Object'
@@ -14,7 +15,6 @@ import type { ObjectRef } from './gen/ObjectRef'
 import type { PodObj } from './gen/PodObj'
 import type { Rollout } from './gen/Rollout'
 import type { ServerMsg } from './gen/ServerMsg'
-import type { SimInfo } from './gen/SimInfo'
 import type { SwitchObj } from './gen/SwitchObj'
 import type { TemplateObj } from './gen/TemplateObj'
 import type { VmObj } from './gen/VmObj'
@@ -27,7 +27,7 @@ export type WsMessage = ServerMsg
 
 /** The UI keeps this many of the newest events; the server's ring drops old ones without tombstones. */
 export const EVENT_CAP = 500
-/** The control plane is unavailable when the client last synced with a leader this long (sim ms) ago. */
+/** The control plane is unavailable when the client last synced with a leader this long (ms) ago. */
 export const STALE_AFTER_MS = 3000
 
 export type Connection = 'connecting' | 'live' | 'cp-unavailable'
@@ -65,8 +65,9 @@ export interface View {
 
 export interface UiState {
   view: View
-  truth: GroundTruth
-  sim: SimInfo
+  /** What the lab sees from outside the machines. */
+  truth: LabTruth
+  clock: ClockInfo
   connection: Connection
 }
 
@@ -78,16 +79,7 @@ export interface Store {
   setDisconnected(): void
 }
 
-const emptyTruth: GroundTruth = {
-  hosts: [],
-  vip_owner_by_switch: {},
-  partitions: [],
-  split_brain_vms: [],
-  ports: [],
-  flows: [],
-  alerts: [],
-  sim_time: 0,
-}
+const emptyTruth: LabTruth = { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], split_brain_vms: [], at: 0 }
 
 function initialState(): UiState {
   return {
@@ -115,13 +107,13 @@ function initialState(): UiState {
       volumeStatus: {},
     },
     truth: emptyTruth,
-    sim: { now: 0, speed: 1, paused: false },
+    clock: { now: 0 },
     connection: 'connecting',
   }
 }
 
-function connectionOf(view: View, sim: SimInfo): Connection {
-  return view.last_sync_at !== null && sim.now - view.last_sync_at <= STALE_AFTER_MS ? 'live' : 'cp-unavailable'
+function connectionOf(view: View, clock: ClockInfo): Connection {
+  return view.last_sync_at !== null && clock.now - view.last_sync_at <= STALE_AFTER_MS ? 'live' : 'cp-unavailable'
 }
 
 /** A pod's key in `View.pods`, and its id in `ObjectRef`s. */
@@ -371,10 +363,10 @@ export function createStore(): Store {
     applyMessage(msg) {
       if (msg.type === 'snapshot') {
         const view = viewFromSnapshot(msg.view)
-        set({ view, truth: msg.truth, sim: msg.sim, connection: connectionOf(view, msg.sim) })
+        set({ view, truth: msg.truth, clock: msg.clock, connection: connectionOf(view, msg.clock) })
       } else {
         const view = mergeDelta(state.view, msg)
-        set({ view, truth: msg.truth, sim: msg.sim, connection: connectionOf(view, msg.sim) })
+        set({ view, truth: msg.truth, clock: msg.clock, connection: connectionOf(view, msg.clock) })
       }
     },
     setDisconnected() {

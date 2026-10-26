@@ -45,32 +45,34 @@ function Alerts({ onSelect }: { onSelect(id: string): void }) {
   )
 }
 
-/** VMs the simulator sees running on several hosts at once. The control plane cannot see this, so it is shown only with the ground-truth overlay. */
+/**
+ * What the lab sees from outside the machines that the control plane cannot:
+ * a VM instance running on several machines at once, and the VIP held by more
+ * than one. Shown only with the ground-truth overlay.
+ */
 function SplitBrain() {
-  const alerts = useStore((s) => s.truth.alerts)
-  const items = useMemo(
-    () => alerts.filter((a) => a.kind === 'VmSplitBrain').sort((a, b) => (a.resolved_at === null ? 0 : 1) - (b.resolved_at === null ? 0 : 1) || b.raised_at - a.raised_at),
-    [alerts],
-  )
+  const truth = useStore((s) => s.truth)
+  const vms = useMemo(() => truth.vms.filter((v) => v.instances.some((i) => truth.split_brain_vms.includes(i))), [truth])
   return (
     <div className="truth-section">
       <h4>
         Split-brain <span className="truth-label">ground truth</span>
       </h4>
-      {items.length === 0 ? (
-        <p className="muted">No VM is running in two places.</p>
+      {truth.split_brain_vms.length === 0 && truth.vip_holders.length <= 1 ? (
+        <p className="muted">No VM is running in two places; the VIP has {truth.vip_holders.length === 1 ? `one holder (${truth.vip_holders[0]})` : 'no holder'}.</p>
       ) : (
         <ul className="rail-list">
-          {items.map((a) => (
-            <li key={a.id} className={a.resolved_at === null ? '' : 'resolved'}>
-              <span className={`sev sev-${a.severity}`}>{a.severity}</span> <strong>{a.kind}</strong> <span className="muted">{a.entity.id}</span>
-              <div>{a.message}</div>
-              <div className="muted">
-                {formatClock(a.raised_at)}
-                {a.resolved_at !== null && ` — resolved ${formatClock(a.resolved_at)}`}
-              </div>
+          {truth.split_brain_vms.map((i) => (
+            <li key={i}>
+              <span className="sev sev-Critical">Critical</span> <strong>{i}</strong> runs on{' '}
+              {vms.filter((v) => v.instances.includes(i)).map((v) => v.id).join(' and ')}
             </li>
           ))}
+          {truth.vip_holders.length > 1 && (
+            <li>
+              <span className="sev sev-Critical">Critical</span> <strong>VIP</strong> held by {truth.vip_holders.join(' and ')}
+            </li>
+          )}
         </ul>
       )}
     </div>
@@ -93,7 +95,7 @@ function Events() {
   )
 }
 
-function PendingRow({ host, disabled, onSelect }: { host: HostObj; disabled: boolean; onSelect(id: string): void }) {
+function PendingRow({ host, disabled = false, onSelect }: { host: HostObj; disabled?: boolean; onSelect(id: string): void }) {
   const [open, setOpen] = useState(false)
   const [roles, setRoles] = useState<Role[]>(['Compute'])
   const { error, busy, run } = useAction()
@@ -131,8 +133,7 @@ function PendingRow({ host, disabled, onSelect }: { host: HostObj; disabled: boo
 function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
   const hosts = useStore((s) => s.view.hosts)
   const tokens = useStore((s) => s.view.tokens)
-  const paused = useStore((s) => s.sim.paused)
-  const now = useStore((s) => s.sim.now)
+  const now = useStore((s) => s.clock.now)
   const pending = useMemo(
     () => Object.values(hosts).filter((h) => h.lifecycle === 'Pending').sort((a, b) => a.id.localeCompare(b.id)),
     [hosts],
@@ -145,7 +146,7 @@ function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
     <div>
       <div className="actions">
         <button
-          disabled={paused || busy}
+          disabled={busy}
           onClick={() =>
             run(async () => {
               setCreated(String(await op('CreateJoinToken')))
@@ -167,7 +168,7 @@ function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
       ) : (
         <ul className="rail-list">
           {pending.map((h) => (
-            <PendingRow key={h.id} host={h} disabled={paused} onSelect={onSelect} />
+            <PendingRow key={h.id} host={h} onSelect={onSelect} />
           ))}
         </ul>
       )}

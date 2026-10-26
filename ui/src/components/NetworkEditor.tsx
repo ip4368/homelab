@@ -208,7 +208,6 @@ const same = (a: HostNetworkConfig, b: HostNetworkConfig) => JSON.stringify(a) =
 /** A host's network: status, drift from its template, validation issues, and the override form. */
 export function NetworkEditor({ host }: { host: HostObj }) {
   const template = useStore((s) => (host.template ? s.view.templates[host.template] : undefined))
-  const paused = useStore((s) => s.sim.paused)
   const { net } = host
   const start = host.override_ ?? net.desired ?? EMPTY
   const [draft, setDraft] = useState<HostNetworkConfig>(start)
@@ -262,18 +261,17 @@ export function NetworkEditor({ host }: { host: HostObj }) {
       )}
       <ConfigForm cfg={draft} onChange={setDraft} ports={host.inventory.nics.map((n) => n.name)} showIp />
       <div className="actions">
-        <button disabled={paused || busy || problems.length > 0 || same(draft, start)} onClick={() => run(() => op({ SetHostOverride: { id: host.id, config: draft } }))}>
+        <button disabled={busy || problems.length > 0 || same(draft, start)} onClick={() => run(() => op({ SetHostOverride: { id: host.id, config: draft } }))}>
           Save override
         </button>
         <button disabled={busy || same(draft, start)} onClick={() => setDraft(start)}>
           Reset
         </button>
-        <button disabled={paused || busy || host.override_ === null} onClick={() => run(() => op({ SetHostOverride: { id: host.id, config: null } }))}>
+        <button disabled={busy || host.override_ === null} onClick={() => run(() => op({ SetHostOverride: { id: host.id, config: null } }))}>
           Clear override
         </button>
         {error && <span className="bad">{error}</span>}
       </div>
-      {paused && <p className="muted">Paused: saving is disabled.</p>}
     </div>
   )
 }

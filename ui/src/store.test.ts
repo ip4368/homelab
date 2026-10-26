@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { Alert } from './gen/Alert'
 import type { Event as ClusterEvent } from './gen/Event'
-import type { GroundTruth } from './gen/GroundTruth'
 import type { HostObj } from './gen/HostObj'
 import type { ServerMsg } from './gen/ServerMsg'
-import type { SimInfo } from './gen/SimInfo'
+import type { ClockInfo } from './gen/ClockInfo'
+import type { LabTruth } from './gen/LabTruth'
 import type { ViewSnapshot } from './gen/ViewSnapshot'
 import { EVENT_CAP, STALE_AFTER_MS, createStore } from './store'
 
-const truth: GroundTruth = { hosts: [], vip_owner_by_switch: {}, partitions: [], split_brain_vms: [], ports: [], flows: [], alerts: [], sim_time: 0 }
+const truth: LabTruth = { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], split_brain_vms: [], at: 0 }
 
 function host(id: string, lifecycle: HostObj['lifecycle'] = 'Ready'): HostObj {
   return {
@@ -27,7 +27,7 @@ function event(seq: number): ClusterEvent {
   return { seq, at: seq, entity: { kind: 'Host', id: 'a' }, message: `e${seq}`, version: seq }
 }
 
-function snapshot(over: Partial<ViewSnapshot> = {}, sim: Partial<SimInfo> = {}): ServerMsg {
+function snapshot(over: Partial<ViewSnapshot> = {}, clock: Partial<ClockInfo> = {}): ServerMsg {
   const view: ViewSnapshot = {
     version: 1,
     leader: 'cp-1',
@@ -52,7 +52,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, sim: Partial<SimInfo> = {}):
     metrics: {},
     ...over,
   }
-  return { type: 'snapshot', view, truth, sim: { now: 2000, speed: 1, paused: false, ...sim } }
+  return { type: 'snapshot', view, truth, clock: { now: 2000, ...clock } }
 }
 
 function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): ServerMsg {
@@ -66,7 +66,7 @@ function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): Serve
     removed: [],
     metrics: {},
     truth,
-    sim: { now: 2500, speed: 1, paused: false },
+    clock: { now: 2500 },
     ...over,
   }
 }
@@ -289,13 +289,13 @@ describe('store', () => {
     expect(Object.keys(s.getState().view.metrics)).toEqual(['a'])
   })
 
-  it('takes leader, term, truth and sim from every delta', () => {
+  it('takes leader, term, truth and clock from every delta', () => {
     const s = createStore()
     s.applyMessage(snapshot())
-    s.applyMessage(delta({ leader: 'cp-2', term: 4, sim: { now: 9000, speed: 20, paused: false } }))
+    s.applyMessage(delta({ leader: 'cp-2', term: 4, clock: { now: 9000 } }))
     expect(s.getState().view.leader).toBe('cp-2')
     expect(s.getState().view.term).toBe(4)
-    expect(s.getState().sim).toEqual({ now: 9000, speed: 20, paused: false })
+    expect(s.getState().clock).toEqual({ now: 9000 })
   })
 
   it('stale sync flips connection to cp-unavailable', () => {
@@ -303,10 +303,10 @@ describe('store', () => {
     s.applyMessage(snapshot({ last_sync_at: 1000 }, { now: 1000 + STALE_AFTER_MS }))
     expect(s.getState().connection).toBe('live')
 
-    s.applyMessage(delta({ last_sync_at: 1000, sim: { now: 1000 + STALE_AFTER_MS + 1, speed: 1, paused: false } }))
+    s.applyMessage(delta({ last_sync_at: 1000, clock: { now: 1000 + STALE_AFTER_MS + 1 } }))
     expect(s.getState().connection).toBe('cp-unavailable')
 
-    s.applyMessage(delta({ last_sync_at: 5000, sim: { now: 5100, speed: 1, paused: false } }))
+    s.applyMessage(delta({ last_sync_at: 5000, clock: { now: 5100 } }))
     expect(s.getState().connection).toBe('live')
   })
 

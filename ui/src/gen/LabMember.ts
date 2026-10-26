@@ -3,6 +3,6 @@ import type { HostId } from "./HostId";
 import type { SwitchId } from "./SwitchId";
 
 /**
- * A member of a partition group. A host member puts all its ports inside.
+ * A member of a partition group: a listed host puts all its ports inside.
  */
-export type PartitionMember = { "Host": HostId } | { "Switch": SwitchId };
+export type LabMember = { "Host": HostId } | { "Switch": SwitchId };

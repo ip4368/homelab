@@ -79,8 +79,8 @@ describe('alignSeries', () => {
 })
 
 describe('labels', () => {
-  it('says from when the leader has metrics, on the sim clock', () => {
-    expect(metricsSince(3_725_000)).toBe('metrics since 01:02:05')
+  it('says from when the leader has metrics, in local time', () => {
+    expect(metricsSince(new Date(2026, 9, 26, 1, 2, 5).getTime())).toBe('metrics since 01:02:05')
   })
 
   it('formats bit rates compactly', () => {

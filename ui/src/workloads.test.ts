@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import type { GroundTruth } from './gen/GroundTruth'
+import type { LabTruth } from './gen/LabTruth'
+import type { Power } from './gen/Power'
 import type { HostObj } from './gen/HostObj'
 import {
   buildWorkloads,
@@ -16,8 +17,24 @@ import {
 } from './workloads'
 
 const host = (id: string, lifecycle: HostObj['lifecycle'], roles: HostObj['roles'] = []) => ({ id, lifecycle, roles }) as HostObj
-const truthOf = (over: Partial<GroundTruth> = {}): Pick<GroundTruth, 'hosts' | 'split_brain_vms'> => ({ hosts: [], split_brain_vms: [], ...over })
-const up = (id: string, powered = true) => ({ id, powered, cp_role: null })
+const truthOf = (over: Partial<Pick<LabTruth, 'vms' | 'split_brain_vms'>> & { hosts?: LabTruth['vms'] } = {}): Pick<LabTruth, 'vms' | 'split_brain_vms'> => ({
+  vms: over.hosts ?? over.vms ?? [],
+  split_brain_vms: over.split_brain_vms ?? [],
+})
+const vm = (id: string, power: Power): LabTruth['vms'][number] => ({
+  id,
+  profile: 'Ms01',
+  installed: true,
+  power,
+  unplugged: [],
+  disks: ['nvme0'],
+  failed_disks: [],
+  holds_vip: false,
+  instances: [],
+  clock_offset_ms: null,
+  uptime_s: null,
+})
+const up = (id: string, powered = true) => vm(id, powered ? 'Running' : 'Off')
 
 function source(): WorkloadSource {
   return {
@@ -90,11 +107,16 @@ describe('truthDiff', () => {
     expect(diff).toEqual([{ hostId: 'a', believed: 'Ready', actual: 'powered off' }])
   })
 
-  it('flags a NotReady host that is powered (a partition), and treats cordoned/draining hosts as believed up', () => {
+  it('flags a frozen host the view still has up', () => {
+    const view = { hosts: { a: host('a', 'Ready') } }
+    expect(truthDiff(view, truthOf({ vms: [vm('a', 'Paused')] }))).toEqual([{ hostId: 'a', believed: 'Ready', actual: 'frozen' }])
+  })
+
+  it('flags a NotReady host that is running (a partition), and treats cordoned/draining hosts as believed up', () => {
     const view = { hosts: { a: host('a', 'NotReady'), b: host('b', 'Draining'), c: host('c', 'Cordoned'), d: host('d', 'NotReady') } }
     const diff = truthDiff(view, truthOf({ hosts: [up('a'), up('b', false), up('c'), up('d', false)] }))
     expect(diff).toEqual([
-      { hostId: 'a', believed: 'NotReady', actual: 'powered on' },
+      { hostId: 'a', believed: 'NotReady', actual: 'running' },
       { hostId: 'b', believed: 'Draining', actual: 'powered off' },
     ])
   })

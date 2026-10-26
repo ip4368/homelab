@@ -81,7 +81,7 @@ function Inventory({ host }: { host: HostObj }) {
 }
 
 /** Roles editor: Approve while the host is Pending, otherwise Apply (SetRoles). */
-function RolesEditor({ host, disabled }: { host: HostObj; disabled: boolean }) {
+function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boolean }) {
   const pending = host.lifecycle === 'Pending'
   const [roles, setRoles] = useState<Role[]>(pending && host.roles.length === 0 ? ['Compute'] : host.roles)
   const { error, busy, run } = useAction()
@@ -173,7 +173,6 @@ function HostWorkloads({ host, onSelectWorkload }: { host: HostObj; onSelectWork
 
 export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onClose(): void; onSelectWorkload(ref: WorkloadRef): void }) {
   const host = useStore((s) => s.view.hosts[id])
-  const paused = useStore((s) => s.sim.paused)
   const pods = useStore((s) => s.view.pods)
   const vmStatus = useStore((s) => s.view.vmStatus)
   const volumeStatus = useStore((s) => s.view.volumeStatus)
@@ -189,7 +188,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
 
   const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0]) =>
     show && (
-      <button onClick={() => run(() => op(o))} disabled={paused || busy}>
+      <button onClick={() => run(() => op(o))} disabled={busy}>
         {label}
       </button>
     )
@@ -204,7 +203,6 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           ×
         </button>
       </div>
-      {paused && <p className="muted">Paused: actions are disabled.</p>}
       <Inventory host={host} />
       <div className="section">
         <h4>Lifecycle</h4>
@@ -212,7 +210,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
           <button
             onClick={() => run(() => op({ Drain: { host: host.id } }))}
-            disabled={paused || busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
+            disabled={busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
             title="Live-migrate VMs, reschedule pods and move volume replicas off this host"
           >
             Drain
@@ -220,7 +218,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
           {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
           {host.lifecycle !== 'Removed' && (
-            <button onClick={remove} disabled={paused || busy}>
+            <button onClick={remove} disabled={busy}>
               Remove
             </button>
           )}
@@ -232,7 +230,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
       </div>
       <HostWorkloads host={host} onSelectWorkload={onSelectWorkload} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
-      <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} disabled={paused} />
+      <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
       {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
       <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
     </aside>

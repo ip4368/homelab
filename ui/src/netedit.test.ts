@@ -109,7 +109,7 @@ describe('netedit', () => {
   })
 
   it('networkFromForm round-trips a network and names the bad field', () => {
-    const n = { id: 'storage', purpose: 'Storage' as const, vlan: 20, subnet: '10.20.0.0/22', mtu: 9000 }
+    const n = { id: 'storage', purpose: 'Storage' as const, vlan: 20, subnet: '10.20.0.0/22', mtu: 9000, reserved: [{ first: '10.20.3.0', last: '10.20.3.255' }] }
     expect(networkFromForm(formFromNetwork(n))).toEqual({ network: n })
     const f = formFromNetwork(n)
     expect(networkFromForm({ ...f, vlan: '5000' })).toEqual({ error: 'VLAN: "5000" is not a VLAN id (1-4094)' })

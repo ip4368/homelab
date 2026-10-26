@@ -43,10 +43,9 @@ function Refusal({ what, error }: { what: string; error: string }) {
 /** Delete button that keeps the server's refusal next to it. */
 function useDelete(what: string, send: () => Promise<unknown>) {
   const { error, busy, run } = useAction()
-  const paused = useStore((s) => s.sim.paused)
   const button = (
     <button
-      disabled={paused || busy}
+      disabled={busy}
       onClick={() => {
         if (window.confirm(`Delete ${what}?`)) void run(send)
       }}
@@ -363,7 +362,6 @@ function RuleRow({ r, onEdit }: { r: AutoApproveRule; onEdit(): void }) {
 
 function RuleEditorForm({ initial, existing, onDone }: { initial: RuleDraft; existing: boolean; onDone(): void }) {
   const templates = useStore((s) => s.view.templates)
-  const paused = useStore((s) => s.sim.paused)
   const [draft, setDraft] = useState(initial)
   const { error, busy, run } = useAction()
   const toggle = (role: Role, on: boolean) => setDraft({ ...draft, roles: ALL_ROLES.filter((r) => (r === role ? on : draft.roles.includes(r))) })
@@ -403,7 +401,7 @@ function RuleEditorForm({ initial, existing, onDone }: { initial: RuleDraft; exi
         </select>
       </div>
       <div className="actions">
-        <button className="active" disabled={paused || busy || draft.id.trim() === '' || draft.roles.length === 0} onClick={save}>
+        <button className="active" disabled={busy || draft.id.trim() === '' || draft.roles.length === 0} onClick={save}>
           Save rule
         </button>
         <button onClick={onDone}>Cancel</button>

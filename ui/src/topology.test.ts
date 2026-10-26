@@ -2,11 +2,24 @@ import { describe, expect, it } from 'vitest'
 import type { Alert } from './gen/Alert'
 import type { HostObj } from './gen/HostObj'
 import type { Issue } from './gen/Issue'
-import type { PortLoad } from './gen/PortLoad'
+import type { PortTruth } from './gen/PortTruth'
 import type { SwitchObj } from './gen/SwitchObj'
 import { layoutTopology, suggestedFixes, utilisationBand } from './topology'
 
 const cfg = { mode: { Access: 1 }, mtu: 1500, lacp_group: null, admin_up: true } as const
+
+const counters = { rx_bytes: 0, tx_bytes: 0, rx_frames: 0, tx_frames: 0, drop_vlan: 0, drop_mtu: 0, drop_rate: 0, drop_partition: 0 }
+/** A switch port's measured load, with the host NIC cabled to it if any. */
+const load = (sw: string, port: string, rx_bps: number, tx_bps: number, host: string | null = null, nic: string | null = null): PortTruth => ({
+  switch: sw,
+  port,
+  host,
+  nic,
+  link_up: true,
+  rx_bps,
+  tx_bps,
+  counters,
+})
 
 function sw(id: string, ports: string[] = [], mlag_peer: string | null = null): SwitchObj {
   return {
@@ -108,10 +121,7 @@ describe('layoutTopology', () => {
   it('capacity of a switch link is the slower end; load comes from either end', () => {
     const f = fabric('access-1')
     cable(f.access[0], 'sfp1', f.cores[0], 'p60', 2_500) // a degraded cable
-    const ports: PortLoad[] = [
-      { port: { SwitchPort: ['core-1', 'p60'] }, rx_bps: 0, tx_bps: 1.25e9 },
-      { port: { SwitchPort: ['core-1', 'qsfp1'] }, rx_bps: 10e9, tx_bps: 2e9 },
-    ]
+    const ports = [load('core-1', 'p60', 0, 1.25e9), load('core-1', 'qsfp1', 10e9, 2e9)]
     const { edges } = layoutTopology(f.all, [host('h1', 'access-1', 1)], { collapseOver: 24, ports })
     const util = (a: string, b: string) => edges.find((e) => e.a === a && e.b === b)!.utilisation
     expect(util('access-1', 'core-1')).toBeCloseTo(0.5)
@@ -209,11 +219,8 @@ describe('layoutTopology', () => {
     expect(edges.find((e) => e.a === 'off' && e.b === 'access-1')!.state).toBe('down')
   })
 
-  it('host edge utilisation is the busier direction over the NIC speed, from the host-side port', () => {
-    const loads: PortLoad[] = [
-      { port: { HostPort: ['h1', 'eth0'] }, rx_bps: 250e6, tx_bps: 1e9 },
-      { port: { HostPort: ['h2', 'eth0'] }, rx_bps: 9e9, tx_bps: 0 },
-    ]
+  it('host edge utilisation is the busier direction over the NIC speed, from the port the NIC is cabled to', () => {
+    const loads = [load('access-1', 'p1', 1e9, 250e6, 'h1', 'eth0'), load('access-1', 'p2', 0, 9e9, 'h2', 'eth0')]
     const { edges } = layoutTopology(fabric('access-1').all, [host('h1', 'access-1', 1), host('h2', 'access-1', 2)], {
       collapseOver: 24,
       ports: loads,
@@ -226,7 +233,7 @@ describe('layoutTopology', () => {
   it('a collapsed group takes the busiest and worst of its hosts', () => {
     const issue: Issue = { NativeVlanMismatch: { network: 'mgmt', host_port: 'eth0', switch: 'access-1', switch_port: 'p2', vlan: 1, native: null } }
     const hosts = [host('h1', 'access-1', 1), host('h2', 'access-1', 2, [], [issue])]
-    const ports: PortLoad[] = [{ port: { HostPort: ['h1', 'eth0'] }, rx_bps: 1.25e9, tx_bps: 0 }]
+    const ports = [load('access-1', 'p1', 1.25e9, 0, 'h1', 'eth0')]
     const { edges, nodes } = layoutTopology([sw('access-1'), ...cores], hosts, { collapseOver: 1, ports })
     expect(edges.find((e) => e.a === 'group:access-1')).toMatchObject({ utilisation: 0.5, state: 'mismatch' })
     expect(nodes.find((n) => n.id === 'group:access-1')).toMatchObject({ hosts: 2, mismatched: 1, down: 0 })

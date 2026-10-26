@@ -56,7 +56,7 @@ function ReplicaMap({ replicas, onSelectHost }: { replicas: ReplicaRef[]; onSele
 }
 
 /** Delete with a second click to confirm; the server's refusal (a volume in use, say) shows beside it. */
-function DeleteButton({ label, o, disabled, onDeleted }: { label: string; o: ApiOp; disabled: boolean; onDeleted(): void }) {
+function DeleteButton({ label, o, disabled = false, onDeleted }: { label: string; o: ApiOp; disabled?: boolean; onDeleted(): void }) {
   const [confirming, setConfirming] = useState(false)
   const { error, busy, run } = useAction()
   return (
@@ -93,7 +93,7 @@ function DeleteButton({ label, o, disabled, onDeleted }: { label: string; o: Api
   )
 }
 
-function MigrateForm({ vm, from, running, paused }: { vm: string; from: string | null; running: boolean; paused: boolean }) {
+function MigrateForm({ vm, from, running }: { vm: string; from: string | null; running: boolean }) {
   const hosts = useStore((s) => s.view.hosts)
   const [target, setTarget] = useState(AUTO)
   const { error, busy, run } = useAction()
@@ -113,7 +113,7 @@ function MigrateForm({ vm, from, running, paused }: { vm: string; from: string |
             ))}
           </select>
         </label>
-        <button disabled={paused || busy || !running} onClick={() => run(() => op({ MigrateVm: { vm, to: chosen === AUTO ? null : chosen } }))}>
+        <button disabled={busy || !running} onClick={() => run(() => op({ MigrateVm: { vm, to: chosen === AUTO ? null : chosen } }))}>
           Migrate
         </button>
       </div>
@@ -131,7 +131,6 @@ function VmDetail({ id, onSelectHost, onSelect, onClose }: DetailProps) {
   const vm = useStore((s) => s.view.vms[id])
   const status = useStore((s) => s.view.vmStatus[id])
   const volume = useStore((s) => (vm ? s.view.volumeStatus[vm.volume] : undefined))
-  const paused = useStore((s) => s.sim.paused)
   if (!vm) return null
   const phase = status ? vmPhaseName(status.phase) : 'Pending'
   const note = status ? vmPhaseNote(status.phase) : ''
@@ -159,12 +158,12 @@ function VmDetail({ id, onSelectHost, onSelect, onClose }: DetailProps) {
           </button>
         </dd>
       </dl>
-      <MigrateForm vm={vm.id} from={status?.host ?? null} running={status?.phase === 'Running'} paused={paused} />
+      <MigrateForm vm={vm.id} from={status?.host ?? null} running={status?.phase === 'Running'} />
       <div className="section">
         <h4>Disk replicas ({vm.volume})</h4>
         {volume ? <ReplicaMap replicas={volume.replicas} onSelectHost={onSelectHost} /> : <p className="muted">Volume not found.</p>}
       </div>
-      <DeleteButton label="Delete VM" o={{ DeleteVm: { id: vm.id } }} disabled={paused} onDeleted={onClose} />
+      <DeleteButton label="Delete VM" o={{ DeleteVm: { id: vm.id } }} onDeleted={onClose} />
     </>
   )
 }
@@ -173,7 +172,6 @@ function VolumeDetail({ id, onSelectHost, onSelect, onClose }: DetailProps) {
   const volume = useStore((s) => s.view.volumes[id])
   const status = useStore((s) => s.view.volumeStatus[id])
   const vms = useStore((s) => s.view.vms)
-  const paused = useStore((s) => s.sim.paused)
   if (!volume) return null
   const health = status?.health ?? 'Faulted'
   const users = Object.values(vms)
@@ -212,7 +210,7 @@ function VolumeDetail({ id, onSelectHost, onSelect, onClose }: DetailProps) {
         <h4>Replicas</h4>
         <ReplicaMap replicas={status?.replicas ?? []} onSelectHost={onSelectHost} />
       </div>
-      <DeleteButton label="Delete volume" o={{ DeleteVolume: { id } }} disabled={paused} onDeleted={onClose} />
+      <DeleteButton label="Delete volume" o={{ DeleteVolume: { id } }} onDeleted={onClose} />
     </>
   )
 }
@@ -220,7 +218,6 @@ function VolumeDetail({ id, onSelectHost, onSelect, onClose }: DetailProps) {
 function DeploymentDetail({ id, onSelectHost, onClose }: DetailProps) {
   const deployment = useStore((s) => s.view.deployments[id])
   const allPods = useStore((s) => s.view.pods)
-  const paused = useStore((s) => s.sim.paused)
   if (!deployment) return null
   const pods = Object.values(allPods)
     .filter((p) => p.deployment === id)
@@ -280,7 +277,7 @@ function DeploymentDetail({ id, onSelectHost, onClose }: DetailProps) {
         </table>
         {pods.length > 200 && <p className="muted">Showing the first 200 of {pods.length} pods.</p>}
       </div>
-      <DeleteButton label="Delete deployment" o={{ DeleteDeployment: { id } }} disabled={paused} onDeleted={onClose} />
+      <DeleteButton label="Delete deployment" o={{ DeleteDeployment: { id } }} onDeleted={onClose} />
     </>
   )
 }
@@ -307,10 +304,8 @@ function Head({ title, badge, onClose }: { title: string; badge: string; onClose
 
 /** The drawer for a VM, volume or deployment (a pod opens its deployment). */
 export function WorkloadDrawer({ workload, ...rest }: { workload: WorkloadRef } & Omit<DetailProps, 'id'>) {
-  const paused = useStore((s) => s.sim.paused)
   return (
     <aside className="drawer workload-drawer" aria-label={`${workload.kind} ${workload.id}`}>
-      {paused && <p className="muted">Paused: actions are disabled.</p>}
       {workload.kind === 'vm' && <VmDetail id={workload.id} {...rest} />}
       {workload.kind === 'volume' && <VolumeDetail id={workload.id} {...rest} />}
       {workload.kind === 'deployment' && <DeploymentDetail id={workload.id} {...rest} />}

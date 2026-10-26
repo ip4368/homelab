@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { fault } from '../api'
+import { labFault } from '../api'
+import { formatClock } from '../clock'
 import type { SwitchPortCfg } from '../gen/SwitchPortCfg'
 import { formatBps, portPeers, suggestedFixes } from '../topology'
 import { useStore } from '../store'
@@ -60,7 +61,7 @@ export function describeMode(mode: SwitchPortCfg['mode']): string {
   return `trunk native ${native ?? 'none'} allow ${allowed.join(',') || 'none'}`
 }
 
-/** The human editing a switch port: posts `SetSwitchPort`. Works while paused, since faults are allowed. */
+/** The human editing a switch port: posts the lab fault `SetSwitchPort` (the control plane never configures switches). */
 function PortEditor({ switchId, port, cfg }: { switchId: string; port: string; cfg: SwitchPortCfg }) {
   const [form, setForm] = useState(formFromCfg(cfg))
   const [invalid, setInvalid] = useState<string | null>(null)
@@ -75,7 +76,7 @@ function PortEditor({ switchId, port, cfg }: { switchId: string; port: string; c
     setInvalid('error' in parsed ? parsed.error : null)
     if ('error' in parsed) return
     void run(async () => {
-      await fault({ SetSwitchPort: { switch: switchId, port, cfg: parsed.cfg } })
+      await labFault({ SetSwitchPort: { switch: switchId, port, cfg: parsed.cfg } })
       setSent(true)
     })
   }
@@ -142,7 +143,7 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
   const hosts = Object.values(hostMap)
   const peers = portPeers(id, hosts)
   const load = new Map(
-    loads.flatMap((l) => (typeof l.port !== 'string' && 'SwitchPort' in l.port && l.port.SwitchPort[0] === id ? [[l.port.SwitchPort[1], l] as const] : [])),
+    loads.flatMap((l) => (l.switch === id && (l.rx_bps > 0 || l.tx_bps > 0) ? [[l.port, l] as const] : [])),
   )
   // A port stands out if it is cabled, busy, admin-down or configured unlike most of the switch.
   const configs = sw.ports.map((p) => JSON.stringify(p.cfg))
@@ -168,7 +169,7 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
         </button>
       </div>
       <p className="muted">
-        {sw.mlag_peer ? `MLAG peer ${sw.mlag_peer}. ` : ''}Last seen at sim {Math.round(sw.last_seen / 1000)} s. Ports show the last poll.
+        {sw.mlag_peer ? `MLAG peer ${sw.mlag_peer}. ` : ''}Last seen at {formatClock(sw.last_seen)}. Ports show the last poll.
       </p>
       {fixes.length > 0 && (
         <div className="section">
