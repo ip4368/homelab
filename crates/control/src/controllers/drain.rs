@@ -652,6 +652,7 @@ mod tests {
         let mut v = Volatile::new(0, 1);
         for h in s.hosts.keys() {
             v.replicas.insert(h.clone(), vec![]);
+            v.last_heartbeat.insert(h.clone(), SimTime::MAX);
         }
         for r in &s.volume_status[volume].status.replicas {
             v.replicas.insert(r.host.clone(), vec![rep(volume, &r.disk, 100, false)]);

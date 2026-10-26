@@ -295,14 +295,15 @@ fn stalled(v: &Volatile, now: SimTime, volume: &str, r: &ReplicaRef) -> bool {
             .is_some_and(|(_, since)| now.saturating_sub(*since) > REBUILD_STALL_MS)
 }
 
-/// Whether `r` is healthy on a host that exists, is not `NotReady` and was
-/// heard from within [`UNHEARD_MS`]. A replica on a host that stopped
+/// Whether `r` is healthy on a host that exists, is not `NotReady` and this
+/// leader heard from within [`UNHEARD_MS`]. A replica on a host that stopped
 /// heartbeating stays `Healthy` until the host is lost, but may be gone, so
-/// it never makes another replica unneeded.
+/// it never makes another replica unneeded; nor does one on a host not heard
+/// from since the election (unlike [`Volatile::last_seen`], no grace period).
 fn usable(state: &ClusterState, v: &Volatile, now: SimTime, r: &ReplicaRef) -> bool {
     r.state == ReplicaState::Healthy
         && state.hosts.get(&r.host).is_some_and(|h| h.lifecycle != Lifecycle::NotReady)
-        && now.saturating_sub(v.last_seen(&r.host)) <= UNHEARD_MS
+        && v.last_heartbeat.get(&r.host).is_some_and(|at| now.saturating_sub(*at) <= UNHEARD_MS)
 }
 
 /// Whether `host`'s storage role is held: as far as the control plane
@@ -978,6 +979,20 @@ mod tests {
         s.apply(10_000, Command::SetLifecycle { id: hid("m1"), lifecycle: Lifecycle::NotReady }).unwrap();
         let out = run(&s, &v, 20_000);
         assert!(deletes(&out).is_empty() && statuses(&out).is_empty(), "m2 is still needed: {out:?}");
+    }
+
+    #[test]
+    fn a_new_leader_relies_only_on_hosts_it_has_heard_from() {
+        // Elected at 50 s, just after m2 died: m2 is not NotReady yet, and m4's stale copy may be needed.
+        let (mut s, mut v) = whole(4);
+        let st = vec![healthy("m1"), healthy("m2"), healthy("m3"), stale("m4")];
+        s.apply(0, Command::SetVolumeStatus { id: "d".into(), replicas: st, health: VolumeHealth::Healthy }).unwrap();
+        v.elected_at = 50_000;
+        v.last_heartbeat.remove(&hid("m2"));
+        v.replicas.insert(hid("m4"), vec![rep("d", "nvme0", 100, false)]);
+        assert!(statuses(&run(&s, &v, 51_000)).is_empty(), "m2 has not been heard from since the election: the stale entry stays");
+        v.last_heartbeat.insert(hid("m2"), 51_000);
+        assert_eq!(statuses(&run(&s, &v, 51_000))[0].0.len(), 3, "once heard: whole, so the stale entry goes");
     }
 
     #[test]
