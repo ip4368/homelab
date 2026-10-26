@@ -176,6 +176,28 @@ mod tests {
     }
 
     #[test]
+    fn a_no_fit_retry_whose_run_was_skipped_happens_at_the_next_run() {
+        let mut s = running_on_m1();
+        for h in ["m2", "m3"] {
+            s.apply(0, Command::SetLifecycle { id: hid(h), lifecycle: Lifecycle::Cordoned }).unwrap();
+        }
+        not_ready(&mut s, "m1", 0);
+        let t0 = FAILOVER_GRACE_MS + 1000;
+        for c in proposals(&scheduler::run(&s, &Volatile::new(0, 1), t0)) {
+            s.apply(t0, c).unwrap();
+        }
+        s.apply(t0, Command::SetLifecycle { id: hid("m2"), lifecycle: Lifecycle::Ready }).unwrap();
+        // The run at t0 + 30 s was skipped (the leader briefly lacked quorum).
+        let mut v = Volatile::new(0, 1);
+        v.last_run = Some(t0 + NO_FIT_RETRY_MS - 1000);
+        let out = proposals(&scheduler::run(&s, &v, t0 + NO_FIT_RETRY_MS + 1000));
+        assert_eq!(vm_statuses(&out), [Command::SetVmStatus { id: "vm1".into(), host: Some(hid("m2")), phase: VmPhase::Starting }]);
+        // Had the run at t0 + 30 s retried (and still found no fit), the next would not.
+        v.last_run = Some(t0 + NO_FIT_RETRY_MS);
+        assert!(vm_statuses(&proposals(&scheduler::run(&s, &v, t0 + NO_FIT_RETRY_MS + 1000))).is_empty());
+    }
+
+    #[test]
     fn a_vm_whose_volume_has_no_healthy_replica_waits_for_it() {
         let mut s = running_on_m1();
         let stale = vec![ReplicaRef { host: hid("m1"), disk: "nvme0".into(), state: ReplicaState::Stale }];

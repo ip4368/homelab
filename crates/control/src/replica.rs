@@ -167,6 +167,7 @@ impl CpReplica {
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         let mut actions = controllers::run_all(&self.state, v, now);
         let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
+        v.last_run = Some(now);
         actions.extend(plan.actions);
         if let Some(change) = plan.change {
             // Refused only if the leader cannot change membership now; the next run asks again.

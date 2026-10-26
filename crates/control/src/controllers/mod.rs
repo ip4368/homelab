@@ -87,6 +87,8 @@ pub struct Volatile {
     /// Whether an entry of `term` (the leader's no-op) has applied, i.e. the
     /// state includes everything committed before this leader.
     pub caught_up: bool,
+    /// When this leader's controllers last ran; `None` before the first run.
+    pub last_run: Option<SimTime>,
     pub last_heartbeat: BTreeMap<HostId, SimTime>,
     /// Each host's latest sample.
     pub metrics: BTreeMap<HostId, MetricSample>,
@@ -147,6 +149,7 @@ impl Volatile {
             elected_at,
             term,
             caught_up: false,
+            last_run: None,
             last_heartbeat: BTreeMap::new(),
             metrics: BTreeMap::new(),
             history: MetricsStore::new(elected_at),

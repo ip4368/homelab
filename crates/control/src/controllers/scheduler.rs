@@ -222,7 +222,7 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
             (VmPhase::Starting | VmPhase::Running, Some(host)) if host_lost(state, host, now) => {
                 out.extend(failover::fail_over(state, now, id, vm, host, hosts));
             }
-            (VmPhase::Pending(why), _) if why.starts_with(NO_FIT) && !retry_due(status.since, now) => {}
+            (VmPhase::Pending(why), _) if why.starts_with(NO_FIT) && !retry_due(status.since, v.last_run, now) => {}
             (VmPhase::Pending(_), _) => {
                 let (host, phase) = match volume_ready(state, &vm.volume, now).and_then(|()| hosts.place(&PlacementReq::vm(vm))) {
                     Ok(host) => (Some(host), VmPhase::Starting),
@@ -252,10 +252,12 @@ fn vms(state: &ClusterState, v: &Volatile, now: SimTime, hosts: &mut Hosts) -> V
 }
 
 /// Whether a VM that fit nowhere when its status was written at `since` is
-/// due another try: once every [`NO_FIT_RETRY_MS`], in the controller run
-/// that falls in the first period of each.
-fn retry_due(since: SimTime, now: SimTime) -> bool {
-    now.saturating_sub(since) % NO_FIT_RETRY_MS < crate::replica::CONTROLLER_PERIOD_MS
+/// due another try: once every [`NO_FIT_RETRY_MS`], in the first controller
+/// run at or after each, even if the run that would have fallen there was
+/// skipped. A leader's first run (`last_run` is `None`) tries once 30 s are up.
+fn retry_due(since: SimTime, last_run: Option<SimTime>, now: SimTime) -> bool {
+    let tries = |t: SimTime| t.saturating_sub(since) / NO_FIT_RETRY_MS;
+    tries(now) > last_run.map_or(0, tries)
 }
 
 /// A VM only starts once its volume has a healthy replica on a host that is
