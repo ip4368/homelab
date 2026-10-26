@@ -1,0 +1,15 @@
+[package]
+name = "lab"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+control = { path = "../control" }
+model = { path = "../model" }
+node = { path = "../node" }
+serde.workspace = true
+serde_json.workspace = true
+ts-rs.workspace = true
+ipnet.workspace = true
+tokio = { version = "1", features = ["full"] }
+libc = "0.2"
