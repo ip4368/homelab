@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { HostNetworkConfig } from '../gen/HostNetworkConfig'
-import { linkPorts, nicState } from './HostDrawer'
+import { kubeSummary, linkPorts, nicState } from './HostDrawer'
 
 const cfg: HostNetworkConfig = {
   links: [
@@ -24,5 +24,24 @@ describe('host drawer ports', () => {
     expect(nicState(nic('eth1', false), linkPorts({ applied: null, desired: cfg }))).toBe('unused')
     expect(linkPorts({ applied: null, desired: null })).toBeNull()
     expect(nicState(nic('eth1', false), null)).toBe('down')
+  })
+})
+
+describe('host drawer kubernetes', () => {
+  const k = (over: Partial<NonNullable<Parameters<typeof kubeSummary>[0]>>) => ({
+    role: 'Server' as const,
+    phase: 'Running' as const,
+    node_ready: true,
+    labels: {},
+    storage_disks: ['nvme0'],
+    version: 'v1.36.5+k3s1',
+    detail: null,
+    ...over,
+  })
+  it('says what the host runs and how far it got', () => {
+    expect(kubeSummary(null).tone).toBe('muted')
+    expect(kubeSummary(k({}))).toEqual({ text: 'K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0', tone: 'ok' })
+    expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'starting k3s-agent' })).text).toBe('K3s agent: starting k3s-agent')
+    expect(kubeSummary(k({ phase: { Failed: 'no route' } })).tone).toBe('bad')
   })
 })

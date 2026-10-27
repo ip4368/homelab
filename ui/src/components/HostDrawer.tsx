@@ -80,6 +80,28 @@ function Inventory({ host }: { host: HostObj }) {
   )
 }
 
+/** One line on the host's Kubernetes node, from what its agent reports. */
+export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'warn' | 'bad' | 'muted' } {
+  if (!k) return { text: 'not installed yet (comes once the host is Ready on its network)', tone: 'muted' }
+  const role = k.role === 'Server' ? 'K3s server (API + etcd)' : k.role === 'Agent' ? 'K3s agent' : 'nothing installed'
+  const phase = k.phase
+  if (phase === 'Absent') return { text: 'nothing installed', tone: 'muted' }
+  if (typeof phase === 'object' && 'Failed' in phase) return { text: `${role}: failed (${phase.Failed}); retrying`, tone: 'bad' }
+  if (phase === 'Installing') return { text: `${role}: ${k.detail ?? 'installing'}`, tone: 'warn' }
+  const disks = k.storage_disks.length ? `, Longhorn on ${k.storage_disks.join(', ')}` : ''
+  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}`, tone: k.node_ready ? 'ok' : 'warn' }
+}
+
+function Kubernetes({ host }: { host: HostObj }) {
+  const { text, tone } = kubeSummary(host.kube)
+  return (
+    <div className="section">
+      <h4>Kubernetes</h4>
+      <p className={tone}>{text}</p>
+    </div>
+  )
+}
+
 /** Roles editor: Approve while the host is Pending, otherwise Apply (SetRoles). */
 function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boolean }) {
   const pending = host.lifecycle === 'Pending'
@@ -204,6 +226,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
         </button>
       </div>
       <Inventory host={host} />
+      <Kubernetes host={host} />
       <div className="section">
         <h4>Lifecycle</h4>
         <div className="actions">
