@@ -132,3 +132,4 @@ Confirmed as designed:
 - Joining servers register through the VIP.
 - The Kubernetes API answers through the VIP about 2 s after the homelabd leader (a K3s server) is powered off, because the VIP moves with the leadership.
 - A host whose storage VLAN is missing joins Kubernetes and gives Longhorn no disks.
+- One full e2e run from a reset lab (`./lab.sh reset`, `./lab.sh up`, then `node e2e/lab.e2e.ts`), with the kubeconfig from the control plane and K3s from the sha256-checked downloads, passes every criterion, K1–K6 included. In that run the K4 pod read its token back 132 s after its host was powered off, and Longhorn rebuilt the lost replica within 174 s.
