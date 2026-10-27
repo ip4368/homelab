@@ -273,9 +273,10 @@ pub fn install_script() -> String {
     include_str!("../../node/install.sh").replace("@URL@", &format!("http://{ROUTER_IP}:{BIN_PORT}"))
 }
 
-/// Serves `GET /install.sh` and `GET /homelabd` (the current build of
+/// Serves `GET /install.sh`, `GET /homelabd` (the current build of
 /// `binary`, re-read on every request so a rebuild reaches the next machine
-/// installed or upgraded): what a release download site would.
+/// installed or upgraded) and `GET /homelabd.sha256` (its sha256, which
+/// `install.sh` checks): what a release download site would.
 pub async fn run_binary_server(binary: PathBuf) -> io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((ROUTER_IP, BIN_PORT))).await?;
     tokio::spawn(async move {
@@ -288,6 +289,9 @@ pub async fn run_binary_server(binary: PathBuf) -> io::Result<()> {
                 let req = String::from_utf8_lossy(&req[..n]);
                 let body = if req.starts_with("GET /homelabd ") {
                     tokio::fs::read(&binary).await.ok()
+                } else if req.starts_with("GET /homelabd.sha256 ") {
+                    let b = binary.clone();
+                    tokio::task::spawn_blocking(move || sha256_line(&b)).await.ok().and_then(Result::ok).map(String::into_bytes)
                 } else if req.starts_with("GET /install.sh ") {
                     Some(install_script().into_bytes())
                 } else {
@@ -306,6 +310,16 @@ pub async fn run_binary_server(binary: PathBuf) -> io::Result<()> {
         }
     });
     Ok(())
+}
+
+/// `binary`'s sha256 as `sha256sum` prints it for a file named `homelabd`.
+pub fn sha256_line(binary: &Path) -> io::Result<String> {
+    let out = Command::new("sha256sum").arg(binary).output()?;
+    let sum = String::from_utf8_lossy(&out.stdout).split_whitespace().next().map(String::from);
+    match sum {
+        Some(s) if out.status.success() => Ok(format!("{s}  homelabd\n")),
+        _ => Err(io::Error::other(format!("sha256sum {}: {}", binary.display(), String::from_utf8_lossy(&out.stderr).trim()))),
+    }
 }
 
 /// Each switch's management interface: answers the control plane's
@@ -431,5 +445,16 @@ mod tests {
     fn the_install_script_points_at_the_lab() {
         let s = install_script();
         assert!(s.contains("URL=\"${HOMELAB_URL:-http://10.0.0.1:7480}\""), "{s}");
+        assert!(s.contains("$URL/homelabd.sha256") && s.contains("not running it"), "the script checks the binary: {s}");
+    }
+
+    #[test]
+    fn the_binary_is_published_with_its_sha256() {
+        let f = std::env::temp_dir().join(format!("homelab-sha-{}", std::process::id()));
+        std::fs::write(&f, "abc").unwrap();
+        // sha256("abc"), the FIPS 180-2 test vector.
+        assert_eq!(sha256_line(&f).unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  homelabd\n");
+        std::fs::remove_file(&f).unwrap();
+        assert!(sha256_line(&f).is_err(), "a missing binary has no sum");
     }
 }

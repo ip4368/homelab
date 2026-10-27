@@ -18,7 +18,8 @@ This guide covers installing the homelab cluster on real machines: homelabd, K3s
 - Optionally, switches that send LLDP with a management address. homelabd learns each switch's port map from it.
 
 **Where the files come from**
-- `install.sh` and the `homelabd` binary, served from one URL (`<url>` below). From a checkout: `cargo build --release -p node`, then serve `target/release/homelabd` and `crates/node/install.sh`. Replace the `@URL@` placeholder in the script with the URL, or set `HOMELAB_URL`.
+- `install.sh`, the `homelabd` binary and its sha256, served from one URL (`<url>` below). From a checkout: `cargo build --release -p node`, then `(cd target/release && sha256sum homelabd > homelabd.sha256)`, and serve `homelabd`, `homelabd.sha256` and `crates/node/install.sh`. Replace the `@URL@` placeholder in the script with the URL, or set `HOMELAB_URL`.
+- `install.sh` runs only a `homelabd` that matches `homelabd.sha256`. The sum comes from the same URL as the binary, so it catches a corrupt or swapped file there, not someone who controls the URL: serve it over HTTPS, or publish the sum elsewhere and pass it as `HOMELAB_SHA256=<sum>` (`curl -fsSL <url>/install.sh | sudo HOMELAB_SHA256=<sum> sh -s -- ...`).
 - K3s comes from its GitHub release. homelabd checks the install script and the binary against sha256 sums pinned in the build, so a machine needs to reach `raw.githubusercontent.com`, `github.com` and `release-assets.githubusercontent.com`.
 
 The seed configuration is the one the lab uses: networks, templates, and auto-approve rules per hardware profile. If your subnets differ, change them in the UI after `init`, before joining the other machines.

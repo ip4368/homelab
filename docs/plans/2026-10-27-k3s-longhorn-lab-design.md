@@ -74,6 +74,7 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - The technician installs machines over SSH: `init` on `ms01-01`, then `join` with a token from `homelabd token`. *Add VM* does the same.
 - `LLDP` frames carry each switch's management address.
 - `/api/lab/kubeconfig` asks the control plane for the kubeconfig (`ApiOp::GetKubeconfig`), so it works without the lab too.
+- The binary server publishes `homelabd.sha256` beside `homelabd`, and `install.sh` refuses a binary that does not match it.
 
 **server and UI**
 - The host drawer shows the K3s role and phase and whether the node is Ready. The top bar shows the K3s node count.
