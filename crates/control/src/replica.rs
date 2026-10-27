@@ -477,6 +477,13 @@ impl Actor for CpReplica {
                 }
             }
             Msg::MigrationDone { instance } => self.on_migration_done(from, instance),
+            Msg::KubeStatus { host, status } => {
+                if let Some(v) = &mut self.volatile
+                    && self.state.hosts.contains_key(&host)
+                {
+                    v.kube_status.insert(host, status);
+                }
+            }
             Msg::Api { req, op } => self.on_api(ctx, from, req, op),
             Msg::Sync { since } => self.on_sync(ctx, from, since),
             Msg::Ping(_)
@@ -495,6 +502,7 @@ impl Actor for CpReplica {
             | Msg::CreateReplica { .. }
             | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. }
+            | Msg::Kube(_)
             | Msg::Directory { .. } => {}
         }
     }

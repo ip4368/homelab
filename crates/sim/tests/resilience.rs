@@ -264,6 +264,28 @@ fn default_preset_all_ready() {
     assert!(view.state.cp.voters.iter().all(|v| v.as_str().starts_with("ms01-")));
 }
 
+#[test]
+fn every_ready_host_runs_kubernetes_with_servers_on_the_voters() {
+    use control::proto::{KubePhase, KubeRole};
+    let mut e = default_fleet(12);
+    settle(&mut e);
+    let converged = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.cp.voters.len() == 5
+            && s.hosts.values().all(|h| {
+                let server = h.roles.contains(&Role::ControlPlane);
+                h.kube.as_ref().is_some_and(|k| k.phase == KubePhase::Running && k.role == Some(if server { KubeRole::Server } else { KubeRole::Agent }))
+            })
+    };
+    let deadline = e.now() + 5 * 60_000;
+    assert!(e.run_until(deadline, converged), "kubernetes did not converge: {:?}", e.client_view().state.hosts.values().filter(|h| h.kube.is_none()).map(|h| h.id.clone()).collect::<Vec<_>>());
+    let s = &e.client_view().state;
+    let servers: BTreeSet<HostId> = s.hosts.values().filter(|h| h.kube.as_ref().unwrap().role == Some(KubeRole::Server)).map(|h| h.id.clone()).collect();
+    assert_eq!(servers, s.cp.voters, "the K3s servers are the CP voters");
+    let pi = &s.hosts[&hid("pi5-01")];
+    assert_eq!(pi.kube.as_ref().unwrap().labels.get("homelab.io/transcode").map(String::as_str), Some("true"));
+}
+
 /// Kills the settled leader at the end of a client write, so its log may
 /// hold an entry it has not committed. Returns (leader, kill time, its log
 /// and commit index at the kill).

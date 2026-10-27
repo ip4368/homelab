@@ -10,6 +10,7 @@ use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{Deployment, HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId, Vm, Volume};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 use ts_rs::TS;
 
 /// A live migration not complete this long after it began fails: the
@@ -136,6 +137,75 @@ pub struct ReplicaReport {
     /// copying was interrupted (its host or source lost power) and waits for
     /// a `CreateReplica` naming a source to resume.
     pub copying: bool,
+}
+
+/// What a host runs of Kubernetes (K3s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum KubeRole {
+    /// An API server with an embedded etcd member.
+    Server,
+    Agent,
+}
+
+/// What the leader asks a host to run of Kubernetes. The agent installs or
+/// reinstalls it until what it runs matches, and reports a [`KubeStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeSpec {
+    pub role: KubeRole,
+    /// Start a new Kubernetes cluster instead of joining through the VIP.
+    /// Only ever true for the first server, the first time.
+    pub init: bool,
+    /// The cluster's shared secret (`k3s --token`).
+    pub token: String,
+    /// The address the node registers with: its static mgmt address.
+    pub node_ip: Ipv4Addr,
+    /// Node labels: the host's profile and roles, and its own labels.
+    pub labels: BTreeMap<String, String>,
+    /// The data disks Longhorn keeps replicas on; empty on a host without an
+    /// active storage role.
+    pub storage_disks: Vec<String>,
+}
+
+/// How a host's Kubernetes install stands.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum KubePhase {
+    /// Nothing installed, nothing asked for.
+    Absent,
+    /// Installing, reinstalling, or waiting for the node to register
+    /// ([`KubeStatus::detail`] says which).
+    Installing,
+    Running,
+    /// The last attempt failed (it is retried); why.
+    Failed(String),
+}
+
+/// What a host's agent reports of its Kubernetes node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KubeStatus {
+    /// What is installed; `None` for nothing.
+    pub role: Option<KubeRole>,
+    pub phase: KubePhase,
+    /// Registered and `Ready` in Kubernetes, as the node sees itself.
+    pub node_ready: bool,
+    /// The labels and Longhorn disks the node has been given.
+    pub labels: BTreeMap<String, String>,
+    pub storage_disks: Vec<String>,
+    /// The installed K3s version.
+    pub version: String,
+    /// What an `Installing` host is doing or waiting on. Statuses are kept
+    /// in the Raft log, so a field added later must default for old entries.
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
+impl KubeStatus {
+    /// Whether the host runs what `spec` asks for.
+    pub fn satisfies(&self, spec: &KubeSpec) -> bool {
+        self.role == Some(spec.role) && self.phase == KubePhase::Running && self.labels == spec.labels && self.storage_disks == spec.storage_disks
+    }
 }
 
 /// A user operation, as submitted through the API.
@@ -300,6 +370,11 @@ pub enum Msg {
     Directory { hosts: BTreeMap<HostId, BTreeMap<NetworkId, std::net::Ipv4Addr>> },
     /// Agent to the VIP, every metrics interval.
     Metrics { host: HostId, sample: MetricSample },
+    /// Leader to agent: run this of Kubernetes (a repeat changes nothing).
+    Kube(KubeSpec),
+    /// Agent to the VIP: how its Kubernetes stands, when that changes and
+    /// every [`crate::agent::KUBE_REPORT_MS`] regardless.
+    KubeStatus { host: HostId, status: KubeStatus },
     /// Leader to a switch's management interface, every poll interval.
     SwitchPoll,
     /// Switch to the leader: its own configuration.

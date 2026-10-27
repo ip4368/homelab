@@ -16,6 +16,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use ts_rs::TS;
 
+/// The cluster's Kubernetes settings, chosen when it was created. Not sent
+/// to clients: the token is a secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KubeCluster {
+    pub token: String,
+    /// The host whose K3s server starts the Kubernetes cluster (`--cluster-init`).
+    pub init_host: HostId,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct HostObj {
@@ -39,6 +48,8 @@ pub struct HostObj {
     /// Static addresses allocated at provisioning, by network.
     pub ips: BTreeMap<NetworkId, Ipv4Addr>,
     pub net: HostNet,
+    /// What its agent last reported of its Kubernetes node; `None` before any report.
+    pub kube: Option<crate::proto::KubeStatus>,
     #[ts(type = "number")]
     pub last_transition: SimTime,
     #[ts(type = "number")]

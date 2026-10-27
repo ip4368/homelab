@@ -188,7 +188,7 @@ pub fn seeded_durable(w: &World, hosts: &[(HostId, String)], voters: &BTreeSet<H
             running: Some(w.hosts[id].applied_net.clone()),
         })
         .collect();
-    bootstrap::seeded_durable(&seeds, voters, 0)
+    bootstrap::seeded_durable(&seeds, voters, "sim-kube-token", 0)
 }
 
 pub fn host_id(p: ProfileId, n: u32) -> HostId {

@@ -120,6 +120,11 @@ pub enum Command {
     SetVmStatus { id: String, host: Option<HostId>, phase: VmPhase },
     /// Replaces a volume's replica list and health as the storage controller judged them.
     SetVolumeStatus { id: String, replicas: Vec<ReplicaRef>, health: VolumeHealth },
+    /// Sets the cluster's Kubernetes secret and the host whose K3s server
+    /// starts the Kubernetes cluster. Fails with `AlreadyExists` once set.
+    SetKube { token: String, init_host: HostId },
+    /// What a host's agent last reported of its Kubernetes node.
+    RecordKube { id: HostId, status: crate::proto::KubeStatus },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

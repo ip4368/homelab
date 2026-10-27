@@ -412,6 +412,7 @@ mod tests {
                 running: None,
             }],
             &voters,
+            "test-token",
             wall_ms(),
         );
         let os = MemOs::new(id.clone(), Some(durable));

@@ -50,6 +50,8 @@ pub struct ClusterState {
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
     pub cp: CpInfo,
+    /// `None` until the cluster's first host set it ([`Command::SetKube`]).
+    pub kube: Option<KubeCluster>,
     next_event_seq: u64,
     /// Removed objects and the version at which they went. Unbounded, which is
     /// fine for a prototype. Events leave the ring silently and have no tombstones.
@@ -82,6 +84,7 @@ impl ClusterState {
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
+            kube: None,
             next_event_seq: 1,
             tombstones: Vec::new(),
         }
@@ -129,6 +132,7 @@ impl ClusterState {
                     override_: None,
                     ips: BTreeMap::new(),
                     net: HostNet::default(),
+                    kube: None,
                     last_transition: at,
                     version: v,
                 };
@@ -398,6 +402,17 @@ impl ClusterState {
             Command::SetPodStatus { deployment, idx, host, phase } => self.set_pod_status(v, deployment, idx, host, phase)?,
             Command::SetVmStatus { id, host, phase } => self.set_vm_status(at, v, &id, host, phase)?,
             Command::SetVolumeStatus { id, replicas, health } => self.set_volume_status(v, &id, replicas, health)?,
+            Command::SetKube { token, init_host } => {
+                if self.kube.is_some() {
+                    return Err(ApplyError::AlreadyExists);
+                }
+                self.kube = Some(KubeCluster { token, init_host });
+            }
+            Command::RecordKube { id, status } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                host.kube = Some(status);
+                host.version = v;
+            }
         }
         self.version = v;
         Ok(())

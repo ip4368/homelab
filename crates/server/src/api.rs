@@ -128,7 +128,7 @@ pub mod tests {
         let id = HostId::from("ms01-01");
         let voters = [id.clone()].into();
         let seed = SeedHost { id: id.clone(), inventory: Inventory::from_profile(ProfileId::Ms01, 0), location: "lab".into(), running: None };
-        let durable = seeded_durable(&[seed], &voters, wall_ms());
+        let durable = seeded_durable(&[seed], &voters, "test-token", wall_ms());
         let cfg = NodeConfig { me: Addr::Host(id.clone()), listen: Some("127.0.0.1:0".parse().unwrap()), port: 0, book: AddressBook::default() };
         let host = NodeHandle::spawn_with(cfg, Some(Box::new(MemOs::new(id.clone(), Some(durable)))), move |n| {
             n.start(Svc::Cp, Box::new(CpReplica::new(id, None, voters)));

@@ -14,6 +14,7 @@ pub mod drain;
 pub mod failover;
 pub mod health;
 pub mod join;
+pub mod kube;
 pub mod membership;
 pub mod network;
 pub mod observe;
@@ -22,7 +23,7 @@ pub mod scheduler;
 pub mod storage;
 
 use crate::metrics::MetricsStore;
-use crate::proto::{MetricSample, Msg, Observed, ReplicaReport};
+use crate::proto::{KubeStatus, MetricSample, Msg, Observed, ReplicaReport};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
@@ -142,6 +143,10 @@ pub struct Volatile {
     pub failed_sources: BTreeMap<(String, HostId), BTreeSet<HostId>>,
     /// The address directory last sent to the agents, and when.
     pub directory_sent: Option<(directory::Directory, SimTime)>,
+    /// Each host's latest Kubernetes status report.
+    pub kube_status: BTreeMap<HostId, KubeStatus>,
+    /// When each host was last sent its Kubernetes spec.
+    pub kube_sent: BTreeMap<HostId, SimTime>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -178,6 +183,8 @@ impl Volatile {
             copy_source: BTreeMap::new(),
             failed_sources: BTreeMap::new(),
             directory_sent: None,
+            kube_status: BTreeMap::new(),
+            kube_sent: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -314,6 +321,8 @@ impl Volatile {
         self.replica_deleted.retain(|(_, h), _| h != host);
         self.copy_progress.retain(|(_, h), _| h != host);
         self.copy_source.retain(|(_, h), _| h != host);
+        self.kube_status.remove(host);
+        self.kube_sent.remove(host);
     }
 
     /// Records that the replica sent `msg` to `to`, for controllers that pace
@@ -351,6 +360,9 @@ impl Volatile {
                     self.directory_sent = Some((hosts.clone(), now));
                 }
             }
+            (Addr::Host(id), Msg::Kube(_)) => {
+                self.kube_sent.insert(id.clone(), now);
+            }
             (Addr::Host(id), Msg::StopInstance(instance)) => {
                 self.instance_stopped.insert((id.clone(), instance.clone()), now);
             }
@@ -375,5 +387,6 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(scheduler::run(state, volatile, now));
     out.extend(failover::run(state, volatile, now));
     out.extend(directory::run(state, volatile, now));
+    out.extend(kube::run(state, volatile, now));
     out
 }

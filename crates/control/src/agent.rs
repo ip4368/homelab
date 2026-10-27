@@ -10,7 +10,7 @@
 //! incoming instance: it reports `MigrationDone` once the instance runs, and
 //! gives it up if it has not by the deadline the leader set.
 
-use crate::proto::{mgmt, InstanceSpec, MetricSample, Msg, Observed};
+use crate::proto::{mgmt, InstanceSpec, KubeStatus, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::NetworkResult;
 use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork};
@@ -24,6 +24,8 @@ pub const METRICS_MS: u64 = 10_000;
 pub const REVERT_MS: u64 = 30_000;
 /// How often the agent looks in on the instances migrating in.
 pub const MIGRATION_POLL_MS: u64 = 1000;
+/// How often a member reports its Kubernetes status even when unchanged.
+pub const KUBE_REPORT_MS: u64 = 30_000;
 /// Synthetic temperature: idle plus a share of CPU load.
 const IDLE_TEMP_C: f32 = 35.0;
 const TEMP_C_PER_CPU_PCT: f32 = 0.4;
@@ -59,13 +61,15 @@ pub struct HostAgent {
     trial: Option<Trial>,
     /// The instances migrating in, and the deadline of each.
     incoming: BTreeMap<String, SimTime>,
+    /// The Kubernetes status last reported, and when.
+    kube_reported: Option<(KubeStatus, SimTime)>,
 }
 
 impl HostAgent {
     /// `token` is the join token for an unjoined host; `None` means the host
     /// already joined (e.g. it rebooted) and the agent just heartbeats.
     pub fn new(token: Option<String>) -> Self {
-        Self { token, observed: None, net_generation: 0, trial: None, incoming: BTreeMap::new() }
+        Self { token, observed: None, net_generation: 0, trial: None, incoming: BTreeMap::new(), kube_reported: None }
     }
 
     /// Whether the agent runs as a cluster member (not trying to join).
@@ -108,8 +112,21 @@ impl HostAgent {
             None => (None, None),
         };
         let net_generation = self.net_generation;
-        let hb = Msg::Heartbeat { host, lifecycle_seen: 0, observed_at, observed, net_generation, instances, replicas };
+        let hb = Msg::Heartbeat { host: host.clone(), lifecycle_seen: 0, observed_at, observed, net_generation, instances, replicas };
         ctx.send(VIP, mgmt(), hb);
+        self.report_kube(ctx, host, now);
+    }
+
+    /// Reports the host's Kubernetes status if it changed since the last
+    /// report, or every [`KUBE_REPORT_MS`] regardless (a report may be lost,
+    /// and a new leader knows nothing).
+    fn report_kube(&mut self, ctx: &mut dyn Ctx, host: HostId, now: SimTime) {
+        let Some(status) = ctx.host().and_then(|os| os.kube_status()) else { return };
+        let due = self.kube_reported.as_ref().is_none_or(|(last, at)| *last != status || now >= at + KUBE_REPORT_MS);
+        if due {
+            self.kube_reported = Some((status.clone(), now));
+            ctx.send(VIP, mgmt(), Msg::KubeStatus { host, status });
+        }
     }
 
     fn send_metrics(&self, ctx: &mut dyn Ctx) {
@@ -306,6 +323,11 @@ impl Actor for HostAgent {
             Msg::StartCpReplica { voters } if self.token.is_none() => {
                 if let Some(os) = ctx.host() {
                     os.spawn_cp_replica(voters);
+                }
+            }
+            Msg::Kube(spec) if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.apply_kube(spec);
                 }
             }
             _ => {}

@@ -6,7 +6,7 @@
 use crate::topology::{Node, Topology};
 use crate::traffic::{FlowEnd, FlowKind, Traffic};
 use crate::truth::TruthAlerts;
-use control::proto::{InstanceSpec, LogCmd, ReplicaReport, UsageProfile};
+use control::proto::{InstanceSpec, KubeSpec, LogCmd, ReplicaReport, UsageProfile};
 use control::raft::Durable;
 use control::runtime::{HostUsage, SimTime, SwitchConfig};
 use model::network::{
@@ -119,6 +119,9 @@ pub struct HostHw {
     pub instances: BTreeMap<String, Instance>,
     /// Volume replicas on its disks, by volume; they survive power loss.
     pub replicas: BTreeMap<String, Replica>,
+    /// The Kubernetes it runs (a stand-in: asked for is installed at once);
+    /// survives power loss.
+    pub kube: Option<KubeSpec>,
 }
 
 impl HostHw {
@@ -142,6 +145,7 @@ impl HostHw {
             join_token: None,
             instances: BTreeMap::new(),
             replicas: BTreeMap::new(),
+            kube: None,
         }
     }
 

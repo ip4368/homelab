@@ -4,6 +4,7 @@ import type { HostId } from "./HostId";
 import type { HostNet } from "./HostNet";
 import type { HostNetworkConfig } from "./HostNetworkConfig";
 import type { Inventory } from "./Inventory";
+import type { KubeStatus } from "./KubeStatus";
 import type { Lifecycle } from "./Lifecycle";
 import type { LldpNeighbor } from "./LldpNeighbor";
 import type { NetworkId } from "./NetworkId";
@@ -31,4 +32,8 @@ override_: HostNetworkConfig | null,
 /**
  * Static addresses allocated at provisioning, by network.
  */
-ips: { [key in NetworkId]: string }, net: HostNet, last_transition: number, version: number, };
+ips: { [key in NetworkId]: string }, net: HostNet, 
+/**
+ * What its agent last reported of its Kubernetes node; `None` before any report.
+ */
+kube: KubeStatus | null, last_transition: number, version: number, };

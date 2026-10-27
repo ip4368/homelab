@@ -25,13 +25,17 @@ pub struct SeedHost {
 
 /// The Raft state of a freshly installed cluster: one term-1 log entry per
 /// command, stamped `at`, all uncommitted until the first leader's no-op
-/// commits them. The log sets the CP voters, adds the seed networks and
+/// commits them. The log sets the CP voters and the Kubernetes secret
+/// `kube_token` (the first voter starts the Kubernetes cluster), adds the seed networks and
 /// templates and the seed auto-approve rules (each naming its template), and
 /// adds every host at its location, approved with its rule's roles (those it
 /// is eligible for, plus `ControlPlane` for voters) and provisioned on its
 /// rule's template (see [`SeedHost::running`]).
-pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, at: SimTime) -> Durable<LogCmd> {
+pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, kube_token: &str, at: SimTime) -> Durable<LogCmd> {
     let mut cmds = vec![Command::SetCp { voters: voters.clone(), mode: CpMode::Suggest }];
+    if let Some(first) = voters.first() {
+        cmds.push(Command::SetKube { token: kube_token.into(), init_host: first.clone() });
+    }
     let networks = seed_networks();
     let templates: BTreeMap<String, _> = seed_templates().into_iter().map(|t| (t.id.clone(), t)).collect();
     cmds.extend(networks.iter().cloned().map(|network| Command::UpsertNetwork { network }));
@@ -140,7 +144,7 @@ mod tests {
         let mut inventory = Inventory::from_profile(ProfileId::Ms01, 0);
         (inventory.cpu_threads, inventory.ram_gb) = (8, 16);
         let host = SeedHost { id: id.clone(), inventory, location: "lab".into(), running: None };
-        let d = seeded_durable(&[host], &[id.clone()].into(), 1_700_000_000_000);
+        let d = seeded_durable(&[host], &[id.clone()].into(), "t", 1_700_000_000_000);
         assert!(d.log.iter().all(|e| matches!(&e.payload, EntryPayload::Normal(c) if c.at == 1_700_000_000_000)));
         let s = replay(&d);
         let h = &s.hosts[&id];

@@ -1,7 +1,7 @@
 //! The runtime interface: what an [`Actor`] can see and do. The simulator
 //! implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{InstanceSpec, LogCmd, Msg, ReplicaReport};
+use crate::proto::{InstanceSpec, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -122,6 +122,14 @@ pub trait HostOs {
     /// `voters`, unless the host already holds CP state (its replica runs, or
     /// resumes from disk on boot).
     fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>);
+    /// Brings the host's Kubernetes in line with `spec`, in the background:
+    /// installs it, reinstalls it as the other role, labels the node and
+    /// gives Longhorn its disks. A repeat of the spec in hand changes nothing.
+    fn apply_kube(&mut self, _spec: KubeSpec) {}
+    /// How the host's Kubernetes stands now; `None` if this host has none to report.
+    fn kube_status(&self) -> Option<KubeStatus> {
+        None
+    }
 }
 
 /// A switch's own configuration, as its management interface reports it.

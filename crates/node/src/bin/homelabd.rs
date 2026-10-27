@@ -72,7 +72,9 @@ fn bootstrap(cfg: &NodeFile) -> ExitCode {
         return ExitCode::FAILURE;
     }
     let host = SeedHost { id: cfg.host.clone(), inventory: os.inventory(), location: UNKNOWN_LOCATION.into(), running: None };
-    os.store_cp(seeded_durable(&[host], &[cfg.host.clone()].into(), wall_ms()));
+    // The Kubernetes cluster's shared secret, chosen once with the cluster.
+    let kube_token = format!("{:032x}", rand::random::<u128>());
+    os.store_cp(seeded_durable(&[host], &[cfg.host.clone()].into(), &kube_token, wall_ms()));
     os.mark_joined();
     eprintln!("homelabd: {} is a new cluster; `homelabd run` starts it", cfg.host);
     ExitCode::SUCCESS
