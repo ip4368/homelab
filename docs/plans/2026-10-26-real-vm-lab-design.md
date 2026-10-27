@@ -344,5 +344,4 @@ Behaviour confirmed as designed: a killed core switch raises `SwitchUnreachable`
 
 ### 15.1 Left open after the pre-commit review
 
-- `labswitch` only checks that a LAG member is collecting on egress; it accepts ingress from a member before LACP readies it. Linux bonds don't send before then.
 - The server returns 400 rather than 500 when lab code panics. `bring_up` doesn't retry an install that failed after the root disk was created.

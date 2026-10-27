@@ -8,7 +8,7 @@ import { layoutTopology, suggestedFixes, utilisationBand } from './topology'
 
 const cfg = { mode: { Access: 1 }, mtu: 1500, lacp_group: null, admin_up: true } as const
 
-const counters = { rx_bytes: 0, tx_bytes: 0, rx_frames: 0, tx_frames: 0, drop_vlan: 0, drop_mtu: 0, drop_rate: 0, drop_partition: 0 }
+const counters = { rx_bytes: 0, tx_bytes: 0, rx_frames: 0, tx_frames: 0, drop_vlan: 0, drop_mtu: 0, drop_rate: 0, drop_partition: 0, drop_lacp: 0 }
 /** A switch port's measured load, with the host NIC cabled to it if any. */
 const load = (sw: string, port: string, rx_bps: number, tx_bps: number, host: string | null = null, nic: string | null = null): PortTruth => ({
   switch: sw,

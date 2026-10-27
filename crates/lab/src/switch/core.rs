@@ -73,6 +73,9 @@ pub struct PortCounters {
     /// Frames dropped crossing a partition.
     #[ts(type = "number")]
     pub drop_partition: u64,
+    /// Frames dropped arriving on a LAG member LACP has not readied.
+    #[ts(type = "number")]
+    pub drop_lacp: u64,
 }
 
 /// A token bucket in bits: refills at `rate` and holds a few ms of it (it starts full).
@@ -416,6 +419,12 @@ impl Core {
         if h.dst == frame::LLDP_DST {
             return;
         }
+        // A LAG member takes frames only once LACP readied it, as a bond sends only then.
+        if p.def.cfg.lacp_group.is_some() && !self.lag_member_ready(port, now) {
+            self.ports[port].counters.drop_lacp += 1;
+            return;
+        }
+        let p = &mut self.ports[port];
         let Some(vlan) = classify(&p.def.cfg, &h) else {
             p.counters.drop_vlan += 1;
             return;
@@ -746,12 +755,16 @@ mod tests {
         }
         let to_lag = |c: &mut Core, src: Mac, t| c.ingress(2, &frame(BCAST, src, Some(20), 64), t);
         assert!(to_lag(&mut c, C, now).is_empty(), "no partner heard yet");
+        let from_lag = |c: &mut Core, t| c.ingress(0, &frame(BCAST, A, Some(20), 64), t);
+        assert!(from_lag(&mut c, now).is_empty(), "nor taken from it");
+        assert_eq!(c.counters(0).drop_lacp, 1);
         let pdus = c.tick(now);
         assert_eq!(pdus.iter().filter(|(_, f)| parse(f).unwrap().dst == frame::SLOW_DST).count(), 2, "LACPDUs on both members");
         let host_says = LacpInfo { system: A, key: 1, port: 1, state: LACP_SYNC, ..LacpInfo::default() };
         for p in [0, 1] {
             assert!(c.ingress(p, &lacpdu(A, &host_says, &LacpInfo::default()), now).is_empty(), "consumed, not forwarded");
         }
+        assert_eq!(from_lag(&mut c, now).iter().map(|(p, _)| *p).collect::<Vec<_>>(), [2], "a ready member forwards");
         let used: BTreeSet<PortId> = (0..64u8).flat_map(|i| to_lag(&mut c, [0x52, 0, 0, 0, 1, i], now)).map(|(p, _)| p).collect();
         assert_eq!(used, [0, 1].into(), "flows spread over both members");
         c.set_peer_up(1, false);

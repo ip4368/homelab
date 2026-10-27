@@ -16,4 +16,8 @@ drop_rate: number,
 /**
  * Frames dropped crossing a partition.
  */
-drop_partition: number, };
+drop_partition: number, 
+/**
+ * Frames dropped arriving on a LAG member LACP has not readied.
+ */
+drop_lacp: number, };
