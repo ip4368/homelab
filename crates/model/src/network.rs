@@ -35,6 +35,22 @@ impl IpRange {
     }
 }
 
+impl LogicalNetwork {
+    /// The first reserved range that is out of order or reaches outside the
+    /// subnet, as a message naming it.
+    pub fn check_reserved(&self) -> Result<(), String> {
+        for r in &self.reserved {
+            if r.first > r.last {
+                return Err(format!("reserved range {}-{} of {} ends before it starts", r.first, r.last, self.id));
+            }
+            if !self.subnet.contains(&r.first) || !self.subnet.contains(&r.last) {
+                return Err(format!("reserved range {}-{} is outside {}'s subnet {}", r.first, r.last, self.id, self.subnet));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct LogicalNetwork {
@@ -227,6 +243,21 @@ pub struct ObservedSwitchPort {
 mod tests {
     use super::*;
     use crate::hardware::{ProfileId, profile};
+
+    #[test]
+    fn reserved_ranges_must_be_in_order_and_inside_the_subnet() {
+        let mut mgmt = seed_networks().remove(0);
+        assert_eq!(mgmt.check_reserved(), Ok(()));
+        let range = |first: &str, last: &str| IpRange { first: first.parse().unwrap(), last: last.parse().unwrap() };
+        mgmt.reserved = vec![range("10.0.0.0", "10.0.3.255")];
+        assert_eq!(mgmt.check_reserved(), Ok(()), "the whole subnet, ends included");
+        mgmt.reserved = vec![range("10.0.3.200", "10.0.3.100")];
+        assert_eq!(mgmt.check_reserved(), Err("reserved range 10.0.3.200-10.0.3.100 of mgmt ends before it starts".into()));
+        mgmt.reserved = vec![range("10.0.3.100", "10.0.4.10")];
+        assert_eq!(mgmt.check_reserved(), Err("reserved range 10.0.3.100-10.0.4.10 is outside mgmt's subnet 10.0.0.0/22".into()));
+        mgmt.reserved = vec![range("9.255.255.255", "10.0.0.5")];
+        assert!(mgmt.check_reserved().is_err(), "starts before the subnet");
+    }
 
     #[test]
     fn seed_networks_match_global_constraints() {

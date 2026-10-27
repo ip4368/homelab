@@ -58,6 +58,23 @@ fn with_change(state: &ClusterState, change: &Change) -> ClusterState {
     after
 }
 
+/// Why `change` cannot be previewed or rolled out, if it cannot: a
+/// network's reserved ranges must be in order, inside its subnet, and clear
+/// of the addresses hosts hold on it. Ranges the network already had are not
+/// judged against the holders again, so they never block an unrelated edit.
+pub fn check(state: &ClusterState, change: &Change) -> Result<(), String> {
+    let Change::Network(n) = change else { return Ok(()) };
+    n.check_reserved()?;
+    let before = state.networks.get(&n.id).map_or(&[][..], |o| &o.network.reserved[..]);
+    for r in n.reserved.iter().filter(|r| !before.contains(r)) {
+        let held = state.hosts.values().filter_map(|h| Some((&h.id, *h.ips.get(&n.id)?))).find(|(_, ip)| r.contains(*ip));
+        if let Some((host, ip)) = held {
+            return Err(format!("reserved range {}-{} takes {ip}, which {host} holds on {}", r.first, r.last, n.id));
+        }
+    }
+    Ok(())
+}
+
 /// The managed hosts a change concerns, each list in id order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Concerned {
@@ -231,6 +248,30 @@ mod tests {
         }
         s.apply(0, Command::ObserveSwitch { id: SwitchId::from("access-1"), model: "m".into(), ports, mlag_peer: None, last_seen: 0 }).unwrap();
         s
+    }
+
+    #[test]
+    fn reserved_ranges_are_checked_against_the_subnet_and_held_addresses() {
+        let s = state(2);
+        let range = |first: [u8; 4], last: [u8; 4]| model::network::IpRange { first: first.into(), last: last.into() };
+        let mut mgmt = s.networks[&NetworkId::from("mgmt")].network.clone();
+        assert_eq!(check(&s, &Change::Network(mgmt.clone())), Ok(()), "unchanged");
+        mgmt.mtu = 9000;
+        mgmt.reserved.push(range([10, 0, 0, 11], [10, 0, 0, 20]));
+        assert_eq!(check(&s, &Change::Network(mgmt.clone())), Err("reserved range 10.0.0.11-10.0.0.20 takes 10.0.0.11, which m2 holds on mgmt".into()));
+        mgmt.reserved[1] = range([10, 0, 0, 13], [10, 0, 0, 20]);
+        assert_eq!(check(&s, &Change::Network(mgmt.clone())), Ok(()), "clear of m1, m2 and p1");
+        mgmt.reserved[1] = range([10, 0, 0, 20], [10, 0, 0, 13]);
+        assert!(check(&s, &Change::Network(mgmt.clone())).is_err(), "out of order");
+
+        // A range the network already has is not judged again, even over a held address.
+        let mut s = s;
+        let mut held = s.networks[&NetworkId::from("mgmt")].network.clone();
+        held.reserved.push(range([10, 0, 0, 10], [10, 0, 0, 10]));
+        s.apply(0, Command::UpsertNetwork { network: held.clone() }).unwrap();
+        held.mtu = 9000;
+        assert_eq!(check(&s, &Change::Network(held)), Ok(()));
+        assert_eq!(check(&s, &Change::Template(template("minipc-standard"))), Ok(()));
     }
 
     /// One controller period of the network and rollout controllers, with

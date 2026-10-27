@@ -364,10 +364,16 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
             return Handling::Propose(Command::CreateJoinToken { token, ttl_ms: JOIN_TOKEN_TTL_MS }, ok);
         }
         ApiOp::PreviewChange { change } => {
+            if let Err(e) = rollout::check(state, &change) {
+                return Handling::Answer(ApiResult::Err(e));
+            }
             let preview = serde_json::to_value(rollout::preview(state, &change)).expect("a preview serializes");
             return Handling::Answer(ApiResult::Ok(preview));
         }
         ApiOp::StartRollout { change, include_overridden, batch_pct, soak_s } => {
+            if let Err(e) = rollout::check(state, &change) {
+                return Handling::Answer(ApiResult::Err(e));
+            }
             let id = format!("rollout-{term}-{}", ctx.now());
             let soak_ms = u64::from(soak_s) * 1000;
             let cmd = Command::StartRollout { id: id.clone(), change, include_overridden, batch_pct, soak_ms };

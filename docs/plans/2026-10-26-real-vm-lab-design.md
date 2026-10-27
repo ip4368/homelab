@@ -344,7 +344,6 @@ Behaviour confirmed as designed: a killed core switch raises `SwitchUnreachable`
 
 ### 15.1 Left open after the pre-commit review
 
-- Reserved IP ranges are not validated (`first <= last`, inside the subnet, clear of addresses already held).
 - A NIC missing from the catalogue takes its "expected" speed from the speed it negotiated at join.
 - `labswitch` only checks that a LAG member is collecting on egress; it accepts ingress from a member before LACP readies it. Linux bonds don't send before then.
 - The server returns 400 rather than 500 when lab code panics. `bring_up` doesn't retry an install that failed after the root disk was created.
