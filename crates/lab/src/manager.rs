@@ -2,7 +2,8 @@
 //! VMs. Every operation is something done to hardware (power, a cable, a
 //! disk, a switch port) or seen from outside it; none touches the cluster.
 
-use crate::cloudinit::{self, Role};
+use crate::cloudinit;
+use crate::install::{self, Role};
 use crate::qemu::{self, VmFiles};
 use crate::services::{self, Daemon};
 use crate::switch::core::{Core, Member, Peer, PortCounters, PortId};
@@ -105,6 +106,8 @@ pub struct VmTruth {
     /// Seconds since the guest booted, when the guest agent answered.
     #[ts(type = "number | null")]
     pub uptime_s: Option<u64>,
+    /// What the technician last did to install homelab on it, if anything.
+    pub installer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -176,8 +179,9 @@ pub struct Lab {
     spec: Mutex<LabSpec>,
     switch: Arc<LabSwitch>,
     vms: Mutex<BTreeMap<HostId, VmState>>,
-    switch_addrs: BTreeMap<SwitchId, Ipv4Addr>,
     ssh_pub: String,
+    /// What the technician last did on each machine, for the truth.
+    installer: Mutex<BTreeMap<HostId, String>>,
     daemons: Vec<Daemon>,
     /// Held for the whole of each fault, so faults apply one at a time.
     faults: Mutex<()>,
@@ -299,7 +303,6 @@ impl Lab {
         services::run_egress(cfg.upstream_proxy.clone()).await?;
         services::run_binary_server(cfg.homelabd.clone()).await?;
         services::run_switch_mgmt(spec.switches.clone(), switch.clone()).await?;
-        let switch_addrs = spec.switches.iter().map(|s| (s.id.clone(), s.mgmt_ip)).collect();
         let vms = spec
             .vms
             .iter()
@@ -313,8 +316,8 @@ impl Lab {
             spec: Mutex::new(spec),
             switch,
             vms: Mutex::new(vms),
-            switch_addrs,
             ssh_pub,
+            installer: Mutex::new(BTreeMap::new()),
             daemons,
             faults: Mutex::new(()),
             truth: Mutex::new(LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], split_brain_vms: vec![], at: 0 }),
@@ -420,21 +423,110 @@ impl Lab {
         }
     }
 
+    /// Whether `id` has its OS installed (it has a root disk).
     pub fn installed(&self, id: &HostId) -> bool {
         self.files(id).is_ok_and(|f| f.disk("root").exists())
     }
 
-    /// Installs `id` (disks and seed, if it has none) and powers it on.
-    pub fn install(&self, id: &HostId, role: &Role) -> io::Result<()> {
+    /// Whether the technician installed homelab on `id`.
+    pub fn homelab_installed(&self, id: &HostId) -> bool {
+        self.files(id).is_ok_and(|f| f.dir.join("homelab").exists())
+    }
+
+    /// Installs Debian on `id` (disks and seed, if it has none) and powers it on.
+    pub fn install(&self, id: &HostId) -> io::Result<()> {
         let (spec, files) = {
             let vms = self.vms.lock().expect("vms lock");
             let v = vms.get(id).ok_or_else(|| io::Error::other(format!("no VM {id}")))?;
             (v.spec.clone(), v.files.clone())
         };
         let base = base_image(&self.cfg.state)?;
-        let seed = cloudinit::seed(&spec, role, &self.ssh_pub, &self.switch_addrs);
+        let seed = cloudinit::seed(&spec, &self.ssh_pub);
         qemu::install(&spec, &files, &base, &seed)?;
         self.power_on(id)
+    }
+
+    /// `id`'s management address: the first on `eth0` that is not the VIP,
+    /// as its guest agent sees it, else the router's DHCP lease for its
+    /// `eth0` (what a person would look up).
+    pub fn mgmt_ip(&self, id: &HostId) -> io::Result<Ipv4Addr> {
+        let (spec, files) = {
+            let vms = self.vms.lock().expect("vms lock");
+            let v = vms.get(id).ok_or_else(|| io::Error::other(format!("no VM {id}")))?;
+            (v.spec.clone(), v.files.clone())
+        };
+        // The guest agent serves one request at a time (the truth sampler
+        // asks it twice a second): a busy one is asked again.
+        for _ in 0..5 {
+            match qemu::guest_exec(&files, "/usr/sbin/ip", &["-4", "-o", "addr", "show", "eth0"], Duration::from_secs(3)) {
+                Ok(out) => {
+                    if let Some(ip) = out.split_whitespace().filter_map(|w| w.split_once('/')).filter_map(|(a, _)| a.parse::<Ipv4Addr>().ok()).find(|a| *a != VIP) {
+                        return Ok(ip);
+                    }
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(300)),
+            }
+        }
+        let mac = spec.nics.iter().find(|n| n.name == "eth0").map(|n| VmSpec::mac_str(&n.mac)).ok_or_else(|| io::Error::other(format!("{id} has no eth0")))?;
+        let leases = std::fs::read_to_string(self.cfg.run.join("dnsmasq.leases")).unwrap_or_default();
+        leases
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let (_, m, ip) = (f.next()?, f.next()?, f.next()?);
+                (m == mac).then(|| ip.parse().ok()).flatten()
+            })
+            .next_back()
+            .ok_or_else(|| io::Error::other(format!("{id} has no address yet")))
+    }
+
+    /// Runs `script` on `id` over SSH, as the technician (the image's
+    /// default user, which may `sudo`).
+    pub fn ssh(&self, id: &HostId, script: &str) -> io::Result<String> {
+        install::ssh(&self.cfg.state.join("id_ed25519"), self.mgmt_ip(id)?, script, Duration::from_secs(60))
+    }
+
+    /// Runs `script` on `id` over SSH with `input` on its stdin.
+    pub fn ssh_with_input(&self, id: &HostId, script: &str, input: &str) -> io::Result<String> {
+        install::ssh_with_input(&self.cfg.state.join("id_ed25519"), self.mgmt_ip(id)?, script, input)
+    }
+
+    fn note_installer(&self, id: &HostId, what: String) {
+        self.installer.lock().expect("installer lock").insert(id.clone(), what);
+    }
+
+    /// Has the technician install homelab on `id` as `role` (see
+    /// [`install::install`]), once its OS is up; returns what the install
+    /// command printed. Waits for the machine's DHCP address.
+    pub fn install_homelab(&self, id: &HostId, role: &Role) -> io::Result<String> {
+        let what = if *role == Role::Bootstrap { "init" } else { "join" };
+        self.note_installer(id, format!("{what}: waiting for the machine"));
+        let deadline = Instant::now() + Duration::from_secs(300);
+        let ip = loop {
+            match self.mgmt_ip(id) {
+                Ok(ip) => break ip,
+                Err(e) if Instant::now() >= deadline => {
+                    self.note_installer(id, format!("{what} failed: {e}"));
+                    return Err(e);
+                }
+                Err(_) => std::thread::sleep(Duration::from_secs(3)),
+            }
+        };
+        self.note_installer(id, format!("{what}: running on {ip}"));
+        eprintln!("lab: technician on {id} ({ip}): {}", role.command());
+        match install::install(&self.cfg.state.join("id_ed25519"), ip, role) {
+            Ok(out) => {
+                eprintln!("lab: {id}: {}", out.trim().replace('\n', "\n  "));
+                std::fs::write(self.files(id)?.dir.join("homelab"), &out)?;
+                self.note_installer(id, format!("{what}: done"));
+                Ok(out)
+            }
+            Err(e) => {
+                self.note_installer(id, format!("{what} failed: {e}"));
+                Err(e)
+            }
+        }
     }
 
     // ---- faults -------------------------------------------------------------
@@ -604,30 +696,41 @@ impl Lab {
     }
 
     /// Racks a new machine: cables it, has its ports configured (perhaps
-    /// wrongly), installs it with `token` and powers it on.
-    pub fn add_vm(&self, profile: ProfileId, mistake: Option<Mistake>, token: String) -> io::Result<HostId> {
-        let _one_at_a_time = self.faults.lock().expect("faults lock");
-        let vm = self.spec.lock().expect("spec lock").add_vm(profile, mistake).map_err(io::Error::other)?;
-        let mut added = load_added(&self.cfg.state);
-        added.push(Added { profile, mistake });
-        let path = added_path(&self.cfg.state);
-        std::fs::create_dir_all(path.parent().expect("under vms/"))?;
-        std::fs::write(&path, serde_json::to_vec_pretty(&added).map_err(io::Error::other)?)?;
-        for nic in &vm.nics {
-            if let Some((s, p)) = &nic.cable {
-                let port = self.port_of(s, p).expect("cabled to a real port");
-                let cfg = crate::topology::technician_cfg(profile, &vm.id, &nic.name, mistake);
-                self.switch.with(|c| {
-                    c.set_cfg(port, cfg);
-                    c.set_peer(port, Peer::Host { host: vm.id.clone(), nic: nic.name.clone(), nic_mbps: nic.speed_mbps });
-                });
+    /// wrongly), installs Debian on it and powers it on; then the
+    /// technician installs homelab on it with `token`, in the background.
+    /// Returns once it is powered on.
+    pub fn add_vm(self: &Arc<Self>, profile: ProfileId, mistake: Option<Mistake>, token: String) -> io::Result<HostId> {
+        let id = {
+            let _one_at_a_time = self.faults.lock().expect("faults lock");
+            let vm = self.spec.lock().expect("spec lock").add_vm(profile, mistake).map_err(io::Error::other)?;
+            let mut added = load_added(&self.cfg.state);
+            added.push(Added { profile, mistake });
+            let path = added_path(&self.cfg.state);
+            std::fs::create_dir_all(path.parent().expect("under vms/"))?;
+            std::fs::write(&path, serde_json::to_vec_pretty(&added).map_err(io::Error::other)?)?;
+            for nic in &vm.nics {
+                if let Some((s, p)) = &nic.cable {
+                    let port = self.port_of(s, p).expect("cabled to a real port");
+                    let cfg = crate::topology::technician_cfg(profile, &vm.id, &nic.name, mistake);
+                    self.switch.with(|c| {
+                        c.set_cfg(port, cfg);
+                        c.set_peer(port, Peer::Host { host: vm.id.clone(), nic: nic.name.clone(), nic_mbps: nic.speed_mbps });
+                    });
+                }
             }
-        }
-        let files = VmFiles::new(&self.cfg.state, &self.cfg.run, &vm);
-        let id = vm.id.clone();
-        self.vms.lock().expect("vms lock").insert(id.clone(), VmState { spec: vm, files, unplugged: BTreeSet::new(), failed_disks: BTreeSet::new(), booted: None });
-        self.cable_all();
-        self.install(&id, &Role::Join(token))?;
+            let files = VmFiles::new(&self.cfg.state, &self.cfg.run, &vm);
+            let id = vm.id.clone();
+            self.vms.lock().expect("vms lock").insert(id.clone(), VmState { spec: vm, files, unplugged: BTreeSet::new(), failed_disks: BTreeSet::new(), booted: None });
+            self.cable_all();
+            self.install(&id)?;
+            id
+        };
+        let (lab, vm) = (self.clone(), id.clone());
+        std::thread::spawn(move || {
+            if let Err(e) = lab.install_homelab(&vm, &Role::Join(token)) {
+                eprintln!("lab: install homelab on {vm}: {e}");
+            }
+        });
         Ok(id)
     }
 
@@ -707,6 +810,7 @@ impl Lab {
                 instances,
                 clock_offset_ms,
                 uptime_s,
+                installer: self.installer.lock().expect("installer lock").get(&spec.id).cloned(),
             });
         }
         let mut seen: BTreeMap<&str, usize> = BTreeMap::new();

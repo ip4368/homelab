@@ -18,6 +18,9 @@ pub enum Addr {
     /// The virtual IP held by the current control-plane leader.
     Vip,
     Client,
+    /// A short-lived admin client (e.g. `homelabd token`), told apart from
+    /// other clients by a random id so replies reach the right one.
+    Admin(u64),
     Router,
     /// A switch's management interface, which sits on the switch itself on
     /// the mgmt VLAN.

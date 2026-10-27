@@ -9,7 +9,7 @@
 
 use control::client::ClientActor;
 use control::runtime::Svc;
-use lab::cloudinit::Role;
+use lab::install::Role;
 use lab::manager::{Lab, LabConfig};
 use model::HostId;
 use std::process::ExitCode;
@@ -44,7 +44,14 @@ async fn smoke() -> ExitCode {
     let boot = HostId::from("ms01-01");
     let l = lab.clone();
     let b = boot.clone();
-    if let Err(e) = tokio::task::spawn_blocking(move || if l.installed(&b) { l.power_on(&b) } else { l.install(&b, &Role::Bootstrap) }).await.expect("join") {
+    let up = move || -> std::io::Result<()> {
+        if l.installed(&b) { l.power_on(&b)? } else { l.install(&b)? }
+        if !l.homelab_installed(&b) {
+            l.install_homelab(&b, &Role::Bootstrap)?;
+        }
+        Ok(())
+    };
+    if let Err(e) = tokio::task::spawn_blocking(up).await.expect("join") {
         eprintln!("lab: boot {boot}: {e}");
         return ExitCode::FAILURE;
     }
@@ -112,7 +119,16 @@ fn down(wipe: bool) -> ExitCode {
 fn ip(vm: &str) -> ExitCode {
     let cfg = LabConfig::from_env();
     let files = lab::qemu::VmFiles { dir: cfg.state.join("vms").join(vm), run: cfg.run.join(vm) };
-    match lab::qemu::guest_exec(&files, "/usr/sbin/ip", &["-4", "-o", "addr", "show", "eth0"], Duration::from_secs(3)) {
+    // The guest agent serves one request at a time (a running lab samples it): ask again if busy.
+    let mut answer = lab::qemu::guest_exec(&files, "/usr/sbin/ip", &["-4", "-o", "addr", "show", "eth0"], Duration::from_secs(3));
+    for _ in 0..5 {
+        if answer.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        answer = lab::qemu::guest_exec(&files, "/usr/sbin/ip", &["-4", "-o", "addr", "show", "eth0"], Duration::from_secs(3));
+    }
+    match answer {
         Ok(out) => {
             // The first address on eth0 that is not the VIP.
             let addr = out.split_whitespace().filter_map(|w| w.split_once('/')).map(|(a, _)| a).find(|a| *a != lab::topology::VIP.to_string());

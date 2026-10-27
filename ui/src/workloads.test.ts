@@ -33,6 +33,7 @@ const vm = (id: string, power: Power): LabTruth['vms'][number] => ({
   instances: [],
   clock_offset_ms: null,
   uptime_s: null,
+  installer: null,
 })
 const up = (id: string, powered = true) => vm(id, powered ? 'Running' : 'Off')
 

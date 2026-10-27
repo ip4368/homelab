@@ -268,8 +268,14 @@ fn sni(h: &[u8]) -> Option<String> {
     None
 }
 
-/// Serves `GET /homelabd` with the current build of `binary`, re-read on
-/// every request so a rebuild reaches the next machine to boot.
+/// What a machine is installed from: `install.sh`, with its download URL filled in.
+pub fn install_script() -> String {
+    include_str!("../../node/install.sh").replace("@URL@", &format!("http://{ROUTER_IP}:{BIN_PORT}"))
+}
+
+/// Serves `GET /install.sh` and `GET /homelabd` (the current build of
+/// `binary`, re-read on every request so a rebuild reaches the next machine
+/// installed or upgraded): what a release download site would.
 pub async fn run_binary_server(binary: PathBuf) -> io::Result<()> {
     let listener = TcpListener::bind(SocketAddr::from((ROUTER_IP, BIN_PORT))).await?;
     tokio::spawn(async move {
@@ -279,14 +285,21 @@ pub async fn run_binary_server(binary: PathBuf) -> io::Result<()> {
             tokio::spawn(async move {
                 let mut req = [0u8; 1024];
                 let Ok(n) = s.read(&mut req).await else { return };
-                let wanted = String::from_utf8_lossy(&req[..n]).starts_with("GET /homelabd ");
-                let reply = match (wanted, tokio::fs::read(&binary).await) {
-                    (true, Ok(body)) => {
+                let req = String::from_utf8_lossy(&req[..n]);
+                let body = if req.starts_with("GET /homelabd ") {
+                    tokio::fs::read(&binary).await.ok()
+                } else if req.starts_with("GET /install.sh ") {
+                    Some(install_script().into_bytes())
+                } else {
+                    None
+                };
+                let reply = match body {
+                    Some(body) => {
                         let mut r = format!("HTTP/1.0 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\n\r\n", body.len()).into_bytes();
                         r.extend_from_slice(&body);
                         r
                     }
-                    _ => b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
+                    None => b"HTTP/1.0 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_vec(),
                 };
                 let _ = s.write_all(&reply).await;
             });
@@ -412,5 +425,11 @@ mod tests {
         assert_eq!(http_host(b"GET / HTTP/1.1\r\nhost: Example.COM:8080\r\n\r\n"), Named::Host("example.com".into()));
         assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: deb"), Named::NeedMore);
         assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), Named::Never);
+    }
+
+    #[test]
+    fn the_install_script_points_at_the_lab() {
+        let s = install_script();
+        assert!(s.contains("URL=\"${HOMELAB_URL:-http://10.0.0.1:7480}\""), "{s}");
     }
 }

@@ -27,4 +27,8 @@ clock_offset_ms: number | null,
 /**
  * Seconds since the guest booted, when the guest agent answered.
  */
-uptime_s: number | null, };
+uptime_s: number | null, 
+/**
+ * What the technician last did to install homelab on it, if anything.
+ */
+installer: string | null, };

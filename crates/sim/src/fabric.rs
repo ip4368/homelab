@@ -65,7 +65,7 @@ impl<'a> Station<'a> {
             Addr::Client => Some(Station::Client),
             Addr::Router => Some(Station::Router),
             Addr::Switch(s) => Some(Station::Switch(s)),
-            Addr::Vip => None,
+            Addr::Vip | Addr::Admin(_) => None,
         }
     }
 }

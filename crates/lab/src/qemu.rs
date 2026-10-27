@@ -91,7 +91,7 @@ pub fn install(vm: &VmSpec, f: &VmFiles, base: &Path, seed: &Seed) -> io::Result
         let part = f.disk("root.part");
         let _ = fs::remove_file(&part);
         let base = base.to_string_lossy();
-        run("qemu-img", &["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", &base, &part.to_string_lossy(), "16G"])?;
+        run("qemu-img", &["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", &base, &part.to_string_lossy(), "32G"])?;
         fs::rename(&part, &root)?;
     }
     Ok(())

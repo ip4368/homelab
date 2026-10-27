@@ -5,6 +5,7 @@
 pub mod switch;
 pub mod client;
 pub mod cloudinit;
+pub mod install;
 pub mod qemu;
 pub mod services;
 pub mod topology;

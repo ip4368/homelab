@@ -222,7 +222,7 @@ export function LabPanel({ selected }: { selected: string | null }) {
               <button
                 disabled={rack.busy}
                 onClick={() => rack.run(() => labFault({ AddVm: { profile, mistake: mistakeOf(mistake) } }))}
-                title="Cable a new VM, have its switch ports configured, and boot it with a fresh join token"
+                title="Cable a new VM, have its switch ports configured, install Debian on it, and have the technician run the join command over SSH with a fresh token"
               >
                 Add VM
               </button>
@@ -241,6 +241,9 @@ export function LabPanel({ selected }: { selected: string | null }) {
                     <td className="muted">{v.clock_offset_ms === null ? '' : `clock ${v.clock_offset_ms >= 0 ? '+' : ''}${v.clock_offset_ms} ms`}</td>
                     <td className="muted">{v.unplugged.length > 0 ? `unplugged: ${v.unplugged.join(', ')}` : ''}</td>
                     <td className="muted">{v.failed_disks.length > 0 ? `disk pulled: ${v.failed_disks.join(', ')}` : ''}</td>
+                    <td className={v.installer?.includes('failed') ? 'bad' : 'muted'} title="what the technician last did to install homelab on it">
+                      {v.installer && !v.installer.endsWith(': done') ? `technician: ${v.installer}` : ''}
+                    </td>
                   </tr>
                 ))}
               </tbody>

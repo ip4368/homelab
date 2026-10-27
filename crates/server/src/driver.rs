@@ -6,7 +6,7 @@
 use control::client::{ClusterView, ClientActor};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::Svc;
-use lab::cloudinit::Role;
+use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
 use model::HostId;
 use node::runtime::{wall_ms, NodeHandle};
@@ -145,11 +145,13 @@ impl DriverHandle {
             .map_err(|e| LabError::Failed(e.to_string()))
     }
 
-    /// Brings the lab's machines up, the way an admin installs a cluster:
-    /// powers on every installed machine, installs and boots the first one
-    /// as a new cluster if it has never been, waits for it to lead, then
-    /// installs the rest with a join token. A machine that fails to install
-    /// does not stop the others; the error names every one that failed.
+    /// Brings the lab's machines up, the way a person installs a cluster
+    /// (README, "Setting up a cluster"): powers on every installed machine,
+    /// installs Debian on the rest, then has the technician install homelab
+    /// over SSH: `init` on the first machine, and `join` on the others with
+    /// the token `init` printed (or a fresh one from the control plane, if
+    /// the first machine was installed before). A machine that fails does
+    /// not stop the others; the error names every one that failed.
     pub async fn bring_up(&self) -> Result<(), String> {
         let lab = self.lab.clone().ok_or("no lab")?;
         let ids = lab.vm_ids();
@@ -160,53 +162,84 @@ impl DriverHandle {
                 eprintln!("lab: power on: {e}");
             }
         }
-        let first = HostId::from("ms01-01");
-        if !lab.installed(&first) {
-            eprintln!("lab: installing {first} as a new cluster");
-            install(&lab, &first, Role::Bootstrap).await?;
-        }
-        let rest: Vec<HostId> = ids.into_iter().filter(|id| !lab.installed(id)).collect();
-        if rest.is_empty() {
-            return Ok(());
-        }
-        let token = loop {
-            if let Some(t) = self.join_token().await {
-                break t;
-            }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        };
         let mut failed = vec![];
-        for id in rest {
-            eprintln!("lab: installing {id} to join the cluster");
-            if let Err(e) = install(&lab, &id, Role::Join(token.clone())).await {
+        for id in ids.iter().filter(|id| !lab.installed(id)) {
+            eprintln!("lab: installing Debian on {id}");
+            if let Err(e) = retry(&format!("install {id}"), || {
+                let (l, id) = (lab.clone(), id.clone());
+                async move { tokio::task::spawn_blocking(move || l.install(&id)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string()) }
+            })
+            .await
+            {
                 failed.push(e);
             }
         }
-        if failed.is_empty() {
-            Ok(())
-        } else {
-            Err(failed.join("; "))
+        let first = HostId::from("ms01-01");
+        let mut token = None;
+        if !lab.homelab_installed(&first) {
+            let out = technician(&lab, &first, Role::Bootstrap).await?;
+            token = lab::install::token_in(&out);
         }
+        let rest: Vec<HostId> = ids.into_iter().filter(|id| *id != first && lab.installed(id) && !lab.homelab_installed(id)).collect();
+        if !rest.is_empty() {
+            let token = match token {
+                Some(t) => t,
+                None => loop {
+                    if let Some(t) = self.join_token().await {
+                        break t;
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                },
+            };
+            let joins = rest.into_iter().map(|id| {
+                let (lab, token) = (lab.clone(), token.clone());
+                tokio::spawn(async move { technician(&lab, &id, Role::Join(token)).await })
+            });
+            for j in futures_join(joins).await {
+                if let Err(e) = j {
+                    failed.push(e);
+                }
+            }
+        }
+        if failed.is_empty() { Ok(()) } else { Err(failed.join("; ")) }
     }
 }
 
-/// Installs `id` as `role`, trying again after a failure. A failed attempt
-/// leaves the machine not installed (its root disk goes in place last), so
-/// the next one starts afresh.
-async fn install(lab: &Arc<Lab>, id: &HostId, role: Role) -> Result<(), String> {
+/// Waits for every task, in order.
+async fn futures_join(tasks: impl Iterator<Item = tokio::task::JoinHandle<Result<String, String>>>) -> Vec<Result<String, String>> {
+    let mut out = vec![];
+    for t in tasks.collect::<Vec<_>>() {
+        out.push(t.await.unwrap_or_else(|e| Err(format!("panicked: {e}"))));
+    }
+    out
+}
+
+/// Has the technician install homelab on `id` as `role`, trying again after
+/// a failure (the install command is safe to repeat).
+async fn technician(lab: &Arc<Lab>, id: &HostId, role: Role) -> Result<String, String> {
+    retry(&format!("install homelab on {id}"), || {
+        let (l, id, role) = (lab.clone(), id.clone(), role.clone());
+        async move { tokio::task::spawn_blocking(move || l.install_homelab(&id, &role)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string()) }
+    })
+    .await
+}
+
+/// Runs `f` up to [`INSTALL_ATTEMPTS`] times, [`INSTALL_RETRY`] apart, until it succeeds.
+async fn retry<T, F, Fut>(what: &str, mut f: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
     let mut attempt = 1;
     loop {
-        let (l, i, r) = (lab.clone(), id.clone(), role.clone());
-        let e = match tokio::task::spawn_blocking(move || l.install(&i, &r)).await {
-            Ok(Ok(())) => return Ok(()),
-            Ok(Err(e)) => e.to_string(),
-            Err(e) => return Err(format!("install {id}: panicked: {e}")),
-        };
-        if attempt == INSTALL_ATTEMPTS {
-            return Err(format!("install {id}: {e}"));
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt == INSTALL_ATTEMPTS => return Err(format!("{what}: {e}")),
+            Err(e) => {
+                eprintln!("lab: {what} (attempt {attempt} of {INSTALL_ATTEMPTS}): {e}; trying again");
+                attempt += 1;
+                tokio::time::sleep(INSTALL_RETRY).await;
+            }
         }
-        eprintln!("lab: install {id} (attempt {attempt} of {INSTALL_ATTEMPTS}): {e}; trying again");
-        attempt += 1;
-        tokio::time::sleep(INSTALL_RETRY).await;
     }
 }

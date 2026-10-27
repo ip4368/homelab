@@ -157,7 +157,7 @@ impl Node {
             timers: BinaryHeap::new(),
             seq: 0,
             local: VecDeque::new(),
-            rng: ChaCha8Rng::seed_from_u64(wall_ms() ^ u64::from(std::process::id())),
+            rng: ChaCha8Rng::from_os_rng(),
             vip_held: false,
         };
         let node = Self { core, actors: HashMap::new(), vip, book_version: None, on_directory: None, last_directory: Directory::new() };
