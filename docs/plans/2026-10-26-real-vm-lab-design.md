@@ -344,7 +344,6 @@ Behaviour confirmed as designed: a killed core switch raises `SwitchUnreachable`
 
 ### 15.1 Left open after the pre-commit review
 
-- **Raft runs on wall time.** `ctx.now()` is wall-clock milliseconds, because committed timestamps (alerts, `last_seen`) are compared across leaders. Raft's election and lease timing use the same clock. If chrony steps a guest's clock *backwards* by Δ, a partitioned leader keeps its lease for about Δ longer. A forward step is harmless: it steps down early. The fix is a monotonic clock for Raft alongside the wall clock for state, which changes `Ctx` (and the sim). Until then the lab's chrony steps only after a freeze, and that step is forward.
 - `homelabd` formats a blank data disk (`mkfs.ext4`) on its event loop. A slow format could stall keepalives.
 - Reserved IP ranges are not validated (`first <= last`, inside the subnet, clear of addresses already held).
 - A NIC missing from the catalogue takes its "expected" speed from the speed it negotiated at join.

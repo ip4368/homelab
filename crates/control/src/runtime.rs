@@ -141,6 +141,12 @@ pub trait SwitchOs {
 
 pub trait Ctx {
     fn now(&self) -> SimTime;
+    /// Milliseconds on a clock that never steps, for Raft's election and
+    /// lease timing. On a real host `now` is wall time, which chrony may step
+    /// backwards; sim time is already monotonic, hence the default.
+    fn monotonic_ms(&self) -> SimTime {
+        self.now()
+    }
     fn me(&self) -> Endpoint;
     fn send(&mut self, to: Endpoint, net: NetworkId, msg: Msg);
     /// Fire `on_timer(token)` on this actor `after_ms` of sim-time from now.

@@ -156,7 +156,7 @@ impl CpReplica {
 
     fn on_tick(&mut self, ctx: &mut dyn Ctx) {
         let now = ctx.now();
-        let outs = self.raft().tick(now);
+        let outs = self.raft().tick(ctx.monotonic_ms());
         self.handle(ctx, outs);
         let Some(v) = &mut self.volatile else { return };
         let overdue = |_: &u64, p: &mut PendingApi| now >= p.proposed_at + API_COMMIT_TIMEOUT_MS;
@@ -166,8 +166,8 @@ impl CpReplica {
     }
 
     fn run_controllers(&mut self, ctx: &mut dyn Ctx) {
-        let now = ctx.now();
-        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
+        let (now, mono) = (ctx.now(), ctx.monotonic_ms());
+        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         v.forget_silent_removed(&self.state, now);
@@ -186,7 +186,7 @@ impl CpReplica {
                         continue;
                     }
                     v.note_proposed(&self.state, &cmd, now);
-                    if let Ok(index) = raft.propose(now, LogCmd { at: now, cmd: cmd.clone() }) {
+                    if let Ok(index) = raft.propose(mono, LogCmd { at: now, cmd: cmd.clone() }) {
                         v.in_flight.insert(index, cmd);
                     }
                 }
@@ -197,12 +197,12 @@ impl CpReplica {
             }
         }
         // `propose` returns no effects; flush them now rather than at the next tick.
-        let outs = raft.tick(now);
+        let outs = raft.tick(mono);
         self.handle(ctx, outs);
     }
 
     fn on_api(&mut self, ctx: &mut dyn Ctx, from: Endpoint, req: u64, op: ApiOp) {
-        let now = ctx.now();
+        let (now, mono) = (ctx.now(), ctx.monotonic_ms());
         let raft = self.raft.as_mut().expect("on_start runs before anything else");
         if !raft.is_leader() {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::NotLeader });
@@ -210,13 +210,13 @@ impl CpReplica {
         let v = self.volatile.as_ref().expect("leader has volatile state");
         // Without quorum, or before its no-op applied (its state may lag what
         // earlier leaders committed), the leader cannot answer safely.
-        if !raft.has_quorum(now) || !v.caught_up {
+        if !raft.has_quorum(mono) || !v.caught_up {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Unavailable });
         }
         let term = raft.term();
         let (index, ok) = match handle_op(ctx, &self.state, v, term, op) {
             Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
-            Handling::Propose(cmd, ok) => (raft.propose(now, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
+            Handling::Propose(cmd, ok) => (raft.propose(mono, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
             Handling::ReplaceCpMember { dead, with } => {
                 let members = RaftMembers::of(raft);
                 let added = membership::check_replace(&self.state, &members, &dead, &with)
@@ -233,34 +233,34 @@ impl CpReplica {
         };
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
-        let outs = self.raft().tick(now);
+        let outs = self.raft().tick(mono);
         self.handle(ctx, outs);
     }
 
     /// Only a leader with quorum and a caught-up state can judge a token or
     /// know whether the host exists; anyone else stays silent and the agent retries.
     fn on_join(&mut self, ctx: &mut dyn Ctx, from: Endpoint, token: String, inventory: Inventory) {
-        let now = ctx.now();
+        let (now, mono) = (ctx.now(), ctx.monotonic_ms());
         let Addr::Host(host) = from.addr.clone() else { return };
-        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(now)) else { return };
+        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         match join::on_request(&self.state, v, now, &host, &token, inventory) {
             JoinOutcome::Accepted => ctx.send(from, mgmt(), Msg::JoinResp(Ok(()))),
             JoinOutcome::InProgress => {}
             JoinOutcome::Add(cmd) => {
                 let term = raft.term();
-                let index = raft.propose(now, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
+                let index = raft.propose(mono, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
                 v.pending_joins.insert(index, PendingJoin { from, term });
             }
             JoinOutcome::Rejected { reason, event } => {
                 ctx.send(from, mgmt(), Msg::JoinResp(Err(reason)));
                 if let Some(cmd) = event {
-                    raft.propose(now, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
+                    raft.propose(mono, LogCmd { at: now, cmd }).expect("has_quorum implies leadership");
                 }
             }
         }
         // `propose` returns no effects; flush them now.
-        let outs = self.raft().tick(now);
+        let outs = self.raft().tick(mono);
         self.handle(ctx, outs);
     }
 
@@ -335,10 +335,10 @@ impl CpReplica {
     }
 
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
-        let now = ctx.now();
+        let mono = ctx.monotonic_ms();
         let raft = self.raft.as_ref().expect("on_start runs before anything else");
         // A leader cut off from its quorum, or not caught up yet, may hold a stale view; stay silent.
-        let Some(v) = self.volatile.as_ref().filter(|v| v.caught_up && raft.has_quorum(now)) else { return };
+        let Some(v) = self.volatile.as_ref().filter(|v| v.caught_up && raft.has_quorum(mono)) else { return };
         let metrics = v.metrics.iter().map(|(h, m)| (h.clone(), m.clone())).collect();
         let changes = self.state.changes_since(since);
         ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics });
@@ -447,7 +447,7 @@ impl Actor for CpReplica {
         match msg {
             Msg::Raft(m) => {
                 let Addr::Host(peer) = from.addr else { return };
-                let outs = self.raft().step(now, peer, m);
+                let outs = self.raft().step(ctx.monotonic_ms(), peer, m);
                 self.handle(ctx, outs);
             }
             Msg::Heartbeat { host, observed_at, observed, net_generation, instances, replicas, .. } => {
@@ -517,7 +517,10 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCtx {
+        /// The monotonic clock.
         now: SimTime,
+        /// How far a clock step has put wall time behind `now`.
+        wall_behind: SimTime,
         /// Everything sent except Raft traffic.
         sent: Vec<(Endpoint, Msg)>,
         /// (after_ms, token) of every timer set.
@@ -528,6 +531,9 @@ mod tests {
 
     impl Ctx for FakeCtx {
         fn now(&self) -> SimTime {
+            self.now - self.wall_behind
+        }
+        fn monotonic_ms(&self) -> SimTime {
             self.now
         }
         fn me(&self) -> Endpoint {
@@ -690,6 +696,19 @@ mod tests {
         assert_eq!(rig.r.commit_index(), 1, "the no-op committed");
         rig.controllers();
         assert_eq!(rig.proposed(), [Command::ResolveAlert { id: "hostdown-h9-0-0".into() }]);
+    }
+
+    #[test]
+    fn a_wall_clock_stepped_back_does_not_stretch_the_leaders_quorum() {
+        let mut rig = Rig::new(vec![]);
+        rig.elect();
+        rig.ack();
+        // No peer answers for a check-quorum window, while chrony steps wall time back as far.
+        let window = RaftConfig::default().election_min_ms + RAFT_TICK_MS;
+        rig.ctx.now += window;
+        rig.ctx.wall_behind = window;
+        rig.r.on_timer(&mut rig.ctx, TICK);
+        assert_eq!(rig.r.raft_role(), Some(RaftRole::Follower), "check-quorum runs on the monotonic clock");
     }
 
     #[test]

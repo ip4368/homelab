@@ -22,6 +22,7 @@ use std::any::Any;
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, BinaryHeap, HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -56,6 +57,14 @@ pub fn wall_ms() -> SimTime {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as SimTime)
 }
 
+/// Milliseconds since this process first asked, on the monotonic clock:
+/// what [`Ctx::monotonic_ms`] means on a real host. Unlike [`wall_ms`], a
+/// clock step (chrony, an operator) never moves it.
+pub fn monotonic_ms() -> SimTime {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as SimTime
+}
+
 pub type Command = Box<dyn FnOnce(&mut Node) + Send>;
 
 /// How often a node holding the VIP checks its address is still there.
@@ -83,6 +92,9 @@ struct NodeCtx<'a> {
 impl Ctx for NodeCtx<'_> {
     fn now(&self) -> SimTime {
         wall_ms()
+    }
+    fn monotonic_ms(&self) -> SimTime {
+        monotonic_ms()
     }
     fn me(&self) -> Endpoint {
         self.me.clone()
