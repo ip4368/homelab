@@ -24,6 +24,9 @@ pub const TRUTH_EVERY: Duration = Duration::from_millis(500);
 /// itself after 5 s, so this only bounds a client that went away.
 const OP_TIMEOUT: Duration = Duration::from_secs(10);
 const OP_POLL: Duration = Duration::from_millis(25);
+/// Tries at installing one machine during bring-up, and the pause between them.
+const INSTALL_ATTEMPTS: u32 = 3;
+const INSTALL_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
 #[ts(export)]
@@ -51,7 +54,10 @@ pub enum LabError {
     NoLab,
     /// The control plane did not hand out a join token.
     NoToken,
+    /// The lab refused or could not do it.
     Failed(String),
+    /// The lab's code panicked: a bug, not a refusal.
+    Panicked(String),
 }
 
 #[derive(Clone)]
@@ -129,12 +135,12 @@ impl DriverHandle {
         let lab = self.lab.clone().ok_or(LabError::NoLab)?;
         if let LabFault::AddVm { profile, mistake } = fault {
             let token = self.join_token().await.ok_or(LabError::NoToken)?;
-            let id = tokio::task::spawn_blocking(move || lab.add_vm(profile, mistake, token)).await.map_err(|e| LabError::Failed(e.to_string()))?;
+            let id = tokio::task::spawn_blocking(move || lab.add_vm(profile, mistake, token)).await.map_err(|e| LabError::Panicked(e.to_string()))?;
             return id.map(Some).map_err(|e| LabError::Failed(e.to_string()));
         }
         tokio::task::spawn_blocking(move || lab.apply(fault))
             .await
-            .map_err(|e| LabError::Failed(e.to_string()))?
+            .map_err(|e| LabError::Panicked(e.to_string()))?
             .map(|()| None)
             .map_err(|e| LabError::Failed(e.to_string()))
     }
@@ -142,7 +148,8 @@ impl DriverHandle {
     /// Brings the lab's machines up, the way an admin installs a cluster:
     /// powers on every installed machine, installs and boots the first one
     /// as a new cluster if it has never been, waits for it to lead, then
-    /// installs the rest with a join token.
+    /// installs the rest with a join token. A machine that fails to install
+    /// does not stop the others; the error names every one that failed.
     pub async fn bring_up(&self) -> Result<(), String> {
         let lab = self.lab.clone().ok_or("no lab")?;
         let ids = lab.vm_ids();
@@ -156,8 +163,7 @@ impl DriverHandle {
         let first = HostId::from("ms01-01");
         if !lab.installed(&first) {
             eprintln!("lab: installing {first} as a new cluster");
-            let (l, f) = (lab.clone(), first.clone());
-            tokio::task::spawn_blocking(move || l.install(&f, &Role::Bootstrap)).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            install(&lab, &first, Role::Bootstrap).await?;
         }
         let rest: Vec<HostId> = ids.into_iter().filter(|id| !lab.installed(id)).collect();
         if rest.is_empty() {
@@ -169,11 +175,38 @@ impl DriverHandle {
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
         };
+        let mut failed = vec![];
         for id in rest {
             eprintln!("lab: installing {id} to join the cluster");
-            let (l, t) = (lab.clone(), token.clone());
-            tokio::task::spawn_blocking(move || l.install(&id, &Role::Join(t))).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+            if let Err(e) = install(&lab, &id, Role::Join(token.clone())).await {
+                failed.push(e);
+            }
         }
-        Ok(())
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(failed.join("; "))
+        }
+    }
+}
+
+/// Installs `id` as `role`, trying again after a failure. A failed attempt
+/// leaves the machine not installed (its root disk goes in place last), so
+/// the next one starts afresh.
+async fn install(lab: &Arc<Lab>, id: &HostId, role: Role) -> Result<(), String> {
+    let mut attempt = 1;
+    loop {
+        let (l, i, r) = (lab.clone(), id.clone(), role.clone());
+        let e = match tokio::task::spawn_blocking(move || l.install(&i, &r)).await {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(e)) => e.to_string(),
+            Err(e) => return Err(format!("install {id}: panicked: {e}")),
+        };
+        if attempt == INSTALL_ATTEMPTS {
+            return Err(format!("install {id}: {e}"));
+        }
+        eprintln!("lab: install {id} (attempt {attempt} of {INSTALL_ATTEMPTS}): {e}; trying again");
+        attempt += 1;
+        tokio::time::sleep(INSTALL_RETRY).await;
     }
 }

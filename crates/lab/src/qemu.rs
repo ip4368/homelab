@@ -68,8 +68,6 @@ pub fn install(vm: &VmSpec, f: &VmFiles, base: &Path, seed: &Seed) -> io::Result
     fs::create_dir_all(&f.run)?;
     let root = f.disk("root");
     if !root.exists() {
-        let base = base.to_string_lossy();
-        run("qemu-img", &["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", &base, &root.to_string_lossy(), "16G"])?;
         let seed_dir = f.dir.join("seed");
         fs::create_dir_all(&seed_dir)?;
         fs::write(seed_dir.join("user-data"), &seed.user_data)?;
@@ -86,6 +84,15 @@ pub fn install(vm: &VmSpec, f: &VmFiles, base: &Path, seed: &Seed) -> io::Result
         if !d.exists() {
             run("qemu-img", &["create", "-q", "-f", "qcow2", &d.to_string_lossy(), &format!("{size}G")])?;
         }
+    }
+    // The root disk marks the machine installed, so it goes in place last,
+    // whole: an install that failed before here is done again from scratch.
+    if !root.exists() {
+        let part = f.disk("root.part");
+        let _ = fs::remove_file(&part);
+        let base = base.to_string_lossy();
+        run("qemu-img", &["create", "-q", "-f", "qcow2", "-F", "qcow2", "-b", &base, &part.to_string_lossy(), "16G"])?;
+        fs::rename(&part, &root)?;
     }
     Ok(())
 }

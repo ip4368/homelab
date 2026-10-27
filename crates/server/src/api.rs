@@ -86,7 +86,8 @@ async fn get_metrics(State(driver): State<DriverHandle>, Query(q): Query<Metrics
 }
 
 /// 200 `{"ok": true}` (with `"vm"` naming a machine `AddVm` racked), 400
-/// if the lab refused, 503 without a lab or a join token.
+/// if the lab refused, 500 if its code panicked, 503 without a lab or a
+/// join token.
 async fn lab_fault(State(driver): State<DriverHandle>, Json(fault): Json<LabFault>) -> Response {
     match driver.fault(fault).await {
         Ok(None) => Json(json!({ "ok": true })).into_response(),
@@ -94,6 +95,7 @@ async fn lab_fault(State(driver): State<DriverHandle>, Json(fault): Json<LabFaul
         Err(LabError::NoLab) => error(StatusCode::SERVICE_UNAVAILABLE, "no lab attached"),
         Err(LabError::NoToken) => error(StatusCode::SERVICE_UNAVAILABLE, "the control plane gave no join token"),
         Err(LabError::Failed(message)) => error(StatusCode::BAD_REQUEST, &message),
+        Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
     }
 }
 

@@ -341,7 +341,3 @@ Things the simulator could not have shown, found on the real VMs:
 | A restarted lab forgot VMs racked by *Add VM*. | The lab rebuilt only the first four from code. | Racked machines are listed in `vms/added.json` and re-racked (same names, cables and ports) at start; `lab reset` deletes the list with the disks. |
 
 Behaviour confirmed as designed: a killed core switch raises `SwitchUnreachable`, and the hosts' port alerts name it as the cause. Killing the access switch (mgmt has only `eth0`) loses quorum, so no VM holds the VIP, and the UI shows the control plane as unavailable. It recovers in about 3 s. An isolated leader steps down within one election, and pre-vote keeps it from disrupting the leader when the partition heals.
-
-### 15.1 Left open after the pre-commit review
-
-- The server returns 400 rather than 500 when lab code panics. `bring_up` doesn't retry an install that failed after the root disk was created.
