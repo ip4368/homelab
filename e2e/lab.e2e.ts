@@ -3,7 +3,11 @@
 // Talks only to the server's public interfaces: the WebSocket (the control
 // plane's view and the lab's ground truth) and `POST /api/lab/fault` (things
 // done to hardware). Each step is a success criterion of the real VM lab
-// design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed.
+// design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
+// Kubernetes criteria K1–K6 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
+// §5, checked against the cluster's Kubernetes API through the VIP with the
+// admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
+// get it with `sudo homelabd kubeconfig`).
 //
 //   node e2e/lab.e2e.ts [--only 3a,4]     (LAB_URL defaults to http://127.0.0.1:8080)
 //
@@ -20,6 +24,7 @@ import type { SwitchObj } from '../ui/src/gen/SwitchObj.ts'
 import type { Mistake } from '../ui/src/gen/Mistake.ts'
 import type { PortTruth } from '../ui/src/gen/PortTruth.ts'
 import type { SwitchPortCfg } from '../ui/src/gen/SwitchPortCfg.ts'
+import { Kube } from './kube.ts'
 
 const BASE = process.env.LAB_URL ?? 'http://127.0.0.1:8080'
 
@@ -175,6 +180,83 @@ async function step(id: string, name: string, fn: (note: (s: string) => void) =>
 
 const secs = (ms: number) => `${(ms / 1000).toFixed(1)} s`
 
+// ---- Kubernetes ---------------------------------------------------------
+
+let kubeClient: Kube | null = null
+
+/** The cluster's Kubernetes API, with the admin kubeconfig a K3s server prints. */
+async function kube(): Promise<Kube> {
+  if (kubeClient) return kubeClient
+  const deadline = now() + 10 * 60_000
+  for (;;) {
+    const res = await fetch(`${BASE}/api/lab/kubeconfig`)
+    if (res.ok) return (kubeClient = new Kube(await res.text()))
+    if (now() > deadline) throw new Failed(`no kubeconfig: ${res.status} ${await res.text()}`)
+    await sleep(5000)
+  }
+}
+
+/** Polls the async `check` until it returns something truthy (or throws `Failed` with the last reason). */
+async function waitAsync<T>(what: string, timeoutMs: number, check: () => Promise<T | null | undefined | false | string>): Promise<{ value: T; ms: number }> {
+  const start = now()
+  let why = ''
+  for (;;) {
+    let v: T | null | undefined | false | string
+    try {
+      v = await check()
+    } catch (e) {
+      v = (e as Error).message
+    }
+    if (typeof v === 'string') why = v
+    else if (v) return { value: v, ms: now() - start }
+    if (now() - start > timeoutMs) throw new Failed(`timed out after ${timeoutMs / 1000} s waiting for ${what}${why ? ` (last: ${why})` : ''}`)
+    await sleep(2000)
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type Obj = any
+const isReady = (n: Obj) => n.status?.conditions?.some((c: Obj) => c.type === 'Ready' && c.status === 'True') ?? false
+const LH = '/apis/longhorn.io/v1beta2/namespaces/longhorn-system'
+
+/** Every lab machine a Ready node, the K3s servers exactly the CP voters, Longhorn running with a schedulable disk per data disk on every storage host. Why not, or the nodes. */
+async function kubeUnhealthy(k: Kube): Promise<string | Obj[]> {
+  const s = watch.seen!
+  const nodes: Obj[] = (await k.must('/api/v1/nodes')).items
+  const byName = new Map(nodes.map((n) => [n.metadata.name, n]))
+  const vms = s.truth.vms.filter((v) => v.installed)
+  const missing = vms.filter((v) => !byName.has(v.id) || !isReady(byName.get(v.id)))
+  if (missing.length) return `not Ready nodes: ${missing.map((v) => v.id).join(', ')}`
+  const servers = nodes.filter((n) => n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true').map((n) => n.metadata.name).sort()
+  if (servers.join() !== [...s.cp.voters].sort().join()) return `K3s servers [${servers}] are not the voters [${s.cp.voters}]`
+  const lhNodes = await k.get(`${LH}/nodes`)
+  if (lhNodes.status !== 200) return `Longhorn not installed yet (${lhNodes.status})`
+  const lh = new Map<string, Obj>(lhNodes.body.items.map((n: Obj) => [n.metadata.name, n]))
+  for (const h of s.hosts.values()) {
+    if (!h.roles.includes('Storage') || h.net.held_roles.Storage !== undefined || h.lifecycle !== 'Ready') continue
+    const n = lh.get(h.id)
+    if (!n) return `no Longhorn node ${h.id}`
+    for (const d of h.inventory.disks.filter((d) => !d.failed)) {
+      const disk = Object.entries(n.spec.disks ?? {}).find(([, v]: [string, Obj]) => v.path === `/mnt/${d.name}`)
+      if (!disk) return `Longhorn has no disk /mnt/${d.name} on ${h.id}`
+      const st = n.status?.diskStatus?.[disk[0]]
+      if (!st?.conditions?.some((c: Obj) => c.type === 'Schedulable' && c.status === 'True')) return `disk /mnt/${d.name} on ${h.id} not schedulable`
+    }
+  }
+  const pods: Obj[] = (await k.must('/api/v1/namespaces/longhorn-system/pods')).items
+  const down = pods.filter((p) => !['Running', 'Succeeded'].includes(p.status.phase))
+  if (down.length) return `Longhorn pods not running: ${down.map((p) => `${p.metadata.name}=${p.status.phase}`).join(', ')}`
+  return nodes
+}
+
+async function kubeHealthy(timeoutMs: number) {
+  const k = await kube()
+  return waitAsync('a healthy Kubernetes', timeoutMs, async () => {
+    const r = await kubeUnhealthy(k)
+    return typeof r === 'string' ? r : r
+  })
+}
+
 await watch.ready
 
 await step('1', 'Up: every machine Ready, three CP voters, one VIP holder', async (note) => {
@@ -185,6 +267,22 @@ await step('1', 'Up: every machine Ready, three CP voters, one VIP holder', asyn
   const unmeasured = s.truth.vms.filter((v) => v.clock_offset_ms === null)
   if (unmeasured.length) throw new Failed(`no clock reading from ${unmeasured.map((v) => v.id).join(', ')} (guest agent not answering)`)
   if (Math.max(...s.truth.vms.map((v) => Math.abs(v.clock_offset_ms!))) > 250) throw new Failed('guest clocks disagree by more than 250 ms')
+})
+
+await step('K1', 'Kubernetes: every host a Ready node, servers on the CP voters, Longhorn on the storage hosts\' data disks', async (note) => {
+  await healthy(5 * 60_000)
+  const { value: nodes, ms } = await kubeHealthy(20 * 60_000)
+  const s = watch.seen!
+  const servers = nodes.filter((n: Obj) => n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true').map((n: Obj) => n.metadata.name)
+  note(`healthy after ${secs(ms)}: ${nodes.length} Ready nodes (${nodes.map((n: Obj) => `${n.metadata.name} ${n.status.nodeInfo.kubeletVersion}`).join(', ')})`)
+  note(`K3s servers (etcd): ${servers.join(', ')} = CP voters`)
+  const notRunning = [...s.hosts.values()].filter((h) => h.kube?.phase !== 'Running')
+  if (notRunning.length) throw new Failed(`homelabd does not report Kubernetes Running on ${notRunning.map((h) => h.id).join(', ')}`)
+  const lh: Obj[] = (await (await kube()).must(`${LH}/nodes`)).items
+  note(`Longhorn disks: ${lh.map((n) => `${n.metadata.name} [${Object.values(n.spec.disks ?? {}).map((d: Obj) => d.path).join(' ')}]`).join(', ')}`)
+  const api = await (await kube()).get('/readyz')
+  if (api.status !== 200) throw new Failed(`the API through the VIP answered ${api.status}`)
+  note(`the API answers through the VIP (${(await kube()).server.host})`)
 })
 
 /** Racks a new MS-01 (with `mistake`, if any) and waits until it is a Ready host; its id and how long that took. */
@@ -216,15 +314,35 @@ await step('2', 'Join: Add VM boots a fifth machine that becomes Ready unaided; 
     return a && s.hosts.get(bad.id)?.net.held_roles.Storage !== undefined && a
   })
   note(`flagged: "${flagged.value.message}"; storage role held inactive (needs ${watch.seen!.hosts.get(bad.id)!.net.held_roles.Storage})`)
+
+  // K2: both join Kubernetes; only the clean one gives Longhorn its disks.
+  const k = await kube()
+  const joined = await kubeHealthy(15 * 60_000)
+  note(`K2: ${clean.id} and ${bad.id} are Ready Kubernetes nodes ${secs(joined.ms)} later`)
+  const lh = new Map<string, Obj>(((await k.must(`${LH}/nodes`)).items as Obj[]).map((n) => [n.metadata.name, n]))
+  const disks = (id: string) => Object.values(lh.get(id)?.spec.disks ?? {}).map((d: Obj) => d.path)
+  if (disks(clean.id).length !== 2) throw new Failed(`${clean.id} gave Longhorn ${disks(clean.id).length} disks`)
+  if (disks(bad.id).length !== 0) throw new Failed(`${bad.id}, its storage role held, gave Longhorn disks: ${disks(bad.id)}`)
+  note(`K2: ${clean.id} stores on ${disks(clean.id).join(' ')}; ${bad.id} (storage held) gives Longhorn no disks`)
 })
 
 await step('3a', 'Leader failover: power off the leader', async (note) => {
   await healthy(5 * 60_000)
   const old = watch.seen!.leader!
   const term = watch.seen!.term
+  const k = await kube()
   await fault({ PowerOff: { vm: old } })
+  const offAt = now()
   const elected = await waitFor('a new leader in the client view', 30_000, (s) => s.leader !== null && s.leader !== old && s.leader)
   note(`powered off ${old}; the client saw ${elected.value} lead (term ${watch.seen!.term} > ${term}) after ${secs(elected.ms)}`)
+  // K5: the Kubernetes API (a K3s server on the new leader) answers through the VIP again.
+  const api = await waitAsync('the Kubernetes API through the VIP', 60_000, async () => {
+    const r = await k.get('/readyz')
+    return r.status === 200 || `readyz ${r.status} ${r.text.slice(0, 80)}`
+  })
+  note(`K5: the Kubernetes API answered through the VIP ${secs(now() - offAt)} after the power-off`)
+  if (now() - offAt > 30_000) throw new Failed(`the Kubernetes API was gone for ${secs(now() - offAt)}`)
+  void api
   if (elected.ms > 10_000) throw new Failed(`re-election took ${secs(elected.ms)} (2 election timeouts are at most 6 s, plus reconnecting through the VIP)`)
   const vip = await waitFor('the VIP on the new leader only', 15_000, (s) => s.truth.vip_holders.length === 1 && s.truth.vip_holders[0] === elected.value)
   note(`the VIP moved to ${elected.value} (${secs(elected.ms + vip.ms)} after the power-off)`)
@@ -279,6 +397,8 @@ await step('4', 'Reboot persistence: reset a CP voter', async (note) => {
   const victim = s0.cp.voters.find((v) => v !== s0.leader)!
   const uptime0 = s0.truth.vms.find((v) => v.id === victim)!.uptime_s ?? Infinity
   const voters0 = [...s0.cp.voters].sort().join()
+  const k = await kube()
+  const bootId0 = (await k.must(`/api/v1/nodes/${victim}`)).status.nodeInfo.bootID as string
   const resetAt = now()
   await fault({ Reset: { vm: victim } })
   let wentNotReady = false
@@ -297,6 +417,120 @@ await step('4', 'Reboot persistence: reset a CP voter', async (note) => {
   const h = s.hosts.get(victim)!
   if (h.net.state !== 'Applied') throw new Failed(`network ${h.net.state}`)
   note(`same voters; its network config is still generation ${h.net.applied_generation}, Applied (booted from the persisted copy)`)
+  const rebooted8s = await waitAsync(`${victim} Ready in Kubernetes on its new boot`, 5 * 60_000, async () => {
+    const n = await k.must(`/api/v1/nodes/${victim}`)
+    return (n.status.nodeInfo.bootID !== bootId0 && isReady(n)) || `boot ${n.status.nodeInfo.bootID === bootId0 ? 'unchanged' : 'new'}, Ready ${isReady(n)}`
+  })
+  const k8s = await kubeHealthy(5 * 60_000)
+  note(`K6: ${victim}'s kubelet reports its new boot and the node is Ready (${secs(rebooted8s.ms)}); every node Ready, the K3s servers still the voters`)
+  void k8s
+})
+
+await step('K4', 'Volume and host failure: a pod\'s Longhorn volume survives losing its host, and its lost replica is rebuilt elsewhere', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const run = Math.random().toString(36).slice(2, 8)
+  const token = `t-${run}-${Math.random().toString(36).slice(2, 10)}`
+  const ns = 'e2e'
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  // Replicas come back sooner than Longhorn's default 10 min wait for a failed one.
+  await waitAsync('Longhorn to take replica-replenishment-wait-interval=20', 120_000, async () => {
+    const r = await k.req('PATCH', `${LH}/settings/replica-replenishment-wait-interval`, { value: '20' }, 'application/merge-patch+json', 30_000)
+    return r.status === 200 || `${r.status} ${r.text.slice(0, 200)}`
+  })
+  await k.create('/apis/storage.k8s.io/v1/storageclasses', {
+    metadata: { name: 'e2e-2-replicas' },
+    provisioner: 'driver.longhorn.io',
+    reclaimPolicy: 'Delete',
+    // best-effort locality keeps a replica on the pod's host, so losing that host loses one.
+    parameters: { numberOfReplicas: '2', staleReplicaTimeout: '30', dataLocality: 'best-effort' },
+  })
+  const pvc = `data-${run}`
+  await k.create(`/api/v1/namespaces/${ns}/persistentvolumeclaims`, {
+    metadata: { name: pvc },
+    spec: { accessModes: ['ReadWriteOnce'], storageClassName: 'e2e-2-replicas', resources: { requests: { storage: '1Gi' } } },
+  })
+  // The writer runs on a host Longhorn stores on (so a replica can live with it), not the homelabd leader.
+  const storing: string[] = ((await k.must(`${LH}/nodes`)).items as Obj[])
+    .filter((n) => Object.keys(n.spec.disks ?? {}).length > 0 && n.metadata.name !== watch.seen!.leader)
+    .map((n) => n.metadata.name)
+  if (storing.length < 3) throw new Failed(`only ${storing.length} storage hosts besides the leader: ${storing}`)
+  const app = `writer-${run}`
+  const script = 'if [ -f /data/token ]; then echo "found $(cat /data/token)"; else echo "$TOKEN" > /data/token && sync && echo "wrote $TOKEN"; fi; exec sleep 1000000'
+  const toleration = (key: string) => ({ key, operator: 'Exists', effect: 'NoExecute', tolerationSeconds: 20 })
+  await k.create(`/apis/apps/v1/namespaces/${ns}/deployments`, {
+    metadata: { name: app },
+    spec: {
+      replicas: 1,
+      strategy: { type: 'Recreate' },
+      selector: { matchLabels: { app } },
+      template: {
+        metadata: { labels: { app } },
+        spec: {
+          terminationGracePeriodSeconds: 5,
+          affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchExpressions: [{ key: 'kubernetes.io/hostname', operator: 'In', values: storing }] }] } } },
+          tolerations: [toleration('node.kubernetes.io/unreachable'), toleration('node.kubernetes.io/not-ready')],
+          containers: [{ name: 'writer', image: 'busybox:1.37', command: ['sh', '-c', script], env: [{ name: 'TOKEN', value: token }], volumeMounts: [{ name: 'data', mountPath: '/data' }] }],
+          volumes: [{ name: 'data', persistentVolumeClaim: { claimName: pvc } }],
+        },
+      },
+    },
+  })
+  try {
+    /** The deployment's running pod whose log says `want`, and its node. */
+    const runningWith = (want: string, notOn?: string) => async () => {
+      const pods: Obj[] = (await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)).items
+      const p = pods.find((p) => p.status.phase === 'Running' && !p.metadata.deletionTimestamp && p.spec.nodeName !== notOn)
+      if (!p) return `pods: ${pods.map((p) => `${p.metadata.name}@${p.spec.nodeName}=${p.status.phase}${p.metadata.deletionTimestamp ? '(terminating)' : ''}`).join(', ') || 'none'}`
+      const log = await k.get(`/api/v1/namespaces/${ns}/pods/${p.metadata.name}/log`)
+      return log.text.includes(want) ? { pod: p.metadata.name as string, node: p.spec.nodeName as string, log: log.text.trim() } : `log of ${p.metadata.name}: ${log.text.slice(0, 80)}`
+    }
+    const first = await waitAsync('the writer running with its token written', 10 * 60_000, runningWith(`wrote ${token}`))
+    const pv = (await k.must(`/api/v1/namespaces/${ns}/persistentvolumeclaims/${pvc}`)).spec.volumeName as string
+    note(`${first.value.pod} on ${first.value.node} wrote its token to Longhorn volume ${pv} (${secs(first.ms)} to schedule, attach and start)`)
+    /** The volume's healthy state: robustness, and its running replicas' nodes. */
+    const volume = async () => {
+      const v = await k.must(`${LH}/volumes/${pv}`)
+      const reps: Obj[] = (await k.must(`${LH}/replicas?labelSelector=longhornvolume%3D${pv}`)).items
+      const running = reps.filter((r) => r.status?.currentState === 'running' && !r.spec.failedAt).map((r) => r.spec.nodeID as string)
+      return { robustness: v.status?.robustness as string, nodes: running, all: reps.map((r) => `${r.spec.nodeID}:${r.status?.currentState}${r.spec.failedAt ? '(failed)' : ''}`) }
+    }
+    const healthyVol = await waitAsync(`${pv} healthy with 2 replicas on 2 hosts, one on ${first.value.node}`, 5 * 60_000, async () => {
+      const v = await volume()
+      return (v.robustness === 'healthy' && new Set(v.nodes).size === 2 && v.nodes.includes(first.value.node) && v) || `${v.robustness} [${v.all}]`
+    })
+    note(`${pv} is healthy, replicas on ${healthyVol.value.nodes.join(' and ')}`)
+
+    const victim = first.value.node
+    const off = now()
+    await fault({ PowerOff: { vm: victim } })
+    note(`powered off ${victim}${victim === watch.seen!.leader ? ' (also the homelabd leader)' : ''}`)
+    const notReady = await waitAsync(`${victim} NotReady in Kubernetes`, 3 * 60_000, async () => {
+      const n = await k.get(`/api/v1/nodes/${victim}`)
+      return (n.status === 200 && !isReady(n.body)) || 'still Ready'
+    })
+    note(`${victim} NotReady in Kubernetes after ${secs(now() - off)}`)
+    void notReady
+    const moved = await waitAsync('the writer running elsewhere, reading its token back', 10 * 60_000, runningWith(`found ${token}`, victim))
+    note(`${moved.value.pod} runs on ${moved.value.node} and read back "${token}" ${secs(now() - off)} after the power-off`)
+    const rebuilt = await waitAsync(`${pv} healthy again with 2 replicas, none on ${victim}`, 10 * 60_000, async () => {
+      const v = await volume()
+      return (v.robustness === 'healthy' && new Set(v.nodes).size === 2 && !v.nodes.includes(victim) && v) || `${v.robustness} [${v.all}]`
+    })
+    const fresh = rebuilt.value.nodes.filter((n) => !healthyVol.value.nodes.includes(n))
+    if (fresh.length === 0) throw new Failed(`no replica was rebuilt: replicas on ${rebuilt.value.nodes} before and after`)
+    note(`Longhorn rebuilt the lost replica onto ${fresh.join(', ')}: healthy on ${rebuilt.value.nodes.join(' and ')}, ${secs(now() - off)} after the power-off`)
+    const hd = await waitFor(`${victim} NotReady in homelabd`, 120_000, (s) => s.hosts.get(victim)?.lifecycle === 'NotReady')
+    void hd
+    await fault({ PowerOn: { vm: victim } })
+    const back = await healthy(5 * 60_000)
+    const kb = await kubeHealthy(5 * 60_000)
+    note(`powered ${victim} back on: Ready in homelabd after ${secs(back.ms)}, a Ready node again ${secs(kb.ms)} after that`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+    await k.delete('/apis/storage.k8s.io/v1/storageclasses/e2e-2-replicas')
+  }
 })
 
 /** The switch ports `host`'s `nics` are cabled to, from the lab's ground truth. */
