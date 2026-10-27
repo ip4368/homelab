@@ -198,10 +198,12 @@ export interface NetworkForm {
   mtu: string
   /** Not edited in the form: carried through so an edit keeps the network's reservations. */
   reserved?: IpRange[]
+  /** Kept from the network being edited: the form does not edit them. */
+  dns?: string[]
 }
 
 export function formFromNetwork(n: LogicalNetwork): NetworkForm {
-  return { id: n.id, purpose: n.purpose, vlan: String(n.vlan), subnet: n.subnet, mtu: String(n.mtu), reserved: n.reserved }
+  return { id: n.id, purpose: n.purpose, vlan: String(n.vlan), subnet: n.subnet, mtu: String(n.mtu), reserved: n.reserved, dns: n.dns }
 }
 
 const CIDR = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/
@@ -217,5 +219,5 @@ export function networkFromForm(f: NetworkForm): { network: LogicalNetwork } | {
   if (!m || m.slice(1, 5).some((o) => Number(o) > 255) || Number(m[5]) > 30) return { error: `Subnet: "${f.subnet}" is not an IPv4 CIDR like 10.0.0.0/22` }
   const mtu = Number(f.mtu)
   if (!Number.isInteger(mtu) || mtu < 576 || mtu > 9216) return { error: `MTU: "${f.mtu}" is not between 576 and 9216` }
-  return { network: { id, purpose: f.purpose, vlan, subnet, mtu, reserved: f.reserved ?? [] } }
+  return { network: { id, purpose: f.purpose, vlan, subnet, mtu, reserved: f.reserved ?? [], dns: f.dns ?? [] } }
 }

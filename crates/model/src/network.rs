@@ -65,6 +65,11 @@ pub struct LogicalNetwork {
     /// management interfaces, the control-plane VIP).
     #[serde(default)]
     pub reserved: Vec<IpRange>,
+    /// The DNS resolvers a host with a static address on this network uses
+    /// (only the mgmt network's are configured).
+    #[serde(default)]
+    #[ts(type = "Array<string>")]
+    pub dns: Vec<Ipv4Addr>,
 }
 
 /// The `mgmt` block kept out of IPAM: the bootstrap DHCP pool
@@ -81,9 +86,10 @@ pub fn seed_networks() -> Vec<LogicalNetwork> {
         subnet: subnet.parse().expect("seed subnet is valid"),
         mtu,
         reserved: vec![],
+        dns: vec![],
     };
     vec![
-        LogicalNetwork { reserved: vec![MGMT_RESERVED], ..net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500) },
+        LogicalNetwork { reserved: vec![MGMT_RESERVED], dns: vec![Ipv4Addr::new(10, 0, 0, 1)], ..net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500) },
         net("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000),
         net("migration", NetworkPurpose::Migration, 30, "10.30.0.0/22", 9000),
         net("vm-lan", NetworkPurpose::Vm, 100, "10.100.0.0/22", 1500),

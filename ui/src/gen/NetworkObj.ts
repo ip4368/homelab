@@ -12,4 +12,9 @@ export type NetworkObj = { version: number, id: NetworkId, purpose: NetworkPurpo
  * uses (a DHCP pool for hosts that have not joined yet, switch
  * management interfaces, the control-plane VIP).
  */
-reserved: Array<IpRange>, };
+reserved: Array<IpRange>, 
+/**
+ * The DNS resolvers a host with a static address on this network uses
+ * (only the mgmt network's are configured).
+ */
+dns: Array<string>, };

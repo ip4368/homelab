@@ -4,7 +4,7 @@ import { changeLabel, rolloutProgress } from './RolloutDialog'
 
 const rollout = (patch: Partial<Rollout>): Rollout => ({
   id: 'r1',
-  change: { Network: { id: 'storage', purpose: 'Storage', vlan: 20, subnet: '10.20.0.0/22', mtu: 9000, reserved: [] } },
+  change: { Network: { id: 'storage', purpose: 'Storage', vlan: 20, subnet: '10.20.0.0/22', mtu: 9000, reserved: [], dns: [] } },
   hosts: Array.from({ length: 25 }, (_, i) => `h${i}`),
   batch_size: 3,
   current_batch: 0,

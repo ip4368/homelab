@@ -89,13 +89,17 @@ pub fn render(cfg: &HostNetworkConfig, networks: &BTreeMap<NetworkId, LogicalNet
     Ok(files)
 }
 
-/// `Address=` for `ip` in `n`'s subnet, plus the default route through the
-/// router (the subnet's `.1`) on the management network.
+/// `Address=` for `ip` in `n`'s subnet, plus, on the management network,
+/// the default route through the router (the subnet's `.1`) and the
+/// network's DNS resolvers.
 fn address(body: &mut String, ip: Ipv4Addr, n: &LogicalNetwork) {
     writeln!(body, "Address={ip}/{}", n.subnet.prefix_len()).expect("writing to a String");
     if n.purpose == NetworkPurpose::Mgmt {
         let gw = Ipv4Addr::from(u32::from(n.subnet.network()) + 1);
         writeln!(body, "Gateway={gw}").expect("writing to a String");
+        for dns in &n.dns {
+            writeln!(body, "DNS={dns}").expect("writing to a String");
+        }
     }
 }
 
@@ -178,6 +182,7 @@ mod tests {
         assert!(!file(&files, "bond0.100.network").contains("Address="), "VM networks address guests, not the host");
         let eth0 = file(&files, "eth0.network");
         assert!(eth0.contains("Address=10.0.0.2/22") && eth0.contains("Gateway=10.0.0.1"), "{eth0}");
+        assert!(eth0.contains("DNS=10.0.0.1"), "the mgmt network's resolver: {eth0}");
         assert!(!eth0.contains("DHCP"), "{eth0}");
         assert!(file(&files, "eth1.network").contains("ActivationPolicy=up"), "the unused NIC still comes up");
         assert_eq!(netdevs(&files).keys().collect::<Vec<_>>(), ["bond0", "bond0.100", "bond0.110", "bond0.20", "bond0.30"]);
