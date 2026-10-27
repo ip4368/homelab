@@ -325,6 +325,16 @@ impl ClusterState {
                 {
                     host.location = location;
                 }
+                // A NIC is expected to run at the best speed it has shown. One
+                // the catalogue does not know starts at what it negotiated at
+                // join, which may have been a degraded link.
+                for n in inventory.nics.iter().filter(|n| n.link_up) {
+                    if let Some(p) = host.profile.nics.iter_mut().find(|p| p.name == n.name)
+                        && n.speed_mbps > p.speed_mbps
+                    {
+                        p.speed_mbps = n.speed_mbps;
+                    }
+                }
                 host.lldp = lldp;
                 host.inventory = inventory;
                 host.version = v;
@@ -1113,6 +1123,28 @@ mod tests {
         assert_eq!(h.location, "rack-1", "a known location is never overwritten");
         assert_eq!(s.apply(3, observe_host("nope", vec![])), Err(ApplyError::NotFound));
         assert_eq!(s.version, 2);
+    }
+
+    #[test]
+    fn a_nic_is_expected_at_the_best_speed_it_has_shown() {
+        let mut inv = Inventory::from_profile(ProfileId::MiniPc, 0);
+        inv.nics.push(model::NicState { name: "eth9".into(), speed_mbps: 100, link_up: true });
+        let mut s = ClusterState::new();
+        s.apply(1, Command::AddPendingHost { id: hid("h1"), profile: HardwareProfile::with_discovered(&inv), inventory: inv.clone(), location: "rack-1".into() }).unwrap();
+        let expected = |s: &ClusterState, nic: &str| s.hosts[&hid("h1")].profile.nics.iter().find(|n| n.name == nic).unwrap().speed_mbps;
+        assert_eq!(expected(&s, "eth9"), 100, "not in the catalogue: what it negotiated at join");
+        let observe = |s: &mut ClusterState, v, mbps, link_up| {
+            let mut inv = inv.clone();
+            *inv.nics.last_mut().unwrap() = model::NicState { name: "eth9".into(), speed_mbps: mbps, link_up };
+            s.apply(v, Command::ObserveHost { id: hid("h1"), lldp: vec![], inventory: inv }).unwrap();
+        };
+        observe(&mut s, 2, 2500, true);
+        assert_eq!(expected(&s, "eth9"), 2500);
+        observe(&mut s, 3, 100, true);
+        assert_eq!(expected(&s, "eth9"), 2500, "a slower link later is low, not the new normal");
+        observe(&mut s, 4, 10_000, false);
+        assert_eq!(expected(&s, "eth9"), 2500, "a link that is down says nothing");
+        assert_eq!(expected(&s, "eth0"), profile(ProfileId::MiniPc, 0).nics[0].speed_mbps, "a catalogue NIC keeps its speed");
     }
 
     #[test]
