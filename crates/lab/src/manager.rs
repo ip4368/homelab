@@ -296,7 +296,7 @@ impl Lab {
         drop(tap);
         services::configure_router(&spec.switches)?;
         let daemons = vec![services::start_dnsmasq(&cfg.run)?, services::start_chronyd(&cfg.run)?];
-        services::run_relay(cfg.upstream_proxy.clone()).await?;
+        services::run_egress(cfg.upstream_proxy.clone()).await?;
         services::run_binary_server(cfg.homelabd.clone()).await?;
         services::run_switch_mgmt(spec.switches.clone(), switch.clone()).await?;
         let switch_addrs = spec.switches.iter().map(|s| (s.id.clone(), s.mgmt_ip)).collect();

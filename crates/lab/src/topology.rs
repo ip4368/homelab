@@ -17,8 +17,6 @@ pub const VIP: Ipv4Addr = Ipv4Addr::new(10, 0, 3, 253);
 /// The bootstrap DHCP pool, inside the mgmt network's reserved block.
 pub const DHCP_FIRST: Ipv4Addr = MGMT_RESERVED.first;
 pub const DHCP_LAST: Ipv4Addr = Ipv4Addr::new(10, 0, 3, 199);
-/// The guests' HTTP proxy (to the lab host's upstream proxy) on the router.
-pub const RELAY_PORT: u16 = 3130;
 /// Where the lab serves the `homelabd` binary to guests.
 pub const BIN_PORT: u16 = 7480;
 /// The tap the lab host joins the lab network through: the router port.

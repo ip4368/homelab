@@ -1,10 +1,10 @@
 //! What the homelab's network provides around the machines, all on the lab
-//! host behind the router port: the router's addresses, bootstrap DHCP,
-//! time, an HTTP proxy to the outside, the `homelabd` download, and each
-//! switch's management interface.
+//! host behind the router port: the router's addresses, bootstrap DHCP, DNS,
+//! time, the internet uplink, the `homelabd` download, and each switch's
+//! management interface.
 
 use crate::switch::io::LabSwitch;
-use crate::topology::{SwitchSpec, BIN_PORT, DHCP_FIRST, DHCP_LAST, RELAY_PORT, ROUTER_IP, ROUTER_TAP, ROUTER_VLAN_IPS, SWITCH_MTU};
+use crate::topology::{SwitchSpec, BIN_PORT, DHCP_FIRST, DHCP_LAST, ROUTER_IP, ROUTER_TAP, ROUTER_VLAN_IPS, SWITCH_MTU};
 use control::proto::Msg;
 use control::runtime::{Addr, Endpoint, Svc};
 use node::wire::{read_frame, write_frame, Wire, PORT};
@@ -72,7 +72,8 @@ impl Daemon {
     }
 }
 
-/// Starts dnsmasq handing out the bootstrap pool on the mgmt network (DHCP only, no DNS).
+/// Starts dnsmasq: the bootstrap DHCP pool on the mgmt network, and DNS
+/// that answers every name with the router's address (see [`run_egress`]).
 pub fn start_dnsmasq(run: &Path) -> io::Result<Daemon> {
     let pid_file = run.join("dnsmasq.pid");
     let d = Daemon { name: "dnsmasq", pid_file: pid_file.clone() };
@@ -83,10 +84,17 @@ pub fn start_dnsmasq(run: &Path) -> io::Result<Daemon> {
             &format!("--interface={ROUTER_TAP}"),
             "--bind-interfaces",
             "--except-interface=lo",
-            "--port=0",
+            "--no-resolv",
+            "--no-hosts",
+            &format!("--address=/#/{ROUTER_IP}"),
+            // Every other record type (AAAA above all) is answered "no
+            // data", not refused: Go's resolver (containerd's) fails a whole
+            // lookup on a refused AAAA.
+            "--local=/#/",
             "--dhcp-authoritative",
             &format!("--dhcp-range={DHCP_FIRST},{DHCP_LAST},255.255.252.0,12h"),
             &format!("--dhcp-option=3,{ROUTER_IP}"),
+            &format!("--dhcp-option=6,{ROUTER_IP}"),
             &format!("--dhcp-leasefile={}", run.join("dnsmasq.leases").display()),
             &format!("--pid-file={}", pid_file.display()),
             &format!("--log-facility={}", run.join("dnsmasq.log").display()),
@@ -115,22 +123,149 @@ pub fn start_chronyd(run: &Path) -> io::Result<Daemon> {
     Ok(d)
 }
 
-/// Relays the guests' proxy connections on the router to `upstream` (the
-/// lab host's own HTTP proxy): the lab network has no route out.
-pub async fn run_relay(upstream: String) -> io::Result<()> {
-    let listener = TcpListener::bind(SocketAddr::from((ROUTER_IP, RELAY_PORT))).await?;
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut inbound, _)) = listener.accept().await else { continue };
-            let upstream = upstream.clone();
-            tokio::spawn(async move {
-                if let Ok(mut out) = TcpStream::connect(&upstream).await {
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
-                }
-            });
-        }
-    });
+/// The ports the lab's internet uplink carries: HTTP and HTTPS.
+pub const EGRESS_PORTS: [u16; 2] = [80, 443];
+/// How long a guest has to send enough of its first request to name the host.
+const EGRESS_HELLO: Duration = Duration::from_secs(10);
+/// The most of a first request read while looking for the host name.
+const EGRESS_PEEK_MAX: usize = 32 * 1024;
+
+/// The lab network's internet uplink, as close to a plain one as the lab
+/// host allows (it reaches the internet only through an HTTP proxy, and only
+/// over IPv6). Guests need no proxy settings: every name resolves to the
+/// router ([`start_dnsmasq`]), and the router relays each connection to
+/// port 80 or 443 through `upstream` to the host it names: the HTTP `Host`
+/// header, or the TLS ClientHello's server name. Anything else (another
+/// port, an address without a name, UDP) has no way out.
+pub async fn run_egress(upstream: String) -> io::Result<()> {
+    for port in EGRESS_PORTS {
+        let listener = TcpListener::bind(SocketAddr::from((ROUTER_IP, port))).await?;
+        let upstream = upstream.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((inbound, _)) = listener.accept().await else { continue };
+                let upstream = upstream.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = relay(inbound, port, &upstream).await {
+                        eprintln!("lab: egress on :{port}: {e}");
+                    }
+                });
+            }
+        });
+    }
     Ok(())
+}
+
+async fn relay(mut inbound: TcpStream, port: u16, upstream: &str) -> io::Result<()> {
+    let mut first = Vec::with_capacity(2048);
+    let host = tokio::time::timeout(EGRESS_HELLO, async {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = inbound.read(&mut buf).await?;
+            if n == 0 {
+                return Err(io::Error::other("closed before naming a host"));
+            }
+            first.extend_from_slice(&buf[..n]);
+            let found = if port == 443 { tls_server_name(&first) } else { http_host(&first) };
+            match found {
+                Named::Host(h) => return Ok(h),
+                Named::Never => return Err(io::Error::other("the request names no host")),
+                Named::NeedMore if first.len() >= EGRESS_PEEK_MAX => return Err(io::Error::other("no host name in the first request")),
+                Named::NeedMore => {}
+            }
+        }
+    })
+    .await
+    .map_err(|_| io::Error::other("timed out waiting for the request"))??;
+    let mut out = TcpStream::connect(upstream).await?;
+    out.write_all(format!("CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n").as_bytes()).await?;
+    let mut reply = Vec::new();
+    let mut b = [0u8; 1];
+    while !reply.ends_with(b"\r\n\r\n") {
+        if out.read(&mut b).await? == 0 || reply.len() > 8192 {
+            return Err(io::Error::other(format!("the upstream proxy hung up on CONNECT {host}:{port}")));
+        }
+        reply.push(b[0]);
+    }
+    let status = String::from_utf8_lossy(&reply);
+    if !status.split_whitespace().nth(1).is_some_and(|c| c.starts_with('2')) {
+        return Err(io::Error::other(format!("CONNECT {host}:{port}: {}", status.lines().next().unwrap_or(""))));
+    }
+    out.write_all(&first).await?;
+    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut out).await;
+    Ok(())
+}
+
+/// What the start of a request says about the host it is for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Named {
+    Host(String),
+    /// Not enough of it yet.
+    NeedMore,
+    /// It will not say.
+    Never,
+}
+
+fn host_name_ok(h: &str) -> bool {
+    !h.is_empty() && h.len() <= 253 && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+}
+
+/// The host of an HTTP request's `Host` header (port dropped).
+pub fn http_host(req: &[u8]) -> Named {
+    let Some(end) = req.windows(4).position(|w| w == b"\r\n\r\n") else { return Named::NeedMore };
+    let head = String::from_utf8_lossy(&req[..end]);
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("host")
+        {
+            let v = v.trim();
+            let host = v.rsplit_once(':').filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit())).map_or(v, |(h, _)| h);
+            return if host_name_ok(host) { Named::Host(host.to_ascii_lowercase()) } else { Named::Never };
+        }
+    }
+    Named::Never
+}
+
+/// The server name (SNI) of a TLS ClientHello.
+pub fn tls_server_name(b: &[u8]) -> Named {
+    if b.len() < 5 {
+        return Named::NeedMore;
+    }
+    if b[0] != 0x16 {
+        return Named::Never;
+    }
+    let record = 5 + usize::from(u16::from_be_bytes([b[3], b[4]]));
+    if b.len() < record {
+        return Named::NeedMore;
+    }
+    let h = &b[5..record];
+    sni(h).map_or(Named::Never, Named::Host)
+}
+
+fn sni(h: &[u8]) -> Option<String> {
+    let u16_at = |i: usize| Some(usize::from(u16::from_be_bytes([*h.get(i)?, *h.get(i + 1)?])));
+    if *h.first()? != 1 {
+        return None;
+    }
+    // Handshake header (4), version (2), random (32).
+    let mut i = 4 + 2 + 32;
+    i += 1 + usize::from(*h.get(i)?); // session id
+    i += 2 + u16_at(i)?; // cipher suites
+    i += 1 + usize::from(*h.get(i)?); // compression methods
+    let end = i + 2 + u16_at(i)?;
+    i += 2;
+    while i + 4 <= end.min(h.len()) {
+        let (kind, len) = (u16_at(i)?, u16_at(i + 2)?);
+        let body = h.get(i + 4..i + 4 + len)?;
+        if kind == 0 {
+            // Server name list: list length (2), name type (1, 0 = host), name length (2), name.
+            let n = usize::from(u16::from_be_bytes([*body.get(3)?, *body.get(4)?]));
+            let name = std::str::from_utf8(body.get(5..5 + n)?).ok()?;
+            return host_name_ok(name).then(|| name.to_ascii_lowercase());
+        }
+        i += 4 + len;
+    }
+    None
 }
 
 /// Serves `GET /homelabd` with the current build of `binary`, re-read on
@@ -229,4 +364,53 @@ pub fn upstream_proxy() -> String {
 
 pub fn router_ip() -> Ipv4Addr {
     ROUTER_IP
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A TLS 1.3 ClientHello as curl sends it, naming `name`.
+    fn client_hello(name: &str) -> Vec<u8> {
+        let mut sni = vec![];
+        sni.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
+        sni.push(0);
+        sni.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni.extend_from_slice(name.as_bytes());
+        let mut ext = vec![0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04]; // supported_versions first
+        ext.extend_from_slice(&[0, 0]);
+        ext.extend_from_slice(&(sni.len() as u16).to_be_bytes());
+        ext.extend_from_slice(&sni);
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[7; 32]);
+        body.extend_from_slice(&[32]);
+        body.extend_from_slice(&[9; 32]);
+        body.extend_from_slice(&[0, 4, 0x13, 0x01, 0x13, 0x02]);
+        body.extend_from_slice(&[1, 0]);
+        body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ext);
+        let mut hs = vec![1];
+        hs.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        hs.extend_from_slice(&body);
+        let mut rec = vec![0x16, 0x03, 0x01];
+        rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
+        rec.extend_from_slice(&hs);
+        rec
+    }
+
+    #[test]
+    fn a_tls_client_hello_names_its_server() {
+        let hello = client_hello("registry-1.docker.io");
+        assert_eq!(tls_server_name(&hello), Named::Host("registry-1.docker.io".into()));
+        assert_eq!(tls_server_name(&hello[..40]), Named::NeedMore, "the record is not all here yet");
+        assert_eq!(tls_server_name(b"GET / HTTP/1.1"), Named::Never);
+    }
+
+    #[test]
+    fn an_http_request_names_its_host() {
+        assert_eq!(http_host(b"GET /debian/ HTTP/1.1\r\nHost: deb.debian.org\r\nUser-Agent: apt\r\n\r\n"), Named::Host("deb.debian.org".into()));
+        assert_eq!(http_host(b"GET / HTTP/1.1\r\nhost: Example.COM:8080\r\n\r\n"), Named::Host("example.com".into()));
+        assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: deb"), Named::NeedMore);
+        assert_eq!(http_host(b"GET / HTTP/1.0\r\n\r\n"), Named::Never);
+    }
 }

@@ -4,7 +4,7 @@
 //! router, installs the guest agent, and installs `homelabd` with the node
 //! config (and, for a machine joining an existing cluster, the join token).
 
-use crate::topology::{VmSpec, BIN_PORT, MGMT_NET, RELAY_PORT, ROUTER_IP, VIP};
+use crate::topology::{VmSpec, BIN_PORT, MGMT_NET, ROUTER_IP, VIP};
 use model::SwitchId;
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -72,7 +72,6 @@ pub fn seed(vm: &VmSpec, role: &Role, ssh_key: &str, switches: &BTreeMap<SwitchI
     let mut u = String::from("#cloud-config\n");
     writeln!(u, "hostname: {}", vm.id).unwrap();
     writeln!(u, "ssh_authorized_keys:\n  - \"{}\"", ssh_key.trim()).unwrap();
-    writeln!(u, "apt:\n  http_proxy: http://{ROUTER_IP}:{RELAY_PORT}\n  https_proxy: http://{ROUTER_IP}:{RELAY_PORT}").unwrap();
     u.push_str("packages: [qemu-guest-agent, chrony]\n");
     u.push_str("write_files:\n");
     let mut file = |path: &str, perms: &str, body: &str| {
