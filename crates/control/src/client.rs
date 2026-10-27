@@ -33,6 +33,8 @@ pub struct ClusterView {
     pub last_sync_at: Option<SimTime>,
     /// Latest sample per host.
     pub metrics: BTreeMap<HostId, MetricSample>,
+    /// The K3s/Longhorn snapshot the leader last served, if any.
+    pub k8s: Option<crate::k8s_obs::K8sSnapshot>,
 }
 
 impl ClusterView {
@@ -246,7 +248,7 @@ impl Actor for ClientActor {
 
     fn on_message(&mut self, ctx: &mut dyn Ctx, _from: Endpoint, msg: Msg) {
         match msg {
-            Msg::SyncResp { changes, leader, term, metrics } => {
+            Msg::SyncResp { changes, leader, term, metrics, k8s } => {
                 self.sync_stats.syncs += 1;
                 self.sync_stats.upserts += changes.upserts.len() as u64;
                 self.view.merge(changes);
@@ -254,6 +256,7 @@ impl Actor for ClientActor {
                 self.view.term = term;
                 self.view.last_sync_at = Some(ctx.now());
                 self.view.metrics.extend(metrics);
+                self.view.k8s = k8s;
             }
             // Never proposed, so trying again is safe.
             Msg::ApiResp { req, result: ApiResult::NotLeader } if self.outstanding.contains_key(&req) => {

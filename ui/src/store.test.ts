@@ -50,6 +50,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, clock: Partial<ClockInfo> = 
     events: [],
     cp: { voters: ['cp-1'], mode: 'Suggest', version: 1 },
     metrics: {},
+    k8s: null,
     ...over,
   }
   return { type: 'snapshot', view, truth, clock: { now: 2000, ...clock } }
@@ -65,6 +66,7 @@ function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): Serve
     upserts: [],
     removed: [],
     metrics: {},
+    k8s: null,
     truth,
     clock: { now: 2500 },
     ...over,
@@ -76,6 +78,17 @@ describe('store', () => {
     const s = createStore()
     expect(s.getState().connection).toBe('connecting')
     expect(s.getState().view.hosts).toEqual({})
+  })
+
+  it('carries the observed snapshot, replacing it only on a newer take', () => {
+    const at = (n: number) => ({ at: n, nodes: [], deployments: [], pods: [], lh_nodes: [], volumes: [] })
+    const s = createStore()
+    s.applyMessage(snapshot({ k8s: at(5) }))
+    expect(s.getState().view.k8s?.at).toBe(5)
+    s.applyMessage(delta())
+    expect(s.getState().view.k8s?.at).toBe(5)
+    s.applyMessage(delta({ k8s: at(35) }))
+    expect(s.getState().view.k8s?.at).toBe(35)
   })
 
   it('snapshot then delta merges upserts and removes', () => {

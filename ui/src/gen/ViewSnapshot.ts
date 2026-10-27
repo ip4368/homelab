@@ -7,6 +7,7 @@ import type { Event } from "./Event";
 import type { HostId } from "./HostId";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
+import type { K8sSnapshot } from "./K8sSnapshot";
 import type { MetricSample } from "./MetricSample";
 import type { NetworkObj } from "./NetworkObj";
 import type { PodObj } from "./PodObj";
@@ -25,4 +26,8 @@ export type ViewSnapshot = { version: number, leader: HostId | null, term: numbe
 /**
  * Latest sample per host.
  */
-metrics: { [key in HostId]: MetricSample }, };
+metrics: { [key in HostId]: MetricSample }, 
+/**
+ * The observed K3s/Longhorn snapshot, if the leader serves one.
+ */
+k8s: K8sSnapshot | null, };

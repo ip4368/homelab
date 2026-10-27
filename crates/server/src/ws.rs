@@ -7,6 +7,7 @@ use crate::driver::{ClockInfo, DriverHandle, Published};
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
+use control::k8s_obs::K8sSnapshot;
 use control::proto::MetricSample;
 use control::state::{
     Alert, AutoApproveRule, CpInfo, DeploymentObj, Event, HostObj, JoinToken, NetworkObj, Object, ObjectRef, PodObj, Rollout,
@@ -47,6 +48,8 @@ pub struct ViewSnapshot {
     pub cp: CpInfo,
     /// Latest sample per host.
     pub metrics: BTreeMap<HostId, MetricSample>,
+    /// The observed K3s/Longhorn snapshot, if the leader serves one.
+    pub k8s: Option<K8sSnapshot>,
 }
 
 impl ViewSnapshot {
@@ -74,6 +77,7 @@ impl ViewSnapshot {
             events: s.events.values().cloned().collect(),
             cp: s.cp.clone(),
             metrics: v.metrics.clone(),
+            k8s: v.k8s.clone(),
         }
     }
 }
@@ -97,6 +101,8 @@ pub enum ServerMsg {
         removed: Vec<ObjectRef>,
         /// Samples newer than the last ones sent.
         metrics: BTreeMap<HostId, MetricSample>,
+        /// The observed snapshot, when newer than the one sent.
+        k8s: Option<K8sSnapshot>,
         truth: LabTruth,
         clock: ClockInfo,
     },
@@ -108,12 +114,14 @@ pub struct Connection {
     version: u64,
     /// When each host's latest sample was taken, as last sent.
     metrics_sent: BTreeMap<HostId, u64>,
+    /// When the observed snapshot was taken, as last sent.
+    k8s_sent: Option<u64>,
 }
 
 impl Connection {
     /// Starts a connection with its snapshot of `p`.
     pub fn open(p: &Published) -> (Self, ServerMsg) {
-        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new() };
+        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new(), k8s_sent: None };
         let msg = c.snapshot(p);
         (c, msg)
     }
@@ -122,6 +130,7 @@ impl Connection {
         self.epoch = p.epoch;
         self.version = p.view.version;
         self.metrics_sent = p.view.metrics.iter().map(|(h, m)| (h.clone(), m.at)).collect();
+        self.k8s_sent = p.view.k8s.as_ref().map(|k| k.at);
         ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), clock: p.clock }
     }
 
@@ -143,6 +152,10 @@ impl Connection {
         for (h, m) in &metrics {
             self.metrics_sent.insert(h.clone(), m.at);
         }
+        let k8s = p.view.k8s.clone().filter(|k| self.k8s_sent.is_none_or(|at| k.at > at));
+        if let Some(k) = &k8s {
+            self.k8s_sent = Some(k.at);
+        }
         self.version = p.view.version;
         ServerMsg::Delta {
             version: changes.version,
@@ -152,6 +165,7 @@ impl Connection {
             upserts: changes.upserts,
             removed: changes.removed,
             metrics,
+            k8s,
             truth: p.truth.clone(),
             clock: p.clock,
         }
@@ -335,6 +349,28 @@ mod tests {
         view.metrics.insert(HostId::from("h2"), sample(16));
         assert_eq!(metrics(conn.next(&published(&view, 30))).len(), 2);
         assert!(metrics(conn.next(&published(&view, 40))).is_empty());
+    }
+
+    fn snap(at: u64) -> K8sSnapshot {
+        K8sSnapshot { at, nodes: vec![], deployments: vec![], pods: vec![], lh_nodes: vec![], volumes: vec![] }
+    }
+
+    #[test]
+    fn the_observed_snapshot_is_sent_once_per_new_take() {
+        let mut view = ClusterView::default();
+        view.k8s = Some(snap(5));
+        let (mut conn, first) = Connection::open(&published(&view, 10));
+        let ServerMsg::Snapshot { view: snapv, .. } = first else { panic!() };
+        assert_eq!(snapv.k8s.as_ref().map(|k| k.at), Some(5));
+
+        let k8s = |m: ServerMsg| match m {
+            ServerMsg::Delta { k8s, .. } => k8s,
+            other => panic!("{other:?}"),
+        };
+        assert!(k8s(conn.next(&published(&view, 20))).is_none(), "same take: not resent");
+        view.k8s = Some(snap(35));
+        assert_eq!(k8s(conn.next(&published(&view, 40))).as_ref().map(|k| k.at), Some(35));
+        assert!(k8s(conn.next(&published(&view, 50))).is_none());
     }
 
     #[test]

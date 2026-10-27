@@ -12,6 +12,7 @@ pub mod sysfs;
 
 use crate::k3s::K3sLink;
 use crate::runtime::{NodeOs, VipControl};
+use control::k8s_obs::K8sSnapshot;
 use control::proto::{InstanceSpec, LogCmd, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::runtime::{HostOs, HostUsage, SimTime};
@@ -171,6 +172,9 @@ pub struct LinuxOs {
     /// Shared with the K3s worker thread (spawned by `homelabd run`): the
     /// agent drops the join token in, the worker reports whether K3s runs.
     k3s: std::sync::Arc<K3sLink>,
+    /// The observed K3s snapshot by file mtime: the controller loop asks
+    /// every second, and only a changed file is reread.
+    k3s_state: std::sync::Mutex<(Option<std::time::SystemTime>, Option<K8sSnapshot>)>,
 }
 
 impl LinuxOs {
@@ -202,6 +206,7 @@ impl LinuxOs {
             speeds: BTreeMap::new(),
             lldp: None,
             k3s: Default::default(),
+            k3s_state: std::sync::Mutex::new((None, None)),
         };
         // A persisted network config is one the leader confirmed: the
         // address is final even though this process never saw it confirmed.
@@ -478,6 +483,18 @@ impl HostOs for LinuxOs {
 
     fn set_net_confirmed(&mut self, confirmed: bool) {
         self.k3s.set_net_applied(confirmed);
+    }
+
+    fn k3s_snapshot(&self) -> Option<K8sSnapshot> {
+        let path = self.paths.run.join("k3s_state.json");
+        let mtime = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+        let mut cache = self.k3s_state.lock().expect("k3s snapshot");
+        if cache.0 == Some(mtime) {
+            return cache.1.clone();
+        }
+        let snap: K8sSnapshot = serde_json::from_slice(&fs::read(&path).ok()?).ok()?;
+        *cache = (Some(mtime), Some(snap.clone()));
+        Some(snap)
     }
 }
 

@@ -6,6 +6,7 @@ pub mod agent;
 pub mod bootstrap;
 pub mod client;
 pub mod controllers;
+pub mod k8s_obs;
 pub mod metrics;
 pub mod proto;
 pub mod raft;

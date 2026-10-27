@@ -5,6 +5,7 @@ import type { HostObj } from './gen/HostObj'
 import {
   buildWorkloads,
   filterWorkloads,
+  formatBytes,
   hostWorkloads,
   migrationTargets,
   removeHostPrompt,
@@ -63,6 +64,15 @@ function source(): WorkloadSource {
 }
 
 const all: WorkloadFilter = { kind: 'all', text: '', host: '', health: '' }
+
+describe('formatBytes', () => {
+  it('scales bytes to units', () => {
+    expect(formatBytes(0)).toBe('0 B')
+    expect(formatBytes(1536)).toBe('1.5 KB')
+    expect(formatBytes(1073741824)).toBe('1.0 GB')
+    expect(formatBytes(16694517760)).toBe('15.5 GB')
+  })
+})
 
 describe('buildWorkloads', () => {
   it('lists VMs, pods and volumes with their hosts and health', () => {

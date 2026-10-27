@@ -4,6 +4,7 @@ import {
   KIND_LABELS,
   buildWorkloads,
   filterWorkloads,
+  formatBytes,
   healthTone,
   refOf,
   type WorkloadFilter,
@@ -152,6 +153,145 @@ export function WorkloadsView({
           Showing the first {ROWS_SHOWN} of {shown.length}; narrow the filters to see the rest.
         </p>
       )}
+      <ObservedK8s onSelectHost={onSelectHost} />
+      <ObservedLonghorn />
     </section>
+  )
+}
+
+/** K8s node names are lowercased hostnames: the host id they belong to, if it is one of ours. */
+function hostForNode(hosts: Record<string, unknown>, node: string): string | null {
+  const id = Object.keys(hosts).find((h) => h.toLowerCase() === node.toLowerCase())
+  return id ?? null
+}
+
+/** Deployments and pods as K3s reports them (read-only: our API does not manage them yet). */
+function ObservedK8s({ onSelectHost }: { onSelectHost(id: string): void }) {
+  const k8s = useStore((s) => s.view.k8s)
+  const hosts = useStore((s) => s.view.hosts)
+  if (!k8s) return null
+  const nodeLink = (node: string) => {
+    const id = hostForNode(hosts, node)
+    return id ? (
+      <button
+        className="link"
+        onClick={(e) => {
+          e.stopPropagation()
+          onSelectHost(id)
+        }}
+      >
+        {id}
+      </button>
+    ) : (
+      <span className="muted">{node || 'unplaced'}</span>
+    )
+  }
+  return (
+    <div className="section">
+      <h4>Observed from K3s</h4>
+      <p className="muted">What K3s runs, as the leader last observed it. Read-only.</p>
+      <table className="data workload-table">
+        <thead>
+          <tr>
+            <th>Kind</th>
+            <th>Name</th>
+            <th>Health</th>
+            <th>Placement</th>
+            <th>Detail</th>
+          </tr>
+        </thead>
+        <tbody>
+          {k8s.deployments.map((d) => (
+            <tr key={`deployment:${d.namespace}/${d.name}`}>
+              <td>Deployment</td>
+              <td>
+                <strong>
+                  {d.namespace}/{d.name}
+                </strong>
+              </td>
+              <td className={d.ready === d.total ? 'ok' : 'warn'}>
+                {d.ready}/{d.total} ready
+              </td>
+              <td className="muted">—</td>
+              <td className="muted">K3s</td>
+            </tr>
+          ))}
+          {k8s.pods.slice(0, ROWS_SHOWN).map((p) => (
+            <tr key={`pod:${p.namespace}/${p.name}`}>
+              <td>Pod</td>
+              <td>
+                <strong>
+                  {p.namespace}/{p.name}
+                </strong>
+              </td>
+              <td className={healthTone(p.phase)}>{p.phase}</td>
+              <td>{nodeLink(p.node)}</td>
+              <td className="muted">K3s</td>
+            </tr>
+          ))}
+          {k8s.deployments.length + k8s.pods.length === 0 && (
+            <tr>
+              <td colSpan={5} className="muted">
+                K3s runs nothing yet.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+/** Volumes and replica placement as Longhorn reports them (read-only). */
+function ObservedLonghorn() {
+  const k8s = useStore((s) => s.view.k8s)
+  if (!k8s) return null
+  const tone = (robustness: string) => healthTone(robustness.charAt(0).toUpperCase() + robustness.slice(1))
+  return (
+    <div className="section">
+      <h4>Observed from Longhorn</h4>
+      <p className="muted">What Longhorn stores, as the leader last observed it. Read-only.</p>
+      <table className="data workload-table">
+        <thead>
+          <tr>
+            <th>Volume</th>
+            <th>Size</th>
+            <th>Health</th>
+            <th>Replicas</th>
+          </tr>
+        </thead>
+        <tbody>
+          {k8s.volumes.map((v) => (
+            <tr key={v.name}>
+              <td>
+                <strong>{v.pvc ?? v.name}</strong>
+                <div className="muted">{v.state}</div>
+              </td>
+              <td>{formatBytes(v.size_bytes)}</td>
+              <td className={tone(v.robustness)}>{v.robustness}</td>
+              <td>
+                {v.replicas.length === 0 ? (
+                  <span className="muted">none</span>
+                ) : (
+                  v.replicas.map((r, n) => (
+                    <span key={`${r.node}:${n}`}>
+                      {n > 0 && ', '}
+                      {r.node} <span className={r.running ? 'ok' : 'bad'}>{r.running ? '●' : '○'}</span>
+                    </span>
+                  ))
+                )}
+              </td>
+            </tr>
+          ))}
+          {k8s.volumes.length === 0 && (
+            <tr>
+              <td colSpan={4} className="muted">
+                Longhorn stores no volumes yet.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
   )
 }

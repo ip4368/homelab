@@ -169,6 +169,7 @@ impl CpReplica {
         let (now, mono) = (ctx.now(), ctx.monotonic_ms());
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
+        v.k8s = ctx.host().and_then(|os| os.k3s_snapshot());
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         v.forget_silent_removed(&self.state, now);
         let mut actions = controllers::run_all(&self.state, v, now);
@@ -355,7 +356,8 @@ impl CpReplica {
         let Some(v) = self.volatile.as_ref().filter(|v| v.caught_up && raft.has_quorum(mono)) else { return };
         let metrics = v.metrics.iter().map(|(h, m)| (h.clone(), m.clone())).collect();
         let changes = self.state.changes_since(since);
-        ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics });
+        let k8s = v.k8s.clone();
+        ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics, k8s });
     }
 }
 

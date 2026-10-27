@@ -5,7 +5,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
-import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
+import { formatBytes, hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
 import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
@@ -102,6 +102,89 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
 }
 
 const MAX_LISTED = 12
+
+/** What K3s and Longhorn report about this host (observed, read-only). K8s
+ * node names are the lowercased hostnames, so the match ignores case. */
+function K8sSection({ host }: { host: HostObj }) {
+  const k8s = useStore((s) => s.view.k8s)
+  if (!k8s) {
+    return (
+      <div className="section">
+        <h4>K3s &amp; Longhorn</h4>
+        <p className="muted">Not observed yet (the leader snapshots K3s every 30 s).</p>
+      </div>
+    )
+  }
+  const id = host.id.toLowerCase()
+  const node = k8s.nodes.find((n) => n.name.toLowerCase() === id)
+  const lh = k8s.lh_nodes.find((n) => n.name.toLowerCase() === id)
+  const pods = k8s.pods.filter((p) => p.node.toLowerCase() === id)
+  const replicas = k8s.volumes.flatMap((v) => v.replicas.filter((r) => r.node.toLowerCase() === id).map((r) => ({ volume: v, running: r.running })))
+  if (!node && !lh) {
+    return (
+      <div className="section">
+        <h4>K3s &amp; Longhorn</h4>
+        <p className="muted">Not a K3s node.</p>
+      </div>
+    )
+  }
+  return (
+    <div className="section">
+      <h4>K3s &amp; Longhorn</h4>
+      <dl className="inventory">
+        {node && (
+          <>
+            <dt>K3s node</dt>
+            <dd className={node.ready ? 'ok' : 'bad'}>
+              {node.ready ? 'Ready' : 'NotReady'}
+              {node.roles.length > 0 && <span className="muted"> ({node.roles.join(', ')})</span>}
+              <span className="muted"> {node.version}</span>
+            </dd>
+          </>
+        )}
+        {lh && (
+          <>
+            <dt>Longhorn</dt>
+            <dd>
+              {lh.schedulable ? 'schedulable' : <span className="bad">unschedulable</span>}
+              {lh.disks.map((d) => (
+                <div key={d.path} className="muted">
+                  {d.path} {formatBytes(d.total_bytes - d.avail_bytes)} of {formatBytes(d.total_bytes)} · {d.replicas} replica{d.replicas === 1 ? '' : 's'}
+                </div>
+              ))}
+            </dd>
+          </>
+        )}
+        {pods.length > 0 && (
+          <>
+            <dt>Pods ({pods.length})</dt>
+            <dd>
+              {pods.slice(0, MAX_LISTED).map((p) => (
+                <div key={`${p.namespace}/${p.name}`}>
+                  {p.namespace}/{p.name} <span className="muted">{p.phase}</span>
+                </div>
+              ))}
+              {pods.length > MAX_LISTED && <span className="muted">and {pods.length - MAX_LISTED} more</span>}
+            </dd>
+          </>
+        )}
+        {replicas.length > 0 && (
+          <>
+            <dt>Replicas ({replicas.length})</dt>
+            <dd>
+              {replicas.map((r) => (
+                <div key={r.volume.name}>
+                  {r.volume.pvc ?? r.volume.name}{' '}
+                  <span className={r.running ? 'ok' : 'bad'}>{r.running ? 'running' : 'stopped'}</span>
+                </div>
+              ))}
+            </dd>
+          </>
+        )}
+      </dl>
+    </div>
+  )
+}
 
 /** What the view places on the host. While it drains, this is what is left to move off. */
 function HostWorkloads({ host, onSelectWorkload }: { host: HostObj; onSelectWorkload(ref: WorkloadRef): void }) {
@@ -204,6 +287,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
         </button>
       </div>
       <Inventory host={host} />
+      <K8sSection host={host} />
       <div className="section">
         <h4>Lifecycle</h4>
         <div className="actions">

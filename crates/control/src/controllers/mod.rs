@@ -146,6 +146,9 @@ pub struct Volatile {
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
     pub failed: Vec<(Command, SimTime)>,
+    /// The K3s/Longhorn snapshot this host last observed (the leader serves
+    /// it to clients; `None` where K3s is unmanaged or down).
+    pub k8s: Option<crate::k8s_obs::K8sSnapshot>,
 }
 
 impl Volatile {
@@ -180,6 +183,7 @@ impl Volatile {
             directory_sent: None,
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
+            k8s: None,
         }
     }
 

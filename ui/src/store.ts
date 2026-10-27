@@ -7,6 +7,7 @@ import type { DeploymentObj } from './gen/DeploymentObj'
 import type { Event as ClusterEvent } from './gen/Event'
 import type { HostObj } from './gen/HostObj'
 import type { JoinToken } from './gen/JoinToken'
+import type { K8sSnapshot } from './gen/K8sSnapshot'
 import type { LabTruth } from './gen/LabTruth'
 import type { MetricSample } from './gen/MetricSample'
 import type { NetworkObj } from './gen/NetworkObj'
@@ -61,6 +62,8 @@ export interface View {
   volumes: Record<string, VolumeObj>
   /** Keyed by volume id. */
   volumeStatus: Record<string, VolumeStatusObj>
+  /** The observed K3s/Longhorn snapshot, if the leader serves one. */
+  k8s: K8sSnapshot | null
 }
 
 export interface UiState {
@@ -105,6 +108,7 @@ function initialState(): UiState {
       vmStatus: {},
       volumes: {},
       volumeStatus: {},
+      k8s: null,
     },
     truth: emptyTruth,
     clock: { now: 0 },
@@ -158,6 +162,7 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
     vmStatus: byKey(s.vm_status, (v) => v.id),
     volumes: byKey(s.volumes, (v) => v.id),
     volumeStatus: byKey(s.volume_status, (v) => v.id),
+    k8s: s.k8s ?? null,
   }
 }
 
@@ -165,6 +170,7 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
 function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
   let { hosts, tokens, rules, switches, networks, templates, rollouts, alerts, events, cp, metrics } = view
   let { deployments, pods, vms, vmStatus, volumes, volumeStatus } = view
+  let k8s = view.k8s
   const upsertedEvents = new Map<number, ClusterEvent>()
   const removedEvents = new Set<number>()
   const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
@@ -311,6 +317,7 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
   }
 
   if (Object.keys(d.metrics).length > 0) metrics = { ...metrics, ...d.metrics }
+  if (d.k8s !== null && d.k8s !== undefined) k8s = d.k8s
 
   if (upsertedEvents.size > 0 || removedEvents.size > 0) {
     const merged = new Map(events.map((e) => [e.seq, e]))
@@ -341,6 +348,7 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
     vmStatus,
     volumes,
     volumeStatus,
+    k8s,
   }
 }
 

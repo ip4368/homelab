@@ -77,9 +77,11 @@ Small, sim-safe additions in the style of §8 of the lab design:
    never ask; zero behaviour change), true in `LinuxOs`.
 3. `HostOs::k3s_token() -> Option<String>`: the local server's node-token
    (file read; safe on the event loop). `None` in the sim.
-4. No heartbeat or UI change in this phase: `kubectl` is the validation
-   interface for K3s/Longhorn state. Surfacing it in our UI comes with the
-   API→K8s integration step. No new controller logic.
+4. No heartbeat change in this phase. The leader's worker snapshots
+   K3s/Longhorn every 30 s and serves it volatile (like metrics); the UI
+   shows per-node K3s/Longhorn details and observed workloads, read-only.
+   Driving K8s resources from our API is still a later step. No new
+   controller logic.
 
 ## 6. Node changes (`node`)
 

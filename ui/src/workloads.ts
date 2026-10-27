@@ -64,6 +64,20 @@ export function healthTone(health: string): 'ok' | 'warn' | 'bad' {
   return 'warn'
 }
 
+/** Bytes as `1.5 GB` (Longhorn reports raw byte counts). */
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let v = bytes / 1024
+  let u = units[0]
+  for (const unit of units) {
+    u = unit
+    if (v < 1024 || unit === 'TB') break
+    v /= 1024
+  }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${u}`
+}
+
 function unique(items: string[]): string[] {
   return [...new Set(items)]
 }

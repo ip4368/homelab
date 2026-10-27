@@ -8,7 +8,8 @@
 //! join token in, and reads whether K3s runs.
 
 use crate::linux::store::RaftStore;
-use std::collections::BTreeSet;
+use control::k8s_obs::{K8sDeployment, K8sNode, K8sPod, K8sSnapshot, LhDisk, LhNode, LhReplica, LhVolume};
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
@@ -43,6 +44,9 @@ const AGENT_SETTLE: Duration = Duration::from_secs(5 * 60);
 /// How long the cluster-init host waits for every voter to be a Ready K3s
 /// node before installing Longhorn anyway.
 const LONGHORN_WAIT: Duration = Duration::from_secs(15 * 60);
+/// How often a server refreshes the observed snapshot (seven `kubectl`
+/// queries; the leader serves the file to clients).
+const SNAP_EVERY: Duration = Duration::from_secs(30);
 
 /// What the event loop and the worker share.
 #[derive(Debug, Default)]
@@ -115,6 +119,7 @@ impl Mode {
 #[derive(Debug, Clone)]
 pub struct K3sPaths {
     pub state: PathBuf,
+    pub run: PathBuf,
     pub bin: PathBuf,
     pub env: PathBuf,
     pub unit: PathBuf,
@@ -127,6 +132,7 @@ impl K3sPaths {
     pub fn system() -> Self {
         Self {
             state: PathBuf::from("/var/lib/homelab"),
+            run: PathBuf::from("/run/homelab"),
             bin: PathBuf::from(K3S_BIN),
             env: PathBuf::from(K3S_ENV),
             unit: PathBuf::from(K3S_UNIT),
@@ -134,6 +140,11 @@ impl K3sPaths {
             token: PathBuf::from(K3S_TOKEN),
             kubeconfig: PathBuf::from(K3S_KUBECONFIG),
         }
+    }
+
+    /// The observed K3s/Longhorn snapshot the leader serves to clients.
+    pub fn snapshot_file(&self) -> PathBuf {
+        self.run.join("k3s_state.json")
     }
 
     fn mode_file(&self) -> PathBuf {
@@ -260,16 +271,178 @@ fn env_ref(env: &[(String, String)]) -> Vec<(&str, &str)> {
     env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 }
 
+/// The string at `v[k]`, or `""` (kubectl shapes drift; missing means empty).
+fn s<'a>(v: &'a serde_json::Value, k: &str) -> &'a str {
+    v.get(k).and_then(serde_json::Value::as_str).unwrap_or("")
+}
+
+/// The u64 at `v[k]`, read as a number or a string (Longhorn sizes are strings).
+fn n(v: &serde_json::Value, k: &str) -> u64 {
+    v.get(k)
+        .map(|x| x.as_u64().or_else(|| x.as_str()?.parse().ok()).unwrap_or(0))
+        .unwrap_or(0)
+}
+
+fn items(doc: &str) -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(doc)
+        .ok()
+        .and_then(|d| d.get("items").cloned())
+        .and_then(|i| serde_json::from_value::<Vec<serde_json::Value>>(i).ok())
+        .unwrap_or_default()
+}
+
+fn parse_nodes(doc: &str) -> Vec<K8sNode> {
+    items(doc)
+        .iter()
+        .map(|i| {
+            let md = &i["metadata"];
+            let labels = md.get("labels").and_then(serde_json::Value::as_object);
+            let mut roles: Vec<String> = labels
+                .into_iter()
+                .flat_map(|l| l.keys())
+                .filter_map(|k| k.strip_prefix("node-role.kubernetes.io/").map(str::to_string))
+                .collect();
+            roles.sort();
+            let ready = i["status"]["conditions"]
+                .as_array()
+                .is_some_and(|cs| cs.iter().any(|c| s(c, "type") == "Ready" && s(c, "status") == "True"));
+            K8sNode { name: s(md, "name").to_string(), ready, roles, version: s(&i["status"]["nodeInfo"], "kubeletVersion").to_string() }
+        })
+        .collect()
+}
+
+fn parse_deployments(doc: &str) -> Vec<K8sDeployment> {
+    items(doc)
+        .iter()
+        .map(|i| K8sDeployment {
+            namespace: s(&i["metadata"], "namespace").to_string(),
+            name: s(&i["metadata"], "name").to_string(),
+            ready: n(&i["status"], "readyReplicas") as u32,
+            total: n(&i["status"], "replicas") as u32,
+        })
+        .collect()
+}
+
+fn parse_pods(doc: &str) -> Vec<K8sPod> {
+    items(doc)
+        .iter()
+        .map(|i| K8sPod {
+            namespace: s(&i["metadata"], "namespace").to_string(),
+            name: s(&i["metadata"], "name").to_string(),
+            node: s(&i["spec"], "nodeName").to_string(),
+            phase: s(&i["status"], "phase").to_string(),
+        })
+        .collect()
+}
+
+/// Volume name → `namespace/name` of the claiming PVC.
+fn parse_pvcs(doc: &str) -> BTreeMap<String, String> {
+    items(doc)
+        .iter()
+        .filter_map(|i| {
+            let vol = s(&i["spec"], "volumeName");
+            (!vol.is_empty()).then(|| (vol.to_string(), format!("{}/{}", s(&i["metadata"], "namespace"), s(&i["metadata"], "name"))))
+        })
+        .collect()
+}
+
+fn parse_lh_nodes(doc: &str) -> Vec<LhNode> {
+    items(doc)
+        .iter()
+        .map(|i| {
+            let disks = i["spec"]["disks"].as_object().map(|spec| {
+                spec.iter()
+                    .map(|(uuid, d)| {
+                        let st = &i["status"]["diskStatus"][uuid];
+                        LhDisk {
+                            path: s(d, "path").to_string(),
+                            total_bytes: n(st, "storageMaximum"),
+                            avail_bytes: n(st, "storageAvailable"),
+                            replicas: st.get("scheduledReplica").and_then(serde_json::Value::as_object).map(|m| m.len() as u64).unwrap_or(0),
+                        }
+                    })
+                    .collect()
+            });
+            // A node whose spec has not arrived yet still reports status.
+            let disks = disks.or_else(|| {
+                i["status"]["diskStatus"].as_object().map(|st| {
+                    st.iter()
+                        .map(|(uuid, d)| LhDisk {
+                            path: uuid.clone(),
+                            total_bytes: n(d, "storageMaximum"),
+                            avail_bytes: n(d, "storageAvailable"),
+                            replicas: d.get("scheduledReplica").and_then(serde_json::Value::as_object).map(|m| m.len() as u64).unwrap_or(0),
+                        })
+                        .collect()
+                })
+            });
+            LhNode {
+                name: s(&i["metadata"], "name").to_string(),
+                schedulable: i["spec"].get("allowScheduling").and_then(serde_json::Value::as_bool).unwrap_or(false),
+                disks: disks.unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+fn parse_volumes(doc: &str, pvcs: &BTreeMap<String, String>, by_volume: &BTreeMap<String, Vec<LhReplica>>) -> Vec<LhVolume> {
+    items(doc)
+        .iter()
+        .map(|i| {
+            let name = s(&i["metadata"], "name").to_string();
+            LhVolume {
+                name: name.clone(),
+                pvc: pvcs.get(&name).cloned(),
+                size_bytes: n(&i["spec"], "size"),
+                robustness: s(&i["status"], "robustness").to_string(),
+                state: s(&i["status"], "state").to_string(),
+                replicas: by_volume.get(&name).cloned().unwrap_or_default(),
+            }
+        })
+        .collect()
+}
+
+/// Groups parsed replicas by volume name.
+fn group_replicas(parsed: Vec<(String, LhReplica)>) -> BTreeMap<String, Vec<LhReplica>> {
+    let mut by_volume: BTreeMap<String, Vec<LhReplica>> = BTreeMap::new();
+    for (vol, r) in parsed {
+        by_volume.entry(vol).or_default().push(r);
+    }
+    for rs in by_volume.values_mut() {
+        rs.sort_by(|a, b| a.node.cmp(&b.node));
+    }
+    by_volume
+}
+
+/// (volume, placement) per replica object.
+fn parse_replicas(doc: &str) -> Vec<(String, LhReplica)> {
+    items(doc)
+        .iter()
+        .map(|i| {
+            let vol = s(&i["spec"], "volumeName");
+            let vol = if vol.is_empty() { s(&i["metadata"]["labels"], "longhornvolume") } else { vol };
+            (
+                vol.to_string(),
+                LhReplica {
+                    node: s(&i["spec"], "nodeID").to_string(),
+                    running: s(&i["status"], "currentState") == "running",
+                },
+            )
+        })
+        .collect()
+}
+
 pub struct K3sWorker {
     site: Site,
     paths: K3sPaths,
     link: std::sync::Arc<K3sLink>,
     started: Instant,
+    snapped: Option<Instant>,
 }
 
 impl K3sWorker {
     pub fn new(site: Site, paths: K3sPaths, link: std::sync::Arc<K3sLink>) -> Self {
-        Self { site, paths, link, started: Instant::now() }
+        Self { site, paths, link, started: Instant::now(), snapped: None }
     }
 
     /// Converges forever: prerequisites, binary, mode, running K3s, and —
@@ -310,6 +483,36 @@ impl K3sWorker {
         if running && self.paths.state.join("cluster_init").exists() {
             self.ensure_longhorn()?;
         }
+        if running && matches!(mode, Mode::ServerInit | Mode::ServerJoin) && self.snapped.is_none_or(|at| at.elapsed() >= SNAP_EVERY) {
+            // A failed snapshot keeps the previous file; the next poll retries.
+            match self.write_snapshot() {
+                Ok(()) => self.snapped = Some(Instant::now()),
+                Err(e) => eprintln!("homelabd: k3s snapshot: {e}"),
+            }
+        }
+        Ok(())
+    }
+
+    /// Queries the K3s API (nodes, deployments, pods, PVCs, Longhorn nodes,
+    /// volumes, replicas) and writes the observed snapshot for the leader.
+    fn write_snapshot(&self) -> io::Result<()> {
+        let bin = self.paths.bin.to_string_lossy().into_owned();
+        let env = kubectl_env(&self.site, &self.paths);
+        let env = env_ref(&env);
+        let q = |args: &[&str]| sh_env(&bin, args, &env);
+        let nodes = parse_nodes(&q(&["kubectl", "get", "nodes", "-o", "json"])?);
+        let deployments = parse_deployments(&q(&["kubectl", "get", "deployments", "-A", "-o", "json"])?);
+        let pods = parse_pods(&q(&["kubectl", "get", "pods", "-A", "-o", "json"])?);
+        let pvcs = parse_pvcs(&q(&["kubectl", "get", "pvc", "-A", "-o", "json"])?);
+        let lh_nodes = parse_lh_nodes(&q(&["kubectl", "-n", "longhorn-system", "get", "nodes.longhorn.io", "-o", "json"])?);
+        let by_volume = group_replicas(parse_replicas(&q(&["kubectl", "-n", "longhorn-system", "get", "replicas.longhorn.io", "-o", "json"])?));
+        let volumes = parse_volumes(&q(&["kubectl", "-n", "longhorn-system", "get", "volumes.longhorn.io", "-o", "json"])?, &pvcs, &by_volume);
+        let snap = K8sSnapshot { at: crate::runtime::wall_ms(), nodes, deployments, pods, lh_nodes, volumes };
+        let file = self.paths.snapshot_file();
+        if let Some(dir) = file.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        std::fs::write(&file, serde_json::to_vec(&snap).map_err(io::Error::other)?)?;
         Ok(())
     }
 
@@ -515,12 +718,68 @@ mod tests {
     }
 
     #[test]
+    fn nodes_parse_roles_and_readiness() {
+        let doc = r#"{"items": [
+            {"metadata": {"name": "ms01-01", "labels": {"node-role.kubernetes.io/control-plane": "true", "node-role.kubernetes.io/etcd": "true", "kubernetes.io/hostname": "ms01-01"}},
+             "status": {"conditions": [{"type": "Ready", "status": "True"}], "nodeInfo": {"kubeletVersion": "v1.36.5+k3s1"}}},
+            {"metadata": {"name": "ms01-02"}, "status": {"conditions": [{"type": "Ready", "status": "False"}]}}
+        ]}"#;
+        let nodes = parse_nodes(doc);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].roles, ["control-plane", "etcd"]);
+        assert!(nodes[0].ready);
+        assert_eq!(nodes[0].version, "v1.36.5+k3s1");
+        assert!(nodes[1].roles.is_empty() && !nodes[1].ready);
+        assert!(parse_nodes("not json").is_empty());
+    }
+
+    #[test]
+    fn pods_and_deployments_parse() {
+        let pods = parse_pods(r#"{"items": [{"metadata": {"namespace": "default", "name": "w"}, "spec": {"nodeName": "ms01-01"}, "status": {"phase": "Running"}}]}"#);
+        assert_eq!(pods, [K8sPod { namespace: "default".into(), name: "w".into(), node: "ms01-01".into(), phase: "Running".into() }]);
+        let ds = parse_deployments(r#"{"items": [{"metadata": {"namespace": "default", "name": "web"}, "status": {"readyReplicas": 2, "replicas": 3}}]}"#);
+        assert_eq!(ds.len(), 1);
+        assert_eq!((ds[0].ready, ds[0].total), (2, 3));
+    }
+
+    #[test]
+    fn longhorn_parse_joins_disks_volumes_pvcs_and_replicas() {
+        let nodes = parse_lh_nodes(r#"{"items": [{"metadata": {"name": "ms01-01"},
+            "spec": {"allowScheduling": true, "disks": {"uuid-1": {"path": "/var/lib/longhorn/"}}},
+            "status": {"diskStatus": {"uuid-1": {"storageMaximum": 100, "storageAvailable": 40, "scheduledReplica": {"r-a": 1, "r-b": 1}}}}}]}"#);
+
+        assert_eq!(nodes.len(), 1);
+        assert!(nodes[0].schedulable);
+        assert_eq!(nodes[0].disks.len(), 1);
+        assert_eq!(nodes[0].disks[0].path, "/var/lib/longhorn/");
+        assert_eq!((nodes[0].disks[0].total_bytes, nodes[0].disks[0].avail_bytes, nodes[0].disks[0].replicas), (100, 40, 2));
+        let pvcs = parse_pvcs(r#"{"items": [{"metadata": {"namespace": "default", "name": "data"}, "spec": {"volumeName": "pvc-1"}}]}"#);
+        assert_eq!(pvcs.get("pvc-1").map(String::as_str), Some("default/data"));
+        let by_volume = group_replicas(parse_replicas(r#"{"items": [
+            {"metadata": {"name": "pvc-1-r-a"}, "spec": {"volumeName": "pvc-1", "nodeID": "ms01-02"}, "status": {"currentState": "running"}},
+            {"metadata": {"name": "pvc-1-r-b", "labels": {"longhornvolume": "pvc-1"}}, "spec": {"volumeName": "", "nodeID": "ms01-01"}, "status": {"currentState": "stopped"}}
+        ]}"#));
+        let vols = parse_volumes(
+            r#"{"items": [{"metadata": {"name": "pvc-1"}, "spec": {"size": "1073741824"}, "status": {"robustness": "degraded", "state": "attached"}}]}"#,
+            &pvcs,
+            &by_volume,
+        );
+        assert_eq!(vols.len(), 1);
+        assert_eq!(vols[0].pvc.as_deref(), Some("default/data"));
+        assert_eq!(vols[0].size_bytes, 1073741824);
+        assert_eq!(vols[0].replicas.len(), 2);
+        assert_eq!(vols[0].replicas[0].node, "ms01-01");
+        assert!(vols[0].replicas.iter().any(|r| r.running));
+    }
+
+    #[test]
     fn mode_choice_prefers_init_then_voter_then_settled_agent() {
         let scratch = std::env::temp_dir().join(format!("k3s-mode-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&scratch);
         std::fs::create_dir_all(&scratch).unwrap();
         let paths = K3sPaths {
             state: scratch.clone(),
+            run: scratch.join("run"),
             bin: scratch.join("k3s"),
             env: scratch.join("env"),
             unit: scratch.join("unit"),

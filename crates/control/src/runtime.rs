@@ -142,6 +142,11 @@ pub trait HostOs {
     /// accepted, not a trial or the bootstrap DHCP): the K3s worker only
     /// starts K3s once its address is final.
     fn set_net_confirmed(&mut self, _confirmed: bool) {}
+    /// The K3s/Longhorn snapshot the host last observed, if any (a file
+    /// read; the leader serves it to clients).
+    fn k3s_snapshot(&self) -> Option<crate::k8s_obs::K8sSnapshot> {
+        None
+    }
 }
 
 /// A switch's own configuration, as its management interface reports it.

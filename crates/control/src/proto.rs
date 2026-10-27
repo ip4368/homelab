@@ -318,5 +318,12 @@ pub enum Msg {
     ApiResp { req: u64, result: ApiResult },
     /// Client to the VIP: everything after state version `since`.
     Sync { since: u64 },
-    SyncResp { changes: Changes, leader: HostId, term: u64, metrics: Vec<(HostId, MetricSample)> },
+    SyncResp {
+        changes: Changes,
+        leader: HostId,
+        term: u64,
+        metrics: Vec<(HostId, MetricSample)>,
+        #[serde(default)]
+        k8s: Option<crate::k8s_obs::K8sSnapshot>,
+    },
 }
