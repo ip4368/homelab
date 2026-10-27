@@ -3,6 +3,7 @@
 //! time and TCP ([`runtime`], [`transport`]) and [`control::runtime::HostOs`]
 //! over a Linux machine ([`linux`]).
 
+pub mod k3s;
 pub mod linux;
 pub mod runtime;
 pub mod testing;

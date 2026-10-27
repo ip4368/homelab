@@ -10,6 +10,7 @@ pub mod packet;
 pub mod store;
 pub mod sysfs;
 
+use crate::k3s::K3sLink;
 use crate::runtime::{NodeOs, VipControl};
 use control::proto::{InstanceSpec, LogCmd, ReplicaReport};
 use control::raft::{Durable, DurableOp};
@@ -70,6 +71,20 @@ pub fn instance_of_unit(unit: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn net_applied_starts_confirmed_only_with_a_persisted_config() {
+        let root = std::env::temp_dir().join(format!("homelab-netconf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths { state: root.join("state"), run: root.join("run"), networkd: root.join("networkd"), mnt: root.join("mnt"), sys_root: root.join("sys") };
+        std::fs::create_dir_all(&paths.state).unwrap();
+        let os = LinuxOs::new(HostId::from("m1"), paths.clone());
+        assert!(!os.k3s_link().net_applied(), "no persisted config: still bootstrapping");
+        std::fs::write(paths.state.join("net.json"), "{}").unwrap();
+        let os = LinuxOs::new(HostId::from("m1"), paths);
+        assert!(os.k3s_link().net_applied(), "a persisted config was confirmed");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn instance_units_round_trip() {
@@ -153,6 +168,9 @@ pub struct LinuxOs {
     speeds: BTreeMap<String, u32>,
     /// What the NICs hear over LLDP, once [`LinuxOs::boot`] started listening.
     lldp: Option<lldp::Lldp>,
+    /// Shared with the K3s worker thread (spawned by `homelabd run`): the
+    /// agent drops the join token in, the worker reports whether K3s runs.
+    k3s: std::sync::Arc<K3sLink>,
 }
 
 impl LinuxOs {
@@ -167,7 +185,7 @@ impl LinuxOs {
             .or_else(|| load_json(&paths.state.join("net.json")))
             .unwrap_or_else(|| bootstrap_config(&profile(sys.profile(), 0)));
         let raft = RaftStore::new(paths.state.join("raft"));
-        Self {
+        let os = Self {
             id,
             paths,
             sys,
@@ -183,6 +201,26 @@ impl LinuxOs {
             formatting: BTreeMap::new(),
             speeds: BTreeMap::new(),
             lldp: None,
+            k3s: Default::default(),
+        };
+        // A persisted network config is one the leader confirmed: the
+        // address is final even though this process never saw it confirmed.
+        // (Only `persist_network` writes it.)
+        let confirmed = os.paths.state.join("net.json").exists();
+        os.k3s.set_net_applied(confirmed);
+        os
+    }
+
+    /// The K3s link for the worker thread to share.
+    pub fn k3s_link(&self) -> std::sync::Arc<K3sLink> {
+        self.k3s.clone()
+    }
+
+    /// Records that this host bootstrapped the cluster: its K3s worker runs
+    /// the first server (`--cluster-init`) rather than joining one.
+    pub fn mark_cluster_init(&mut self) {
+        if let Err(e) = fs::create_dir_all(&self.paths.state).and_then(|()| write_synced(&self.paths.state.join("cluster_init"), b"")) {
+            eprintln!("homelabd: mark cluster init: {e}");
         }
     }
 
@@ -420,6 +458,26 @@ impl HostOs for LinuxOs {
             self.store_cp(Durable::new(voters.clone()));
             self.spawn = Some(voters);
         }
+    }
+
+    fn k3s_managed(&self) -> bool {
+        true
+    }
+
+    fn k3s_token(&self) -> Option<String> {
+        std::fs::read_to_string("/var/lib/rancher/k3s/server/node-token").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    }
+
+    fn k3s_running(&self) -> bool {
+        self.k3s.running()
+    }
+
+    fn set_k3s_join(&mut self, token: &str) {
+        self.k3s.set_join(token.to_string());
+    }
+
+    fn set_net_confirmed(&mut self, confirmed: bool) {
+        self.k3s.set_net_applied(confirmed);
     }
 }
 

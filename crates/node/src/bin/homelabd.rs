@@ -13,6 +13,7 @@ use control::controllers::join::UNKNOWN_LOCATION;
 use control::replica::CpReplica;
 use control::runtime::{Addr, HostOs, Svc};
 use model::{HostId, SwitchId};
+use node::k3s::{self, K3sPaths, Site};
 use node::linux::store::write_synced;
 use node::linux::{LinuxOs, LinuxVip, Paths};
 use node::runtime::{wall_ms, Node, NodeConfig};
@@ -37,6 +38,10 @@ struct NodeFile {
     /// Switch management addresses, as the site's DHCP or install config gives them.
     #[serde(default)]
     switches: BTreeMap<SwitchId, Ipv4Addr>,
+    /// The site's HTTP proxy (`http://host:port`), if K3s, Longhorn and
+    /// packages are fetched through one; `None` goes direct.
+    #[serde(default)]
+    proxy: Option<String>,
 }
 
 fn usage() -> ExitCode {
@@ -74,6 +79,7 @@ fn bootstrap(cfg: &NodeFile) -> ExitCode {
     let host = SeedHost { id: cfg.host.clone(), inventory: os.inventory(), location: UNKNOWN_LOCATION.into(), running: None };
     os.store_cp(seeded_durable(&[host], &[cfg.host.clone()].into(), wall_ms()));
     os.mark_joined();
+    os.mark_cluster_init();
     eprintln!("homelabd: {} is a new cluster; `homelabd run` starts it", cfg.host);
     ExitCode::SUCCESS
 }
@@ -94,6 +100,9 @@ fn run(cfg: NodeFile) -> ExitCode {
             book.hosts = dir;
         }
         let token = if os.joined() { None } else { cfg.token.clone() };
+        // K3s converges on its own thread from here on (prerequisites,
+        // install, server/agent, Longhorn); the agent feeds it the join token.
+        k3s::spawn_worker(Site { proxy: cfg.proxy.clone(), vip: cfg.vip, mgmt: cfg.mgmt }, K3sPaths::system(), os.k3s_link());
         let voters = os.load_cp().map(|d| d.voters);
         let node_cfg = NodeConfig {
             me: Addr::Host(cfg.host.clone()),

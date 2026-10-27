@@ -25,7 +25,8 @@ pub struct Seed {
     pub network_config: String,
 }
 
-/// The `/etc/homelab/node.json` for `vm`.
+/// The `/etc/homelab/node.json` for `vm`. Guests fetch K3s, Longhorn and
+/// packages through the lab's proxy relay.
 pub fn node_json(vm: &VmSpec, token: Option<&str>, switches: &BTreeMap<SwitchId, Ipv4Addr>) -> String {
     let v = serde_json::json!({
         "host": vm.id,
@@ -33,6 +34,7 @@ pub fn node_json(vm: &VmSpec, token: Option<&str>, switches: &BTreeMap<SwitchId,
         "vip": VIP,
         "mgmt": MGMT_NET,
         "switches": switches,
+        "proxy": format!("http://{ROUTER_IP}:{RELAY_PORT}"),
     });
     serde_json::to_string_pretty(&v).expect("node config serializes")
 }
@@ -119,6 +121,7 @@ mod tests {
         assert!(s.user_data.starts_with("#cloud-config\nhostname: ms01-02\n"));
         assert!(s.user_data.contains("\"token\": \"abc123\""), "{}", s.user_data);
         assert!(s.user_data.contains("\"vip\": \"10.0.3.253\""));
+        assert!(s.user_data.contains("\"proxy\": \"http://10.0.0.1:3130\""));
         assert!(s.user_data.contains("\"core-1\": \"10.0.3.251\""));
         assert!(!s.user_data.contains("homelabd bootstrap"));
         assert!(s.network_config.contains("  sfp0:\n    match:\n      macaddress: \"52:54:00:1a:02:01\"\n    set-name: sfp0\n    dhcp4: false"));
