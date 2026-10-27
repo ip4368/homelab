@@ -20,6 +20,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/metrics", get(get_metrics))
         .route("/api/lab/fault", post(lab_fault))
         .route("/api/lab/kubeconfig", get(lab_kubeconfig))
+        .route("/api/lab/seed", post(lab_seed))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -105,6 +106,17 @@ async fn lab_fault(State(driver): State<DriverHandle>, Json(fault): Json<LabFaul
 async fn lab_kubeconfig(State(driver): State<DriverHandle>) -> Response {
     match driver.kubeconfig().await {
         Ok(k) => ([("content-type", "application/yaml")], k).into_response(),
+        Err(e @ (LabError::NoLab | LabError::NoToken | LabError::NoKubeServer)) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        Err(LabError::Failed(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
+        Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
+}
+
+/// 200 `{"ok": true, "output": <kubectl's>}` once the demo workloads are
+/// applied; 503 while no Kubernetes server runs, or without a lab.
+async fn lab_seed(State(driver): State<DriverHandle>) -> Response {
+    match driver.seed_workloads().await {
+        Ok(output) => Json(json!({ "ok": true, "output": output })).into_response(),
         Err(e @ (LabError::NoLab | LabError::NoToken | LabError::NoKubeServer)) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
         Err(LabError::Failed(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),

@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { labFault } from '../api'
+import { labFault, seedWorkloads } from '../api'
 import type { LabFault } from '../gen/LabFault'
 import type { LabMember } from '../gen/LabMember'
 import type { Mistake } from '../gen/Mistake'
@@ -48,6 +48,7 @@ export function LabPanel({ selected }: { selected: string | null }) {
   const machine = useAction()
   const network = useAction()
   const rack = useAction()
+  const seed = useAction()
 
   const vmIds = useMemo(() => truth.vms.map((v) => v.id), [truth.vms])
   // The one picked here until the fleet selection changes; then the host selected in the fleet, if the lab has it.
@@ -228,6 +229,20 @@ export function LabPanel({ selected }: { selected: string | null }) {
               </button>
             </div>
             {rack.error && <div className="bad">{rack.error}</div>}
+          </div>
+          <div className="fault-group">
+            <h4>Workloads</h4>
+            <div className="actions">
+              <button
+                disabled={seed.busy}
+                onClick={() => seed.run(() => seedWorkloads())}
+                title="kubectl apply deploy/demo-workloads.yaml: PostgreSQL with pgbench load and a writer on Longhorn volumes, a web app with clients, a transcode-style CPU burner"
+              >
+                Seed workloads
+              </button>
+            </div>
+            <p className="muted">Real Kubernetes workloads in the <code>demo</code> namespace; watch them with <code>./lab.sh kubectl -n demo get pods -o wide</code>.</p>
+            {seed.error && <div className="bad">{seed.error}</div>}
           </div>
           <div className="fault-group">
             <h4>Machines, seen from outside</h4>

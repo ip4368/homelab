@@ -1,0 +1,248 @@
+# A small, homelab-shaped mix of workloads to exercise the cluster: a
+# database under steady load on a Longhorn volume, a writer that keeps
+# Longhorn replicating, a web app with clients, and a transcode-style CPU
+# burner on the transcode hosts. Everything lives in the `demo` namespace.
+#
+#   kubectl apply -f deploy/demo-workloads.yaml      (or: ./lab.sh seed)
+#   kubectl delete namespace demo                    (removes it all)
+#
+# The stateful pods tolerate an unreachable node for 20 s (Kubernetes'
+# default is 5 min), so a host failure moves them quickly; Longhorn
+# deletes pods stuck on a dead node (nodeDownPodDeletionPolicy).
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: demo
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+  namespace: demo
+stringData:
+  POSTGRES_USER: demo
+  POSTGRES_PASSWORD: demo-password
+  POSTGRES_DB: demo
+---
+# PostgreSQL on a 3-replica Longhorn volume, on a storage host.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: demo
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      nodeSelector: { homelab.io/storage: "true" }
+      terminationGracePeriodSeconds: 10
+      tolerations:
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+      containers:
+        - name: postgres
+          image: postgres:17-alpine
+          envFrom: [{ secretRef: { name: postgres } }]
+          env:
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec: { command: [pg_isready, -U, demo] }
+            periodSeconds: 5
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 1Gi }
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        storageClassName: longhorn
+        resources: { requests: { storage: 2Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: demo
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+# A steady, rate-limited pgbench load against the database.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgbench
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: pgbench }
+  template:
+    metadata:
+      labels: { app: pgbench }
+    spec:
+      containers:
+        - name: pgbench
+          image: postgres:17-alpine
+          env:
+            - { name: PGHOST, value: postgres }
+            - { name: PGUSER, valueFrom: { secretKeyRef: { name: postgres, key: POSTGRES_USER } } }
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: postgres, key: POSTGRES_PASSWORD } } }
+            - { name: PGDATABASE, valueFrom: { secretKeyRef: { name: postgres, key: POSTGRES_DB } } }
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -q; do echo waiting for postgres; sleep 2; done
+              psql -tAc "select 1 from pgbench_branches limit 1" >/dev/null 2>&1 || pgbench -i -s 5
+              while true; do pgbench -n -c 2 -j 1 -T 300 -R 25 -P 60 || sleep 5; done
+          resources:
+            requests: { cpu: 50m, memory: 32Mi }
+---
+# Rewrites 64 MiB on its Longhorn volume every 30 s, synced: steady
+# replication traffic between the storage hosts.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: writer
+  namespace: demo
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources: { requests: { storage: 2Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: writer
+  namespace: demo
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector:
+    matchLabels: { app: writer }
+  template:
+    metadata:
+      labels: { app: writer }
+    spec:
+      terminationGracePeriodSeconds: 5
+      tolerations:
+        - { key: node.kubernetes.io/unreachable, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+        - { key: node.kubernetes.io/not-ready, operator: Exists, effect: NoExecute, tolerationSeconds: 20 }
+      containers:
+        - name: writer
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - |
+              while true; do
+                dd if=/dev/urandom of=/data/blob bs=1M count=64 conv=fsync 2>/dev/null
+                echo "$(date -u +%T) wrote 64 MiB"
+                sleep 30
+              done
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+          persistentVolumeClaim: { claimName: writer }
+---
+# A web app spread over the hosts, reachable through K3s's ingress
+# (Traefik) at http://<vip>/, with two clients keeping it busy.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: demo
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: web }
+  template:
+    metadata:
+      labels: { app: web }
+    spec:
+      topologySpreadConstraints:
+        - { maxSkew: 1, topologyKey: kubernetes.io/hostname, whenUnsatisfiable: ScheduleAnyway, labelSelector: { matchLabels: { app: web } } }
+      containers:
+        - name: web
+          image: nginx:1.29-alpine
+          ports: [{ containerPort: 80 }]
+          readinessProbe:
+            httpGet: { path: /, port: 80 }
+          resources:
+            requests: { cpu: 20m, memory: 16Mi }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: demo
+spec:
+  selector: { app: web }
+  ports: [{ port: 80 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: web
+  namespace: demo
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend: { service: { name: web, port: { number: 80 } } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web-clients
+  namespace: demo
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: web-clients }
+  template:
+    metadata:
+      labels: { app: web-clients }
+    spec:
+      containers:
+        - name: client
+          image: busybox:1.37
+          command: [sh, -c, "while true; do wget -q -O /dev/null http://web/ || echo miss; sleep 0.2; done"]
+          resources:
+            requests: { cpu: 10m, memory: 8Mi }
+---
+# Transcode-style CPU load, only on hosts with the transcode role.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: transcode
+  namespace: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: transcode }
+  template:
+    metadata:
+      labels: { app: transcode }
+    spec:
+      nodeSelector: { homelab.io/transcode: "true" }
+      containers:
+        - name: transcode
+          image: busybox:1.37
+          command: [sh, -c, "while true; do head -c 256M /dev/urandom | gzip -1 > /dev/null; done"]
+          resources:
+            requests: { cpu: 250m, memory: 16Mi }
+            limits: { cpu: 500m, memory: 64Mi }

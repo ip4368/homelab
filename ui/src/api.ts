@@ -25,6 +25,12 @@ export async function op(o: ApiOp): Promise<unknown> {
   return result.Ok
 }
 
+/** Applies the demo workloads (deploy/demo-workloads.yaml) to the cluster's Kubernetes; resolves with kubectl's output. */
+export async function seedWorkloads(): Promise<string> {
+  const result = (await post('/api/lab/seed', {})) as { output: string }
+  return result.output
+}
+
 /** Does something to the lab's hardware; resolves with the new machine's id for `AddVm`. */
 export async function labFault(f: LabFault): Promise<string | null> {
   const result = (await post('/api/lab/fault', f)) as { vm?: string }

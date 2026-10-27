@@ -16,6 +16,9 @@ use std::time::Duration;
 use tokio::sync::watch;
 use ts_rs::TS;
 
+/// The demo workloads `./lab.sh seed` and the lab panel apply.
+pub const DEMO_WORKLOADS: &str = include_str!("../../../deploy/demo-workloads.yaml");
+
 /// Wall time between publishes: at most 4 per second.
 pub const PUBLISH_EVERY: Duration = Duration::from_millis(250);
 /// The pause between samples of the lab's ground truth (each asks every VM's guest agent).
@@ -162,6 +165,12 @@ impl DriverHandle {
     /// kubeconfig` on a host running a K3s server (tried in turn).
     pub async fn kubeconfig(&self) -> Result<String, LabError> {
         self.on_kube_server(|lab, id| lab.ssh(&id, "sudo homelabd kubeconfig").and_then(|k| if k.contains("apiVersion") { Ok(k) } else { Err(std::io::Error::other(k)) })).await
+    }
+
+    /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an
+    /// admin would with `kubectl apply` on a K3s server; kubectl's output.
+    pub async fn seed_workloads(&self) -> Result<String, LabError> {
+        self.on_kube_server(|lab, id| lab.ssh_with_input(&id, "sudo k3s kubectl apply -f -", DEMO_WORKLOADS)).await
     }
 
     /// Runs `f` against each host running a K3s server in turn, until one succeeds.
