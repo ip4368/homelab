@@ -6,6 +6,24 @@ UI before building the real thing: joining hosts, templated per-port network con
 VLAN-capable switches, one page for every host and workload, and staying up when hosts, ports or
 switches fail, at up to 500 hosts.
 
+## Status: real machines (K3s and Longhorn)
+
+The control plane now runs on real machines too. `homelabd` is the daemon on every host: it joins
+the cluster, applies the network templates, holds the control-plane VIP, and **installs and joins
+K3s** (servers on the control-plane hosts, agents elsewhere), with **Longhorn** on the storage hosts'
+data disks.
+
+- **Setting up a cluster on your machines:** [docs/setup.md](docs/setup.md) covers what you need,
+  the first machine (`install.sh init`) and every other machine (`install.sh join`).
+- **The VM lab** (`./lab.sh up`, Linux with KVM and sudo) runs those same steps on QEMU VMs behind
+  userspace VLAN switches. It boots plain Debian, and a "technician" runs the install one-liners
+  over SSH. `node e2e/lab.e2e.ts` then checks the whole stack: joins, leader failover, reboots,
+  network faults, Kubernetes nodes, and a Longhorn volume surviving its host's loss. Design and
+  findings: [docs/plans/2026-10-27-k3s-longhorn-lab-design.md](docs/plans/2026-10-27-k3s-longhorn-lab-design.md).
+
+The rest of this README describes the original simulator, which is kept as a headless test harness
+(`cargo test`).
+
 ## What is real and what is simulated
 
 Real (this is the code under evaluation):
