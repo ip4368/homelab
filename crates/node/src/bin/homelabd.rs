@@ -86,6 +86,7 @@ fn run(cfg: NodeFile) -> ExitCode {
         let paths = Paths::default();
         let dir_file = paths.state.join("directory.json");
         let mut os = LinuxOs::new(cfg.host.clone(), paths);
+        os.set_vip(cfg.vip);
         os.boot();
         let mut book = AddressBook::default();
         book.fixed.insert(Addr::Vip, cfg.vip);

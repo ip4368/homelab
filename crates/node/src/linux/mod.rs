@@ -1,9 +1,12 @@
 //! [`HostOs`] over a real Linux machine (a Debian guest in the lab):
 //! inventory from `/sys`, network configs through systemd-networkd with
 //! `netplan try` semantics, LLDP heard on every NIC, Raft state on disk,
-//! data disks mounted under `/mnt/<name>`. Workloads arrive in phase E;
-//! until then the host runs none.
+//! data disks mounted under `/mnt/<name>`, and Kubernetes (K3s and
+//! Longhorn) run by a worker thread ([`kube`]). The control plane's own
+//! workload stand-ins (instances, replicas) do not run on real hosts:
+//! Kubernetes runs the workloads.
 
+pub mod kube;
 pub mod lldp;
 pub mod networkd;
 pub mod packet;
@@ -11,7 +14,7 @@ pub mod store;
 pub mod sysfs;
 
 use crate::runtime::{NodeOs, VipControl};
-use control::proto::{InstanceSpec, LogCmd, ReplicaReport};
+use control::proto::{InstanceSpec, KubeSpec, KubeStatus, LogCmd, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::runtime::{HostOs, HostUsage, SimTime};
 use model::network::{bootstrap_config, HostNetworkConfig, LldpNeighbor, LogicalNetwork};
@@ -153,6 +156,10 @@ pub struct LinuxOs {
     speeds: BTreeMap<String, u32>,
     /// What the NICs hear over LLDP, once [`LinuxOs::boot`] started listening.
     lldp: Option<lldp::Lldp>,
+    /// The cluster's VIP, which Kubernetes joins through.
+    vip: Option<Ipv4Addr>,
+    /// The Kubernetes worker, once [`LinuxOs::boot`] started it (it needs the VIP).
+    kube: Option<kube::Kube>,
 }
 
 impl LinuxOs {
@@ -183,7 +190,15 @@ impl LinuxOs {
             formatting: BTreeMap::new(),
             speeds: BTreeMap::new(),
             lldp: None,
+            vip: None,
+            kube: None,
         }
+    }
+
+    /// Tells the host the cluster's VIP, so [`LinuxOs::boot`] can start its
+    /// Kubernetes worker.
+    pub fn set_vip(&mut self, vip: Ipv4Addr) {
+        self.vip = Some(vip);
     }
 
     /// Brings the machine to its configured state at boot: the running
@@ -200,6 +215,9 @@ impl LinuxOs {
             eprintln!("homelabd: boot network: {e}");
         }
         self.prepare_disks();
+        if let Some(vip) = self.vip {
+            self.kube = Some(kube::Kube::start(self.id.clone(), vip, self.paths.clone()));
+        }
         if let Err(e) = self.raft.compact() {
             eprintln!("homelabd: compact raft store: {e}");
         }
@@ -216,6 +234,21 @@ impl LinuxOs {
         let files = networkd::render(cfg, networks, &self.nics).map_err(io::Error::other)?;
         let netdevs = networkd::netdevs(&files);
         fs::create_dir_all(&self.paths.networkd)?;
+        // Already running it (homelabd restarted, the machine did not): a
+        // reload would reconfigure the interfaces under everything using
+        // them (K3s's flannel panics when its interface flaps).
+        let on_disk: BTreeMap<String, String> = fs::read_dir(&self.paths.networkd)?
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(networkd::PREFIX))
+            .filter_map(|e| Some((e.file_name().to_string_lossy().into_owned(), fs::read_to_string(e.path()).ok()?)))
+            .collect();
+        let wanted: BTreeMap<String, String> = files.iter().map(|f| (f.name.clone(), f.body.clone())).collect();
+        if on_disk == wanted {
+            self.netdevs = netdevs;
+            save_json(&self.paths.run.join("net.json"), cfg)?;
+            save_json(&self.paths.run.join("networks.json"), networks)?;
+            return Ok(());
+        }
         for e in fs::read_dir(&self.paths.networkd)?.flatten() {
             if e.file_name().to_string_lossy().starts_with(networkd::PREFIX) {
                 fs::remove_file(e.path())?;
@@ -415,6 +448,16 @@ impl HostOs for LinuxOs {
     }
     fn delete_replica(&mut self, _volume: &str) {}
 
+    fn apply_kube(&mut self, spec: KubeSpec) {
+        if let Some(k) = &self.kube {
+            k.want(spec);
+        }
+    }
+
+    fn kube_status(&self) -> Option<KubeStatus> {
+        self.kube.as_ref()?.status()
+    }
+
     fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
         if self.load_cp().is_none() {
             self.store_cp(Durable::new(voters.clone()));
@@ -442,7 +485,7 @@ pub struct LinuxVip {
 
 impl LinuxVip {
     /// Interfaces and their IPv4 addresses, from `ip -j -4 addr`.
-    fn addresses() -> Vec<(String, Ipv4Addr)> {
+    pub fn addresses() -> Vec<(String, Ipv4Addr)> {
         let Ok(out) = sh("ip", &["-j", "-4", "addr"]) else { return vec![] };
         let Ok(serde_json::Value::Array(links)) = serde_json::from_str(&out) else { return vec![] };
         let mut found = vec![];
