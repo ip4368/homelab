@@ -122,6 +122,26 @@ pub trait HostOs {
     /// `voters`, unless the host already holds CP state (its replica runs, or
     /// resumes from disk on boot).
     fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>);
+    /// Whether this host's OS runs K3s under homelab management: true on
+    /// real Linux hosts, false in the simulator (whose agents never ask).
+    fn k3s_managed(&self) -> bool {
+        false
+    }
+    /// This host's K3s server node-token, if it runs a server: a file read,
+    /// safe on the event loop.
+    fn k3s_token(&self) -> Option<String> {
+        None
+    }
+    /// Whether K3s (server or agent) runs on this host now.
+    fn k3s_running(&self) -> bool {
+        false
+    }
+    /// Hands the K3s join token to the host; its K3s worker picks it up.
+    fn set_k3s_join(&mut self, _token: &str) {}
+    /// Whether the host runs a confirmed network config (one the leader
+    /// accepted, not a trial or the bootstrap DHCP): the K3s worker only
+    /// starts K3s once its address is final.
+    fn set_net_confirmed(&mut self, _confirmed: bool) {}
 }
 
 /// A switch's own configuration, as its management interface reports it.

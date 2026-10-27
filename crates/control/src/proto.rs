@@ -294,6 +294,15 @@ pub enum Msg {
     /// the current `voters`, to catch up as a learner. A host that already
     /// runs one keeps it.
     StartCpReplica { voters: BTreeSet<HostId> },
+    /// Member agent to the VIP: the K3s node-token to join with. Sent by
+    /// hosts whose OS manages K3s (real Linux hosts) while K3s is not
+    /// running; answered with `K3sJoin`. Silence means "not yet", and the
+    /// agent retries.
+    K3sJoinRequest,
+    /// Any CP replica to the agent: the K3s server's node-token (identical
+    /// on every server). The agent joins `https://<vip>:6443`, which its
+    /// own node config names.
+    K3sJoin { token: String },
     /// Leader to every member agent: every member host's static addresses,
     /// by network ([`crate::controllers::directory`]). Control logic ignores
     /// it; a real host's runtime resolves `Addr::Host` with it.

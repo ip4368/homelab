@@ -264,6 +264,20 @@ impl CpReplica {
         self.handle(ctx, outs);
     }
 
+    /// Answers a member's `K3sJoinRequest` with this host's K3s server
+    /// node-token, if it runs a server. Any replica answers (the token is
+    /// identical cluster-wide); silence means "not yet" and the agent
+    /// retries. Strangers are ignored: only members may join K3s.
+    fn on_k3s_join(&mut self, ctx: &mut dyn Ctx, from: Endpoint) {
+        let Addr::Host(host) = from.addr.clone() else { return };
+        if !self.state.hosts.contains_key(&host) {
+            return;
+        }
+        if let Some(token) = ctx.host().and_then(|os| os.k3s_token()) {
+            ctx.send(from, mgmt(), Msg::K3sJoin { token });
+        }
+    }
+
     /// Notes the heartbeat, the host's network generation and what it runs
     /// and holds, files the host's observation if it came with one, and asks
     /// for it if the one held here is not the one the agent stamped (`None`
@@ -469,6 +483,7 @@ impl Actor for CpReplica {
                 }
             }
             Msg::JoinRequest { token, inventory } => self.on_join(ctx, from, token, inventory),
+            Msg::K3sJoinRequest => self.on_k3s_join(ctx, from),
             Msg::Metrics { host, sample } => {
                 if let Some(v) = &mut self.volatile
                     && self.state.hosts.contains_key(&host)
@@ -495,6 +510,7 @@ impl Actor for CpReplica {
             | Msg::CreateReplica { .. }
             | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. }
+            | Msg::K3sJoin { .. }
             | Msg::Directory { .. } => {}
         }
     }
@@ -512,13 +528,67 @@ impl Actor for CpReplica {
 mod tests {
     use super::*;
     use crate::controllers::health::NOT_READY_AFTER_MS;
-    use crate::raft::RaftMsg;
-    use crate::runtime::HostOs;
+    use crate::proto::InstanceSpec;
+    use crate::raft::{DurableOp, RaftMsg};
+    use crate::runtime::{HostOs, HostUsage};
     use crate::state::ObjectRef;
+    use model::network::{HostNetworkConfig, LldpNeighbor, LogicalNetwork};
     use model::{profile, Inventory, NetworkId, ProfileId, Role};
+    use std::collections::BTreeMap;
 
     fn hid(s: &str) -> HostId {
         HostId::from(s)
+    }
+
+    /// A host that only carries a K3s server token (or none).
+    #[derive(Default)]
+    struct TokenOs(Option<String>);
+
+    impl HostOs for TokenOs {
+        fn host_id(&self) -> HostId {
+            hid("h1")
+        }
+        fn inventory(&self) -> Inventory {
+            Inventory::from_profile(ProfileId::MiniPc, 0)
+        }
+        fn lldp(&self) -> Vec<LldpNeighbor> {
+            vec![]
+        }
+        fn apply_network(&mut self, _: HostNetworkConfig, _: Vec<LogicalNetwork>) {}
+        fn applied_network(&self) -> HostNetworkConfig {
+            HostNetworkConfig::default()
+        }
+        fn persist_network(&mut self) {}
+        fn usage(&mut self) -> HostUsage {
+            HostUsage { cpu_pct: 0.0, ram_pct: 0.0, disk_pct: BTreeMap::new(), port_bps: BTreeMap::new() }
+        }
+        fn load_cp(&self) -> Option<Durable<LogCmd>> {
+            None
+        }
+        fn store_cp(&mut self, _: Durable<LogCmd>) {}
+        fn persist_cp(&mut self, _: DurableOp<LogCmd>) {}
+        fn mark_joined(&mut self) {}
+        fn start_instance(&mut self, _: InstanceSpec) {}
+        fn stop_instance(&mut self, _: &str) {}
+        fn instances(&self) -> Vec<String> {
+            vec![]
+        }
+        fn migrate_in(&mut self, _: InstanceSpec, _: HostId, _: SimTime) {}
+        fn abort_migration(&mut self, _: &str) {}
+        fn migrations(&self) -> Vec<String> {
+            vec![]
+        }
+        fn create_replica(&mut self, _: &str, _: u32, _: Option<HostId>) -> Option<String> {
+            None
+        }
+        fn replicas(&self) -> Vec<ReplicaReport> {
+            vec![]
+        }
+        fn delete_replica(&mut self, _: &str) {}
+        fn spawn_cp_replica(&mut self, _: BTreeSet<HostId>) {}
+        fn k3s_token(&self) -> Option<String> {
+            self.0.clone()
+        }
     }
 
     #[derive(Default)]
@@ -533,6 +603,8 @@ mod tests {
         timers: Vec<(u64, u64)>,
         /// What `rand_u64` returns.
         rand: u64,
+        /// The host, when the test gives the replica one.
+        os: Option<TokenOs>,
     }
 
     impl Ctx for FakeCtx {
@@ -558,7 +630,7 @@ mod tests {
         }
         fn claim_vip(&mut self) {}
         fn host(&mut self) -> Option<&mut dyn HostOs> {
-            None
+            self.os.as_mut().map(|os| os as &mut dyn HostOs)
         }
     }
 
@@ -624,6 +696,28 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    #[test]
+    fn a_member_gets_the_k3s_token_strangers_and_a_tokenless_host_do_not() {
+        let member = Command::AddPendingHost {
+            id: hid("h2"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        };
+        let mut rig = Rig::new(vec![member]);
+        rig.ctx.os = Some(TokenOs(Some("k3s-tok".into())));
+        let m2 = Endpoint::new(Addr::Host(hid("h2")), Svc::Agent);
+        rig.r.on_message(&mut rig.ctx, m2.clone(), Msg::K3sJoinRequest);
+        assert_eq!(rig.ctx.sent, [(m2.clone(), Msg::K3sJoin { token: "k3s-tok".into() })]);
+        rig.ctx.sent.clear();
+        let stranger = Endpoint::new(Addr::Host(hid("nope")), Svc::Agent);
+        rig.r.on_message(&mut rig.ctx, stranger, Msg::K3sJoinRequest);
+        assert!(rig.ctx.sent.is_empty(), "a host that never joined gets nothing");
+        rig.ctx.os = Some(TokenOs(None));
+        rig.r.on_message(&mut rig.ctx, m2, Msg::K3sJoinRequest);
+        assert!(rig.ctx.sent.is_empty(), "no local server yet: silence, the agent retries");
     }
 
     /// A removed host whose HostDown alert is still open: health wants to

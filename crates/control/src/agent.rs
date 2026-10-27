@@ -24,6 +24,9 @@ pub const METRICS_MS: u64 = 10_000;
 pub const REVERT_MS: u64 = 30_000;
 /// How often the agent looks in on the instances migrating in.
 pub const MIGRATION_POLL_MS: u64 = 1000;
+/// How often a member whose OS manages K3s asks for the join token while
+/// K3s is not running (starting K3s takes minutes; asking is cheap).
+pub const K3S_JOIN_MS: u64 = 30_000;
 /// Synthetic temperature: idle plus a share of CPU load.
 const IDLE_TEMP_C: f32 = 35.0;
 const TEMP_C_PER_CPU_PCT: f32 = 0.4;
@@ -35,6 +38,7 @@ const HEARTBEAT: u64 = 1;
 const METRICS: u64 = 2;
 const REVERT: u64 = 3;
 const MIGRATION: u64 = 4;
+const K3S: u64 = 5;
 
 /// A network config applied but not yet confirmed, and what to go back to.
 #[derive(Debug)]
@@ -139,6 +143,15 @@ impl HostAgent {
         self.send_heartbeat(ctx, false);
         ctx.set_timer(HEARTBEAT_MS, HEARTBEAT);
         ctx.set_timer(METRICS_MS, METRICS);
+        ctx.set_timer(K3S_JOIN_MS, K3S);
+    }
+
+    /// Asks the VIP for the K3s join token, if this host's OS manages K3s
+    /// and it is not running (the first server needs none: it inits).
+    fn ask_k3s(&self, ctx: &mut dyn Ctx) {
+        if self.token.is_none() && ctx.host().is_some_and(|os| os.k3s_managed() && !os.k3s_running()) {
+            ctx.send(VIP, mgmt(), Msg::K3sJoinRequest);
+        }
     }
 
     /// Applies `config` on trial and reports `Applied` over it; the leader's
@@ -163,6 +176,7 @@ impl HostAgent {
             None => (os.applied_network(), os.applied_networks(), self.net_generation),
         };
         os.apply_network(config, networks);
+        os.set_net_confirmed(false);
         self.trial = Some(Trial { generation, since: now, previous, previous_networks, previous_generation });
         self.net_generation = generation;
         report(ctx, generation, NetworkResult::Applied);
@@ -221,6 +235,7 @@ impl HostAgent {
         let Some(t) = self.trial.take_if(|t| now >= t.since + REVERT_MS) else { return };
         if let Some(os) = ctx.host() {
             os.apply_network(t.previous, t.previous_networks);
+            os.set_net_confirmed(true);
         }
         self.net_generation = t.previous_generation;
         report(ctx, t.generation, NetworkResult::Reverted);
@@ -272,6 +287,7 @@ impl Actor for HostAgent {
                     && let Some(os) = ctx.host()
                 {
                     os.persist_network();
+                    os.set_net_confirmed(true);
                 }
             }
             Msg::ReportRequest if self.token.is_none() => self.send_heartbeat(ctx, true),
@@ -308,6 +324,11 @@ impl Actor for HostAgent {
                     os.spawn_cp_replica(voters);
                 }
             }
+            Msg::K3sJoin { token } if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.set_k3s_join(&token);
+                }
+            }
             _ => {}
         }
     }
@@ -328,6 +349,10 @@ impl Actor for HostAgent {
             }
             REVERT => self.revert(ctx),
             MIGRATION => self.poll_migrations(ctx),
+            K3S => {
+                self.ask_k3s(ctx);
+                ctx.set_timer(K3S_JOIN_MS, K3S);
+            }
             _ => {}
         }
     }
@@ -359,6 +384,12 @@ mod tests {
         cp_spawned: Vec<BTreeSet<HostId>>,
         /// Instances migrating in, and from where.
         incoming: Vec<(InstanceSpec, HostId)>,
+        k3s_managed: bool,
+        k3s_running: bool,
+        /// K3s join tokens handed to the host.
+        k3s_join: Vec<String>,
+        /// Network-confirmed signals handed to the host, in order.
+        net_confirmed: Vec<bool>,
     }
 
     impl HostOs for FakeOs {
@@ -436,6 +467,18 @@ mod tests {
         fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
             self.cp_spawned.push(voters);
         }
+        fn k3s_managed(&self) -> bool {
+            self.k3s_managed
+        }
+        fn k3s_running(&self) -> bool {
+            self.k3s_running
+        }
+        fn set_k3s_join(&mut self, token: &str) {
+            self.k3s_join.push(token.into());
+        }
+        fn set_net_confirmed(&mut self, confirmed: bool) {
+            self.net_confirmed.push(confirmed);
+        }
     }
 
     /// Records what the agent sends; timers fire when the test advances time.
@@ -459,6 +502,10 @@ mod tests {
                 replicas: vec![],
                 cp_spawned: vec![],
                 incoming: vec![],
+                k3s_managed: false,
+                k3s_running: false,
+                k3s_join: vec![],
+                net_confirmed: vec![],
             };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
@@ -556,6 +603,25 @@ mod tests {
     }
 
     #[test]
+    fn member_asks_for_the_k3s_token_only_while_managed_and_down() {
+        let mut ctx = FakeCtx::new(HostNetworkConfig::default());
+        let mut a = HostAgent::new(None);
+        a.on_start(&mut ctx);
+        ctx.take();
+        let k3s_asks = |ctx: &mut FakeCtx| ctx.take().into_iter().filter(|m| matches!(m, Msg::K3sJoinRequest)).count();
+        ctx.advance(&mut a, K3S_JOIN_MS);
+        assert_eq!(k3s_asks(&mut ctx), 0, "an unmanaged OS (the simulator) never asks");
+        ctx.os.k3s_managed = true;
+        ctx.advance(&mut a, 2 * K3S_JOIN_MS);
+        assert_eq!(k3s_asks(&mut ctx), 1, "managed and down: asks once per interval");
+        a.on_message(&mut ctx, VIP, Msg::K3sJoin { token: "k3s-tok".into() });
+        assert_eq!(ctx.os.k3s_join, ["k3s-tok"], "the token reaches the host");
+        ctx.os.k3s_running = true;
+        ctx.advance(&mut a, 3 * K3S_JOIN_MS);
+        assert_eq!(k3s_asks(&mut ctx), 0, "running: stops asking");
+    }
+
+    #[test]
     fn unjoined_agent_boots_bootstrap_network_and_retries_join_until_accepted() {
         let mut ctx = FakeCtx::new(HostNetworkConfig::default());
         let mut a = HostAgent::new(Some("tok".into()));
@@ -621,6 +687,18 @@ mod tests {
         a.on_start(&mut ctx);
         ctx.take();
         (a, ctx)
+    }
+
+    #[test]
+    fn the_host_hears_confirmed_only_for_a_confirmed_config() {
+        let (mut a, mut ctx) = member();
+        a.on_message(&mut ctx, VIP, apply(1, sbc_config()));
+        assert_eq!(ctx.os.net_confirmed, [false], "a trial is not confirmed");
+        a.on_message(&mut ctx, VIP, Msg::ConfirmNetwork { generation: 1 });
+        assert_eq!(ctx.os.net_confirmed, [false, true], "confirmed: the address is final");
+        a.on_message(&mut ctx, VIP, apply(2, sbc_config()));
+        ctx.advance(&mut a, ctx.now + REVERT_MS);
+        assert_eq!(ctx.os.net_confirmed, [false, true, false, true], "reverted: back on the confirmed one");
     }
 
     #[test]
@@ -875,7 +953,7 @@ mod tests {
         a.on_message(&mut ctx, VIP, migrate_in("vm/vm2", t + 60_000));
         ctx.advance(&mut a, t + 59_000);
         assert_eq!(ctx.os.migrations(), ["vm/vm2"]);
-        assert_eq!(ctx.timers.len(), 1 + 2, "one poll pending, beside the heartbeat and metrics timers");
+        assert_eq!(ctx.timers.len(), 1 + 3, "one poll pending, beside the heartbeat, metrics and K3s timers");
     }
 
     #[test]
