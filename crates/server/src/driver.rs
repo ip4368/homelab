@@ -54,10 +54,23 @@ pub enum LabError {
     NoLab,
     /// The control plane did not hand out a join token.
     NoToken,
+    /// No host runs a K3s server yet.
+    NoKubeServer,
     /// The lab refused or could not do it.
     Failed(String),
     /// The lab's code panicked: a bug, not a refusal.
     Panicked(String),
+}
+
+impl std::fmt::Display for LabError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LabError::NoLab => f.write_str("no lab attached"),
+            LabError::NoToken => f.write_str("the control plane gave no join token"),
+            LabError::NoKubeServer => f.write_str("no Kubernetes server runs yet"),
+            LabError::Failed(e) | LabError::Panicked(e) => f.write_str(e),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -143,6 +156,37 @@ impl DriverHandle {
             .map_err(|e| LabError::Panicked(e.to_string()))?
             .map(|()| None)
             .map_err(|e| LabError::Failed(e.to_string()))
+    }
+
+    /// An admin kubeconfig, fetched the way the README says: `sudo homelabd
+    /// kubeconfig` on a host running a K3s server (tried in turn).
+    pub async fn kubeconfig(&self) -> Result<String, LabError> {
+        self.on_kube_server(|lab, id| lab.ssh(&id, "sudo homelabd kubeconfig").and_then(|k| if k.contains("apiVersion") { Ok(k) } else { Err(std::io::Error::other(k)) })).await
+    }
+
+    /// Runs `f` against each host running a K3s server in turn, until one succeeds.
+    async fn on_kube_server(&self, f: impl Fn(&Lab, HostId) -> std::io::Result<String> + Send + Sync + Clone + 'static) -> Result<String, LabError> {
+        let lab = self.lab.clone().ok_or(LabError::NoLab)?;
+        let view = self.published.borrow().view.clone();
+        let servers: Vec<HostId> = view
+            .state
+            .hosts
+            .values()
+            .filter(|h| h.kube.as_ref().is_some_and(|k| k.role == Some(control::proto::KubeRole::Server) && k.phase == control::proto::KubePhase::Running))
+            .map(|h| h.id.clone())
+            .collect();
+        if servers.is_empty() {
+            return Err(LabError::NoKubeServer);
+        }
+        let mut last = String::new();
+        for id in servers {
+            let (l, f) = (lab.clone(), f.clone());
+            match tokio::task::spawn_blocking(move || f(&l, id)).await.map_err(|e| LabError::Panicked(e.to_string()))? {
+                Ok(out) => return Ok(out),
+                Err(e) => last = e.to_string(),
+            }
+        }
+        Err(LabError::Failed(last))
     }
 
     /// Brings the lab's machines up, the way a person installs a cluster

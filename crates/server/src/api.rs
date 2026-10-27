@@ -19,6 +19,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/ops", post(submit_op))
         .route("/api/metrics", get(get_metrics))
         .route("/api/lab/fault", post(lab_fault))
+        .route("/api/lab/kubeconfig", get(lab_kubeconfig))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -92,9 +93,20 @@ async fn lab_fault(State(driver): State<DriverHandle>, Json(fault): Json<LabFaul
     match driver.fault(fault).await {
         Ok(None) => Json(json!({ "ok": true })).into_response(),
         Ok(Some(vm)) => Json(json!({ "ok": true, "vm": vm })).into_response(),
-        Err(LabError::NoLab) => error(StatusCode::SERVICE_UNAVAILABLE, "no lab attached"),
-        Err(LabError::NoToken) => error(StatusCode::SERVICE_UNAVAILABLE, "the control plane gave no join token"),
+        Err(e @ (LabError::NoLab | LabError::NoToken | LabError::NoKubeServer)) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
         Err(LabError::Failed(message)) => error(StatusCode::BAD_REQUEST, &message),
+        Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
+}
+
+/// 200 with an admin kubeconfig for the cluster's Kubernetes (pointed at
+/// the VIP), as `sudo homelabd kubeconfig` prints it on a K3s server; 503
+/// while no server runs, or without a lab.
+async fn lab_kubeconfig(State(driver): State<DriverHandle>) -> Response {
+    match driver.kubeconfig().await {
+        Ok(k) => ([("content-type", "application/yaml")], k).into_response(),
+        Err(e @ (LabError::NoLab | LabError::NoToken | LabError::NoKubeServer)) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
+        Err(LabError::Failed(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
     }
 }
