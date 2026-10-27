@@ -6,6 +6,7 @@
 use control::client::{ClusterView, ClientActor};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::Svc;
+use crate::kube::{self, KubeView};
 use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
 use model::HostId;
@@ -47,6 +48,8 @@ pub struct Published {
     pub epoch: u64,
     pub view: ClusterView,
     pub truth: LabTruth,
+    /// What Kubernetes runs; replaced (a new `Arc`) on each read.
+    pub kube: Arc<KubeView>,
     pub clock: ClockInfo,
 }
 
@@ -91,7 +94,8 @@ impl DriverHandle {
     /// Starts publishing what `client` sees (and `lab`'s truth, sampled in
     /// the background). Must be called inside a tokio runtime.
     pub fn start(client: NodeHandle, lab: Option<Arc<Lab>>) -> Self {
-        let first = Published { epoch: 0, view: ClusterView::default(), truth: empty_truth(), clock: ClockInfo { now: wall_ms() } };
+        let (kube_tx, kube_rx) = watch::channel(Arc::new(KubeView::default()));
+        let first = Published { epoch: 0, view: ClusterView::default(), truth: empty_truth(), kube: kube_rx.borrow().clone(), clock: ClockInfo { now: wall_ms() } };
         let (tx, published) = watch::channel(Arc::new(first));
         if let Some(lab) = lab.clone() {
             tokio::spawn(async move {
@@ -107,13 +111,20 @@ impl DriverHandle {
             loop {
                 let Some(view) = c.exec(|n| n.actor::<ClientActor>(Svc::Client).map(|a| a.view().clone())).await.flatten() else { return };
                 let truth = l.as_ref().map_or_else(empty_truth, |l| l.truth());
-                if tx.send(Arc::new(Published { epoch: 0, view, truth, clock: ClockInfo { now: wall_ms() } })).is_err() {
+                let kube = kube_rx.borrow().clone();
+                if tx.send(Arc::new(Published { epoch: 0, view, truth, kube, clock: ClockInfo { now: wall_ms() } })).is_err() {
                     return;
                 }
                 tokio::time::sleep(PUBLISH_EVERY).await;
             }
         });
-        Self { client, lab, published }
+        let handle = Self { client, lab, published };
+        if handle.lab.is_some() {
+            // Reads Kubernetes with the admin kubeconfig a K3s server hands out.
+            let h = handle.clone();
+            tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx));
+        }
+        handle
     }
 
     pub fn subscribe(&self) -> watch::Receiver<Arc<Published>> {

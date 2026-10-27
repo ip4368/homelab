@@ -6,7 +6,7 @@ import type { ServerMsg } from './gen/ServerMsg'
 import type { ClockInfo } from './gen/ClockInfo'
 import type { LabTruth } from './gen/LabTruth'
 import type { ViewSnapshot } from './gen/ViewSnapshot'
-import { EVENT_CAP, STALE_AFTER_MS, createStore } from './store'
+import { EVENT_CAP, STALE_AFTER_MS, createStore, emptyKube } from './store'
 
 const truth: LabTruth = { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], split_brain_vms: [], at: 0 }
 
@@ -52,7 +52,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, clock: Partial<ClockInfo> = 
     metrics: {},
     ...over,
   }
-  return { type: 'snapshot', view, truth, clock: { now: 2000, ...clock } }
+  return { type: 'snapshot', view, truth, kube: emptyKube, clock: { now: 2000, ...clock } }
 }
 
 function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): ServerMsg {
@@ -66,6 +66,7 @@ function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): Serve
     removed: [],
     metrics: {},
     truth,
+    kube: null,
     clock: { now: 2500 },
     ...over,
   }
@@ -296,6 +297,17 @@ describe('store', () => {
     expect(s.getState().view.leader).toBe('cp-2')
     expect(s.getState().view.term).toBe(4)
     expect(s.getState().clock).toEqual({ now: 9000 })
+  })
+
+  it('keeps the Kubernetes view until a delta brings a newer read', () => {
+    const s = createStore()
+    s.applyMessage(snapshot())
+    expect(s.getState().kube).toBe(emptyKube)
+    const read = { ...emptyKube, at: 5, pods: [{ namespace: 'demo', name: 'web-1', owner: 'Deployment/web', node: 'a', status: 'Running', ready: 1, containers: 1, restarts: 0, created: 1 }] }
+    s.applyMessage(delta({ kube: read }))
+    expect(s.getState().kube).toBe(read)
+    s.applyMessage(delta({ version: 3 }))
+    expect(s.getState().kube).toBe(read)
   })
 
   it('stale sync flips connection to cp-unavailable', () => {

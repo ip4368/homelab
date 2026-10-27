@@ -77,6 +77,8 @@ kubectl delete namespace demo                    # remove it all
 
 The stateful pods tolerate an unreachable node for only 20 s, so powering off their host moves them quickly.
 
+In the lab, the UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with its host, and the Longhorn volumes with where their replicas are and whether they are in sync or rebuilding. The server reads it from the Kubernetes API through the VIP every 3 s.
+
 ## Upgrading homelabd
 
 ```sh

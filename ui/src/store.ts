@@ -7,6 +7,7 @@ import type { DeploymentObj } from './gen/DeploymentObj'
 import type { Event as ClusterEvent } from './gen/Event'
 import type { HostObj } from './gen/HostObj'
 import type { JoinToken } from './gen/JoinToken'
+import type { KubeView } from './gen/KubeView'
 import type { LabTruth } from './gen/LabTruth'
 import type { MetricSample } from './gen/MetricSample'
 import type { NetworkObj } from './gen/NetworkObj'
@@ -67,6 +68,8 @@ export interface UiState {
   view: View
   /** What the lab sees from outside the machines. */
   truth: LabTruth
+  /** What Kubernetes runs, as the server last read it (`at` 0: never). */
+  kube: KubeView
   clock: ClockInfo
   connection: Connection
 }
@@ -80,6 +83,7 @@ export interface Store {
 }
 
 const emptyTruth: LabTruth = { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], split_brain_vms: [], at: 0 }
+export const emptyKube: KubeView = { at: 0, error: null, workloads: [], pods: [], volumes: [] }
 
 function initialState(): UiState {
   return {
@@ -107,6 +111,7 @@ function initialState(): UiState {
       volumeStatus: {},
     },
     truth: emptyTruth,
+    kube: emptyKube,
     clock: { now: 0 },
     connection: 'connecting',
   }
@@ -363,10 +368,10 @@ export function createStore(): Store {
     applyMessage(msg) {
       if (msg.type === 'snapshot') {
         const view = viewFromSnapshot(msg.view)
-        set({ view, truth: msg.truth, clock: msg.clock, connection: connectionOf(view, msg.clock) })
+        set({ view, truth: msg.truth, kube: msg.kube, clock: msg.clock, connection: connectionOf(view, msg.clock) })
       } else {
         const view = mergeDelta(state.view, msg)
-        set({ view, truth: msg.truth, clock: msg.clock, connection: connectionOf(view, msg.clock) })
+        set({ view, truth: msg.truth, kube: msg.kube ?? state.kube, clock: msg.clock, connection: connectionOf(view, msg.clock) })
       }
     },
     setDisconnected() {

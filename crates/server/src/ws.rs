@@ -4,6 +4,7 @@
 //! bigger delta, never a stale one.
 
 use crate::driver::{ClockInfo, DriverHandle, Published};
+use crate::kube::KubeView;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
@@ -16,6 +17,7 @@ use model::HostId;
 use serde::Serialize;
 use lab::manager::LabTruth;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use ts_rs::TS;
 
 /// The client's whole view of the cluster, as lists.
@@ -83,7 +85,7 @@ impl ViewSnapshot {
 #[ts(export)]
 pub enum ServerMsg {
     /// Replaces everything the UI holds.
-    Snapshot { view: ViewSnapshot, truth: LabTruth, clock: ClockInfo },
+    Snapshot { view: ViewSnapshot, truth: LabTruth, kube: KubeView, clock: ClockInfo },
     /// What changed since the previous message. `truth` and `clock` are always whole.
     Delta {
         #[ts(type = "number")]
@@ -98,6 +100,8 @@ pub enum ServerMsg {
         /// Samples newer than the last ones sent.
         metrics: BTreeMap<HostId, MetricSample>,
         truth: LabTruth,
+        /// What Kubernetes runs, if it was read again since the previous message.
+        kube: Option<KubeView>,
         clock: ClockInfo,
     },
 }
@@ -108,12 +112,14 @@ pub struct Connection {
     version: u64,
     /// When each host's latest sample was taken, as last sent.
     metrics_sent: BTreeMap<HostId, u64>,
+    /// The Kubernetes view last sent.
+    kube_sent: Arc<KubeView>,
 }
 
 impl Connection {
     /// Starts a connection with its snapshot of `p`.
     pub fn open(p: &Published) -> (Self, ServerMsg) {
-        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new() };
+        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new(), kube_sent: p.kube.clone() };
         let msg = c.snapshot(p);
         (c, msg)
     }
@@ -122,7 +128,8 @@ impl Connection {
         self.epoch = p.epoch;
         self.version = p.view.version;
         self.metrics_sent = p.view.metrics.iter().map(|(h, m)| (h.clone(), m.at)).collect();
-        ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), clock: p.clock }
+        self.kube_sent = p.kube.clone();
+        ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), kube: (*p.kube).clone(), clock: p.clock }
     }
 
     /// The message that brings this connection up to `p`: a delta, or a fresh
@@ -144,6 +151,8 @@ impl Connection {
             self.metrics_sent.insert(h.clone(), m.at);
         }
         self.version = p.view.version;
+        let kube = (!Arc::ptr_eq(&self.kube_sent, &p.kube)).then(|| (*p.kube).clone());
+        self.kube_sent = p.kube.clone();
         ServerMsg::Delta {
             version: changes.version,
             leader: p.view.leader.clone(),
@@ -153,6 +162,7 @@ impl Connection {
             removed: changes.removed,
             metrics,
             truth: p.truth.clone(),
+            kube,
             clock: p.clock,
         }
     }
@@ -213,7 +223,7 @@ mod tests {
 
     fn published(view: &ClusterView, now: u64) -> Published {
         let truth = LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], split_brain_vms: vec![], at: now };
-        Published { epoch: 0, view: view.clone(), truth, clock: ClockInfo { now } }
+        Published { epoch: 0, view: view.clone(), truth, kube: Arc::new(KubeView::default()), clock: ClockInfo { now } }
     }
 
     fn sample(at: u64) -> MetricSample {
@@ -376,6 +386,24 @@ mod tests {
         let ServerMsg::Snapshot { view: snap, .. } = conn.next(&p) else { panic!("expected a snapshot") };
         assert_eq!(snap.hosts.len(), 3);
         assert!(matches!(conn.next(&p), ServerMsg::Delta { .. }), "one snapshot per epoch");
+    }
+
+    #[test]
+    fn the_kubernetes_view_is_sent_once_per_read() {
+        let view = ClusterView::default();
+        let read = |at| Arc::new(KubeView { at, ..KubeView::default() });
+        let p = Published { kube: read(5), ..published(&view, 10) };
+        let (mut conn, first) = Connection::open(&p);
+        let ServerMsg::Snapshot { kube, .. } = first else { panic!() };
+        assert_eq!(kube.at, 5);
+        let kube_of = |m: ServerMsg| match m {
+            ServerMsg::Delta { kube, .. } => kube,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(kube_of(conn.next(&p)), None, "the same read");
+        let p = Published { kube: read(8), ..p };
+        assert_eq!(kube_of(conn.next(&p)).map(|k| k.at), Some(8));
+        assert_eq!(kube_of(conn.next(&p)), None);
     }
 
     #[test]

@@ -4,6 +4,7 @@ import type { HostNet } from '../gen/HostNet'
 import type { HostObj } from '../gen/HostObj'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
+import { podTone, podsOn, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
 import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
@@ -80,6 +81,8 @@ function Inventory({ host }: { host: HostObj }) {
   )
 }
 
+const MAX_LISTED = 12
+
 /** One line on the host's Kubernetes node, from what its agent reports. */
 export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'warn' | 'bad' | 'muted' } {
   if (!k) return { text: 'not installed yet (comes once the host is Ready on its network)', tone: 'muted' }
@@ -94,10 +97,32 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
 
 function Kubernetes({ host }: { host: HostObj }) {
   const { text, tone } = kubeSummary(host.kube)
+  const kube = useStore((s) => s.kube)
+  const pods = useMemo(() => podsOn(kube, host.id), [kube, host.id])
+  // Your workloads first; K3s's and Longhorn's own pods are summed up.
+  const apps = pods.filter((p) => !SYSTEM_NAMESPACES.includes(p.namespace))
+  const system = pods.length - apps.length
   return (
     <div className="section">
       <h4>Kubernetes</h4>
       <p className={tone}>{text}</p>
+      {pods.length > 0 && (
+        <p>
+          {apps.slice(0, MAX_LISTED).map((p, n) => (
+            <span key={`${p.namespace}/${p.name}`} title={`${p.namespace}/${p.name}: ${p.status}`}>
+              {n > 0 && ', '}
+              <span className={podTone(p)}>{p.name}</span>
+            </span>
+          ))}
+          {apps.length > MAX_LISTED && <span className="muted"> and {apps.length - MAX_LISTED} more</span>}
+          {system > 0 && (
+            <span className="muted">
+              {apps.length > 0 ? ', and ' : ''}
+              {system} K3s and Longhorn pod{system === 1 ? '' : 's'}
+            </span>
+          )}
+        </p>
+      )}
     </div>
   )
 }
@@ -122,8 +147,6 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
     </div>
   )
 }
-
-const MAX_LISTED = 12
 
 /** What the view places on the host. While it drains, this is what is left to move off. */
 function HostWorkloads({ host, onSelectWorkload }: { host: HostObj; onSelectWorkload(ref: WorkloadRef): void }) {

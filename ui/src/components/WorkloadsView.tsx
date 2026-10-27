@@ -12,6 +12,7 @@ import {
   type WorkloadRef,
 } from '../workloads'
 import { CreateWorkload } from './CreateWorkload'
+import { KubeWorkloads } from './KubeWorkloads'
 
 /** Pod tables can have thousands of rows at scale; the filters narrow them. */
 const ROWS_SHOWN = 300
@@ -39,6 +40,8 @@ export function WorkloadsView({
   const vmStatus = useStore((s) => s.view.vmStatus)
   const volumes = useStore((s) => s.view.volumes)
   const volumeStatus = useStore((s) => s.view.volumeStatus)
+  // Only a server with a lab reads Kubernetes; without one there is nothing to show.
+  const hasKube = useStore((s) => s.kube.at > 0 || s.kube.error !== null)
   const [filter, setFilter] = useState<WorkloadFilter>({ kind: 'all', text: '', host: '', health: '' })
   const [creating, setCreating] = useState(false)
   const set = (patch: Partial<WorkloadFilter>) => setFilter((f) => ({ ...f, ...patch }))
@@ -54,6 +57,13 @@ export function WorkloadsView({
 
   return (
     <section className="workloads">
+      {hasKube && <KubeWorkloads onSelectHost={onSelectHost} />}
+      {hasKube && (
+        <>
+          <h3>homelabd workloads</h3>
+          <p className="muted">VMs, pods and volumes placed by homelabd's own scheduler. Real hosts do not run these yet; run workloads on Kubernetes.</p>
+        </>
+      )}
       <div className="fleet-bar">
         <label className="inline">
           Kind{' '}
