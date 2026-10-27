@@ -976,6 +976,7 @@ mod tests {
             local_port: model::PortName::from("eth0"),
             switch: model::SwitchId::from("access-1"),
             switch_port: model::PortName::from("p1"),
+            mgmt_ip: None,
         }];
         rig.r.state.apply(0, Command::ObserveHost { id: hid("m1"), lldp, inventory: Inventory::from_profile(ProfileId::MiniPc, 0) }).unwrap();
         let polls = |rig: &mut Rig| {

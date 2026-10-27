@@ -576,7 +576,7 @@ impl World {
                 let end = Node::HostPort(host.clone(), local_port.clone());
                 match self.topology.peer(&end) {
                     Some(Node::SwitchPort(switch, switch_port)) if self.link_up(&end) => {
-                        Some(LldpNeighbor { local_port, switch: switch.clone(), switch_port: switch_port.clone() })
+                        Some(LldpNeighbor { local_port, switch: switch.clone(), switch_port: switch_port.clone(), mgmt_ip: None })
                     }
                     _ => None,
                 }

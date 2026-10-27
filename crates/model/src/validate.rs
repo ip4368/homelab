@@ -277,7 +277,7 @@ mod tests {
     }
 
     fn neighbor(local: &str, switch: &str, port: &str) -> LldpNeighbor {
-        LldpNeighbor { local_port: pn(local), switch: sid(switch), switch_port: pn(port) }
+        LldpNeighbor { local_port: pn(local), switch: sid(switch), switch_port: pn(port), mgmt_ip: None }
     }
 
     fn trunk(native: Option<u16>, allowed: &[u16], mtu: u16, lacp: Option<&str>) -> SwitchPortCfg {

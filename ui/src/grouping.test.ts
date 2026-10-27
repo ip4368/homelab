@@ -15,6 +15,7 @@ const neighbor = (local_port: string, sw: string): HostObj['lldp'][number] => ({
   local_port,
   switch: sw,
   switch_port: 'p1',
+  mgmt_ip: null,
 })
 
 describe('groupHosts', () => {

@@ -385,7 +385,7 @@ mod tests {
         s.apply(0, Command::ApproveHost { id: hid(id), roles }).unwrap();
         let ips = ips.iter().map(|(n, a)| (nid(n), ip(a))).collect();
         s.apply(0, Command::ProvisionHost { id: hid(id), template: template.map(String::from), ips }).unwrap();
-        let lldp = vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from("access-1"), switch_port: PortName::from("p7") }];
+        let lldp = vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from("access-1"), switch_port: PortName::from("p7"), mgmt_ip: None }];
         s.apply(0, Command::ObserveHost { id: hid(id), lldp, inventory }).unwrap();
     }
 
@@ -739,7 +739,7 @@ mod tests {
         let observe = |s: &mut ClusterState, sfp1_up: bool| {
             let mut inventory = Inventory::from_profile(ProfileId::Ms01, 1);
             inventory.nics.iter_mut().find(|n| n.name == "sfp1").unwrap().link_up = sfp1_up;
-            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port) };
+            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port), mgmt_ip: None };
             let lldp = vec![n("sfp0", "core-1", "p1"), n("eth0", "access-1", "p7")];
             s.apply(0, Command::ObserveHost { id: hid("x"), lldp, inventory }).unwrap();
         };
@@ -769,7 +769,7 @@ mod tests {
         let observe = |s: &mut ClusterState, at: u64, sfp1_up: bool| {
             let mut inventory = Inventory::from_profile(ProfileId::Ms01, 1);
             inventory.nics.iter_mut().find(|n| n.name == "sfp1").unwrap().link_up = sfp1_up;
-            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port) };
+            let n = |local: &str, sw: &str, port: &str| LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(sw), switch_port: PortName::from(port), mgmt_ip: None };
             let lldp = vec![n("sfp0", "core-1", "p1"), n("eth0", "access-1", "p7")];
             s.apply(at, Command::ObserveHost { id: hid("x"), lldp, inventory }).unwrap();
         };

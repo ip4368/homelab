@@ -359,7 +359,7 @@ pub(super) mod tests {
         let mut s = ClusterState::new();
         for &(h, p, roles, switch) in hosts {
             let id = hid(h);
-            let lldp = vec![LldpNeighbor { local_port: PortName::from(MGMT_NIC), switch: SwitchId::from(switch), switch_port: PortName::from("p1") }];
+            let lldp = vec![LldpNeighbor { local_port: PortName::from(MGMT_NIC), switch: SwitchId::from(switch), switch_port: PortName::from("p1"), mgmt_ip: None }];
             for cmd in [
                 Command::AddPendingHost { id: id.clone(), profile: profile(p, 0), inventory: Inventory::from_profile(p, 0), location: "rack-1".into() },
                 Command::ApproveHost { id: id.clone(), roles: roles.iter().copied().collect() },

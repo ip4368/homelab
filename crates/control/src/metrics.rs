@@ -333,7 +333,7 @@ mod tests {
             let (id, p) = (hid(id), ProfileId::Ms01);
             let lldp = cables
                 .iter()
-                .map(|(port, sw)| LldpNeighbor { local_port: PortName::from(*port), switch: sid(sw), switch_port: PortName::from("p1") })
+                .map(|(port, sw)| LldpNeighbor { local_port: PortName::from(*port), switch: sid(sw), switch_port: PortName::from("p1"), mgmt_ip: None })
                 .collect();
             let cmds = [
                 Command::AddPendingHost { id: id.clone(), profile: profile(p, 0), inventory: Inventory::from_profile(p, 0), location: "rack-0".into() },

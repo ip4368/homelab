@@ -9,7 +9,7 @@ use super::{Action, Volatile};
 use crate::proto::Msg;
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Lifecycle};
-use model::{HostId, NetworkId};
+use model::{HostId, NetworkId, SwitchId};
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 
@@ -25,6 +25,18 @@ pub fn directory(state: &ClusterState) -> Directory {
         .values()
         .filter(|h| h.lifecycle != Lifecycle::Removed && !h.ips.is_empty())
         .map(|h| (h.id.clone(), h.ips.clone()))
+        .collect()
+}
+
+/// Each switch's management address, as the hosts' LLDP neighbours
+/// advertise it: where a real host's runtime sends `Addr::Switch`.
+pub fn switch_addresses(state: &ClusterState) -> BTreeMap<SwitchId, Ipv4Addr> {
+    state
+        .hosts
+        .values()
+        .filter(|h| h.lifecycle != Lifecycle::Removed)
+        .flat_map(|h| h.lldp.iter())
+        .filter_map(|n| Some((n.switch.clone(), n.mgmt_ip?)))
         .collect()
 }
 

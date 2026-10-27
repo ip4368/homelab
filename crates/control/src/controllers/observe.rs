@@ -161,7 +161,7 @@ mod tests {
     }
 
     fn lldp(switch: &str) -> Vec<LldpNeighbor> {
-        vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: sid(switch), switch_port: PortName::from("p1") }]
+        vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: sid(switch), switch_port: PortName::from("p1"), mgmt_ip: None }]
     }
 
     /// Hosts h1 (cabled to access-1) and h2 (to core-1 and access-2), each Pending.

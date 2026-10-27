@@ -11,7 +11,7 @@
 //! replica when the agent is asked to.
 
 use crate::transport::{AddressBook, Inbound, Transport};
-use control::controllers::directory::{directory, Directory};
+use control::controllers::directory::{directory, switch_addresses, Directory};
 use control::proto::Msg;
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, SimTime, Svc};
@@ -229,9 +229,11 @@ impl Node {
         let leads = replica.is_some_and(CpReplica::is_leader);
         let fresh = replica.map(|r| r.state().version).filter(|v| Some(*v) != self.book_version);
         if let Some(version) = fresh {
-            let dir = directory(self.actor::<CpReplica>(Svc::Cp).expect("replica checked above").state());
+            let state = self.actor::<CpReplica>(Svc::Cp).expect("replica checked above").state();
+            let (dir, switches) = (directory(state), switch_addresses(state));
             self.book_version = Some(version);
             self.learn_directory(dir);
+            self.core.transport.update_book(|b| b.fixed.extend(switches.into_iter().map(|(s, ip)| (Addr::Switch(s), ip))));
         }
         if leads != self.core.vip_held {
             self.core.vip_held = leads;

@@ -1095,7 +1095,7 @@ mod tests {
     }
 
     fn neighbor(local: &str, switch: &str, port: &str) -> LldpNeighbor {
-        LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(switch), switch_port: PortName::from(port) }
+        LldpNeighbor { local_port: PortName::from(local), switch: SwitchId::from(switch), switch_port: PortName::from(port), mgmt_ip: None }
     }
 
     fn observe_switch(id: &str, last_seen: SimTime) -> Command {

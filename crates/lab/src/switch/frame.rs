@@ -7,6 +7,8 @@ pub const ETH_P_LLDP: u16 = 0x88cc;
 pub const LLDP_DST: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e];
 pub const SLOW_DST: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x02];
 
+use std::net::Ipv4Addr;
+
 pub type Mac = [u8; 6];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +87,9 @@ fn tlv(out: &mut Vec<u8>, kind: u8, value: &[u8]) {
 }
 
 /// An LLDP frame from switch port `port` of `switch`: chassis id and system
-/// name are the switch id, port id is the port name.
-pub fn lldp(src: Mac, switch: &str, port: &str) -> Vec<u8> {
+/// name are the switch id, port id is the port name, and the management
+/// address is `mgmt` (IPv4, no interface number), as real switches send it.
+pub fn lldp(src: Mac, switch: &str, port: &str, mgmt: Option<Ipv4Addr>) -> Vec<u8> {
     let mut f = Vec::with_capacity(64);
     f.extend_from_slice(&LLDP_DST);
     f.extend_from_slice(&src);
@@ -99,6 +102,14 @@ pub fn lldp(src: Mac, switch: &str, port: &str) -> Vec<u8> {
     tlv(&mut f, 2, &pid);
     tlv(&mut f, 3, &120u16.to_be_bytes());
     tlv(&mut f, 5, switch.as_bytes());
+    if let Some(ip) = mgmt {
+        // Address length (subtype + 4), subtype IPv4, the address, interface
+        // numbering "unknown" with number 0, and no OID.
+        let mut m = vec![5, 1];
+        m.extend_from_slice(&ip.octets());
+        m.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
+        tlv(&mut f, 8, &m);
+    }
     tlv(&mut f, 0, &[]);
     f
 }
@@ -208,12 +219,14 @@ mod tests {
 
     #[test]
     fn lldp_frames_carry_switch_and_port() {
-        let f = lldp([2; 6], "core-1", "p3");
+        let f = lldp([2; 6], "core-1", "p3", Some(Ipv4Addr::new(10, 0, 3, 251)));
         let h = parse(&f).unwrap();
         assert_eq!((h.dst, h.ethertype), (LLDP_DST, ETH_P_LLDP));
         assert_eq!(&f[14..16], &[0x02, 7], "chassis TLV, 7 bytes");
         assert_eq!(&f[16..23], b"\x07core-1");
         assert_eq!(&f[23..25], &[0x04, 3], "port TLV, 3 bytes");
         assert_eq!(&f[25..28], b"\x05p3");
+        let mgmt = f.windows(4).position(|w| w == [0x10, 12, 5, 1]).expect("a management address TLV");
+        assert_eq!(&f[mgmt + 4..mgmt + 8], &[10, 0, 3, 251]);
     }
 }

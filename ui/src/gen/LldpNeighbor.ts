@@ -6,4 +6,9 @@ import type { SwitchId } from "./SwitchId";
  * What a host's LLDP daemon reports for one of its ports: the switch port
  * on the other end of the cable.
  */
-export type LldpNeighbor = { local_port: PortName, switch: SwitchId, switch_port: PortName, };
+export type LldpNeighbor = { local_port: PortName, switch: SwitchId, switch_port: PortName, 
+/**
+ * The switch's management address, from LLDP's Management Address TLV
+ * (if the switch sends one): where the control plane polls it.
+ */
+mgmt_ip: string | null, };

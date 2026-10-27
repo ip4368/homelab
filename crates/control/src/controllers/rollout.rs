@@ -239,7 +239,7 @@ mod tests {
             s.apply(0, Command::ApproveHost { id: hid(&id), roles: [Role::Compute].into() }).unwrap();
             let ips: BTreeMap<NetworkId, Ipv4Addr> = [(NetworkId::from("mgmt"), Ipv4Addr::new(10, 0, 0, 10 + i as u8))].into();
             s.apply(0, Command::ProvisionHost { id: hid(&id), template: Some(t.into()), ips }).unwrap();
-            let lldp = vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from("access-1"), switch_port: port }];
+            let lldp = vec![LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from("access-1"), switch_port: port, mgmt_ip: None }];
             s.apply(0, Command::ObserveHost { id: hid(&id), lldp, inventory }).unwrap();
             s.apply(0, Command::SetLifecycle { id: hid(&id), lifecycle: Lifecycle::Ready }).unwrap();
             let config = network::render_host(&s, &s.hosts[&hid(&id)]);

@@ -208,6 +208,11 @@ pub struct LldpNeighbor {
     pub local_port: PortName,
     pub switch: SwitchId,
     pub switch_port: PortName,
+    /// The switch's management address, from LLDP's Management Address TLV
+    /// (if the switch sends one): where the control plane polls it.
+    #[serde(default)]
+    #[ts(type = "string | null")]
+    pub mgmt_ip: Option<Ipv4Addr>,
 }
 
 /// A switch port's configuration as the controller observed it by polling.

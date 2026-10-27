@@ -513,7 +513,7 @@ mod tests {
     }
 
     fn neighbor(switch: &str, port: &str) -> LldpNeighbor {
-        LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from(switch), switch_port: PortName::from(port) }
+        LldpNeighbor { local_port: PortName::from("eth0"), switch: SwitchId::from(switch), switch_port: PortName::from(port), mgmt_ip: None }
     }
 
     fn observed(os: &FakeOs) -> Observed {

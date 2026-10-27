@@ -30,7 +30,7 @@ fn sid(s: &str) -> SwitchId {
 }
 
 fn neighbor(local: &str, switch: &str, port: &str) -> LldpNeighbor {
-    LldpNeighbor { local_port: PortName::from(local), switch: sid(switch), switch_port: PortName::from(port) }
+    LldpNeighbor { local_port: PortName::from(local), switch: sid(switch), switch_port: PortName::from(port), mgmt_ip: None }
 }
 
 fn default_fleet(seed: u64) -> Engine {

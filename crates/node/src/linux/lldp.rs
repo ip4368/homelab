@@ -11,6 +11,7 @@ use model::network::LldpNeighbor;
 use model::{PortName, SwitchId};
 use std::collections::BTreeMap;
 use std::io;
+use std::net::Ipv4Addr;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,6 +24,7 @@ const LLDP_MULTICAST: [u8; 6] = [0x01, 0x80, 0xc2, 0x00, 0x00, 0x0e];
 struct Heard {
     switch: SwitchId,
     port: PortName,
+    mgmt: Option<Ipv4Addr>,
     until: Instant,
 }
 
@@ -32,12 +34,22 @@ pub struct Lldp {
     heard: Arc<Mutex<BTreeMap<String, Heard>>>,
 }
 
-/// The chassis id, port id and TTL of an LLDP frame (whole Ethernet frame).
-pub fn parse(frame: &[u8]) -> Option<(String, String, u16)> {
+/// What an LLDP frame says: chassis id, port id, TTL, and the IPv4
+/// management address if it has one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Frame {
+    pub chassis: String,
+    pub port: String,
+    pub ttl: u16,
+    pub mgmt: Option<Ipv4Addr>,
+}
+
+/// Parses an LLDP frame (a whole Ethernet frame).
+pub fn parse(frame: &[u8]) -> Option<Frame> {
     if frame.len() < 14 || u16::from_be_bytes([frame[12], frame[13]]) != ETH_P_LLDP {
         return None;
     }
-    let (mut chassis, mut port, mut ttl) = (None, None, None);
+    let (mut chassis, mut port, mut ttl, mut mgmt) = (None, None, None, None);
     let mut i = 14;
     while i + 2 <= frame.len() {
         let head = u16::from_be_bytes([frame[i], frame[i + 1]]);
@@ -48,11 +60,15 @@ pub fn parse(frame: &[u8]) -> Option<(String, String, u16)> {
             1 if len > 1 => chassis = Some(String::from_utf8_lossy(&value[1..]).into_owned()),
             2 if len > 1 => port = Some(String::from_utf8_lossy(&value[1..]).into_owned()),
             3 if len == 2 => ttl = Some(u16::from_be_bytes([value[0], value[1]])),
+            // Address string length (subtype + address), subtype 1 = IPv4.
+            8 if len >= 6 && value[0] == 5 && value[1] == 1 && mgmt.is_none() => {
+                mgmt = Some(Ipv4Addr::new(value[2], value[3], value[4], value[5]));
+            }
             _ => {}
         }
         i += 2 + len;
     }
-    Some((chassis?, port?, ttl.unwrap_or(120)))
+    Some(Frame { chassis: chassis?, port: port?, ttl: ttl.unwrap_or(120), mgmt })
 }
 
 impl Lldp {
@@ -80,7 +96,7 @@ impl Lldp {
             .filter(|n| carrier(n))
             .filter_map(|n| {
                 let h = heard.get(n).filter(|h| h.until > now)?;
-                Some(LldpNeighbor { local_port: PortName::new(n), switch: h.switch.clone(), switch_port: h.port.clone() })
+                Some(LldpNeighbor { local_port: PortName::new(n), switch: h.switch.clone(), switch_port: h.port.clone(), mgmt_ip: h.mgmt })
             })
             .collect()
     }
@@ -150,9 +166,9 @@ fn listen(sock: &OwnedFd, heard: &Mutex<BTreeMap<String, Heard>>) {
         if from.sll_pkttype == libc::PACKET_OUTGOING as u8 {
             continue;
         }
-        let (Some((switch, port, ttl)), Some(nic)) = (parse(&buf[..n as usize]), ifname(from.sll_ifindex)) else { continue };
-        let until = Instant::now() + Duration::from_secs(u64::from(ttl));
-        heard.lock().expect("lldp lock").insert(nic, Heard { switch: SwitchId::new(switch), port: PortName::new(port), until });
+        let (Some(f), Some(nic)) = (parse(&buf[..n as usize]), ifname(from.sll_ifindex)) else { continue };
+        let until = Instant::now() + Duration::from_secs(u64::from(f.ttl));
+        heard.lock().expect("lldp lock").insert(nic, Heard { switch: SwitchId::new(f.chassis), port: PortName::new(f.port), mgmt: f.mgmt, until });
     }
 }
 
@@ -162,6 +178,10 @@ mod tests {
 
     /// An LLDP frame as `labswitch` sends it (see `lab::switch::frame::lldp`).
     fn frame(switch: &str, port: &str) -> Vec<u8> {
+        frame_with(switch, port, None)
+    }
+
+    fn frame_with(switch: &str, port: &str, mgmt: Option<[u8; 4]>) -> Vec<u8> {
         let tlv = |out: &mut Vec<u8>, kind: u16, v: &[u8]| {
             out.extend_from_slice(&((kind << 9) | v.len() as u16).to_be_bytes());
             out.extend_from_slice(v);
@@ -170,13 +190,19 @@ mod tests {
         tlv(&mut f, 1, &[&[7u8][..], switch.as_bytes()].concat());
         tlv(&mut f, 2, &[&[5u8][..], port.as_bytes()].concat());
         tlv(&mut f, 3, &30u16.to_be_bytes());
+        if let Some(ip) = mgmt {
+            tlv(&mut f, 8, &[&[5u8, 1][..], &ip[..], &[1, 0, 0, 0, 0, 0][..]].concat());
+        }
         tlv(&mut f, 0, &[]);
         f
     }
 
     #[test]
     fn a_switch_frame_names_its_switch_port_and_ttl() {
-        assert_eq!(parse(&frame("core-1", "p3")), Some(("core-1".into(), "p3".into(), 30)));
+        let f = |chassis: &str, port: &str, mgmt| Frame { chassis: chassis.into(), port: port.into(), ttl: 30, mgmt };
+        assert_eq!(parse(&frame("core-1", "p3")), Some(f("core-1", "p3", None)));
+        let with_mgmt = frame_with("core-1", "p3", Some([10, 0, 3, 251]));
+        assert_eq!(parse(&with_mgmt), Some(f("core-1", "p3", Some(Ipv4Addr::new(10, 0, 3, 251)))), "the management address TLV");
         let mut not_lldp = frame("core-1", "p3");
         not_lldp[13] = 0x00;
         assert_eq!(parse(&not_lldp), None);
@@ -188,10 +214,10 @@ mod tests {
         let l = Lldp::default();
         let far = Instant::now() + Duration::from_secs(60);
         let mut h = l.heard.lock().unwrap();
-        h.insert("sfp0".into(), Heard { switch: SwitchId::from("core-1"), port: PortName::from("p1"), until: far });
-        h.insert("eth0".into(), Heard { switch: SwitchId::from("access-1"), port: PortName::from("p1"), until: far });
-        h.insert("sfp1".into(), Heard { switch: SwitchId::from("core-1"), port: PortName::from("p2"), until: far });
-        h.insert("eth1".into(), Heard { switch: SwitchId::from("access-1"), port: PortName::from("p9"), until: Instant::now() });
+        h.insert("sfp0".into(), Heard { switch: SwitchId::from("core-1"), port: PortName::from("p1"), mgmt: None, until: far });
+        h.insert("eth0".into(), Heard { switch: SwitchId::from("access-1"), port: PortName::from("p1"), mgmt: None, until: far });
+        h.insert("sfp1".into(), Heard { switch: SwitchId::from("core-1"), port: PortName::from("p2"), mgmt: None, until: far });
+        h.insert("eth1".into(), Heard { switch: SwitchId::from("access-1"), port: PortName::from("p9"), mgmt: None, until: Instant::now() });
         drop(h);
         let nics: Vec<String> = ["sfp0", "sfp1", "eth0", "eth1"].map(String::from).into();
         let got: Vec<_> = l.neighbours(&nics, |n| n != "sfp1").iter().map(|n| format!("{}>{}/{}", n.local_port, n.switch, n.switch_port)).collect();

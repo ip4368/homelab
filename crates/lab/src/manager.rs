@@ -279,6 +279,9 @@ impl Lab {
             }
         }
         let mut core = Core::new(&spec.switches.iter().map(|s| (s.id.clone(), s.model.clone())).collect::<Vec<_>>(), spec.ports.clone(), Instant::now());
+        for s in &spec.switches {
+            core.set_mgmt_ip(&s.id, s.mgmt_ip);
+        }
         let mut wires = vec![];
         let tap = open_tap(crate::topology::ROUTER_TAP)?;
         for (i, p) in spec.ports.iter().enumerate() {

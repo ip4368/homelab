@@ -10,6 +10,7 @@ use model::network::{LldpPeer, ObservedSwitchPort, PortMode, SwitchPortCfg};
 use model::{HostId, PortName, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use ts_rs::TS;
 
@@ -135,6 +136,8 @@ struct Switch {
     model: String,
     up: bool,
     index: u8,
+    /// The management address its LLDP advertises.
+    mgmt: Option<Ipv4Addr>,
     /// (VLAN, MAC) → where it was last seen, and when.
     fdb: HashMap<(u16, Mac), (Egress, Instant)>,
 }
@@ -164,7 +167,7 @@ impl Core {
         let switches: BTreeMap<SwitchId, Switch> = switches
             .iter()
             .enumerate()
-            .map(|(i, (id, model))| (id.clone(), Switch { model: model.clone(), up: true, index: i as u8, fdb: HashMap::new() }))
+            .map(|(i, (id, model))| (id.clone(), Switch { model: model.clone(), up: true, index: i as u8, mgmt: None, fdb: HashMap::new() }))
             .collect();
         let index = ports.iter().enumerate().map(|(i, p)| ((p.switch.clone(), p.name.clone()), i)).collect();
         let ports = ports
@@ -189,6 +192,13 @@ impl Core {
             })
             .collect();
         Self { switches, ports, index, partitions: vec![] }
+    }
+
+    /// Has `switch` advertise `ip` as its management address in LLDP.
+    pub fn set_mgmt_ip(&mut self, switch: &SwitchId, ip: Ipv4Addr) {
+        if let Some(s) = self.switches.get_mut(switch) {
+            s.mgmt = Some(ip);
+        }
     }
 
     pub fn port_id(&self, switch: &SwitchId, port: &PortName) -> Option<PortId> {
@@ -531,7 +541,7 @@ impl Core {
                 continue;
             }
             let sw = &self.switches[&self.ports[i].def.switch];
-            let system = [0x02, 0x5e, sw.index, 0, 0, 0];
+            let (system, mgmt) = ([0x02, 0x5e, sw.index, 0, 0, 0], sw.mgmt);
             let p = &mut self.ports[i];
             if let Some(group) = p.def.cfg.lacp_group.clone()
                 && p.last_lacp.is_none_or(|t| now.duration_since(t) >= LACP_EVERY)
@@ -551,7 +561,7 @@ impl Core {
             }
             if p.last_lldp.is_none_or(|t| now.duration_since(t) >= LLDP_EVERY) {
                 p.last_lldp = Some(now);
-                out.push((i, frame::lldp(p.mac, p.def.switch.as_str(), p.def.name.as_str())));
+                out.push((i, frame::lldp(p.mac, p.def.switch.as_str(), p.def.name.as_str(), mgmt)));
             }
         }
         out

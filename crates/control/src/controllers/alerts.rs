@@ -345,7 +345,7 @@ mod tests {
         edit(&mut inventory);
         let lldp: Vec<LldpNeighbor> = cables
             .iter()
-            .map(|(port, sw)| LldpNeighbor { local_port: PortName::from(*port), switch: SwitchId::from(*sw), switch_port: PortName::from("p1") })
+            .map(|(port, sw)| LldpNeighbor { local_port: PortName::from(*port), switch: SwitchId::from(*sw), switch_port: PortName::from("p1"), mgmt_ip: None })
             .collect();
         let observed = Observed { lldp: lldp.clone(), inventory: inventory.clone() };
         v.note_report(hid("m"), HostReport { observed_at, observed });
