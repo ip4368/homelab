@@ -19,6 +19,7 @@ This guide covers installing the homelab cluster on real machines: homelabd, K3s
 
 **Where the files come from**
 - `install.sh` and the `homelabd` binary, served from one URL (`<url>` below). From a checkout: `cargo build --release -p node`, then serve `target/release/homelabd` and `crates/node/install.sh`. Replace the `@URL@` placeholder in the script with the URL, or set `HOMELAB_URL`.
+- K3s comes from its GitHub release. homelabd checks the install script and the binary against sha256 sums pinned in the build, so a machine needs to reach `raw.githubusercontent.com`, `github.com` and `release-assets.githubusercontent.com`.
 
 The seed configuration is the one the lab uses: networks, templates, and auto-approve rules per hardware profile. If your subnets differ, change them in the UI after `init`, before joining the other machines.
 

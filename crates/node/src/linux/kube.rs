@@ -6,8 +6,9 @@
 //! What the worker does, every [`EVERY`] or as soon as a new spec arrives:
 //!
 //! 1. Installs K3s as the spec's role if it is not, with the official
-//!    install script (`get.k3s.io`, pinned to [`K3S_VERSION`]), after the
-//!    packages Longhorn needs. A host installed as the other role is
+//!    install script, after the packages Longhorn needs. The script (that of
+//!    [`K3S_VERSION`]'s release) and the K3s binary are checked against
+//!    pinned sha256 sums before anything runs. A host installed as the other role is
 //!    uninstalled first; a server deletes its own node before it goes, so
 //!    its etcd member leaves the cluster.
 //! 2. Starts the service if it stopped, and waits for the node to register.
@@ -29,12 +30,18 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 pub const K3S_VERSION: &str = "v1.36.5+k3s1";
+/// The sha256 of [`K3S_VERSION`]'s amd64 `k3s` binary (the release's
+/// `sha256sum-amd64.txt`).
+const K3S_SHA256: &str = "d73847bcd3c5fccef0115b372e2f9a91f3032dc84bbf71518a4617565294d313";
+/// The sha256 of `install.sh` as tagged [`K3S_VERSION`]. `get.k3s.io` serves
+/// whatever the script is today, so it is fetched from the tag instead.
+const INSTALL_SCRIPT_SHA256: &str = "46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad";
+const K3S_BIN: &str = "/usr/local/bin/k3s";
 pub const LONGHORN_VERSION: &str = "1.13.0";
 /// The admin kubeconfig a K3s server writes.
 pub const KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
 /// What an agent's kubelet authenticates with: enough to label its own node.
 const KUBELET_KUBECONFIG: &str = "/var/lib/rancher/k3s/agent/kubelet.kubeconfig";
-const INSTALL_SCRIPT_URL: &str = "https://get.k3s.io";
 const MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-longhorn.yaml";
 /// How often the worker looks again when nothing changed.
 const EVERY: Duration = Duration::from_secs(10);
@@ -303,7 +310,7 @@ impl Worker {
         };
         let Some(r) = role else { return Observed::default() };
         let active = Command::new("systemctl").args(["is-active", "--quiet", unit(r)]).status().is_ok_and(|s| s.success());
-        let version = sh("/usr/local/bin/k3s", &["--version"]).ok().and_then(|v| v.split_whitespace().nth(2).map(String::from)).unwrap_or_default();
+        let version = sh(K3S_BIN, &["--version"]).ok().and_then(|v| v.split_whitespace().nth(2).map(String::from)).unwrap_or_default();
         let ready = if active {
             self.kubectl(r, &["get", "node", self.host.as_str(), "-o", "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}"])
         } else {
@@ -319,7 +326,7 @@ impl Worker {
             all.extend(["--kubeconfig", KUBELET_KUBECONFIG]);
         }
         all.extend(args);
-        sh("/usr/local/bin/k3s", &all).map_err(|e| e.to_string())
+        sh(K3S_BIN, &all).map_err(|e| e.to_string())
     }
 
     /// Installs K3s as `spec` says, uninstalling `installed` first.
@@ -344,7 +351,10 @@ impl Worker {
             .ok_or_else(|| format!("no interface has the node address {}", spec.node_ip))?;
         let script = self.paths.run.join("k3s-install.sh");
         let _ = std::fs::create_dir_all(&self.paths.run);
-        sh("curl", &["-fsSL", "--retry", "3", "-o", &script.to_string_lossy(), INSTALL_SCRIPT_URL]).map_err(|e| format!("download the K3s installer: {e}"))?;
+        let (script_url, bin_url) = k3s_urls();
+        fetch_verified(&script_url, INSTALL_SCRIPT_SHA256, &script).map_err(|e| format!("download the K3s installer: {e}"))?;
+        fetch_verified(&bin_url, K3S_SHA256, Path::new(K3S_BIN)).map_err(|e| format!("download K3s: {e}"))?;
+        sh("chmod", &["0755", K3S_BIN]).map_err(|e| e.to_string())?;
         let args = install_args(spec, &self.host, self.vip, &iface);
         eprintln!("homelabd: kubernetes: installing K3s {K3S_VERSION}: {}", args.join(" "));
         let out = Command::new("sh")
@@ -352,6 +362,8 @@ impl Worker {
             .args(&args)
             .env("INSTALL_K3S_VERSION", K3S_VERSION)
             .env("K3S_TOKEN", &spec.token)
+            // The binary checked above; the script would fetch it unchecked.
+            .env("INSTALL_K3S_SKIP_DOWNLOAD", "true")
             // Started below without waiting: a joining server's start lasts
             // until it reaches the cluster, which may take a while.
             .env("INSTALL_K3S_SKIP_START", "true")
@@ -410,6 +422,31 @@ fn prerequisites() -> Result<(), String> {
     Ok(())
 }
 
+/// Where [`K3S_VERSION`]'s install script and amd64 binary are downloaded from.
+fn k3s_urls() -> (String, String) {
+    let tag = K3S_VERSION.replace('+', "%2B");
+    (format!("https://raw.githubusercontent.com/k3s-io/k3s/{tag}/install.sh"), format!("https://github.com/k3s-io/k3s/releases/download/{tag}/k3s"))
+}
+
+/// Downloads `url` to `dest` if its sha256 is `sha256`; a file that does not
+/// match never reaches `dest`.
+fn fetch_verified(url: &str, sha256: &str, dest: &Path) -> Result<(), String> {
+    let tmp = dest.with_extension("download");
+    let tmp_s = tmp.to_string_lossy();
+    sh("curl", &["-fsSL", "--retry", "3", "-o", &tmp_s, url]).map_err(|e| e.to_string())?;
+    let sum = sh("sha256sum", &[&tmp_s]).map_err(|e| e.to_string())?;
+    if !sum_matches(&sum, sha256) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{url} does not have the expected sha256 {sha256} (got {})", sum.split_whitespace().next().unwrap_or("nothing")));
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| format!("install {}: {e}", dest.display()))
+}
+
+/// Whether `sha256sum`'s output (`<hex>  <file>`) is for `sha256`.
+fn sum_matches(sha256sum_out: &str, sha256: &str) -> bool {
+    sha256sum_out.split_whitespace().next().is_some_and(|s| s.eq_ignore_ascii_case(sha256))
+}
+
 fn write_if_changed(path: &Path, body: &str) -> std::io::Result<()> {
     if std::fs::read_to_string(path).is_ok_and(|b| b == body) {
         return Ok(());
@@ -449,6 +486,19 @@ mod tests {
         let agent = install_args(&spec(KubeRole::Agent, false), &HostId::from("pi5-01"), vip, "bond0").join(" ");
         assert!(agent.starts_with("agent --server https://10.0.3.253:6443 --node-name pi5-01"), "{agent}");
         assert!(agent.contains("--flannel-iface bond0") && !agent.contains("tls-san"), "{agent}");
+    }
+
+    #[test]
+    fn k3s_downloads_are_those_of_the_pinned_release_and_checked() {
+        let (script, bin) = k3s_urls();
+        assert_eq!(script, "https://raw.githubusercontent.com/k3s-io/k3s/v1.36.5%2Bk3s1/install.sh");
+        assert_eq!(bin, "https://github.com/k3s-io/k3s/releases/download/v1.36.5%2Bk3s1/k3s");
+        let sum = format!("{K3S_SHA256}  /usr/local/bin/k3s.download\n");
+        assert!(sum_matches(&sum, K3S_SHA256));
+        assert!(sum_matches(&sum.to_uppercase(), K3S_SHA256));
+        assert!(!sum_matches(&sum, INSTALL_SCRIPT_SHA256));
+        assert!(!sum_matches("", K3S_SHA256), "no output is no match");
+        assert!([K3S_SHA256, INSTALL_SCRIPT_SHA256].iter().all(|s| s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())));
     }
 
     #[test]

@@ -62,7 +62,7 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - `homelabd init | join | token | kubeconfig | run`, plus `install.sh`.
 - `LinuxOs` K3s supervisor. It runs on a worker thread and does these steps:
   - prerequisites: `open-iscsi`, `nfs-common`, `iscsid`;
-  - the K3s install script, pinned and role-specific;
+  - the K3s install script and binary of the pinned release, each checked against a pinned sha256 (the script then runs with `INSTALL_K3S_SKIP_DOWNLOAD`), role-specific;
   - the Longhorn manifest on servers;
   - node labels and annotations for Longhorn disks;
   - status from `k3s kubectl get node`.
