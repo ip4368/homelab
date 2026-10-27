@@ -24,6 +24,7 @@ use std::io;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::thread::JoinHandle;
 use store::{write_synced, RaftStore};
 use sysfs::{Sys, UsageSampler};
 
@@ -146,6 +147,9 @@ pub struct LinuxOs {
     sampler: UsageSampler,
     /// Data disks ever seen: one missing now has failed.
     known_disks: BTreeSet<String>,
+    /// `mkfs` runs off the event loop, by device: a big disk takes long
+    /// enough to stall keepalives.
+    formatting: BTreeMap<String, JoinHandle<io::Result<String>>>,
     speeds: BTreeMap<String, u32>,
     /// What the NICs hear over LLDP, once [`LinuxOs::boot`] started listening.
     lldp: Option<lldp::Lldp>,
@@ -176,6 +180,7 @@ impl LinuxOs {
             net_changed: false,
             sampler: UsageSampler::default(),
             known_disks,
+            formatting: BTreeMap::new(),
             speeds: BTreeMap::new(),
             lldp: None,
         }
@@ -246,7 +251,8 @@ impl LinuxOs {
     }
 
     /// Formats (if blank) and mounts every data disk at `/mnt/<name>`, and
-    /// remembers it, so it shows as failed if it later disappears.
+    /// remembers it, so it shows as failed if it later disappears. A format
+    /// runs on its own thread; the disk is mounted on a call after it ends.
     fn prepare_disks(&mut self) {
         let mounts = fs::read_to_string(self.sys.root().join("proc/mounts")).unwrap_or_default();
         let present = self.sys.disks();
@@ -267,15 +273,25 @@ impl LinuxOs {
             let dir = self.paths.mnt.join(&d.name);
             let dir_s = dir.to_string_lossy().into_owned();
             if !mounts.lines().any(|l| l.split_whitespace().nth(1) == Some(dir_s.as_str())) {
+                if let Some(f) = self.formatting.get(&dev) {
+                    if !f.is_finished() {
+                        continue;
+                    }
+                    let done = self.formatting.remove(&dev).expect("just seen").join();
+                    if let Err(e) = done.unwrap_or_else(|_| Err(io::Error::other("mkfs panicked"))) {
+                        eprintln!("homelabd: format {dev}: {e}");
+                        continue;
+                    }
+                }
                 // Format only a disk blkid calls blank (exit 2); any other
                 // failure (I/O, ambiguous signatures) leaves it alone.
                 match Command::new("blkid").arg(&dev).status().map(|s| s.code()) {
                     Ok(Some(0)) => {}
                     Ok(Some(2)) => {
-                        if let Err(e) = sh("mkfs.ext4", &["-q", "-L", &d.name, &dev]) {
-                            eprintln!("homelabd: format {dev}: {e}");
-                            continue;
-                        }
+                        let (label, target) = (d.name.clone(), dev.clone());
+                        let job = std::thread::spawn(move || sh("mkfs.ext4", &["-q", "-L", &label, &target]));
+                        self.formatting.insert(dev, job);
+                        continue;
                     }
                     other => {
                         eprintln!("homelabd: probe {dev}: {other:?}; not formatting or mounting it");
