@@ -133,6 +133,11 @@ pub trait HostOs {
     fn kube_status(&self) -> Option<KubeStatus> {
         None
     }
+    /// An admin kubeconfig for the cluster's Kubernetes, pointed at the VIP;
+    /// `None` unless this host runs a K3s server that wrote one.
+    fn kubeconfig(&self) -> Option<String> {
+        None
+    }
 }
 
 /// A switch's own configuration, as its management interface reports it.

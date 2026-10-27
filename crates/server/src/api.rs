@@ -101,8 +101,8 @@ async fn lab_fault(State(driver): State<DriverHandle>, Json(fault): Json<LabFaul
 }
 
 /// 200 with an admin kubeconfig for the cluster's Kubernetes (pointed at
-/// the VIP), as `sudo homelabd kubeconfig` prints it on a K3s server; 503
-/// while no server runs, or without a lab.
+/// the VIP), as `sudo homelabd kubeconfig` prints it; 503 while the control
+/// plane's leader runs no K3s server, or the control plane does not answer.
 async fn lab_kubeconfig(State(driver): State<DriverHandle>) -> Response {
     match driver.kubeconfig().await {
         Ok(k) => ([("content-type", "application/yaml")], k).into_response(),

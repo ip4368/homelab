@@ -119,11 +119,9 @@ impl DriverHandle {
             }
         });
         let handle = Self { client, lab, published };
-        if handle.lab.is_some() {
-            // Reads Kubernetes with the admin kubeconfig a K3s server hands out.
-            let h = handle.clone();
-            tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx));
-        }
+        // Reads Kubernetes with the admin kubeconfig the control plane hands out.
+        let h = handle.clone();
+        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx));
         handle
     }
 
@@ -172,10 +170,15 @@ impl DriverHandle {
             .map_err(|e| LabError::Failed(e.to_string()))
     }
 
-    /// An admin kubeconfig, fetched the way the README says: `sudo homelabd
-    /// kubeconfig` on a host running a K3s server (tried in turn).
+    /// An admin kubeconfig, from the control plane (its leader runs a K3s
+    /// server): no access to a host needed, so it works on real machines too.
     pub async fn kubeconfig(&self) -> Result<String, LabError> {
-        self.on_kube_server(|lab, id| lab.ssh(&id, "sudo homelabd kubeconfig").and_then(|k| if k.contains("apiVersion") { Ok(k) } else { Err(std::io::Error::other(k)) })).await
+        match self.op(ApiOp::GetKubeconfig).await {
+            ApiResult::Ok(serde_json::Value::String(k)) => Ok(k),
+            ApiResult::Ok(v) => Err(LabError::Failed(format!("the control plane answered with no kubeconfig: {v}"))),
+            ApiResult::Err(e) => Err(LabError::Failed(e)),
+            ApiResult::NotLeader | ApiResult::Unavailable => Err(LabError::Failed("the control plane did not answer".into())),
+        }
     }
 
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an

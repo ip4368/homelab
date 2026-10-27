@@ -416,6 +416,13 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
             let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
             return Handling::Answer(result);
         }
+        ApiOp::GetKubeconfig => {
+            let result = match ctx.host().and_then(|os| os.kubeconfig()) {
+                Some(k) => ApiResult::Ok(serde_json::Value::String(k)),
+                None => ApiResult::Err("the leader runs no Kubernetes server yet".into()),
+            };
+            return Handling::Answer(result);
+        }
     };
     Handling::Propose(cmd, serde_json::Value::Null)
 }
@@ -743,6 +750,18 @@ mod tests {
         assert!(matches!(rig.ctx.sent.pop(), Some((_, Msg::SyncResp { .. }))));
         rig.r.on_message(&mut rig.ctx, client.clone(), cordon(2));
         assert!(matches!(rig.proposed().as_slice(), [Command::SetLifecycle { .. }]), "{:?}", rig.proposed());
+    }
+
+    #[test]
+    fn a_leader_without_a_kubernetes_server_has_no_kubeconfig_to_give() {
+        let mut rig = Rig::new(vec![]);
+        rig.elect();
+        rig.ack();
+        let (client, before) = (Endpoint::new(Addr::Client, Svc::Client), rig.proposed());
+        rig.r.on_message(&mut rig.ctx, client, Msg::Api { req: 1, op: ApiOp::GetKubeconfig });
+        let sent = std::mem::take(&mut rig.ctx.sent);
+        assert!(matches!(sent.as_slice(), [(_, Msg::ApiResp { req: 1, result: ApiResult::Err(_) })]), "{sent:?}");
+        assert_eq!(rig.proposed(), before, "a read proposes nothing");
     }
 
     #[test]

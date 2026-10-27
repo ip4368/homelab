@@ -7,7 +7,8 @@
 //!   cluster whose control plane holds `VIP`.
 //! - `homelabd token` asks the cluster for a new join token.
 //! - `homelabd kubeconfig` prints an admin kubeconfig for the cluster's
-//!   Kubernetes, pointed at the VIP (on a control-plane host).
+//!   Kubernetes, pointed at the VIP (this host's own if it runs a K3s
+//!   server, else the control plane's leader's).
 //! - `homelabd status` prints what this host is and how its Kubernetes stands.
 //! - `homelabd upgrade` installs this binary over the running one and restarts it.
 //! - `homelabd run` runs the host's agent, and its CP replica if the host
@@ -26,7 +27,7 @@ use control::replica::{CpReplica, JOIN_TOKEN_TTL_MS};
 use control::state::Command;
 use control::runtime::{Addr, HostOs, Svc};
 use model::{HostId, SwitchId};
-use node::linux::kube::{status_path, KUBECONFIG};
+use node::linux::kube::{admin_kubeconfig, status_path};
 use node::linux::store::write_synced;
 use node::linux::{sh, LinuxOs, LinuxVip, Paths};
 use node::runtime::{wall_ms, Node, NodeConfig, NodeHandle};
@@ -78,7 +79,7 @@ const USAGE: &str = "usage:
   homelabd init --vip IP [--host NAME] [--source URL]   start a new cluster on this machine
   homelabd join VIP TOKEN [--host NAME] [--source URL]  join this machine to a cluster
   homelabd token [-q]                                   create a join token (on a member)
-  homelabd kubeconfig                                   print an admin kubeconfig (on a control-plane host)
+  homelabd kubeconfig                                   print an admin kubeconfig (on a member)
   homelabd status                                       what this host is and how its Kubernetes stands
   homelabd upgrade                                      install this binary and restart the service
   homelabd run                                          run the daemon (the service does this)
@@ -265,8 +266,8 @@ fn join(args: &Args, config: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Asks the control plane, through the VIP, for a new join token.
-fn create_token(cfg: &NodeFile, wait: Duration) -> Result<String, String> {
+/// Asks the control plane, through the VIP, for `op`'s answer: a string.
+fn ask(cfg: &NodeFile, op: ApiOp, wait: Duration) -> Result<String, String> {
     let mut book = AddressBook::default();
     book.fixed.insert(Addr::Vip, cfg.vip);
     let me = Addr::Admin(rand::random());
@@ -274,7 +275,8 @@ fn create_token(cfg: &NodeFile, wait: Duration) -> Result<String, String> {
         .map_err(|e| format!("start a client: {e}"))?;
     let deadline = Instant::now() + wait;
     loop {
-        let req = client.exec_blocking(|n| n.with_actor::<ClientActor, _>(Svc::Client, |c, ctx| c.submit(ctx, ApiOp::CreateJoinToken))).flatten();
+        let op = op.clone();
+        let req = client.exec_blocking(move |n| n.with_actor::<ClientActor, _>(Svc::Client, |c, ctx| c.submit(ctx, op))).flatten();
         let mut answer = None;
         let asked = Instant::now();
         while let Some(req) = req
@@ -285,7 +287,7 @@ fn create_token(cfg: &NodeFile, wait: Duration) -> Result<String, String> {
             answer = client.exec_blocking(move |n| n.with_actor::<ClientActor, _>(Svc::Client, |c, _| c.take_result(req)).flatten()).flatten();
         }
         match answer {
-            Some(ApiResult::Ok(v)) => return v.as_str().map(String::from).ok_or_else(|| "the control plane answered without a token".into()),
+            Some(ApiResult::Ok(v)) => return v.as_str().map(String::from).ok_or_else(|| "the control plane's answer is not text".into()),
             Some(ApiResult::Err(e)) => return Err(e),
             _ if Instant::now() >= deadline => return Err(format!("the control plane at {} did not answer", cfg.vip)),
             _ => std::thread::sleep(Duration::from_secs(1)),
@@ -295,7 +297,7 @@ fn create_token(cfg: &NodeFile, wait: Duration) -> Result<String, String> {
 
 fn token(args: &Args, config: &Path) -> Result<(), String> {
     let cfg = read_config(config)?;
-    let t = create_token(&cfg, Duration::from_secs(20))?;
+    let t = ask(&cfg, ApiOp::CreateJoinToken, Duration::from_secs(20))?;
     if args.quiet {
         println!("{t}");
     } else {
@@ -306,8 +308,11 @@ fn token(args: &Args, config: &Path) -> Result<(), String> {
 
 fn kubeconfig(config: &Path) -> Result<(), String> {
     let cfg = read_config(config)?;
-    let k = std::fs::read_to_string(KUBECONFIG).map_err(|e| format!("read {KUBECONFIG}: {e} (only control-plane hosts have one)"))?;
-    print!("{}", k.replace("https://127.0.0.1:6443", &format!("https://{}:6443", cfg.vip)));
+    let k = match admin_kubeconfig(cfg.vip) {
+        Ok(k) => k,
+        Err(_) => ask(&cfg, ApiOp::GetKubeconfig, Duration::from_secs(20))?,
+    };
+    print!("{k}");
     Ok(())
 }
 

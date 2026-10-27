@@ -273,6 +273,10 @@ pub enum ApiOp {
     /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
     /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.
     GetSeries { entity: MetricEntity, metrics: Vec<String> },
+    /// Reads an admin kubeconfig for the cluster's Kubernetes, pointed at the
+    /// VIP, from the leader's own K3s server (every voter runs one). The
+    /// result is the kubeconfig's text; `Err` until the leader's server is up.
+    GetKubeconfig,
 }
 
 fn default_batch_pct() -> u8 {

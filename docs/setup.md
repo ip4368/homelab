@@ -53,9 +53,9 @@ Machines can be joined in any order and at any time.
 ## Using the cluster
 
 - `sudo homelabd status` on a host shows whether it is a member and how its Kubernetes stands.
-- `sudo homelabd kubeconfig` on a control-plane host prints an admin kubeconfig that points at the VIP:
+- `sudo homelabd kubeconfig` on any member prints an admin kubeconfig that points at the VIP: its own K3s server's on a control-plane host, else the control plane's leader's (every leader runs a K3s server):
   ```sh
-  ssh <a control-plane host> sudo homelabd kubeconfig > ~/.kube/config
+  ssh <a member> sudo homelabd kubeconfig > ~/.kube/config
   kubectl get nodes
   ```
 - `longhorn` is the default StorageClass (3 replicas). If a node dies, Longhorn deletes the pods stuck on it so that they restart elsewhere (`nodeDownPodDeletionPolicy`). Give your pods short `node.kubernetes.io/unreachable` and `not-ready` tolerations (for example 30 s) for a fast failover.
@@ -77,7 +77,7 @@ kubectl delete namespace demo                    # remove it all
 
 The stateful pods tolerate an unreachable node for only 20 s, so powering off their host moves them quickly.
 
-In the lab, the UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with its host, and the Longhorn volumes with where their replicas are and whether they are in sync or rebuilding. The server reads it from the Kubernetes API through the VIP every 3 s.
+The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with its host, and the Longhorn volumes with where their replicas are and whether they are in sync or rebuilding. The server asks the control plane for the admin kubeconfig, then reads the Kubernetes API through the VIP every 3 s, so it needs no access to the hosts themselves.
 
 ## Upgrading homelabd
 
@@ -99,5 +99,5 @@ Remove the host in the UI first, so the cluster forgets it.
 
 - Longhorn's traffic uses the pod network (on mgmt), not the storage VLAN. Moving it to VLAN 20 needs Multus.
 - ARM machines (Pi 5, RK3588): the installer is x86_64-only for now.
-- Authentication: homelabd's API and its node-to-node messages are unauthenticated. Keep the management network trusted.
+- Authentication: homelabd's API and its node-to-node messages are unauthenticated: anyone who can reach the management network can get a join token or an admin kubeconfig. Keep the management network trusted.
 - When a dead control-plane member is replaced, its etcd member is removed only once the replacement is done and the dead host comes back or is removed.

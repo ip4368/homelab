@@ -6,7 +6,7 @@
 use crate::fabric::Fabric;
 use crate::world::{HostHw, World};
 use control::client::{ClientActor, ClusterView, CLIENT};
-use control::proto::{ApiOp, ApiResult, InstanceSpec, KubePhase, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
+use control::proto::{ApiOp, ApiResult, InstanceSpec, KubePhase, KubeRole, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, SimTime, SwitchConfig, SwitchOs, Svc};
@@ -301,6 +301,10 @@ impl HostOs for EngineCtx<'_> {
             version: "sim".into(),
             detail: None,
         })
+    }
+    fn kubeconfig(&self) -> Option<String> {
+        let hw = self.hw().expect(NO_HOST);
+        (hw.kube.as_ref()?.role == KubeRole::Server).then(|| format!("apiVersion: v1\n# the stand-in K3s server on {}\n", self.host_id()))
     }
 }
 

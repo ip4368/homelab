@@ -458,6 +458,10 @@ impl HostOs for LinuxOs {
         self.kube.as_ref()?.status()
     }
 
+    fn kubeconfig(&self) -> Option<String> {
+        kube::admin_kubeconfig(self.vip?).ok()
+    }
+
     fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
         if self.load_cp().is_none() {
             self.store_cp(Durable::new(voters.clone()));

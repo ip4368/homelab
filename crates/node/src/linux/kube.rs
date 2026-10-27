@@ -47,6 +47,16 @@ pub fn status_path(paths: &Paths) -> PathBuf {
     paths.run.join("kube.json")
 }
 
+/// The admin kubeconfig this host's K3s server wrote, pointed at `vip`
+/// instead of the server itself (only K3s servers have one).
+pub fn admin_kubeconfig(vip: Ipv4Addr) -> std::io::Result<String> {
+    Ok(at_vip(&std::fs::read_to_string(KUBECONFIG)?, vip))
+}
+
+fn at_vip(kubeconfig: &str, vip: Ipv4Addr) -> String {
+    kubeconfig.replace("https://127.0.0.1:6443", &format!("https://{vip}:6443"))
+}
+
 /// The systemd unit K3s runs as in `role`.
 fn unit(role: KubeRole) -> &'static str {
     match role {
@@ -439,6 +449,12 @@ mod tests {
         let agent = install_args(&spec(KubeRole::Agent, false), &HostId::from("pi5-01"), vip, "bond0").join(" ");
         assert!(agent.starts_with("agent --server https://10.0.3.253:6443 --node-name pi5-01"), "{agent}");
         assert!(agent.contains("--flannel-iface bond0") && !agent.contains("tls-san"), "{agent}");
+    }
+
+    #[test]
+    fn the_kubeconfig_points_at_the_vip() {
+        let k = "clusters:\n- cluster:\n    server: https://127.0.0.1:6443\n";
+        assert_eq!(at_vip(k, Ipv4Addr::new(10, 0, 3, 253)), "clusters:\n- cluster:\n    server: https://10.0.3.253:6443\n");
     }
 
     #[test]

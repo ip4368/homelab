@@ -284,6 +284,13 @@ fn every_ready_host_runs_kubernetes_with_servers_on_the_voters() {
     assert_eq!(servers, s.cp.voters, "the K3s servers are the CP voters");
     let pi = &s.hosts[&hid("pi5-01")];
     assert_eq!(pi.kube.as_ref().unwrap().labels.get("homelab.io/transcode").map(String::as_str), Some("true"));
+
+    // The leader hands out its K3s server's kubeconfig, so a client needs no access to a host.
+    let leader = e.true_leader().expect("a settled leader");
+    let req = e.api(ApiOp::GetKubeconfig);
+    e.run_for(1000);
+    let Some(ApiResult::Ok(serde_json::Value::String(k))) = e.take_api_result(req) else { panic!("GetKubeconfig gave no kubeconfig") };
+    assert!(k.contains(&format!("server on {leader}")), "{k}");
 }
 
 /// Kills the settled leader at the end of a client write, so its log may

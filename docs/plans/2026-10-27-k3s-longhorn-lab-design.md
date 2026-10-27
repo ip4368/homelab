@@ -41,7 +41,7 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 1. Install Debian 13 on every machine. Cable it to switches whose ports are configured for its template. The mgmt network needs DHCP for new machines, and that pool plus the VIP must be in the mgmt network's reserved range.
 2. On the first machine: `curl -fsSL <url>/install.sh | sudo sh -s -- init --vip <vip>`. This installs homelabd, bootstraps a cluster of one and starts it. homelabd moves the machine onto its static address, installs a K3s server with `--cluster-init`, and deploys Longhorn. The script prints the join command.
 3. On every other machine: `curl -fsSL <url>/install.sh | sudo sh -s -- join <vip> <token>`. Get the token from `sudo homelabd token` on any member, or from the UI. The machine is approved by its rule, put on its template, and then joins K3s. Control-plane hosts join as servers.
-4. `sudo homelabd kubeconfig` on a server prints an admin kubeconfig that points at the VIP.
+4. `sudo homelabd kubeconfig` on any member prints an admin kubeconfig that points at the VIP (from the control plane's leader, a K3s server, if this host is not one).
 
 ## 4. Changes
 
@@ -54,6 +54,7 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - `state`: `ClusterState.kube: Option<KubeCluster { token, init_host }>` and `HostObj.kube: Option<KubeStatus>`. New commands `SetKube` and `RecordKube`.
 - `controllers::kube`: computes the desired spec for each `Ready` host and sends it while the host's reported status does not match. It never acts without quorum, like every controller.
 - `HostOs::apply_kube` and `kube_status`. The sim's world makes them a stand-in that is "installed" after a short delay.
+- `ApiOp::GetKubeconfig`: the leader answers with its own K3s server's admin kubeconfig (`HostOs::kubeconfig`), pointed at the VIP. Nothing is written, and the kubeconfig never enters the Raft log or the state clients sync.
 - `bootstrap::seeded_durable` takes the K3s token and records the init host.
 - The runtime resolves `Addr::Switch` from the LLDP management addresses in the replica's state.
 
@@ -72,7 +73,7 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - Transparent egress (DNS plus the SNI/Host relay). The root disk grows to 32 GB.
 - The technician installs machines over SSH: `init` on `ms01-01`, then `join` with a token from `homelabd token`. *Add VM* does the same.
 - `LLDP` frames carry each switch's management address.
-- `/api/lab/kubeconfig` runs `homelabd kubeconfig` on a server through the guest agent.
+- `/api/lab/kubeconfig` asks the control plane for the kubeconfig (`ApiOp::GetKubeconfig`), so it works without the lab too.
 
 **server and UI**
 - The host drawer shows the K3s role and phase and whether the node is Ready. The top bar shows the K3s node count.
