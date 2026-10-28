@@ -6,7 +6,8 @@ use crate::raft::RaftMsg;
 use crate::runtime::SimTime;
 use crate::controllers::rollout::{DEFAULT_BATCH_PCT, DEFAULT_SOAK_S};
 use crate::state::{Change, Changes, Command, CpMode, NetworkResult};
-use model::network::{LldpNeighbor, ObservedSwitchPort};
+use ipnet::Ipv4Net;
+use model::network::{IpRange, LldpNeighbor, ObservedSwitchPort};
 use model::{Deployment, HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId, Vm, Volume};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -165,6 +166,23 @@ pub struct KubeSpec {
     /// The data disks Longhorn keeps replicas on; empty on a host without an
     /// active storage role.
     pub storage_disks: Vec<String>,
+    /// The network Longhorn replicates over; `None` keeps its traffic on the
+    /// pod network. The same for every host.
+    #[serde(default)]
+    pub storage_network: Option<StorageNetwork>,
+    /// The host's static address on the storage network: the interface that
+    /// holds it carries Longhorn's attachment. `None` if it has none.
+    #[serde(default)]
+    pub storage_ip: Option<Ipv4Addr>,
+}
+
+/// The storage network as Longhorn's pods use it: each host attaches them
+/// (Multus, macvlan) to its own interface on the network, and they take
+/// addresses from `pods`, which IPAM never hands to hosts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageNetwork {
+    pub subnet: Ipv4Net,
+    pub pods: IpRange,
 }
 
 /// What the leader asks one running K3s server to do for the whole cluster,

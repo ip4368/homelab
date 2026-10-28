@@ -4,6 +4,7 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+ipnet.workspace = true
 model = { path = "../model" }
 rand_chacha.workspace = true
 serde.workspace = true

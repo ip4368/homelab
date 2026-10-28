@@ -183,6 +183,7 @@ dependencies = [
 name = "control"
 version = "0.1.0"
 dependencies = [
+ "ipnet",
  "model",
  "rand_chacha",
  "serde",

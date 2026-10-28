@@ -17,6 +17,13 @@
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
 //!    Longhorn to use it). A host that stores no more loses that label.
 //!
+//! With a storage network in the spec, Longhorn replicates over it: every
+//! K3s server also writes the Multus (and whereabouts) charts and the
+//! `NetworkAttachmentDefinition` Longhorn uses, which has no config of its
+//! own; each host writes that config, a macvlan on its own interface on the
+//! network ([`storage_attachment`]), where Multus looks for it, before
+//! anything else.
+//!
 //! On a server, it also reads etcd's members (K3s's `/db/info`) for the
 //! status, and does the work the leader asks of it for the cluster
 //! ([`KubeAdmin`]): it deletes the nodes of dead members, so K3s removes
@@ -25,7 +32,7 @@
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
 use super::{sh, LinuxVip, Paths};
-use control::proto::{KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus};
+use control::proto::{KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus, StorageNetwork};
 use model::HostId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -57,6 +64,19 @@ const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
 /// On a Longhorn node: the disks the control plane took out of scheduling
 /// because the host does not store, to give back once it does.
 const STORAGE_OFF_ANNOTATION: &str = "homelab.io/storage-off";
+/// Longhorn's storage network: the `NetworkAttachmentDefinition` (in
+/// `longhorn-system`) and the name of each host's config for it.
+pub const STORAGE_ATTACHMENT: &str = "homelab-storage";
+/// Where Multus looks for the config of an attachment whose definition has
+/// none: each host's own, for its own interface.
+const MULTUS_CONF_DIR: &str = "/etc/cni/multus/net.d";
+const MULTUS_MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-multus.yaml";
+/// The rke2-multus chart (with whereabouts) and its CRDs, as K3s documents them.
+pub const MULTUS_CHART_VERSION: &str = "v4.3.118";
+const MULTUS_CRD_CHART_VERSION: &str = "4.3.118";
+/// Where K3s's CNI configs and plugins live, which Multus and whereabouts use.
+const K3S_CNI_CONF: &str = "/var/lib/rancher/k3s/agent/etc/cni/net.d";
+const K3S_CNI_BIN: &str = "/var/lib/rancher/k3s/data/cni/";
 /// A K3s server's certificates: its CA and the admin's client certificate.
 const SERVER_TLS: &str = "/var/lib/rancher/k3s/server/tls";
 
@@ -83,7 +103,20 @@ fn unit(role: KubeRole) -> &'static str {
 }
 
 /// The Longhorn deployment, as a manifest K3s's helm controller installs.
-pub fn longhorn_manifest() -> String {
+/// With `storage_network`, Longhorn replicates over the storage network
+/// ([`STORAGE_ATTACHMENT`]) and runs only on the hosts attached to it.
+pub fn longhorn_manifest(storage_network: bool) -> String {
+    let label = control::controllers::kube::STORAGE_NETWORK_LABEL;
+    let (settings, manager) = if storage_network {
+        (
+            format!(
+                "      storageNetwork: longhorn-system/{STORAGE_ATTACHMENT}\n      systemManagedComponentsNodeSelector: \"{label}:true\"\n"
+            ),
+            format!("    longhornManager:\n      nodeSelector:\n        {label}: \"true\"\n"),
+        )
+    } else {
+        (String::new(), String::new())
+    };
     format!(
         "# Written by homelabd on every K3s server: Longhorn, storing on the data
 # disks of the hosts with the storage role.
@@ -102,13 +135,90 @@ spec:
     defaultSettings:
       createDefaultDiskLabeledNodes: true
       nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
-    persistence:
+{settings}    persistence:
       defaultClass: true
       defaultClassReplicaCount: 3
     longhornUI:
       replicas: 1
+{manager}"
+    )
+}
+
+/// Multus (thin, with whereabouts for addresses) installed through K3s's
+/// helm controller, and Longhorn's storage network attachment. The
+/// attachment has no config: Multus reads each host's own
+/// ([`storage_attachment`]). K3s applies it once the CRD chart is in.
+pub fn multus_manifest() -> String {
+    format!(
+        "# Written by homelabd on every K3s server: Multus, which attaches
+# Longhorn's pods to the storage network on each host.
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: multus-crd
+  namespace: kube-system
+spec:
+  repo: https://rke2-charts.rancher.io
+  chart: rke2-multus-crd
+  version: {MULTUS_CRD_CHART_VERSION}
+  targetNamespace: kube-system
+---
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: multus
+  namespace: kube-system
+spec:
+  repo: https://rke2-charts.rancher.io
+  chart: rke2-multus
+  version: {MULTUS_CHART_VERSION}
+  targetNamespace: kube-system
+  valuesContent: |-
+    config:
+      fullnameOverride: multus
+      cni_conf:
+        confDir: {K3S_CNI_CONF}
+        binDir: {K3S_CNI_BIN}
+        kubeconfig: {K3S_CNI_CONF}/multus.d/multus.kubeconfig
+        multusAutoconfigDir: {K3S_CNI_CONF}
+    rke2-whereabouts:
+      fullnameOverride: whereabouts
+      enabled: true
+      cniConf:
+        confDir: {K3S_CNI_CONF}
+        binDir: {K3S_CNI_BIN}
+---
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: {STORAGE_ATTACHMENT}
+  namespace: longhorn-system
+spec: {{}}
 "
     )
+}
+
+/// This host's config of Longhorn's storage network attachment: a macvlan
+/// on `master` (its interface on the network), with addresses from the
+/// network's pod range, network and broadcast addresses left out.
+pub fn storage_attachment(master: &str, net: &StorageNetwork) -> String {
+    let first = net.pods.first.max(Ipv4Addr::from(u32::from(net.subnet.network()) + 1));
+    let last = net.pods.last.min(Ipv4Addr::from(u32::from(net.subnet.broadcast()) - 1));
+    let conf = serde_json::json!({
+        "cniVersion": "0.3.1",
+        "name": STORAGE_ATTACHMENT,
+        "type": "macvlan",
+        "master": master,
+        "mode": "bridge",
+        "ipam": {
+            "type": "whereabouts",
+            "range": net.subnet.trunc().to_string(),
+            "range_start": first.to_string(),
+            "range_end": last.to_string(),
+            "configuration_path": format!("{K3S_CNI_CONF}/whereabouts.d/whereabouts.conf"),
+        },
+    });
+    serde_json::to_string_pretty(&conf).expect("a CNI config serializes") + "\n"
 }
 
 /// The node names of the etcd members in K3s's `/db/info`: a member is named
@@ -122,6 +232,27 @@ pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
             _ => HostId::from(n),
         })
         .collect())
+}
+
+/// The running pods in `pods` (`kubectl get pods -o json`) that asked
+/// Multus for the storage network attachment and did not get it: their
+/// sandbox was made while K3s's CNI config lacked Multus (K3s reinstalled,
+/// or Multus not started yet on a new node), so they run on the pod
+/// network alone.
+pub fn pods_missing_attachment(pods: &serde_json::Value) -> Vec<String> {
+    let want = format!("longhorn-system/{STORAGE_ATTACHMENT}");
+    let attached = |p: &serde_json::Value, key: &str, field: &str| -> bool {
+        let list: Vec<serde_json::Value> = p["metadata"]["annotations"][key].as_str().and_then(|a| serde_json::from_str(a).ok()).unwrap_or_default();
+        list.iter().any(|n| match field {
+            "networks" => n["name"] == STORAGE_ATTACHMENT,
+            _ => n["name"] == want.as_str(),
+        })
+    };
+    let pods = pods["items"].as_array().into_iter().flatten();
+    pods.filter(|p| p["status"]["phase"] == "Running" && p["metadata"]["deletionTimestamp"].is_null())
+        .filter(|p| attached(p, "k8s.v1.cni.cncf.io/networks", "networks") && !attached(p, "k8s.v1.cni.cncf.io/network-status", "status"))
+        .filter_map(|p| p["metadata"]["name"].as_str().map(String::from))
+        .collect()
 }
 
 /// Whether a node (`kubectl get node -o json`) is `Ready`.
@@ -362,6 +493,10 @@ impl Worker {
             };
             return (status, true);
         };
+        // Before K3s, so Longhorn's pods never start here without it.
+        if let Err(e) = self.write_storage_attachment(spec) {
+            return (self.status(&o, KubePhase::Failed(e)), false);
+        }
         if o.role != Some(spec.role) {
             self.applied = None;
             kube.set_status(self.installing(&o, format!("installing K3s as {:?}", spec.role)));
@@ -379,10 +514,17 @@ impl Worker {
         if let Some(why) = &o.unregistered {
             return (self.installing(&o, format!("waiting for the node to register: {why}")), true);
         }
-        if spec.role == KubeRole::Server
-            && let Err(e) = write_if_changed(Path::new(MANIFEST), &longhorn_manifest())
-        {
-            return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifest: {e}"))), false);
+        if spec.role == KubeRole::Server {
+            let multus = match spec.storage_network {
+                Some(_) => write_if_changed(Path::new(MULTUS_MANIFEST), &multus_manifest()),
+                None => Ok(()),
+            };
+            if let Err(e) = multus.and_then(|()| write_if_changed(Path::new(MANIFEST), &longhorn_manifest(spec.storage_network.is_some()))) {
+                return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifests: {e}"))), false);
+            }
+        }
+        if spec.storage_network.is_some() && spec.storage_ip.is_some() {
+            self.reattach_longhorn(spec.role);
         }
         if self.applied.as_ref() != Some(spec) {
             if let Err(e) = self.label(spec) {
@@ -422,6 +564,36 @@ impl Worker {
         let (ca, cert, key) = (tls("server-ca.crt"), tls("client-admin.crt"), tls("client-admin.key"));
         let info = sh("curl", &["-fsS", "--max-time", "5", "--cacert", &ca, "--cert", &cert, "--key", &key, "https://127.0.0.1:6443/db/info"]);
         info.map_err(|e| e.to_string()).and_then(|i| etcd_member_nodes(&i)).unwrap_or_default()
+    }
+
+    /// Writes this host's config of the storage network attachment where
+    /// Multus looks for it, or removes it when the spec has none for it.
+    fn write_storage_attachment(&self, spec: &KubeSpec) -> Result<(), String> {
+        let path = Path::new(MULTUS_CONF_DIR).join(format!("{STORAGE_ATTACHMENT}.conf"));
+        let (Some(net), Some(ip)) = (&spec.storage_network, spec.storage_ip) else {
+            return match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("remove {}: {e}", path.display())),
+                _ => Ok(()),
+            };
+        };
+        let master = LinuxVip::addresses().into_iter().find(|(_, a)| *a == ip).map(|(name, _)| name);
+        let master = master.ok_or_else(|| format!("no interface has the storage address {ip}"))?;
+        write_if_changed(&path, &storage_attachment(&master, net)).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// Deletes this node's Longhorn instance managers that run without the
+    /// storage network they asked for ([`pods_missing_attachment`]);
+    /// Longhorn makes them again, attached.
+    fn reattach_longhorn(&self, role: KubeRole) {
+        let selector = format!("spec.nodeName={}", self.host);
+        let pods = self.kubectl(role, &["-n", "longhorn-system", "get", "pods", "--field-selector", &selector, "-l", "longhorn.io/component=instance-manager", "-o", "json"]);
+        let Ok(pods) = pods.and_then(|j| serde_json::from_str::<serde_json::Value>(&j).map_err(|e| e.to_string())) else { return };
+        for pod in pods_missing_attachment(&pods) {
+            eprintln!("homelabd: kubernetes: {pod} runs without the storage network: deleting it so Longhorn makes it again");
+            if let Err(e) = self.kubectl(role, &["-n", "longhorn-system", "delete", "pod", &pod, "--wait=false"]) {
+                eprintln!("homelabd: kubernetes: {e}");
+            }
+        }
     }
 
     /// Does `admin` with this server's admin access: deletes the nodes of
@@ -607,6 +779,8 @@ mod tests {
             node_ip: Ipv4Addr::new(10, 0, 0, 2),
             labels: [("homelab.io/profile".to_string(), "ms01".to_string())].into(),
             storage_disks: vec!["nvme0".into()],
+            storage_network: None,
+            storage_ip: None,
         }
     }
 
@@ -651,8 +825,57 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v[1]["path"], "/mnt/nvme1");
         assert_eq!(v[0]["allowScheduling"], true);
-        assert!(longhorn_manifest().contains(&format!("version: {LONGHORN_VERSION}")));
-        assert!(longhorn_manifest().contains("createDefaultDiskLabeledNodes: true"));
+        assert!(longhorn_manifest(false).contains(&format!("version: {LONGHORN_VERSION}")));
+        assert!(longhorn_manifest(false).contains("createDefaultDiskLabeledNodes: true"));
+    }
+
+    #[test]
+    fn longhorn_replicates_over_the_storage_network_only_where_it_is() {
+        let off = longhorn_manifest(false);
+        assert!(!off.contains("storageNetwork") && !off.contains("nodeSelector"), "{off}");
+        let on = longhorn_manifest(true);
+        assert!(on.contains("      storageNetwork: longhorn-system/homelab-storage\n"), "{on}");
+        assert!(on.contains("      systemManagedComponentsNodeSelector: \"homelab.io/storage-network:true\"\n"), "{on}");
+        assert!(on.ends_with("    longhornManager:\n      nodeSelector:\n        homelab.io/storage-network: \"true\"\n"), "{on}");
+        assert!(on.contains("    persistence:\n      defaultClass: true\n"), "the settings stay inside defaultSettings: {on}");
+        let multus = multus_manifest();
+        assert!(multus.contains(&format!("chart: rke2-multus\n  version: {MULTUS_CHART_VERSION}\n")), "{multus}");
+        assert!(multus.contains("chart: rke2-multus-crd\n") && multus.contains("      enabled: true\n"), "the CRDs and whereabouts: {multus}");
+        assert!(multus.ends_with("kind: NetworkAttachmentDefinition\nmetadata:\n  name: homelab-storage\n  namespace: longhorn-system\nspec: {}\n"), "{multus}");
+    }
+
+    #[test]
+    fn each_host_attaches_longhorn_to_its_own_storage_interface_with_addresses_from_the_pod_range() {
+        let net = StorageNetwork { subnet: "10.20.0.0/22".parse().unwrap(), pods: model::network::STORAGE_RESERVED };
+        let conf: serde_json::Value = serde_json::from_str(&storage_attachment("bond0.20", &net)).unwrap();
+        assert_eq!((conf["name"].as_str(), conf["type"].as_str(), conf["master"].as_str()), (Some(STORAGE_ATTACHMENT), Some("macvlan"), Some("bond0.20")));
+        let ipam = &conf["ipam"];
+        assert_eq!(ipam["type"], "whereabouts");
+        assert_eq!((ipam["range"].as_str(), ipam["range_start"].as_str()), (Some("10.20.0.0/22"), Some("10.20.3.0")));
+        assert_eq!(ipam["range_end"], "10.20.3.254", "not the broadcast address");
+        let edge = StorageNetwork { subnet: "10.20.0.0/24".parse().unwrap(), pods: model::network::IpRange { first: "10.20.0.0".parse().unwrap(), last: "10.20.0.9".parse().unwrap() } };
+        let conf: serde_json::Value = serde_json::from_str(&storage_attachment("eth0.20", &edge)).unwrap();
+        assert_eq!(conf["ipam"]["range_start"], "10.20.0.1", "not the network address");
+    }
+
+    #[test]
+    fn an_instance_manager_that_runs_without_the_storage_network_it_asked_for_is_found() {
+        let pod = |name: &str, phase: &str, asked: bool, got: bool| {
+            let mut annotations = serde_json::Map::new();
+            if asked {
+                annotations.insert("k8s.v1.cni.cncf.io/networks".into(), r#"[{"namespace": "longhorn-system", "name": "homelab-storage", "interface": "lhnet1"}]"#.into());
+            }
+            let status = if got { r#"[{"name":"cbr0","ips":["10.42.4.9"]},{"name":"longhorn-system/homelab-storage","interface":"lhnet1","ips":["10.20.3.4"]}]"# } else { r#"[{"name":"cbr0","ips":["10.42.4.9"]}]"# };
+            annotations.insert("k8s.v1.cni.cncf.io/network-status".into(), status.into());
+            serde_json::json!({ "metadata": { "name": name, "annotations": annotations }, "status": { "phase": phase } })
+        };
+        let pods = serde_json::json!({ "items": [
+            pod("im-ok", "Running", true, true),
+            pod("im-bare", "Running", true, false),
+            pod("im-starting", "Pending", true, false),
+            pod("im-before", "Running", false, false),
+        ] });
+        assert_eq!(pods_missing_attachment(&pods), ["im-bare"], "a pod that never asked, or is still starting, is left alone");
     }
 
     #[test]

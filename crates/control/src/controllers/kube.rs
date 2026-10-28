@@ -17,6 +17,9 @@
 //!   a running server is asked to take such a host's Longhorn disks out of
 //!   scheduling ([`KubeAdmin::storage_off`]), and to give them back once the
 //!   host stores again.
+//! * Longhorn replicates over the storage network when it has a reserved
+//!   range for Longhorn's pods ([`storage_network`]): every host attached
+//!   to it gets it in its spec, with its own address there.
 //!
 //! Replacing a dead server, etcd's way: remove the dead member, then add the
 //! new one.
@@ -32,10 +35,11 @@
 use super::membership::target_size;
 use super::{Action, Volatile};
 use crate::bootstrap::profile_prefix;
-use crate::proto::{mgmt, KubeAdmin, KubeRole, KubeSpec, KubeStatus, Msg};
+use crate::proto::{mgmt, KubeAdmin, KubeRole, KubeSpec, KubeStatus, Msg, StorageNetwork};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, HostObj, Lifecycle};
-use model::{eligible, HostId, Role};
+use model::network::NetworkPurpose;
+use model::{eligible, HostId, NetworkId, Role};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// How long the controller waits for a host to run its spec before sending
@@ -43,6 +47,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const KUBE_RESEND_MS: u64 = 15_000;
 /// The prefix of the node labels the control plane sets.
 pub const LABEL_PREFIX: &str = "homelab.io/";
+/// The node label of hosts attached to the storage network: Longhorn runs
+/// on them (it needs the network on every node it runs on).
+pub const STORAGE_NETWORK_LABEL: &str = "homelab.io/storage-network";
 
 /// A role's name in a node label, e.g. `homelab.io/control-plane=true`.
 pub fn role_label(r: Role) -> &'static str {
@@ -118,6 +125,14 @@ fn runs_server(status: Option<&KubeStatus>) -> bool {
     status.is_some_and(|s| s.role == Some(KubeRole::Server) && s.phase == crate::proto::KubePhase::Running)
 }
 
+/// The network Longhorn replicates over: the storage network, if it has a
+/// reserved range for Longhorn's pods to take addresses from (its first).
+pub fn storage_network(state: &ClusterState) -> Option<(NetworkId, StorageNetwork)> {
+    let n = state.networks.values().map(|n| &n.network).find(|n| n.purpose == NetworkPurpose::Storage)?;
+    let pods = *n.reserved.first()?;
+    Some((n.id.clone(), StorageNetwork { subnet: n.subnet, pods }))
+}
+
 /// The etcd members, as the servers on up hosts report them.
 pub fn etcd_members(state: &ClusterState, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> BTreeSet<HostId> {
     let reports = state.hosts.keys().filter(|id| up(state, id)).filter_map(|id| status(id).filter(|s| runs_server(Some(s))));
@@ -183,7 +198,13 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
         }
     }
     let storage_disks = if stores(h) { h.inventory.disks.iter().filter(|d| !d.failed).map(|d| d.name.clone()).collect() } else { vec![] };
-    Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels: node_labels(h), storage_disks })
+    let net = storage_network(state);
+    let storage_ip = net.as_ref().and_then(|(n, _)| h.ips.get(n).copied());
+    let mut labels = node_labels(h);
+    if storage_ip.is_some() {
+        labels.insert(STORAGE_NETWORK_LABEL.into(), "true".into());
+    }
+    Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels, storage_disks, storage_network: net.map(|(_, n)| n), storage_ip })
 }
 
 /// What a running server is to do for the cluster now, sent to the first
@@ -256,7 +277,10 @@ mod tests {
             s.apply(0, Command::AddPendingHost { id: hid(id), profile, inventory: Inventory::from_profile(*p, 0), location: "lab".into() }).unwrap();
             let roles = crate::bootstrap::seed_rule_roles(*p);
             s.apply(0, Command::ApproveHost { id: hid(id), roles }).unwrap();
-            let ips = [(mgmt(), std::net::Ipv4Addr::new(10, 0, 0, 10 + i as u8))].into();
+            let mut ips: BTreeMap<_, _> = [(mgmt(), std::net::Ipv4Addr::new(10, 0, 0, 10 + i as u8))].into();
+            if *p != ProfileId::Pi5 {
+                ips.insert(storage(), std::net::Ipv4Addr::new(10, 20, 0, 10 + i as u8));
+            }
             s.apply(0, Command::ProvisionHost { id: hid(id), template: None, ips }).unwrap();
             ready(&mut s, id);
         }
@@ -515,6 +539,29 @@ mod tests {
         roles.remove(&Role::Storage);
         s.apply(0, Command::SetRoles { id: hid("ms01-04"), roles }).unwrap();
         assert_eq!(asked(&run(&s, &v, 0))[0].1.storage_off, set(&["ms01-04"]));
+    }
+
+    #[test]
+    fn longhorn_replicates_over_the_storage_network_on_the_hosts_attached_to_it() {
+        let mut s = cluster(&[("pi5-01", ProfileId::Pi5)]);
+        let first = desired(&s, &hid("ms01-01"), &|_| None).unwrap();
+        let net = first.storage_network.clone().expect("the seed storage network reserves Longhorn's pod addresses");
+        assert_eq!((net.subnet.to_string(), net.pods), ("10.20.0.0/22".to_string(), model::network::STORAGE_RESERVED));
+        assert_eq!(first.storage_ip, s.hosts[&hid("ms01-01")].ips.get(&storage()).copied());
+        assert!(first.storage_ip.is_some());
+        assert_eq!(first.labels[STORAGE_NETWORK_LABEL], "true", "Longhorn runs here");
+        let server = |id: &HostId| (id.as_str() == "ms01-01").then(|| running(KubeRole::Server));
+        let pi = desired(&s, &hid("pi5-01"), &server).unwrap();
+        assert_eq!((pi.storage_network, pi.storage_ip), (Some(net), None), "the same network, no address on it");
+        assert!(!pi.labels.contains_key(STORAGE_NETWORK_LABEL), "Longhorn stays off a host it cannot replicate from");
+
+        // A storage network without a range for the pods: Longhorn stays on the pod network.
+        let mut network = s.networks[&storage()].network.clone();
+        network.reserved.clear();
+        s.apply(0, Command::UpsertNetwork { network }).unwrap();
+        let spec = desired(&s, &hid("ms01-01"), &|_| None).unwrap();
+        assert_eq!((spec.storage_network, spec.storage_ip), (None, None));
+        assert!(!spec.labels.contains_key(STORAGE_NETWORK_LABEL));
     }
 
     #[test]
