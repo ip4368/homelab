@@ -122,6 +122,9 @@ pub struct PortTruth {
     pub rx_bps: f64,
     pub tx_bps: f64,
     pub counters: PortCounters,
+    /// Bytes the port took in, by VLAN.
+    #[ts(type = "Record<number, number>")]
+    pub vlan_rx_bytes: BTreeMap<u16, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -841,7 +844,8 @@ impl Lab {
                         Peer::Host { host, nic, .. } => (Some(host.clone()), Some(nic.clone())),
                         _ => (None, None),
                     };
-                    PortTruth { switch: d.switch.clone(), port: d.name.clone(), host, nic, link_up: c.link_up(i), rx_bps, tx_bps, counters: counters[i] }
+                    let vlan_rx_bytes = c.vlan_rx_bytes(i);
+                    PortTruth { switch: d.switch.clone(), port: d.name.clone(), host, nic, link_up: c.link_up(i), rx_bps, tx_bps, counters: counters[i], vlan_rx_bytes }
                 })
                 .collect::<Vec<_>>();
             *last = Some((now, counters));

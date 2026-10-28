@@ -114,6 +114,8 @@ struct Port {
     rx: Bucket,
     tx: Bucket,
     counters: PortCounters,
+    /// Bytes taken in for each VLAN (frames the port carries on it).
+    vlan_rx_bytes: BTreeMap<u16, u64>,
     /// The LACP partner's latest LACPDU, and when it came.
     partner: Option<(LacpInfo, Instant)>,
     last_lacp: Option<Instant>,
@@ -185,6 +187,7 @@ impl Core {
                     rx: Bucket { tokens: f64::MAX, at: now },
                     tx: Bucket { tokens: f64::MAX, at: now },
                     counters: PortCounters::default(),
+                    vlan_rx_bytes: BTreeMap::new(),
                     partner: None,
                     last_lacp: None,
                     last_lldp: None,
@@ -215,6 +218,11 @@ impl Core {
 
     pub fn counters(&self, port: PortId) -> PortCounters {
         self.ports[port].counters
+    }
+
+    /// The bytes `port` took in on each VLAN.
+    pub fn vlan_rx_bytes(&self, port: PortId) -> BTreeMap<u16, u64> {
+        self.ports[port].vlan_rx_bytes.clone()
     }
 
     pub fn switch_up(&self, s: &SwitchId) -> bool {
@@ -443,6 +451,7 @@ impl Core {
             p.counters.drop_mtu += 1;
             return;
         }
+        *p.vlan_rx_bytes.entry(vlan).or_default() += f.len() as u64;
         let s = p.def.switch.clone();
         let from = match &p.def.cfg.lacp_group {
             Some(g) => Egress::Lag(g.clone()),
@@ -681,6 +690,11 @@ mod tests {
         assert_eq!(c.counters(0).drop_vlan, 1);
         let unknown = c.ingress(1, &frame(BCAST, B, Some(30), 100), now);
         assert!(unknown.is_empty(), "VLAN 30 is not allowed on the trunk");
+        let sent = frame(BCAST, B, Some(20), 100).len() as u64;
+        assert_eq!(c.vlan_rx_bytes(1), [(20, sent)].into(), "bytes are counted on the VLAN they ride, dropped frames not");
+        c.ingress(1, &frame(BCAST, B, None, 100), now);
+        assert_eq!(c.vlan_rx_bytes(1).keys().copied().collect::<Vec<_>>(), [1, 20], "untagged frames ride the native VLAN");
+        assert!(c.vlan_rx_bytes(0).is_empty());
     }
 
     #[test]

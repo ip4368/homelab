@@ -8,4 +8,8 @@ export type PortTruth = { switch: SwitchId, port: PortName,
 /**
  * The host and NIC cabled to it, if any.
  */
-host: HostId | null, nic: string | null, link_up: boolean, rx_bps: number, tx_bps: number, counters: PortCounters, };
+host: HostId | null, nic: string | null, link_up: boolean, rx_bps: number, tx_bps: number, counters: PortCounters, 
+/**
+ * Bytes the port took in, by VLAN.
+ */
+vlan_rx_bytes: Record<number, number>, };

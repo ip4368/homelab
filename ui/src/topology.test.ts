@@ -19,6 +19,7 @@ const load = (sw: string, port: string, rx_bps: number, tx_bps: number, host: st
   rx_bps,
   tx_bps,
   counters,
+  vlan_rx_bytes: {},
 })
 
 function sw(id: string, ports: string[] = [], mlag_peer: string | null = null): SwitchObj {
