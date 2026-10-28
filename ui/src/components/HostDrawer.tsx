@@ -7,8 +7,9 @@ import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
 import { podTone, podsOn, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
-import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
+import { hostWorkloads, removeHostDetail, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
+import { ConfirmDialog } from './ConfirmDialog'
 import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
@@ -146,20 +147,15 @@ function ControlPlane({ host }: { host: HostObj }) {
   const voters = useStore((s) => s.view.cp.voters)
   const hostCount = useStore((s) => Object.keys(s.view.hosts).length)
   const { error, busy, run } = useAction()
+  const [confirming, setConfirming] = useState<'add' | 'remove' | null>(null)
   if (host.lifecycle === 'Pending') return null
   const isVoter = voters.includes(host.id)
   const target = hostCount > 50 ? 5 : 3
   const reason = host.lifecycle !== 'Ready' ? `only a Ready host votes (this one is ${host.lifecycle})` : ineligibleReason(host.profile, 'ControlPlane')
   const extra = voters.length > target
-  const add = () => {
-    if (window.confirm(`Add ${host.id} to the control plane? It will install a K3s server and join as a voter; remove the host it replaces afterwards.`)) {
-      run(() => op({ AddCpMember: { with: host.id } }))
-    }
-  }
-  const remove = () => {
-    if (window.confirm(`Remove ${host.id} from the control plane? Its K3s server will reinstall as an agent. Only do this once its replacement votes with a running server.`)) {
-      run(() => op({ RemoveCpMember: { dead: host.id } }))
-    }
+  const confirm = (send: () => Promise<unknown>) => {
+    setConfirming(null)
+    run(send)
   }
   return (
     <div className="section">
@@ -170,7 +166,7 @@ function ControlPlane({ host }: { host: HostObj }) {
       </p>
       {isVoter ? (
         <div className="actions">
-          <button onClick={remove} disabled={busy}>
+          <button onClick={() => setConfirming('remove')} disabled={busy}>
             Remove from control plane
           </button>
         </div>
@@ -178,13 +174,23 @@ function ControlPlane({ host }: { host: HostObj }) {
         <p className="muted">{reason}.</p>
       ) : (
         <div className="actions">
-          <button onClick={add} disabled={busy || extra} title={extra ? 'The control plane already has an extra member; remove the replaced host first' : undefined}>
+          <button onClick={() => setConfirming('add')} disabled={busy || extra} title={extra ? 'The control plane already has an extra member; remove the replaced host first' : undefined}>
             Add to control plane
           </button>
         </div>
       )}
       {error && <div className="bad">{error}</div>}
       <p className="muted">The control-plane role below follows this membership.</p>
+      {confirming === 'add' && (
+        <ConfirmDialog title={`Add ${host.id} to the control plane?`} confirmLabel="Add" onConfirm={() => confirm(() => op({ AddCpMember: { with: host.id } }))} onCancel={() => setConfirming(null)}>
+          <p>It will install a K3s server and join as a voter; remove the host it replaces afterwards.</p>
+        </ConfirmDialog>
+      )}
+      {confirming === 'remove' && (
+        <ConfirmDialog title={`Remove ${host.id} from the control plane?`} confirmLabel="Remove" onConfirm={() => confirm(() => op({ RemoveCpMember: { dead: host.id } }))} onCancel={() => setConfirming(null)}>
+          <p>Its K3s server will reinstall as an agent. Only do this once its replacement votes with a running server.</p>
+        </ConfirmDialog>
+      )}
     </div>
   )
 }
@@ -284,13 +290,13 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
   const vmStatus = useStore((s) => s.view.vmStatus)
   const volumeStatus = useStore((s) => s.view.volumeStatus)
   const { error, busy, run } = useAction()
+  const [confirmingRemove, setConfirmingRemove] = useState(false)
   if (!host) return null
 
+  // Removal is permanent for the session: say what it does to what runs here.
   const remove = () => {
-    // Removal is permanent for the session: say what it does to what runs here.
-    if (window.confirm(removeHostPrompt(host.id, hostWorkloads({ pods, vmStatus, volumeStatus }, host.id)))) {
-      run(() => op({ RemoveHost: { id: host.id } }))
-    }
+    setConfirmingRemove(false)
+    run(() => op({ RemoveHost: { id: host.id } }))
   }
 
   const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0]) =>
@@ -326,13 +332,18 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
           {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
           {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
           {host.lifecycle !== 'Removed' && (
-            <button onClick={remove} disabled={busy}>
+            <button onClick={() => setConfirmingRemove(true)} disabled={busy}>
               Remove
             </button>
           )}
         </div>
         {error && <div className="bad">{error}</div>}
       </div>
+      {confirmingRemove && (
+        <ConfirmDialog title={`Remove ${host.id}?`} confirmLabel="Remove" onConfirm={remove} onCancel={() => setConfirmingRemove(false)}>
+          <p>{removeHostDetail(hostWorkloads({ pods, vmStatus, volumeStatus }, host.id))}</p>
+        </ConfirmDialog>
+      )}
       <div className="section">
         <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>

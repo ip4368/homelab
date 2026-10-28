@@ -168,8 +168,8 @@ function count(n: number, what: string): string {
   return `${n} ${what}${n === 1 ? '' : 's'}`
 }
 
-/** The confirmation asked before removing `host`, naming what is placed on it. */
-export function removeHostPrompt(host: string, w: HostWorkloads): string {
+/** What removing a host does to what is placed on it: the confirmation dialog's body. */
+export function removeHostDetail(w: HostWorkloads): string {
   const placed = [
     w.vms.length > 0 && count(w.vms.length, 'VM'),
     w.pods.length > 0 && count(w.pods.length, 'pod'),
@@ -179,7 +179,7 @@ export function removeHostPrompt(host: string, w: HostWorkloads): string {
     placed.length === 0
       ? 'Nothing is placed on it.'
       : `It has ${placed.length === 1 ? placed[0] : `${placed.slice(0, -1).join(', ')} and ${placed[placed.length - 1]}`}: VMs restart elsewhere (cold), pods are rescheduled and its replicas are dropped and rebuilt elsewhere.`
-  return `Remove ${host}? ${what} The host cannot rejoin until the preset is reloaded.`
+  return `${what} The host cannot rejoin until the preset is reloaded.`
 }
 
 /** Hosts a VM may be migrated to: Ready, with the Vm role, and not the host it is on. */

@@ -10,6 +10,7 @@ import type { Role } from '../gen/Role'
 import type { TemplateObj } from '../gen/TemplateObj'
 import { formFromNetwork, networkFromForm, parseInUse, formProblems, type NetworkForm } from '../netedit'
 import { useStore } from '../store'
+import { ConfirmDialog } from './ConfirmDialog'
 import { ConfigForm } from './NetworkEditor'
 import { RolloutDialog } from './RolloutDialog'
 import { useAction } from './useAction'
@@ -40,18 +41,27 @@ function Refusal({ what, error }: { what: string; error: string }) {
   )
 }
 
-/** Delete button that keeps the server's refusal next to it. */
+/** Delete button that asks first and keeps the server's refusal next to it. */
 function useDelete(what: string, send: () => Promise<unknown>) {
   const { error, busy, run } = useAction()
+  const [confirming, setConfirming] = useState(false)
   const button = (
-    <button
-      disabled={busy}
-      onClick={() => {
-        if (window.confirm(`Delete ${what}?`)) void run(send)
-      }}
-    >
-      Delete
-    </button>
+    <>
+      <button disabled={busy} onClick={() => setConfirming(true)}>
+        Delete
+      </button>
+      {confirming && (
+        <ConfirmDialog
+          title={`Delete ${what}?`}
+          confirmLabel="Delete"
+          onConfirm={() => {
+            setConfirming(false)
+            void run(send)
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </>
   )
   return { button, refusal: error ? <Refusal what={what} error={error} /> : null }
 }
