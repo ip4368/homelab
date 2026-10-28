@@ -4,7 +4,7 @@
 // plane's view and the lab's ground truth) and `POST /api/lab/fault` (things
 // done to hardware). Each step is a success criterion of the real VM lab
 // design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
-// Kubernetes criteria K1–K6 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
+// Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5, checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
@@ -256,6 +256,58 @@ async function kubeHealthy(timeoutMs: number) {
     return typeof r === 'string' ? r : r
   })
 }
+
+/** The K3s member names `<node>-<8 hex digits>` as node names. */
+const etcdNode = (name: string) => name.replace(/-[0-9a-f]{8}$/, '')
+
+/**
+ * etcd's members as etcd itself lists them, by node: a one-off pod on K3s
+ * server `on` (host network) asks K3s's `/db/info` on loopback with the
+ * server's admin certificate, which is how it answers. Independent of what
+ * homelabd reports. A string says why not.
+ */
+async function etcdMembers(k: Kube, on: string): Promise<string[] | string> {
+  const ns = 'e2e-etcd'
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  const name = `db-info-${Math.random().toString(36).slice(2, 8)}`
+  const tls = '/var/lib/rancher/k3s/server/tls'
+  await k.create(`/api/v1/namespaces/${ns}/pods`, {
+    metadata: { name },
+    spec: {
+      nodeName: on,
+      hostNetwork: true,
+      restartPolicy: 'Never',
+      tolerations: [{ operator: 'Exists' }],
+      containers: [
+        {
+          name: 'curl',
+          image: 'curlimages/curl:8.23.0',
+          securityContext: { runAsUser: 0 },
+          command: ['curl', '-fsS', '--cacert', '/tls/server-ca.crt', '--cert', '/tls/client-admin.crt', '--key', '/tls/client-admin.key', 'https://127.0.0.1:6443/db/info'],
+          volumeMounts: [{ name: 'tls', mountPath: '/tls', readOnly: true }],
+        },
+      ],
+      volumes: [{ name: 'tls', hostPath: { path: tls } }],
+    },
+  })
+  try {
+    const done = await waitAsync(`the etcd query on ${on}`, 3 * 60_000, async () => {
+      const p = await k.must(`/api/v1/namespaces/${ns}/pods/${name}`)
+      return (['Succeeded', 'Failed'].includes(p.status.phase) && { phase: p.status.phase as string }) || `pod ${p.status.phase}`
+    })
+    const log = await k.get(`/api/v1/namespaces/${ns}/pods/${name}/log`)
+    if (done.value.phase !== 'Succeeded') return `the etcd query failed: ${log.text.slice(0, 200)}`
+    const members: Obj[] = JSON.parse(log.text).members
+    return members.map((m) => (m.name ? etcdNode(m.name) : `(unstarted ${m.peerURLs})`)).sort()
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}/pods/${name}`)
+  }
+}
+
+/** An IPv4 address as a number, to compare against a range. */
+const ipNum = (ip: string) => ip.split('.').reduce((n, o) => n * 256 + Number(o), 0)
+/** The seed storage network's range for Longhorn's pods (`STORAGE_RESERVED`). */
+const inStoragePods = (ip: string) => ipNum(ip) >= ipNum('10.20.3.0') && ipNum(ip) <= ipNum('10.20.3.255')
 
 await watch.ready
 
@@ -533,6 +585,94 @@ await step('K4', 'Volume and host failure: a pod\'s Longhorn volume survives los
   }
 })
 
+await step('K7', 'Storage network: Longhorn replicates over VLAN 20, not the management network', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const setting = (await k.must(`${LH}/settings/storage-network`)).value as string
+  if (setting !== 'longhorn-system/homelab-storage') throw new Failed(`Longhorn's storage-network setting is "${setting}"`)
+  // Every instance manager has its storage network interface, with a pod address on VLAN 20.
+  const ims: Obj[] = (await k.must('/api/v1/namespaces/longhorn-system/pods?labelSelector=longhorn.io%2Fcomponent%3Dinstance-manager')).items
+  const lhnet = (p: Obj) => (JSON.parse(p.metadata.annotations?.['k8s.v1.cni.cncf.io/network-status'] ?? '[]') as Obj[]).find((n) => n.name === 'longhorn-system/homelab-storage')
+  const missing = ims.filter((p) => !lhnet(p)?.ips?.every(inStoragePods))
+  if (ims.length === 0 || missing.length) throw new Failed(`instance managers without a storage network address: ${missing.map((p) => p.spec.nodeName).join(', ') || 'none run'}`)
+  note(`instance managers on the storage network: ${ims.map((p) => `${p.spec.nodeName} ${lhnet(p).interface} ${lhnet(p).ips}`).join(', ')}`)
+
+  const run = Math.random().toString(36).slice(2, 8)
+  const ns = 'e2e-net'
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  await k.create('/apis/storage.k8s.io/v1/storageclasses', {
+    metadata: { name: 'e2e-net-2-replicas' },
+    provisioner: 'driver.longhorn.io',
+    reclaimPolicy: 'Delete',
+    // One replica with the writer, so the other one's copy crosses the network.
+    parameters: { numberOfReplicas: '2', dataLocality: 'best-effort' },
+  })
+  const pvc = `net-${run}`
+  await k.create(`/api/v1/namespaces/${ns}/persistentvolumeclaims`, {
+    metadata: { name: pvc },
+    spec: { accessModes: ['ReadWriteOnce'], storageClassName: 'e2e-net-2-replicas', resources: { requests: { storage: '2Gi' } } },
+  })
+  const s0 = watch.seen!
+  const storing: string[] = ((await k.must(`${LH}/nodes`)).items as Obj[])
+    .filter((n) => Object.keys(n.spec.disks ?? {}).length > 0 && n.metadata.name !== s0.leader && s0.hosts.get(n.metadata.name)?.net.held_roles.Storage === undefined)
+    .map((n) => n.metadata.name)
+    .sort()
+  const writerHost = storing.find((h) => h.startsWith('ms01')) ?? storing[0]
+  if (!writerHost) throw new Failed('no storage host besides the leader')
+  // Rewrites 64 MiB, synced, every few seconds: Longhorn copies each write to the other replica.
+  const script = 'i=0; while true; do dd if=/dev/urandom of=/data/blob bs=1M count=64 conv=fsync 2>/dev/null; i=$((i+1)); echo "wrote $i"; sleep 2; done'
+  await k.create(`/api/v1/namespaces/${ns}/pods`, {
+    metadata: { name: 'writer' },
+    spec: {
+      nodeName: writerHost,
+      terminationGracePeriodSeconds: 2,
+      containers: [{ name: 'writer', image: 'busybox:1.37', command: ['sh', '-c', script], volumeMounts: [{ name: 'data', mountPath: '/data' }] }],
+      volumes: [{ name: 'data', persistentVolumeClaim: { claimName: pvc } }],
+    },
+  })
+  try {
+    const started = await waitAsync(`the writer on ${writerHost} writing`, 10 * 60_000, async () => {
+      const log = await k.get(`/api/v1/namespaces/${ns}/pods/writer/log`)
+      return log.text.includes('wrote 1') || `log: ${log.text.slice(0, 80)}`
+    })
+    const pv = (await k.must(`/api/v1/namespaces/${ns}/persistentvolumeclaims/${pvc}`)).spec.volumeName as string
+    note(`the writer on ${writerHost} rewrites 64 MiB at a time on Longhorn volume ${pv} (${secs(started.ms)} to start)`)
+    const healthyVol = await waitAsync(`${pv} healthy with 2 replicas, one on ${writerHost}`, 5 * 60_000, async () => {
+      const v = await k.must(`${LH}/volumes/${pv}`)
+      const reps: Obj[] = (await k.must(`${LH}/replicas?labelSelector=longhornvolume%3D${pv}`)).items
+      const nodes = reps.filter((r) => r.status?.currentState === 'running' && !r.spec.failedAt).map((r) => r.spec.nodeID as string)
+      return (v.status?.robustness === 'healthy' && new Set(nodes).size === 2 && nodes.includes(writerHost) && nodes) || `${v.status?.robustness} [${nodes}]`
+    })
+    const remote = healthyVol.value.find((n) => n !== writerHost)!
+    // The engine reaches its replicas at their storage network addresses.
+    const engines: Obj[] = (await k.must(`${LH}/engines?labelSelector=longhornvolume%3D${pv}`)).items
+    const addrs = Object.values(engines[0]?.spec?.replicaAddressMap ?? {}) as string[]
+    if (addrs.length !== 2 || !addrs.every((a) => inStoragePods(a.split(':')[0]))) throw new Failed(`the engine reaches its replicas at ${addrs.join(', ') || 'nothing'}, not on the storage network`)
+    note(`replicas on ${writerHost} and ${remote}; the engine reaches them at ${addrs.join(' and ')} (VLAN 20 pod addresses)`)
+
+    // What the writer's host sends into the switches, by VLAN, while it writes.
+    const sent = () => {
+      const by = new Map<number, number>()
+      for (const p of watch.seen!.truth.ports.filter((p) => p.host === writerHost)) {
+        for (const [vlan, bytes] of Object.entries(p.vlan_rx_bytes)) by.set(Number(vlan), (by.get(Number(vlan)) ?? 0) + bytes)
+      }
+      return by
+    }
+    const before = sent()
+    await sleep(30_000)
+    const after = sent()
+    const delta = (vlan: number) => (after.get(vlan) ?? 0) - (before.get(vlan) ?? 0)
+    const mib = (b: number) => `${(b / 1048576).toFixed(1)} MiB`
+    note(`in 30 s ${writerHost} sent ${mib(delta(20))} on VLAN 20 (storage) and ${mib(delta(1))} on VLAN 1 (management)`)
+    if (delta(20) < 64 * 1048576) throw new Failed(`only ${mib(delta(20))} crossed VLAN 20 while the writer rewrote 64 MiB blocks`)
+    if (delta(1) * 4 > delta(20)) throw new Failed(`the management network carried ${mib(delta(1))}, against ${mib(delta(20))} on VLAN 20`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+    await k.delete('/apis/storage.k8s.io/v1/storageclasses/e2e-net-2-replicas')
+  }
+})
+
 /** The switch ports `host`'s `nics` are cabled to, from the lab's ground truth. */
 function portsOf(s: Seen, host: string, nics: string[]): PortTruth[] {
   return nics.map((n) => {
@@ -616,6 +756,57 @@ await step('6b', 'Network: remove VLAN 20 from a host\'s switch ports; a mismatc
   }
   const cleared = await waitFor(`the mismatch on ${host} resolved`, 90_000, (s) => openAlerts(s, 'NetworkMismatch', host).length === 0)
   note(`put VLAN 20 back: the mismatch resolved after ${secs(cleared.ms)}`)
+})
+
+await step('K8', 'Replace a K3s server: power one off, replace it; etcd lists exactly the live servers', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const s0 = watch.seen!
+  const voters = () => [...watch.seen!.cp.voters].sort()
+  const before = await etcdMembers(k, s0.leader!)
+  if (typeof before === 'string' || before.join() !== voters().join()) throw new Failed(`etcd [${before}] is not the voters [${voters()}] to start with`)
+  const victim = s0.cp.voters.find((v) => v !== s0.leader)!
+  const ready = (h: HostObj) => h.lifecycle === 'Ready' && h.profile.id === 'Ms01' && Object.keys(h.net.held_roles).length === 0
+  const spare = [...s0.hosts.values()].filter((h) => ready(h) && !s0.cp.voters.includes(h.id)).map((h) => h.id).sort()[0]
+  if (!spare) throw new Failed('no spare MS-01 to replace a server with')
+  note(`etcd lists [${before}], the voters; powering off ${victim}, a K3s server`)
+  await fault({ PowerOff: { vm: victim } })
+  const off = now()
+  await waitFor(`${victim} NotReady`, 90_000, (s) => s.hosts.get(victim)?.lifecycle === 'NotReady')
+  // As the CpReplacementSuggested alert offers it 10 min on; asked for at once here.
+  const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ReplaceCpMember: { dead: victim, with: spare } }) })
+  if (!res.ok) throw new Failed(`ReplaceCpMember: ${res.status} ${await res.text()}`)
+  const asked = now()
+  note(`${victim} NotReady ${secs(asked - off)} after the power-off; replacing it with ${spare}`)
+  const swapped = await waitFor(`${spare} a voter in place of ${victim}`, 5 * 60_000, (s) => s.cp.voters.includes(spare) && !s.cp.voters.includes(victim))
+  note(`the voters are ${voters()} ${secs(swapped.ms)} later`)
+  const server = await waitAsync(`${spare} a Ready K3s server`, 10 * 60_000, async () => {
+    const n = await k.get(`/api/v1/nodes/${spare}`)
+    const h = watch.seen!.hosts.get(spare)
+    const isServer = n.status === 200 && n.body.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true' && isReady(n.body)
+    return (isServer && h?.kube?.role === 'Server' && h.kube.phase === 'Running') || `node ${n.status === 200 ? (isReady(n.body) ? 'Ready' : 'not Ready') : n.status}, homelabd: ${h?.kube?.role} ${JSON.stringify(h?.kube?.phase)} ${h?.kube?.detail ?? ''}`
+  })
+  note(`${spare} runs a K3s server, Ready, ${secs(now() - asked)} after the replacement was asked for`)
+  const live = await waitAsync('etcd to list exactly the live servers', 5 * 60_000, async () => {
+    const m = await etcdMembers(k, watch.seen!.leader!)
+    return (typeof m !== 'string' && m.join() === voters().join() && m) || `etcd [${m}], voters [${voters()}]`
+  })
+  const v = watch.seen!.truth.vms.find((v) => v.id === victim)
+  if (v?.power !== 'Off') throw new Failed(`${victim} is ${v?.power}: the check needs it still off`)
+  note(`etcd lists [${live.value}], exactly the live servers, while ${victim} is still off; ${victim}'s node is ${(await k.get(`/api/v1/nodes/${victim}`)).status === 404 ? 'gone' : 'still there'}`)
+  const nodes: Obj[] = (await k.must('/api/v1/nodes')).items
+  const servers = nodes.filter((n) => n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true').map((n) => n.metadata.name).sort()
+  if (servers.join() !== voters().join()) throw new Failed(`K3s servers [${servers}] are not the voters [${voters()}]`)
+  void server
+
+  await fault({ PowerOn: { vm: victim } })
+  const back = await healthy(10 * 60_000)
+  const kb = await kubeHealthy(15 * 60_000)
+  const after = await etcdMembers(k, watch.seen!.leader!)
+  if (typeof after === 'string' || after.join() !== voters().join()) throw new Failed(`after ${victim} came back, etcd lists [${after}], voters [${voters()}]`)
+  const h = watch.seen!.hosts.get(victim)
+  note(`${victim} powered on: Ready ${secs(back.ms)} later, a K3s ${h?.kube?.role === 'Agent' ? 'agent' : h?.kube?.role} and every node Ready ${secs(kb.ms)} after that; etcd still lists [${after}]`)
 })
 
 watch.close()
