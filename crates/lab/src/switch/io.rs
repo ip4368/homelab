@@ -89,7 +89,13 @@ pub fn open_tap(name: &str) -> io::Result<File> {
     ifr[16..18].copy_from_slice(&(IFF_TAP | IFF_NO_PI).to_ne_bytes());
     // SAFETY: TUNSETIFF reads and writes a struct ifreq, which `ifr` is large enough to hold.
     if unsafe { libc::ioctl(f.as_raw_fd(), TUNSETIFF, ifr.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        if e.raw_os_error() == Some(libc::EBUSY) {
+            // Another process has the tap open: in practice a lab server still running.
+            let why = format!("tap {name} is in use by another process (a lab server already running? `./lab.sh restart` replaces it)");
+            return Err(io::Error::new(io::ErrorKind::ResourceBusy, why));
+        }
+        return Err(e);
     }
     // SAFETY: fcntl on a valid fd.
     unsafe {
