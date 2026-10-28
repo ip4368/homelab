@@ -31,6 +31,9 @@
 //!   member is still to go, or a dead voter still to leave the control
 //!   plane, or while etcd would be short of a quorum until it starts
 //!   ([`join_blocked`]).
+//! * Servers report etcd's members, or why they could not read them. While
+//!   no server can, the members are unknown: nothing is removed and no
+//!   server joins.
 
 use super::membership::target_size;
 use super::{Action, Volatile};
@@ -133,10 +136,15 @@ pub fn storage_network(state: &ClusterState) -> Option<(NetworkId, StorageNetwor
     Some((n.id.clone(), StorageNetwork { subnet: n.subnet, pods }))
 }
 
-/// The etcd members, as the servers on up hosts report them.
-pub fn etcd_members(state: &ClusterState, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> BTreeSet<HostId> {
-    let reports = state.hosts.keys().filter(|id| up(state, id)).filter_map(|id| status(id).filter(|s| runs_server(Some(s))));
-    reports.flat_map(|s| s.etcd_members).collect()
+/// The etcd members, as the servers on up hosts report them; `None` while
+/// servers run but none of them could read the members.
+pub fn etcd_members(state: &ClusterState, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> Option<BTreeSet<HostId>> {
+    let reports: Vec<KubeStatus> = state.hosts.keys().filter(|id| up(state, id)).filter_map(|id| status(id).filter(|s| runs_server(Some(s)))).collect();
+    let read: Vec<&KubeStatus> = reports.iter().filter(|s| s.etcd_unread.is_none()).collect();
+    if read.is_empty() && !reports.is_empty() {
+        return None;
+    }
+    Some(read.into_iter().flat_map(|s| s.etcd_members.iter().cloned()).collect())
 }
 
 /// The members whose hosts are up and run their server.
@@ -192,8 +200,9 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
         return None;
     }
     if role == KubeRole::Server && !init && !runs_server(status(id).as_ref()) {
-        let members = etcd_members(state, status);
-        if !members.contains(id) && join_blocked(state, &members, status) {
+        // With etcd's members unknown, a join waits until a server reads them.
+        let blocked = etcd_members(state, status).is_none_or(|members| !members.contains(id) && join_blocked(state, &members, status));
+        if blocked {
             return None;
         }
     }
@@ -214,7 +223,7 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
 /// set of hosts, at most every [`KUBE_RESEND_MS`].
 fn admin(state: &ClusterState, v: &Volatile, status: &impl Fn(&HostId) -> Option<KubeStatus>, now: SimTime) -> Option<Action> {
     let via = state.hosts.keys().find(|id| up(state, id) && runs_server(status(id).as_ref()))?;
-    let members = etcd_members(state, status);
+    let members = etcd_members(state, status).unwrap_or_default();
     let remove_etcd_members: BTreeSet<HostId> = etcd_removal(state, &members, status).into_iter().cloned().collect();
     let storage_off: BTreeSet<HostId> = state.hosts.values().filter(|h| member(h) && !stores(h)).map(|h| h.id.clone()).collect();
     let applied = status(via).is_some_and(|s| s.storage_off == storage_off);
@@ -309,6 +318,7 @@ mod tests {
             version: "v1".into(),
             detail: None,
             etcd_members: BTreeSet::new(),
+            etcd_unread: None,
             storage_off: BTreeSet::new(),
         }
     }
@@ -447,7 +457,29 @@ mod tests {
         let cmd: LogCmd = serde_json::from_str(logged).expect("the first release's RecordKube replays");
         let Command::RecordKube { status, .. } = cmd.cmd else { panic!("{cmd:?}") };
         assert_eq!((status.phase, status.detail), (KubePhase::Installing, None));
-        assert!(status.etcd_members.is_empty() && status.storage_off.is_empty());
+        assert!(status.etcd_members.is_empty() && status.etcd_unread.is_none() && status.storage_off.is_empty());
+    }
+
+    #[test]
+    fn while_no_server_can_read_etcds_members_none_is_removed_and_no_server_joins() {
+        let (mut s, mut v) = three_servers();
+        down(&mut s, "ms01-03");
+        s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
+        let unread = KubeStatus { etcd_unread: Some("curl: (7) Failed to connect".into()), ..running(KubeRole::Server) };
+        for id in ["ms01-01", "ms01-02"] {
+            v.kube_status.insert(hid(id), unread.clone());
+        }
+        let status = |id: &HostId| v.kube_status.get(id).cloned();
+        assert_eq!(etcd_members(&s, &status), None, "an empty list is not an unread one");
+        let actions = run(&s, &v, 0);
+        assert!(asked(&actions).iter().all(|(_, a)| a.remove_etcd_members.is_empty()), "{:?}", asked(&actions));
+        assert!(!sent(&actions).contains_key(&hid("ms01-04")), "the replacement waits to know etcd's members");
+
+        // One server reads them again: the dead member goes.
+        v.kube_status.insert(hid("ms01-02"), server_seeing(&["ms01-01", "ms01-02", "ms01-03"]));
+        let status = |id: &HostId| v.kube_status.get(id).cloned();
+        assert_eq!(etcd_members(&s, &status), Some(set(&["ms01-01", "ms01-02", "ms01-03"])), "from the server that read them");
+        assert_eq!(asked(&run(&s, &v, 0))[0].1.remove_etcd_members, set(&["ms01-03"]));
     }
 
     #[test]

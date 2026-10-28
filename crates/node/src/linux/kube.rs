@@ -234,6 +234,15 @@ pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
         .collect())
 }
 
+/// What a status says of etcd's members read as `read`: the members, or
+/// none and why.
+fn split<T: Default>(read: Result<T, String>) -> (T, Option<String>) {
+    match read {
+        Ok(members) => (members, None),
+        Err(e) => (T::default(), Some(e)),
+    }
+}
+
 /// The running pods in `pods` (`kubectl get pods -o json`) that asked
 /// Multus for the storage network attachment and did not get it: their
 /// sandbox was made while K3s's CNI config lacked Multus (K3s reinstalled,
@@ -417,6 +426,8 @@ struct Observed {
     version: String,
     /// On a server: etcd's members, by node.
     etcd_members: BTreeSet<HostId>,
+    /// On a server: why etcd's members could not be read.
+    etcd_unread: Option<String>,
 }
 
 struct Worker {
@@ -442,7 +453,7 @@ impl Worker {
                 if let Err(e) = self.admin(&admin, &status.etcd_members) {
                     eprintln!("homelabd: kubernetes: for the cluster: {e}");
                 }
-                status.etcd_members = self.etcd_members();
+                (status.etcd_members, status.etcd_unread) = split(self.etcd_members());
                 status.storage_off.clone_from(&self.storage_off);
             }
             wait = if ok { EVERY } else { BACKOFF };
@@ -477,6 +488,7 @@ impl Worker {
             version: o.version.clone(),
             detail,
             etcd_members: o.etcd_members.clone(),
+            etcd_unread: o.etcd_unread.clone(),
             storage_off: if o.role == Some(KubeRole::Server) { self.storage_off.clone() } else { BTreeSet::new() },
         }
     }
@@ -553,17 +565,17 @@ impl Worker {
             Err("not running".into())
         };
         let node_ready = ready.as_deref().map(str::trim) == Ok("True");
-        let etcd_members = if r == KubeRole::Server && active { self.etcd_members() } else { BTreeSet::new() };
-        Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members }
+        let (etcd_members, etcd_unread) = if r == KubeRole::Server && active { split(self.etcd_members()) } else { (BTreeSet::new(), None) };
+        Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members, etcd_unread }
     }
 
     /// etcd's members, from this host's K3s server (`/db/info` answers the
-    /// admin on loopback); none if it does not answer.
-    fn etcd_members(&self) -> BTreeSet<HostId> {
+    /// admin on loopback).
+    fn etcd_members(&self) -> Result<BTreeSet<HostId>, String> {
         let tls = |f: &str| format!("{SERVER_TLS}/{f}");
         let (ca, cert, key) = (tls("server-ca.crt"), tls("client-admin.crt"), tls("client-admin.key"));
         let info = sh("curl", &["-fsS", "--max-time", "5", "--cacert", &ca, "--cert", &cert, "--key", &key, "https://127.0.0.1:6443/db/info"]);
-        info.map_err(|e| e.to_string()).and_then(|i| etcd_member_nodes(&i)).unwrap_or_default()
+        info.map_err(|e| e.to_string()).and_then(|i| etcd_member_nodes(&i))
     }
 
     /// Writes this host's config of the storage network attachment where

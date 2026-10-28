@@ -92,7 +92,8 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   if (typeof phase === 'object' && 'Failed' in phase) return { text: `${role}: failed (${phase.Failed}); retrying`, tone: 'bad' }
   if (phase === 'Installing') return { text: `${role}: ${k.detail ?? 'installing'}`, tone: 'warn' }
   const disks = k.storage_disks.length ? `, Longhorn on ${k.storage_disks.join(', ')}` : ''
-  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}`, tone: k.node_ready ? 'ok' : 'warn' }
+  const etcd = k.etcd_unread ? `; cannot read etcd's members (${k.etcd_unread})` : ''
+  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
 }
 
 function Kubernetes({ host }: { host: HostObj }) {

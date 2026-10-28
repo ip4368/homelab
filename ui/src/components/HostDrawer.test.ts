@@ -37,6 +37,7 @@ describe('host drawer kubernetes', () => {
     version: 'v1.36.5+k3s1',
     detail: null,
     etcd_members: [],
+    etcd_unread: null,
     storage_off: [],
     ...over,
   })
@@ -45,5 +46,9 @@ describe('host drawer kubernetes', () => {
     expect(kubeSummary(k({}))).toEqual({ text: 'K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0', tone: 'ok' })
     expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'starting k3s-agent' })).text).toBe('K3s agent: starting k3s-agent')
     expect(kubeSummary(k({ phase: { Failed: 'no route' } })).tone).toBe('bad')
+    expect(kubeSummary(k({ etcd_unread: 'curl: (7) Failed to connect' }))).toEqual({
+      text: "K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",
+      tone: 'warn',
+    })
   })
 })

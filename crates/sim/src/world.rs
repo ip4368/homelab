@@ -404,6 +404,7 @@ impl World {
             version: "sim".into(),
             detail: (!joined).then(|| "waiting to join etcd".into()),
             etcd_members: if spec.role == KubeRole::Server && member { self.kube.etcd.clone() } else { BTreeSet::new() },
+            etcd_unread: None,
             storage_off: self.kube.storage_off_applied.get(host).cloned().unwrap_or_default(),
         })
     }

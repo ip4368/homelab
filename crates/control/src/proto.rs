@@ -234,6 +234,10 @@ pub struct KubeStatus {
     /// On a server: the etcd members, by node name (the host's id).
     #[serde(default)]
     pub etcd_members: BTreeSet<HostId>,
+    /// On a server: why it could not read etcd's members, so that
+    /// `etcd_members` says nothing of them.
+    #[serde(default)]
+    pub etcd_unread: Option<String>,
     /// On a server: the hosts whose Longhorn disks it last took out of
     /// scheduling ([`KubeAdmin::storage_off`]).
     #[serde(default)]

@@ -216,7 +216,7 @@ impl CpReplica {
         let term = raft.term();
         let (index, ok) = match handle_op(ctx, &self.state, v, term, op) {
             Handling::Answer(result) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result }),
-            Handling::Propose(cmd, ok) => (raft.propose(mono, LogCmd { at: now, cmd }).expect("checked leadership above"), ok),
+            Handling::Propose(cmd, ok) => (raft.propose(mono, LogCmd { at: now, cmd: *cmd }).expect("checked leadership above"), ok),
             Handling::ReplaceCpMember { dead, with } => {
                 let members = RaftMembers::of(raft);
                 let added = membership::check_replace(&self.state, &members, &dead, &with)
@@ -350,7 +350,7 @@ enum Handling {
     /// Answer now; nothing to write.
     Answer(ApiResult),
     /// Propose the command; answer with the value once it applies.
-    Propose(Command, serde_json::Value),
+    Propose(Box<Command>, serde_json::Value),
     /// Add `with` as a CP learner, to replace `dead`; answer once that commits.
     ReplaceCpMember { dead: HostId, with: HostId },
 }
@@ -361,7 +361,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::CreateJoinToken => {
             let token = format!("{:016x}", ctx.rand_u64());
             let ok = serde_json::Value::String(token.clone());
-            return Handling::Propose(Command::CreateJoinToken { token, ttl_ms: JOIN_TOKEN_TTL_MS }, ok);
+            return Handling::Propose(Box::new(Command::CreateJoinToken { token, ttl_ms: JOIN_TOKEN_TTL_MS }), ok);
         }
         ApiOp::PreviewChange { change } => {
             if let Err(e) = rollout::check(state, &change) {
@@ -377,7 +377,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
             let id = format!("rollout-{term}-{}", ctx.now());
             let soak_ms = u64::from(soak_s) * 1000;
             let cmd = Command::StartRollout { id: id.clone(), change, include_overridden, batch_pct, soak_ms };
-            return Handling::Propose(cmd, serde_json::Value::String(id));
+            return Handling::Propose(Box::new(cmd), serde_json::Value::String(id));
         }
         ApiOp::PauseRollout { id } => Command::PauseRollout { id, reason: "paused by the user".into(), failed: vec![] },
         ApiOp::ResumeRollout { id } => Command::ResumeRollout { id },
@@ -389,7 +389,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
         ApiOp::Drain { host } => Command::SetLifecycle { id: host, lifecycle: Lifecycle::Draining },
         ApiOp::MigrateVm { vm, to } => match drain::migrate_command(state, v, &vm, to) {
-            Ok((cmd, to)) => return Handling::Propose(cmd, serde_json::Value::String(to.to_string())),
+            Ok((cmd, to)) => return Handling::Propose(Box::new(cmd), serde_json::Value::String(to.to_string())),
             Err(e) => return Handling::Answer(ApiResult::Err(e)),
         },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
@@ -424,7 +424,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
             return Handling::Answer(result);
         }
     };
-    Handling::Propose(cmd, serde_json::Value::Null)
+    Handling::Propose(Box::new(cmd), serde_json::Value::Null)
 }
 
 fn reply(ctx: &mut dyn Ctx, p: &PendingApi, result: ApiResult) {

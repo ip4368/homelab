@@ -33,6 +33,11 @@ detail: string | null,
  */
 etcd_members: Array<HostId>, 
 /**
+ * On a server: why it could not read etcd's members, so that
+ * `etcd_members` says nothing of them.
+ */
+etcd_unread: string | null, 
+/**
  * On a server: the hosts whose Longhorn disks it last took out of
  * scheduling ([`KubeAdmin::storage_off`]).
  */
