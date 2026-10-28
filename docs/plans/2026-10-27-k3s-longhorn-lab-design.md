@@ -141,3 +141,16 @@ Confirmed as designed:
 - The Kubernetes API answers through the VIP about 2 s after the homelabd leader (a K3s server) is powered off, because the VIP moves with the leadership.
 - A host whose storage VLAN is missing joins Kubernetes and gives Longhorn no disks.
 - One full e2e run from a reset lab (`./lab.sh reset`, `./lab.sh up`, then `node e2e/lab.e2e.ts`), with the kubeconfig from the control plane and K3s from the sha256-checked downloads, passes every criterion, K1–K6 included. In that run the K4 pod read its token back 132 s after its host was powered off, and Longhorn rebuilt the lost replica within 174 s.
+
+## 10. Findings on K7/K8 (2026-10-28)
+
+What closing the two §8 follow-ups found:
+
+| Found | Cause | Change |
+|---|---|---|
+| A new K3s server never joined while the dead member was still listed: `MemberAdd request timed out`, and a manual `member add` failed with `etcdserver: unhealthy cluster`, although etcd kept quorum for reads and writes. | etcd refuses a new member while a dead one is still listed. Removing the dead member only after the Raft swap (when the new server is already installing) leaves the join blocked. | The dead member goes from etcd once its replacement is decided (a learner stands by, voters at target), and again once the swap is done. Only `Running` servers count toward quorum: a host still `Installing` is not a member yet. |
+| Every live server reported `Installing` (`waiting for Multus`) after a replacement, which held etcd removals for no quorum, which held the dead node's deletion: a deadlock. | The worker waited for Multus's DaemonSet to be ready on every node, including the dead one. | The worker waits only for Multus's CRD (which the chart installs) before applying the attachment, and Longhorn pods start whenever Multus reaches their node. |
+| One instance-manager (on the agent that booted first) never gained a storage interface: it had the `networks` annotation but no `network-status`. | Longhorn started it before the `storage-network` setting had synced, and nothing recreates it afterwards. | The worker deletes `Running` instance-managers without a storage interface; Longhorn restarts them with one. |
+
+Confirmed as designed:
+- One full e2e run from a reset lab passes every criterion, K1–K8 included. In that run K7's replacement joined as a server and the dead node was gone 36 s after the operation (etcd listed exactly the live servers 75 s after the power-off), and K8's replicated 64 MiB write moved 232 MiB across VLAN 20.
