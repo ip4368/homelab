@@ -12,10 +12,17 @@
 //!    uninstalled first; a server deletes its own node before it goes, so
 //!    its etcd member leaves the cluster.
 //! 2. Starts the service if it stopped, and waits for the node to register.
-//! 3. On a server, writes the Longhorn `HelmChart` manifest K3s deploys.
-//! 4. Labels the node, and on a storage host gives Longhorn its data disks
+//! 3. On a server, writes the Multus `HelmChart` manifest, waits for its
+//!    DaemonSet, and applies the storage `NetworkAttachmentDefinition`
+//!    (a macvlan on `storage0`, VLAN 20); then writes the Longhorn
+//!    `HelmChart` manifest (replicating over that network) and, on
+//!    upgrades, patches a live `storage-network` setting to match.
+//! 4. On a server, deletes the nodes in `spec.etcd_remove` (dead, replaced
+//!    servers), which K3s turns into etcd member removals. Never its own
+//!    node, never a Ready one.
+//! 5. Labels the node, and on a storage host gives Longhorn its data disks
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
-//!    Longhorn to use it).
+//!    Longhorn to use it). A host whose storage role is held gives none.
 //!
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
@@ -38,11 +45,22 @@ const K3S_SHA256: &str = "d73847bcd3c5fccef0115b372e2f9a91f3032dc84bbf71518a4617
 const INSTALL_SCRIPT_SHA256: &str = "46177d4c99440b4c0311b67233823a8e8a2fc09693f6c89af1a7161e152fbfad";
 const K3S_BIN: &str = "/usr/local/bin/k3s";
 pub const LONGHORN_VERSION: &str = "1.13.0";
+/// The `rke2-multus` chart (Multus + Whereabouts) for K3s's CNI paths.
+pub const MULTUS_VERSION: &str = "v4.2.410";
+/// Longhorn's storage network: pods' second interfaces on VLAN 20.
+pub const STORAGE_NAD_NAMESPACE: &str = "longhorn-system";
+pub const STORAGE_NAD_NAME: &str = "storage-net";
+/// The `storage-network` setting's value: `<namespace>/<name>`.
+pub const STORAGE_NETWORK: &str = "longhorn-system/storage-net";
+/// Whereabouts range for those interfaces: the last /24 of `storage`
+/// (kept out of host IPAM).
+pub const STORAGE_POD_RANGE: &str = "10.20.3.0/24";
 /// The admin kubeconfig a K3s server writes.
 pub const KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
 /// What an agent's kubelet authenticates with: enough to label its own node.
 const KUBELET_KUBECONFIG: &str = "/var/lib/rancher/k3s/agent/kubelet.kubeconfig";
 const MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-longhorn.yaml";
+const MULTUS_MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-multus.yaml";
 /// How often the worker looks again when nothing changed.
 const EVERY: Duration = Duration::from_secs(10);
 /// How long it waits after a failed step before trying again.
@@ -72,11 +90,75 @@ fn unit(role: KubeRole) -> &'static str {
     }
 }
 
+/// Multus (with the Whereabouts IPAM) for K3s's CNI paths, as a manifest
+/// K3s's helm controller installs. Longhorn's storage network rides on it.
+pub fn multus_manifest() -> String {
+    format!(
+        "# Written by homelabd on every K3s server: Multus + Whereabouts for the
+# storage network (VLAN 20).
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: multus
+  namespace: kube-system
+spec:
+  repo: https://rke2-charts.rancher.io
+  chart: rke2-multus
+  version: {MULTUS_VERSION}
+  targetNamespace: kube-system
+  valuesContent: |-
+    config:
+      fullnameOverride: multus
+      cni_conf:
+        confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+        binDir: /var/lib/rancher/k3s/data/cni/
+        kubeconfig: /var/lib/rancher/k3s/agent/etc/cni/net.d/multus.d/multus.kubeconfig
+        multusAutoconfigDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+    rke2-whereabouts:
+      fullnameOverride: whereabouts
+      enabled: true
+      cniConf:
+        confDir: /var/lib/rancher/k3s/agent/etc/cni/net.d
+        binDir: /var/lib/rancher/k3s/data/cni/
+"
+    )
+}
+
+/// The storage network attachment: a macvlan on every storage host's VLAN
+/// 20 interface (`storage0`), with pod addresses from [`STORAGE_POD_RANGE`].
+/// Applied with `kubectl` once Multus is ready (the CRD comes with it).
+pub fn storage_nad_manifest() -> String {
+    format!(
+        "# Written by homelabd on every K3s server: Longhorn's storage network.
+apiVersion: k8s.cni.cncf.io/v1
+kind: NetworkAttachmentDefinition
+metadata:
+  name: {STORAGE_NAD_NAME}
+  namespace: {STORAGE_NAD_NAMESPACE}
+spec:
+  config: |-
+    {{
+      \"cniVersion\": \"0.3.1\",
+      \"name\": \"{STORAGE_NAD_NAME}\",
+      \"type\": \"macvlan\",
+      \"master\": \"storage0\",
+      \"mode\": \"bridge\",
+      \"mtu\": 9000,
+      \"ipam\": {{
+        \"type\": \"whereabouts\",
+        \"range\": \"{STORAGE_POD_RANGE}\",
+        \"configuration_path\": \"/var/lib/rancher/k3s/agent/etc/cni/net.d/whereabouts.d/whereabouts.conf\"
+      }}
+    }}
+"
+    )
+}
+
 /// The Longhorn deployment, as a manifest K3s's helm controller installs.
 pub fn longhorn_manifest() -> String {
     format!(
         "# Written by homelabd on every K3s server: Longhorn, storing on the data
-# disks of the hosts with the storage role.
+# disks of the hosts with the storage role, replicating over VLAN 20.
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
@@ -92,6 +174,7 @@ spec:
     defaultSettings:
       createDefaultDiskLabeledNodes: true
       nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod
+      storageNetwork: {STORAGE_NETWORK}
     persistence:
       defaultClass: true
       defaultClassReplicaCount: 3
@@ -285,12 +368,33 @@ impl Worker {
         if let Some(why) = &o.unregistered {
             return (self.installing(&o, format!("waiting for the node to register: {why}")), true);
         }
-        if spec.role == KubeRole::Server
-            && let Err(e) = write_if_changed(Path::new(MANIFEST), &longhorn_manifest())
-        {
-            return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifest: {e}"))), false);
+        if spec.role == KubeRole::Server {
+            if let Err(e) = write_if_changed(Path::new(MULTUS_MANIFEST), &multus_manifest()) {
+                return (self.status(&o, KubePhase::Failed(format!("write the Multus manifest: {e}"))), false);
+            }
+            match self.multus_ready() {
+                Ok(true) => {}
+                Ok(false) => return (self.installing(&o, "waiting for Multus".into()), true),
+                Err(e) => return (self.installing(&o, format!("waiting for Multus: {e}")), true),
+            }
+            if let Err(e) = self.apply_storage_nad() {
+                eprintln!("homelabd: kubernetes: {e}");
+                return (self.status(&o, KubePhase::Failed(e)), false);
+            }
+            if let Err(e) = write_if_changed(Path::new(MANIFEST), &longhorn_manifest()) {
+                return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifest: {e}"))), false);
+            }
+            // Upgrades from before the storage network: Longhorn's
+            // `defaultSettings` only apply on install, so patch a live
+            // setting too. Blocked while volumes are attached; retried every
+            // pass without holding up Running.
+            self.ensure_storage_network();
+            self.remove_etcd_members(spec);
         }
-        if self.applied.as_ref() != Some(spec) {
+        // `etcd_remove` is a standing task, not state: relabelling on its
+        // changes alone would churn `kubectl` every 15 s.
+        let labelled = self.applied.as_ref().is_some_and(|a| a.role == spec.role && a.labels == spec.labels && a.storage_disks == spec.storage_disks);
+        if !labelled {
             if let Err(e) = self.label(spec) {
                 eprintln!("homelabd: kubernetes: {e}");
                 return (self.status(&o, KubePhase::Failed(e)), false);
@@ -327,6 +431,52 @@ impl Worker {
         }
         all.extend(args);
         sh(K3S_BIN, &all).map_err(|e| e.to_string())
+    }
+
+    /// Whether Multus's DaemonSet is ready on every node. `Ok(false)` while
+    /// the chart has not created it yet.
+    fn multus_ready(&self) -> Result<bool, String> {
+        match self.kubectl(KubeRole::Server, &["-n", "kube-system", "get", "ds", "multus", "-o", "json"]) {
+            Ok(json) => Ok(ds_ready(&json)),
+            Err(e) if e.contains("NotFound") => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Creates the storage network's namespace and applies its
+    /// `NetworkAttachmentDefinition` (idempotent).
+    fn apply_storage_nad(&self) -> Result<(), String> {
+        // `create ns` fails when it exists; anything else is real.
+        if let Err(e) = self.kubectl(KubeRole::Server, &["create", "ns", STORAGE_NAD_NAMESPACE])
+            && !e.contains("AlreadyExists")
+        {
+            return Err(format!("create namespace {STORAGE_NAD_NAMESPACE}: {e}"));
+        }
+        let path = self.paths.run.join("storage-nad.yaml");
+        std::fs::create_dir_all(&self.paths.run).map_err(|e| format!("write the storage NAD: {e}"))?;
+        std::fs::write(&path, storage_nad_manifest()).map_err(|e| format!("write the storage NAD: {e}"))?;
+        let path_s = path.to_string_lossy().into_owned();
+        self.kubectl(KubeRole::Server, &["apply", "-f", &path_s]).map(|_| ()).map_err(|e| format!("apply the storage NAD: {e}"))
+    }
+
+    /// Patches a live Longhorn `storage-network` setting to
+    /// [`STORAGE_NETWORK`] (fresh installs get it from the chart's
+    /// `defaultSettings`). Blocked while volumes are attached; failures are
+    /// logged and retried on the next pass, never fatal.
+    fn ensure_storage_network(&self) {
+        let current = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "get", "setting", "storage-network", "-o", "jsonpath={.value}"]);
+        let Ok(value) = current else {
+            return;
+        };
+        if value.trim() == STORAGE_NETWORK {
+            return;
+        }
+        let patch = format!(r#"{{"value":"{STORAGE_NETWORK}"}}"#);
+        if let Err(e) = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "patch", "setting", "storage-network", "--type", "merge", "-p", &patch]) {
+            eprintln!("homelabd: kubernetes: set Longhorn storage-network: {e}");
+        } else {
+            eprintln!("homelabd: kubernetes: Longhorn storage-network is {STORAGE_NETWORK}");
+        }
     }
 
     /// Installs K3s as `spec` says, uninstalling `installed` first.
@@ -375,6 +525,38 @@ impl Worker {
         }
         sh("systemctl", &["start", "--no-block", unit(spec.role)]).map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Deletes the nodes in `spec.etcd_remove`: dead, replaced servers
+    /// whose etcd members must leave the cluster (`kubectl delete node`
+    /// removes both). Never its own node, never one that reads Ready (a
+    /// live member the control plane misjudged). Failures are logged and
+    /// retried on the next pass, never fatal: a removal that cannot commit
+    /// (no quorum) must not mark this host Failed.
+    fn remove_etcd_members(&self, spec: &KubeSpec) {
+        for dead in &spec.etcd_remove {
+            if *dead == self.host {
+                eprintln!("homelabd: kubernetes: not removing own etcd member {dead}");
+                continue;
+            }
+            match self.kubectl(spec.role, &["get", "node", dead.as_str(), "-o", "json"]) {
+                Ok(json) if node_is_ready(&json) => {
+                    eprintln!("homelabd: kubernetes: not removing {dead}: its node reads Ready");
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.contains("NotFound") => continue,
+                Err(e) => {
+                    eprintln!("homelabd: kubernetes: read node {dead}: {e}");
+                    continue;
+                }
+            }
+            if let Err(e) = self.kubectl(spec.role, &["delete", "node", dead.as_str(), "--wait=false"]) {
+                eprintln!("homelabd: kubernetes: delete node {dead}: {e}");
+            } else {
+                eprintln!("homelabd: kubernetes: removed dead server {dead} (node and etcd member)");
+            }
+        }
     }
 
     /// Gives the node `spec`'s labels (dropping homelab labels it no longer
@@ -457,6 +639,21 @@ fn write_if_changed(path: &Path, body: &str) -> std::io::Result<()> {
     std::fs::write(path, body)
 }
 
+/// Whether `kubectl get node -o json` shows the node Ready.
+fn node_is_ready(node_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(node_json).is_ok_and(|v| {
+        v["status"]["conditions"].as_array().is_some_and(|cs| cs.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"))
+    })
+}
+
+/// Whether `kubectl get ds -o json` shows every desired pod ready.
+fn ds_ready(ds_json: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(ds_json).is_ok_and(|v| {
+        let (ready, desired) = (v["status"]["numberReady"].as_u64().unwrap_or(0), v["status"]["desiredNumberScheduled"].as_u64().unwrap_or(0));
+        desired > 0 && ready >= desired
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +666,7 @@ mod tests {
             node_ip: Ipv4Addr::new(10, 0, 0, 2),
             labels: [("homelab.io/profile".to_string(), "ms01".to_string())].into(),
             storage_disks: vec!["nvme0".into()],
+            etcd_remove: vec![],
         }
     }
 
@@ -515,5 +713,38 @@ mod tests {
         assert_eq!(v[0]["allowScheduling"], true);
         assert!(longhorn_manifest().contains(&format!("version: {LONGHORN_VERSION}")));
         assert!(longhorn_manifest().contains("createDefaultDiskLabeledNodes: true"));
+        assert!(longhorn_manifest().contains(&format!("storageNetwork: {STORAGE_NETWORK}")), "replication rides VLAN 20");
+    }
+
+    #[test]
+    fn multus_and_the_storage_attachment_fit_k3s_and_vlan_20() {
+        let m = multus_manifest();
+        assert!(m.contains(&format!("version: {MULTUS_VERSION}")), "{m}");
+        assert!(m.contains("chart: rke2-multus") && m.contains("repo: https://rke2-charts.rancher.io"));
+        assert!(m.contains("/var/lib/rancher/k3s/agent/etc/cni/net.d") && m.contains("/var/lib/rancher/k3s/data/cni/"));
+        assert!(m.contains("rke2-whereabouts") && m.contains("enabled: true"));
+        let nad = storage_nad_manifest();
+        assert!(nad.contains("kind: NetworkAttachmentDefinition") && nad.contains(&format!("name: {STORAGE_NAD_NAME}")) && nad.contains(&format!("namespace: {STORAGE_NAD_NAMESPACE}")));
+        assert!(nad.contains(r#""type": "macvlan""#) && nad.contains(r#""master": "storage0""#) && nad.contains(r#""mtu": 9000"#));
+        assert!(nad.contains(r#""type": "whereabouts""#) && nad.contains(&format!(r#""range": "{STORAGE_POD_RANGE}""#)));
+        assert!(nad.contains("whereabouts.d/whereabouts.conf"), "the K3s path Whereabouts needs");
+        assert!(ds_ready(r#"{"status":{"numberReady":4,"desiredNumberScheduled":4}}"#));
+        assert!(!ds_ready(r#"{"status":{"numberReady":3,"desiredNumberScheduled":4}}"#));
+        assert!(!ds_ready(r#"{"status":{"numberReady":0,"desiredNumberScheduled":0}}"#));
+        assert!(!ds_ready("not json"));
+    }
+
+    #[test]
+    fn a_ready_node_is_never_an_etcd_removal() {
+        let ready = r#"{"status":{"conditions":[{"type":"Ready","status":"True"}]}}"#;
+        let not_ready = r#"{"status":{"conditions":[{"type":"Ready","status":"False"}]}}"#;
+        assert!(node_is_ready(ready));
+        assert!(!node_is_ready(not_ready));
+        assert!(!node_is_ready(r#"{"status":{}}"#));
+        assert!(!node_is_ready("not json"));
+        // An old spec without the field still parses (rolling upgrades).
+        let old = r#"{"role":"Server","init":false,"token":"t","node_ip":"10.0.0.2","labels":{},"storage_disks":[]}"#;
+        let spec: KubeSpec = serde_json::from_str(old).unwrap();
+        assert!(spec.etcd_remove.is_empty());
     }
 }
