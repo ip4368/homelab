@@ -9,13 +9,13 @@ use control::proto::{ApiOp, ApiResult, LogCmd};
 use control::raft::{EntryPayload, RaftRole};
 use control::replica::CpReplica;
 use control::state::{Alert, Command, CpMode, Lifecycle, ObjectRef, Severity};
-use model::{Deployment, HostId, ProfileId, Role, Selector, SwitchId, Volume};
+use model::{Deployment, HostId, PortName, ProfileId, Role, Selector, SwitchId, Volume};
 use sim::engine::Engine;
 use sim::fabric::Fabric;
 use sim::faults::Fault;
 use sim::presets::Preset;
 use sim::scenario::Scenario;
-use sim::topology::PartitionMember;
+use sim::topology::{Node, PartitionMember, PortMode};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[test]
@@ -609,6 +609,110 @@ fn suggest_mode_only_alerts() {
     assert!(e.run_until(e.now() + 30_000, replaced), "voters: {:?}", e.client_view().state.cp.voters);
     assert_eq!(e.client_view().state.cp.voters.len(), voters.len());
     assert!(e.run_until(e.now() + 5000, |e| suggestion(e).is_none()), "the suggestion resolves once taken");
+}
+
+/// Drops `vlan` from every trunk cable of `host`'s switch ports.
+fn block_vlan(e: &mut Engine, host: &HostId, vlan: u16) {
+    let w = e.fabric().world();
+    let mut edits = vec![];
+    for n in &w.hosts[host].profile.nics {
+        let Some(Node::SwitchPort(s, p)) = w.topology.peer(&Node::HostPort(host.clone(), PortName::new(&n.name))).cloned() else { continue };
+        let mut cfg = w.topology.switches[&s].port(&p).unwrap().clone();
+        if let PortMode::Trunk { allowed, .. } = &mut cfg.mode {
+            allowed.remove(&vlan);
+            edits.push((s, p, cfg));
+        }
+    }
+    assert!(!edits.is_empty(), "{host} has no trunk carrying VLAN {vlan}");
+    for (switch, port, cfg) in edits {
+        e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
+    }
+}
+
+#[test]
+fn replacing_a_dead_server_removes_its_etcd_member_and_the_new_server_joins() {
+    use control::proto::{KubePhase, KubeRole};
+    let mut e = default_fleet(26);
+    settle(&mut e);
+    // Kubernetes converged: every host runs, servers on the voters.
+    let kube_converged = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.hosts.values().all(|h| h.kube.as_ref().is_some_and(|k| k.phase == KubePhase::Running))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, kube_converged), "kubernetes never converged");
+    let voters0 = e.client_view().state.cp.voters.clone();
+    let leader = e.true_leader().unwrap();
+    let dead = voters0.iter().find(|v| **v != leader).unwrap().clone();
+    e.fault(Fault::KillHost { host: dead.clone() }).unwrap();
+    let killed_at = e.now();
+    // Suggest mode offers the replacement after 10 min down.
+    let suggestion = |e: &Engine| {
+        e.client_view()
+            .state
+            .alerts
+            .values()
+            .find(|a| a.kind == "CpReplacementSuggested" && a.resolved_at.is_none())
+            .cloned()
+    };
+    e.run_until(killed_at + 10 * 60_000 + 60_000, |_| false);
+    let alert = suggestion(&e).expect("a CpReplacementSuggested alert");
+    let Some(ApiOp::ReplaceCpMember { with, .. }) = alert.action.clone() else {
+        panic!("the alert offers the replacement: {alert:?}")
+    };
+    let req = e.api(ApiOp::ReplaceCpMember { dead: dead.clone(), with: with.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    // Raft swaps the voter.
+    let replaced = |e: &Engine| {
+        let v = &e.client_view().state.cp.voters;
+        v.contains(&with) && !v.contains(&dead)
+    };
+    assert!(e.run_until(e.now() + 30_000, replaced), "voters: {:?}", e.client_view().state.cp.voters);
+    // The new server joins Kubernetes cleanly, and the dead member's
+    // stand-in install (node and etcd member) is gone from the sim.
+    let joined = |e: &Engine| {
+        e.client_view().state.hosts.get(&with).and_then(|h| h.kube.clone()).is_some_and(|k| k.role == Some(KubeRole::Server) && k.phase == KubePhase::Running)
+            && e.fabric().world().hosts.get(&dead).is_some_and(|hw| hw.kube.is_none())
+    };
+    assert!(e.run_until(e.now() + 60_000, joined), "new server {:?}, dead kube {:?}", e.client_view().state.hosts.get(&with).and_then(|h| h.kube.clone()), e.fabric().world().hosts.get(&dead).and_then(|hw| hw.kube.clone()));
+    // The K3s servers are exactly the (live) voters.
+    let s = &e.client_view().state;
+    let servers: BTreeSet<HostId> = s.hosts.values().filter(|h| h.kube.as_ref().is_some_and(|k| k.role == Some(KubeRole::Server) && k.phase == KubePhase::Running)).map(|h| h.id.clone()).collect();
+    // The dead host still reports its last status (Running server) in the
+    // view, but its sim install is gone: only live voters run servers.
+    let live_servers: BTreeSet<HostId> = servers.into_iter().filter(|h| *h != dead).collect();
+    assert_eq!(live_servers, s.cp.voters, "the K3s servers are the live voters");
+}
+
+#[test]
+fn a_host_with_vlan_20_missing_gives_longhorn_no_disks() {
+    use control::proto::{KubePhase, KubeRole};
+    let mut e = default_fleet(27);
+    settle(&mut e);
+    let kube_converged = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.hosts.values().all(|h| h.kube.as_ref().is_some_and(|k| k.phase == KubePhase::Running))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, kube_converged), "kubernetes never converged");
+    // A non-voter MS-01 with an active storage role (Longhorn has disks).
+    let s = e.client_view().state.clone();
+    let h = s
+        .hosts
+        .values()
+        .find(|h| !s.cp.voters.contains(&h.id) && h.roles.contains(&Role::Storage) && h.kube.as_ref().is_some_and(|k| !k.storage_disks.is_empty()))
+        .expect("a storing non-voter")
+        .id
+        .clone();
+    assert_eq!(e.client_view().state.hosts[&h].kube.as_ref().unwrap().role, Some(KubeRole::Agent));
+    block_vlan(&mut e, &h, 20);
+    let held = |e: &Engine| e.client_view().state.hosts[&h].net.held_roles.contains_key(&Role::Storage);
+    assert!(e.run_until(e.now() + 90_000, held), "{h}'s storage role never held");
+    let no_disks = |e: &Engine| {
+        e.client_view().state.hosts[&h].kube.as_ref().is_some_and(|k| {
+            k.phase == KubePhase::Running && k.storage_disks.is_empty() && !k.labels.contains_key("homelab.io/storage")
+        })
+    };
+    assert!(e.run_until(e.now() + 60_000, no_disks), "still giving Longhorn disks: {:?}", e.client_view().state.hosts[&h].kube);
 }
 
 // ---- alerts ----

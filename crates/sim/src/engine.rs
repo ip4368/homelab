@@ -287,6 +287,23 @@ impl HostOs for EngineCtx<'_> {
         self.core.spawns.push((Endpoint::new(Addr::Host(host), Svc::Cp), Box::new(replica)));
     }
     fn apply_kube(&mut self, spec: KubeSpec) {
+        // A live server removes dead, replaced servers (node and etcd
+        // member): their stand-in install is gone. Never itself, never a
+        // powered (live) host.
+        if spec.role == KubeRole::Server {
+            let me = self.host_id();
+            for dead in &spec.etcd_remove {
+                if *dead == me {
+                    continue;
+                }
+                if let Some(hw) = self.workloads().host_mut(dead)
+                    && !hw.powered
+                    && hw.kube.as_ref().is_some_and(|k| k.role == KubeRole::Server)
+                {
+                    hw.kube = None;
+                }
+            }
+        }
         self.hw_mut().kube = Some(spec);
     }
     fn kube_status(&self) -> Option<KubeStatus> {
