@@ -12,11 +12,12 @@
 //!    uninstalled first; a server deletes its own node before it goes, so
 //!    its etcd member leaves the cluster.
 //! 2. Starts the service if it stopped, and waits for the node to register.
-//! 3. On a server, writes the Multus `HelmChart` manifest, waits for its
-//!    DaemonSet, and applies the storage `NetworkAttachmentDefinition`
-//!    (a macvlan on `storage0`, VLAN 20); then writes the Longhorn
-//!    `HelmChart` manifest (replicating over that network) and, on
-//!    upgrades, patches a live `storage-network` setting to match.
+//! 3. On a server, writes the Multus `HelmChart` manifest and applies the
+//!    storage `NetworkAttachmentDefinition` once Multus's CRD exists (a
+//!    macvlan on `storage0`, VLAN 20); then writes the Longhorn `HelmChart`
+//!    manifest (replicating over that network), patches a live
+//!    `storage-network` setting to match on upgrades, and recreates
+//!    instance-managers that missed the setting (no storage interface).
 //! 4. On a server, deletes the nodes in `spec.etcd_remove` (dead, replaced
 //!    servers), which K3s turns into etcd member removals. Never its own
 //!    node, never a Ready one.
@@ -372,14 +373,19 @@ impl Worker {
             if let Err(e) = write_if_changed(Path::new(MULTUS_MANIFEST), &multus_manifest()) {
                 return (self.status(&o, KubePhase::Failed(format!("write the Multus manifest: {e}"))), false);
             }
-            match self.multus_ready() {
-                Ok(true) => {}
-                Ok(false) => return (self.installing(&o, "waiting for Multus".into()), true),
-                Err(e) => return (self.installing(&o, format!("waiting for Multus: {e}")), true),
-            }
-            if let Err(e) = self.apply_storage_nad() {
-                eprintln!("homelabd: kubernetes: {e}");
-                return (self.status(&o, KubePhase::Failed(e)), false);
+            // The attachment needs Multus's CRD (which the chart installs);
+            // its DaemonSet being ready on every node is not waited for: a
+            // down node would hold every server Installing, which would in
+            // turn hold etcd removals for no quorum.
+            match self.apply_storage_nad() {
+                Ok(()) => {}
+                Err(e) if e.contains("no matches for kind") => {
+                    return (self.installing(&o, "waiting for Multus".into()), true);
+                }
+                Err(e) => {
+                    eprintln!("homelabd: kubernetes: {e}");
+                    return (self.status(&o, KubePhase::Failed(e)), false);
+                }
             }
             if let Err(e) = write_if_changed(Path::new(MANIFEST), &longhorn_manifest()) {
                 return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifest: {e}"))), false);
@@ -387,7 +393,8 @@ impl Worker {
             // Upgrades from before the storage network: Longhorn's
             // `defaultSettings` only apply on install, so patch a live
             // setting too. Blocked while volumes are attached; retried every
-            // pass without holding up Running.
+            // pass without holding up Running. Instance-managers that missed
+            // the setting (no storage interface) are recreated.
             self.ensure_storage_network();
             self.remove_etcd_members(spec);
         }
@@ -433,16 +440,6 @@ impl Worker {
         sh(K3S_BIN, &all).map_err(|e| e.to_string())
     }
 
-    /// Whether Multus's DaemonSet is ready on every node. `Ok(false)` while
-    /// the chart has not created it yet.
-    fn multus_ready(&self) -> Result<bool, String> {
-        match self.kubectl(KubeRole::Server, &["-n", "kube-system", "get", "ds", "multus", "-o", "json"]) {
-            Ok(json) => Ok(ds_ready(&json)),
-            Err(e) if e.contains("NotFound") => Ok(false),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Creates the storage network's namespace and applies its
     /// `NetworkAttachmentDefinition` (idempotent).
     fn apply_storage_nad(&self) -> Result<(), String> {
@@ -461,21 +458,30 @@ impl Worker {
 
     /// Patches a live Longhorn `storage-network` setting to
     /// [`STORAGE_NETWORK`] (fresh installs get it from the chart's
-    /// `defaultSettings`). Blocked while volumes are attached; failures are
-    /// logged and retried on the next pass, never fatal.
+    /// `defaultSettings`) and recreates instance-managers that missed it
+    /// (Running without a storage interface: Longhorn may start one before
+    /// the setting has synced). Blocked while volumes are attached; failures
+    /// are logged and retried on the next pass, never fatal.
     fn ensure_storage_network(&self) {
         let current = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "get", "setting", "storage-network", "-o", "jsonpath={.value}"]);
         let Ok(value) = current else {
             return;
         };
-        if value.trim() == STORAGE_NETWORK {
-            return;
-        }
-        let patch = format!(r#"{{"value":"{STORAGE_NETWORK}"}}"#);
-        if let Err(e) = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "patch", "setting", "storage-network", "--type", "merge", "-p", &patch]) {
-            eprintln!("homelabd: kubernetes: set Longhorn storage-network: {e}");
-        } else {
+        if value.trim() != STORAGE_NETWORK {
+            let patch = format!(r#"{{"value":"{STORAGE_NETWORK}"}}"#);
+            if let Err(e) = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "patch", "setting", "storage-network", "--type", "merge", "-p", &patch]) {
+                eprintln!("homelabd: kubernetes: set Longhorn storage-network: {e}");
+                return;
+            }
             eprintln!("homelabd: kubernetes: Longhorn storage-network is {STORAGE_NETWORK}");
+        }
+        let Ok(pods) = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "get", "pods", "-o", "json"]) else { return };
+        for name in stale_instance_managers(&pods) {
+            if let Err(e) = self.kubectl(KubeRole::Server, &["-n", STORAGE_NAD_NAMESPACE, "delete", "pod", &name, "--wait=false"]) {
+                eprintln!("homelabd: kubernetes: recreate {name} without a storage interface: {e}");
+            } else {
+                eprintln!("homelabd: kubernetes: recreating {name} without a storage interface");
+            }
         }
     }
 
@@ -646,12 +652,24 @@ fn node_is_ready(node_json: &str) -> bool {
     })
 }
 
-/// Whether `kubectl get ds -o json` shows every desired pod ready.
-fn ds_ready(ds_json: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(ds_json).is_ok_and(|v| {
-        let (ready, desired) = (v["status"]["numberReady"].as_u64().unwrap_or(0), v["status"]["desiredNumberScheduled"].as_u64().unwrap_or(0));
-        desired > 0 && ready >= desired
-    })
+/// The `Running` instance-managers in `kubectl get pods -o json` without a
+/// storage interface in [`STORAGE_POD_RANGE`]: Longhorn may start one before
+/// the `storage-network` setting has synced, and it never gains one.
+fn stale_instance_managers(pods_json: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(pods_json) else { return vec![] };
+    let empty = vec![];
+    let items = v["items"].as_array().unwrap_or(&empty);
+    items
+        .iter()
+        .filter(|p| {
+            p["metadata"]["name"].as_str().is_some_and(|n| n.starts_with("instance-manager-"))
+                && p["status"]["phase"] == "Running"
+                && !p["metadata"]["annotations"]["k8s.v1.cni.cncf.io/network-status"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(STORAGE_NETWORK) && s.contains("10.20.3."))
+        })
+        .filter_map(|p| p["metadata"]["name"].as_str().map(str::to_string))
+        .collect()
 }
 
 #[cfg(test)]
@@ -728,10 +746,18 @@ mod tests {
         assert!(nad.contains(r#""type": "macvlan""#) && nad.contains(r#""master": "storage0""#) && nad.contains(r#""mtu": 9000"#));
         assert!(nad.contains(r#""type": "whereabouts""#) && nad.contains(&format!(r#""range": "{STORAGE_POD_RANGE}""#)));
         assert!(nad.contains("whereabouts.d/whereabouts.conf"), "the K3s path Whereabouts needs");
-        assert!(ds_ready(r#"{"status":{"numberReady":4,"desiredNumberScheduled":4}}"#));
-        assert!(!ds_ready(r#"{"status":{"numberReady":3,"desiredNumberScheduled":4}}"#));
-        assert!(!ds_ready(r#"{"status":{"numberReady":0,"desiredNumberScheduled":0}}"#));
-        assert!(!ds_ready("not json"));
+    }
+
+    #[test]
+    fn instance_managers_without_a_storage_interface_are_recreated() {
+        let with = r#"{"items":[
+            {"metadata":{"name":"instance-manager-a","annotations":{"k8s.v1.cni.cncf.io/network-status":"[{\"name\":\"longhorn-system/storage-net\",\"ips\":[\"10.20.3.5\"]}]"}},"status":{"phase":"Running"}},
+            {"metadata":{"name":"instance-manager-b","annotations":{}},"status":{"phase":"Running"}},
+            {"metadata":{"name":"instance-manager-c"},"status":{"phase":"Pending"}},
+            {"metadata":{"name":"longhorn-manager-x","annotations":{}},"status":{"phase":"Running"}}]}"#;
+        assert_eq!(stale_instance_managers(with), ["instance-manager-b"]);
+        assert!(stale_instance_managers(r#"{"items":[]}"#).is_empty());
+        assert!(stale_instance_managers("not json").is_empty());
     }
 
     #[test]
