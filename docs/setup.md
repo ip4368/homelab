@@ -76,7 +76,7 @@ curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
 
 (`<server>` is the machine the UI's server runs on.) With `{"SetCpMode": {"mode": "Auto"}}` the control plane replaces a member down for 10 minutes without asking.
 
-The replacement goes in etcd's recommended order: once the spare has taken the dead host's place as a control-plane voter, a running K3s server deletes the dead host's node, which removes its etcd member. Only then does the spare reinstall K3s as a server and join etcd. So etcd never counts a dead member while the spare joins. homelabd never removes a member whose node is still `Ready`, removes one at a time, and only while the members on running servers stay a quorum. `sudo homelabd status` on a server lists etcd's members.
+The replacement goes in etcd's recommended order: once the spare has taken the dead host's place as a control-plane voter, a running K3s server deletes the dead host's node, which removes its etcd member. Only then does the spare reinstall K3s as a server and join etcd. So etcd never counts a dead member while the spare joins. homelabd never removes a member whose node is still `Ready`, removes one at a time, and only while the members on running servers stay a quorum. A member K3s cannot find by a node goes through etcd's own API instead. That covers a dead server whose node was already deleted, and a server that died while joining, whose member never started and so has no name yet (it is found by its address). `sudo homelabd status` on a server lists etcd's members. If no server can read them, nothing is removed and no new server joins until one can, and the host's Kubernetes line in the UI says why.
 
 If the dead machine comes back afterwards, it reinstalls K3s as an agent.
 
@@ -130,5 +130,5 @@ Remove the host in the UI first, so the cluster forgets it.
 
 - ARM machines (Pi 5, RK3588): the installer is x86_64-only for now.
 - Authentication: homelabd's API and its node-to-node messages are unauthenticated: anyone who can reach the management network can get a join token or an admin kubeconfig. Keep the management network trusted.
-- An etcd member with no Kubernetes node (a server that died while joining) is not removed automatically: homelabd removes members by deleting their nodes. Remove it by hand with an `etcdctl` (K3s does not ship one) and the server's certificates in `/var/lib/rancher/k3s/server/tls/etcd/`.
+- An unstarted etcd member (a server that died while joining) whose machine was then removed from the cluster is not removed automatically, since homelabd no longer knows the address to find it by. Remove it by hand with an `etcdctl` (K3s does not ship one) and the server's certificates in `/var/lib/rancher/k3s/server/tls/etcd/`.
 - A host without the storage network cannot use Longhorn volumes: Longhorn does not run there.
