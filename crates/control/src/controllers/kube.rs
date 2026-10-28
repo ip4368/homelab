@@ -1,6 +1,6 @@
 //! Kubernetes (K3s): every member host on its final network runs K3s, a
-//! server (API server and etcd member) on control-plane hosts and an agent
-//! everywhere else, and storage hosts give Longhorn their data disks. The
+//! server (API server and etcd member) on the control-plane voters and an
+//! agent everywhere else, and storage hosts give Longhorn their data disks. The
 //! controller works out what each host should run ([`desired`]), sends it
 //! until the host reports that it runs it, and records what hosts report.
 //!
@@ -191,9 +191,11 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
         return None;
     }
     let node_ip = *h.ips.get(&mgmt())?;
-    // A new voter gets the control-plane role a moment after its Raft config
-    // commits: in between it already counts toward the target.
-    let role = if h.roles.contains(&Role::ControlPlane) || state.cp.voters.contains(id) {
+    // The voters, not the control-plane role: the role catches up with a
+    // Raft config a moment after it commits, so it may name a host that is
+    // not a voter (yet, or any more), and a host must not be reinstalled
+    // for that.
+    let role = if state.cp.voters.contains(id) {
         KubeRole::Server
     } else if eligible(&h.profile, Role::ControlPlane).is_ok() && state.cp.voters.len() < target_size(state) {
         return None;
@@ -428,6 +430,26 @@ mod tests {
         assert!(!s.hosts[&hid("ms01-03")].roles.contains(&Role::ControlPlane));
         let specs = sent(&run(&s, &v, 0));
         assert_eq!(specs[&hid("ms01-03")].role, KubeRole::Server, "not an agent, to be reinstalled a second later");
+    }
+
+    #[test]
+    fn the_control_plane_role_on_a_host_that_is_no_voter_makes_no_server() {
+        // Given the role by hand, which membership takes back a moment later:
+        // a server spec now would be an agent spec then, and the host would
+        // flip between the two.
+        let (mut s, v) = three_servers();
+        let status = |id: &HostId| v.kube_status.get(id).cloned();
+        for id in ["ms01-03", "ms01-04"] {
+            let mut roles = s.hosts[&hid(id)].roles.clone();
+            roles.insert(Role::ControlPlane);
+            s.apply(0, Command::SetRoles { id: hid(id), roles }).unwrap();
+        }
+        assert_eq!(desired(&s, &hid("ms01-04"), &status).unwrap().role, KubeRole::Agent);
+
+        // ms01-04 takes ms01-03's place: the voters decide, before the roles catch up.
+        s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
+        assert_eq!(desired(&s, &hid("ms01-03"), &status).unwrap().role, KubeRole::Agent);
+        assert_eq!(desired(&s, &hid("ms01-04"), &status).unwrap().role, KubeRole::Server);
     }
 
     #[test]
