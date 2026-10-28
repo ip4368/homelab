@@ -65,9 +65,18 @@ Machines can be joined in any order and at any time.
 - Longhorn's replication runs on the storage network (VLAN 20), not the management network. Multus gives Longhorn's instance managers a second interface (`lhnet1`), a macvlan on each host's own VLAN 20 interface, with an address from the storage network's reserved range. Longhorn runs only on hosts attached to the storage network (node label `homelab.io/storage-network=true`), so a pod with a Longhorn volume must run on one of them; every MS-01 and mini PC is.
 - Node labels: `homelab.io/profile=<profile>` and `homelab.io/<role>=true` for each of the host's roles (`control-plane`, `storage`, `compute`, `vm`, `transcode`), and `homelab.io/storage-network=true` on hosts attached to the storage network. Labels you set on a host in the UI are added to its node too, when Kubernetes accepts them.
 
+## Moving the control plane to new machines
+
+Each host's drawer has a *Control plane* section listing the voters. To gracefully move a vote from one machine to another, without any downtime:
+
+1. Open the new host and click *Add to control plane*. It joins as a learner, is promoted once caught up, and installs a K3s server. The voters sit one over target until the old host goes.
+2. Once its K3s server runs (`Kubernetes` in its drawer says Ready), open the old host and click *Remove from control plane*. Its K3s server then reinstalls as an agent, deleting its node first so its etcd member leaves with it.
+
+Removal is refused while it would leave fewer voters than the target (add the replacement first) or while too few voters are up to stay quorate. The control-plane role on each host follows the voters by itself; it cannot be set in the roles editor.
+
 ## When a control-plane machine dies
 
-The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To take it, or to replace the host sooner, submit the operation the alert carries:
+The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first), with a button that runs the replacement. To replace the host sooner, submit the operation the alert carries:
 
 ```sh
 curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \

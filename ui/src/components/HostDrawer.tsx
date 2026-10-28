@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { op } from '../api'
+import { ineligibleReason } from '../eligibility'
 import type { HostNet } from '../gen/HostNet'
 import type { HostObj } from '../gen/HostObj'
 import type { NicState } from '../gen/NicState'
@@ -90,7 +91,16 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   const phase = k.phase
   if (phase === 'Absent') return { text: 'nothing installed', tone: 'muted' }
   if (typeof phase === 'object' && 'Failed' in phase) return { text: `${role}: failed (${phase.Failed}); retrying`, tone: 'bad' }
-  if (phase === 'Installing') return { text: `${role}: ${k.detail ?? 'installing'}`, tone: 'warn' }
+  if (phase === 'Installing') {
+    // A reinstall names what it becomes, while `role` is still what is installed: say both.
+    const installing = k.detail?.match(/^installing K3s as (Server|Agent)$/)
+    if (installing) {
+      const want = installing[1] === 'Server' ? 'K3s server (API + etcd)' : 'K3s agent'
+      if (!k.role) return { text: `installing ${want}`, tone: 'warn' }
+      if (k.role !== installing[1]) return { text: `switching from ${role} to ${want}`, tone: 'warn' }
+    }
+    return { text: `${role}: ${k.detail ?? 'installing'}`, tone: 'warn' }
+  }
   const disks = k.storage_disks.length ? `, Longhorn on ${k.storage_disks.join(', ')}` : ''
   const etcd = k.etcd_unread ? `; cannot read etcd's members (${k.etcd_unread})` : ''
   return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
@@ -124,6 +134,57 @@ function Kubernetes({ host }: { host: HostObj }) {
           )}
         </p>
       )}
+    </div>
+  )
+}
+
+/**
+ * Control-plane membership: whether the host votes, and how to move its vote elsewhere.
+ * A graceful move is Add on the new host, then, once its K3s server runs, Remove on the old one.
+ */
+function ControlPlane({ host }: { host: HostObj }) {
+  const voters = useStore((s) => s.view.cp.voters)
+  const hostCount = useStore((s) => Object.keys(s.view.hosts).length)
+  const { error, busy, run } = useAction()
+  if (host.lifecycle === 'Pending') return null
+  const isVoter = voters.includes(host.id)
+  const target = hostCount > 50 ? 5 : 3
+  const reason = host.lifecycle !== 'Ready' ? `only a Ready host votes (this one is ${host.lifecycle})` : ineligibleReason(host.profile, 'ControlPlane')
+  const extra = voters.length > target
+  const add = () => {
+    if (window.confirm(`Add ${host.id} to the control plane? It will install a K3s server and join as a voter; remove the host it replaces afterwards.`)) {
+      run(() => op({ AddCpMember: { with: host.id } }))
+    }
+  }
+  const remove = () => {
+    if (window.confirm(`Remove ${host.id} from the control plane? Its K3s server will reinstall as an agent. Only do this once its replacement votes with a running server.`)) {
+      run(() => op({ RemoveCpMember: { dead: host.id } }))
+    }
+  }
+  return (
+    <div className="section">
+      <h4>Control plane</h4>
+      <p className="muted">
+        Voters ({voters.length} of target {target}): {voters.length ? voters.join(', ') : 'none'}
+        {extra && ' — one extra until the replaced host is removed'}
+      </p>
+      {isVoter ? (
+        <div className="actions">
+          <button onClick={remove} disabled={busy}>
+            Remove from control plane
+          </button>
+        </div>
+      ) : reason ? (
+        <p className="muted">{reason}.</p>
+      ) : (
+        <div className="actions">
+          <button onClick={add} disabled={busy || extra} title={extra ? 'The control plane already has an extra member; remove the replaced host first' : undefined}>
+            Add to control plane
+          </button>
+        </div>
+      )}
+      {error && <div className="bad">{error}</div>}
+      <p className="muted">The control-plane role below follows this membership.</p>
     </div>
   )
 }
@@ -276,6 +337,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
         <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>
       <HostWorkloads host={host} onSelectWorkload={onSelectWorkload} />
+      <ControlPlane host={host} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
       <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
       {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}

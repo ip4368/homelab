@@ -384,11 +384,24 @@ function RuleEditorForm({ initial, existing, onDone }: { initial: RuleDraft; exi
         </select>
         <label>Roles</label>
         <span className="role-picker">
-          {ALL_ROLES.map((r) => (
-            <label key={r} className="inline">
-              <input type="checkbox" checked={draft.roles.includes(r)} onChange={(e) => toggle(r, e.target.checked)} /> {r}
-            </label>
-          ))}
+          {ALL_ROLES.map((r) =>
+            // ControlPlane is managed by membership, not rules; a rule from before that can only drop it.
+            r === 'ControlPlane' ? (
+              <label key={r} className="inline disabled" title="Managed by control-plane membership, in the host drawer">
+                <input
+                  type="checkbox"
+                  checked={draft.roles.includes(r)}
+                  disabled={!draft.roles.includes(r)}
+                  onChange={(e) => toggle(r, e.target.checked)}
+                />{' '}
+                {r}
+              </label>
+            ) : (
+              <label key={r} className="inline">
+                <input type="checkbox" checked={draft.roles.includes(r)} onChange={(e) => toggle(r, e.target.checked)} /> {r}
+              </label>
+            ),
+          )}
         </span>
         <label>Template</label>
         <select value={draft.template} onChange={(e) => setDraft({ ...draft, template: e.target.value })}>

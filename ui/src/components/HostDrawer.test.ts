@@ -52,4 +52,16 @@ describe('host drawer kubernetes', () => {
       tone: 'warn',
     })
   })
+
+  it('names both ends of a reinstall instead of the installed role with the new one', () => {
+    expect(kubeSummary(k({ role: 'Server', phase: 'Installing', detail: 'installing K3s as Agent' }))).toEqual({
+      text: 'switching from K3s server (API + etcd) to K3s agent',
+      tone: 'warn',
+    })
+    expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe(
+      'switching from K3s agent to K3s server (API + etcd)',
+    )
+    expect(kubeSummary(k({ role: null, phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('installing K3s server (API + etcd)')
+    expect(kubeSummary(k({ role: 'Server', phase: 'Installing', detail: 'installed; starting' })).text).toBe('K3s server (API + etcd): installed; starting')
+  })
 })

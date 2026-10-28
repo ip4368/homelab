@@ -10,14 +10,21 @@ interface Props {
   eligibleOnly?: boolean
 }
 
-/** Role checkboxes; roles the hardware cannot take are disabled with the reason as a tooltip. */
+/**
+ * Role checkboxes; roles the hardware cannot take are disabled with the reason as a tooltip.
+ * ControlPlane is never set by hand: it follows control-plane membership (the host drawer's
+ * control-plane section), so it shows disabled with where it is managed.
+ */
 export function RolePicker({ profile, value, onChange, eligibleOnly }: Props) {
   const toggle = (role: Role, on: boolean) =>
     onChange(ALL_ROLES.filter((r) => (r === role ? on : value.includes(r))))
   return (
     <span className="role-picker">
       {ALL_ROLES.map((role) => {
-        const reason = ineligibleReason(profile, role)
+        const reason =
+          role === 'ControlPlane'
+            ? 'Managed by control-plane membership, in the host drawer'
+            : ineligibleReason(profile, role)
         if (eligibleOnly && reason) return null
         return (
           <label key={role} className={reason ? 'disabled' : ''} title={reason ?? undefined}>

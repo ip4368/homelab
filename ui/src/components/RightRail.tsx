@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { op } from '../api'
+import type { ApiOp } from '../gen/ApiOp'
 import type { HostObj } from '../gen/HostObj'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
@@ -11,6 +12,26 @@ type Tab = 'Alerts' | 'Events' | 'Pending joins'
 const TABS: Tab[] = ['Alerts', 'Events', 'Pending joins']
 const RESOLVED_SHOWN = 20
 const EVENTS_SHOWN = 200
+
+/** An alert's remediation as a button label, e.g. "Replace v2 with ms01-9". */
+export function alertActionLabel(action: ApiOp): string {
+  if (typeof action === 'object' && 'ReplaceCpMember' in action) {
+    return `Replace ${action.ReplaceCpMember.dead} with ${action.ReplaceCpMember.with}`
+  }
+  return 'Run'
+}
+
+function AlertAction({ action }: { action: ApiOp }) {
+  const { error, busy, run } = useAction()
+  return (
+    <span className="actions">
+      <button disabled={busy} onClick={() => run(() => op(action))}>
+        {alertActionLabel(action)}
+      </button>
+      {error && <span className="bad">{error}</span>}
+    </span>
+  )
+}
 
 function Alerts({ onSelect }: { onSelect(id: string): void }) {
   const alerts = useStore((s) => s.view.alerts)
@@ -39,6 +60,7 @@ function Alerts({ onSelect }: { onSelect(id: string): void }) {
             {formatClock(a.raised_at)}
             {a.resolved_at !== null && ` — resolved ${formatClock(a.resolved_at)}`}
           </div>
+          {a.resolved_at === null && a.action && <AlertAction action={a.action} />}
         </li>
       ))}
     </ul>
