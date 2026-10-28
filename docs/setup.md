@@ -15,6 +15,7 @@ This guide covers installing the homelab cluster on real machines: homelabd, K3s
 - **DHCP** on the management network for machines that have not joined yet. The DHCP pool must sit inside the management network's **reserved range** (the seed config reserves `10.0.3.100–10.0.3.255`), so that the static addresses homelabd hands out never collide with it.
 - **One free address for the control plane's VIP**, also inside the reserved range (the lab uses `10.0.3.253`). Whichever host leads the control plane holds it. The UI, `homelabd`, joining machines and the Kubernetes API (`https://<vip>:6443`) all use it.
 - Switch ports configured for each machine's template before it is plugged in. For an MS-01: `eth0` access on mgmt; `sfp0`+`sfp1` in an LACP group, trunking VLANs 20 (storage), 30 (migration), 100 and 110 (VMs), MTU 9000 or more. The control plane checks each port against its template and flags mistakes.
+- A **storage network** (the seed config uses `storage` = `10.20.0.0/22` on VLAN 20) that the storage hosts reach each other on: Longhorn replicates over it. Its **reserved range** (the seed config reserves `10.20.3.0–10.20.3.255`) holds the addresses Longhorn's pods take there, so no host is given one. Nothing else may use that range.
 - Optionally, switches that send LLDP with a management address. homelabd learns each switch's port map from it.
 
 **Where the files come from**
@@ -48,7 +49,7 @@ For a fresh token, run `sudo homelabd token` on any member or click *Create join
 The machine asks to join. If an auto-approve rule matches its hardware it is approved straight away; otherwise it waits under *Pending joins* in the UI. Once approved, it moves to its static address on its template and joins Kubernetes:
 - Control-plane hosts join as **K3s servers** (embedded etcd). homelabd keeps 3 control-plane members, or 5 above 50 hosts, and prefers MS-01s.
 - Every other host joins as a **K3s agent**.
-- Hosts with the storage role give Longhorn their data disks. A host whose storage VLAN is misconfigured gives none until the network is fixed.
+- Hosts with the storage role give Longhorn their data disks. A host whose storage VLAN is misconfigured gives none until the network is fixed: if it stored already, Longhorn stops placing replicas on its disks until then.
 
 Machines can be joined in any order and at any time.
 
@@ -61,7 +62,23 @@ Machines can be joined in any order and at any time.
   kubectl get nodes
   ```
 - `longhorn` is the default StorageClass (3 replicas). If a node dies, Longhorn deletes the pods stuck on it so that they restart elsewhere (`nodeDownPodDeletionPolicy`). Give your pods short `node.kubernetes.io/unreachable` and `not-ready` tolerations (for example 30 s) for a fast failover.
-- Node labels: `homelab.io/profile=<profile>` and `homelab.io/<role>=true` for each of the host's roles (`control-plane`, `storage`, `compute`, `vm`, `transcode`). Labels you set on a host in the UI are added to its node too, when Kubernetes accepts them.
+- Longhorn's replication runs on the storage network (VLAN 20), not the management network. Multus gives Longhorn's instance managers a second interface (`lhnet1`), a macvlan on each host's own VLAN 20 interface, with an address from the storage network's reserved range. Longhorn runs only on hosts attached to the storage network (node label `homelab.io/storage-network=true`), so a pod with a Longhorn volume must run on one of them; every MS-01 and mini PC is.
+- Node labels: `homelab.io/profile=<profile>` and `homelab.io/<role>=true` for each of the host's roles (`control-plane`, `storage`, `compute`, `vm`, `transcode`), and `homelab.io/storage-network=true` on hosts attached to the storage network. Labels you set on a host in the UI are added to its node too, when Kubernetes accepts them.
+
+## When a control-plane machine dies
+
+The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To take it, or to replace the host sooner, submit the operation the alert carries:
+
+```sh
+curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
+  -d '{"ReplaceCpMember": {"dead": "<dead host>", "with": "<spare>"}}'
+```
+
+(`<server>` is the machine the UI's server runs on.) With `{"SetCpMode": {"mode": "Auto"}}` the control plane replaces a member down for 10 minutes without asking.
+
+The replacement goes in etcd's recommended order: once the spare has taken the dead host's place as a control-plane voter, a running K3s server deletes the dead host's node, which removes its etcd member. Only then does the spare reinstall K3s as a server and join etcd. So etcd never counts a dead member while the spare joins. homelabd never removes a member whose node is still `Ready`, removes one at a time, and only while the members on running servers stay a quorum. `sudo homelabd status` on a server lists etcd's members.
+
+If the dead machine comes back afterwards, it reinstalls K3s as an agent.
 
 ## Trying it out
 
@@ -87,19 +104,31 @@ The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with 
 curl -fsSL <url>/install.sh | sudo sh -s -- upgrade
 ```
 
+Upgrade every K3s server before relying on new Kubernetes features: each server writes the Longhorn manifest from its own version.
+
+On a cluster created before Longhorn moved to the storage network, the storage network has no reserved range, so Longhorn stays on the pod network. To move it, give the storage network a reserved range that no host uses, as a network change rollout (for the seed network):
+
+```sh
+curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' -d '{"StartRollout": {"change": {"Network":
+  {"id": "storage", "purpose": "Storage", "vlan": 20, "subnet": "10.20.0.0/22", "mtu": 9000,
+   "reserved": [{"first": "10.20.3.0", "last": "10.20.3.255"}], "dns": []}}, "include_overridden": false}}'
+```
+
+Longhorn switches only while no volume is attached, so scale down the workloads that use volumes until its instance managers have restarted with `lhnet1`.
+
 ## Starting over on a machine
 
 ```sh
 sudo systemctl disable --now homelabd
 sudo /usr/local/bin/k3s-uninstall.sh || sudo /usr/local/bin/k3s-agent-uninstall.sh
-sudo rm -rf /var/lib/homelab /etc/homelab /run/homelab
+sudo rm -rf /var/lib/homelab /etc/homelab /run/homelab /etc/cni/multus
 ```
 
 Remove the host in the UI first, so the cluster forgets it.
 
 ## Not covered yet
 
-- Longhorn's traffic uses the pod network (on mgmt), not the storage VLAN. Moving it to VLAN 20 needs Multus.
 - ARM machines (Pi 5, RK3588): the installer is x86_64-only for now.
 - Authentication: homelabd's API and its node-to-node messages are unauthenticated: anyone who can reach the management network can get a join token or an admin kubeconfig. Keep the management network trusted.
-- When a dead control-plane member is replaced, its etcd member is removed only once the replacement is done and the dead host comes back or is removed.
+- An etcd member with no Kubernetes node (a server that died while joining) is not removed automatically: homelabd removes members by deleting their nodes. Remove it by hand with an `etcdctl` (K3s does not ship one) and the server's certificates in `/var/lib/rancher/k3s/server/tls/etcd/`.
+- A host without the storage network cannot use Longhorn volumes: Longhorn does not run there.
