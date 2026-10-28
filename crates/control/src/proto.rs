@@ -323,6 +323,12 @@ pub enum ApiOp {
     /// as a learner, is promoted once caught up, then `dead` is removed.
     /// Answered once `with` is a learner.
     ReplaceCpMember { dead: HostId, with: HostId },
+    /// Hands live CP voter `from`'s place to eligible host `to`: `to` joins
+    /// as a learner and is promoted once caught up, and once it runs a K3s
+    /// server, `from` is removed (and runs a K3s agent). Refused while a
+    /// voter is down or a membership change is in progress. Answered once
+    /// the hand-off is recorded; `CpInfo::handoff` shows it until it ends.
+    HandOffCp { from: HostId, to: HostId },
     /// Reads the leader's metrics history (nothing is written). The result
     /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
     /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.

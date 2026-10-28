@@ -630,6 +630,50 @@ fn replacing_a_dead_k3s_server_removes_its_etcd_member_then_adds_the_new_one() {
 }
 
 #[test]
+fn the_leader_hands_its_control_plane_place_to_a_host_the_user_picks() {
+    use control::proto::{KubePhase, KubeRole};
+    use sim::world::EtcdChange;
+    let mut e = default_fleet(26);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        voters.len() == 5 && e.fabric().world().kube.etcd == *voters && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let from = e.true_leader().expect("a leader");
+    let s = &e.client_view().state;
+    let ready_ms01 = |h: &&control::state::HostObj| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01;
+    let to = s.hosts.values().filter(ready_ms01).find(|h| !s.cp.voters.contains(&h.id)).expect("a spare MS-01").id.clone();
+    assert_eq!(kube_of(&e, &to), Some((Some(KubeRole::Agent), KubePhase::Running)));
+
+    // The role is not set by hand: that would flip the host between a K3s server and an agent.
+    let mut roles = s.hosts[&to].roles.clone();
+    roles.insert(Role::ControlPlane);
+    let req = e.api(ApiOp::SetRoles { id: to.clone(), roles });
+    e.run_for(2000);
+    assert!(matches!(e.take_api_result(req), Some(ApiResult::Err(m)) if m.contains("hand a voter's place to it")));
+
+    let req = e.api(ApiOp::HandOffCp { from: from.clone(), to: to.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let handed = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.cp.voters.contains(&to) && !s.cp.voters.contains(&from) && s.cp.handoff.is_none() && etcd_is_voters(e)
+            && kube_of(e, &from) == Some((Some(KubeRole::Agent), KubePhase::Running))
+    };
+    assert!(e.run_until(e.now() + 3 * 60_000, handed), "voters {:?}, etcd {:?}, {from}: {:?}", e.client_view().state.cp.voters, e.fabric().world().kube.etcd, kube_of(&e, &from));
+    assert_ne!(e.true_leader(), Some(from.clone()), "the old leader stepped down");
+    let s = &e.client_view().state;
+    assert!(s.hosts[&to].roles.contains(&Role::ControlPlane) && !s.hosts[&from].roles.contains(&Role::ControlPlane));
+    assert_eq!(s.hosts[&from].lifecycle, Lifecycle::Ready, "the old voter stays in the fleet");
+    let kube = &e.fabric().world().kube;
+    let at = |c: EtcdChange| kube.etcd_log.iter().position(|l| *l == c);
+    let (joined, left) = (at(EtcdChange::Joined(to.clone())), at(EtcdChange::Left(from.clone())));
+    assert!(joined.is_some() && joined < left, "the new server joins etcd before the old one leaves: {:?}", kube.etcd_log);
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
+}
+
+#[test]
 fn a_replacement_that_dies_joining_etcd_leaves_a_member_that_goes_once_it_is_replaced_in_turn() {
     use control::proto::{KubePhase, KubeRole};
     use sim::world::EtcdChange;

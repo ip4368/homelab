@@ -13,7 +13,7 @@ describe('TopBar helpers', () => {
   })
 
   it('counts live voters: present in the view and not NotReady', () => {
-    const cp = { voters: ['a', 'b', 'c'], mode: 'Suggest' as const, version: 1 }
+    const cp = { voters: ['a', 'b', 'c'], mode: 'Suggest' as const, handoff: null, version: 1 }
     const hosts = { a: host('Ready'), b: host('NotReady'), c: host('Ready') }
     expect(quorumOf(cp, hosts)).toEqual({ live: 2, voters: 3, ok: true })
     expect(quorumOf(cp, { a: host('Ready') })).toEqual({ live: 1, voters: 3, ok: false })

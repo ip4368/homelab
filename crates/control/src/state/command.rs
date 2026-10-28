@@ -53,6 +53,11 @@ pub enum Command {
     /// Raises a `CpReplacementSuggested` alert on `dead` whose button
     /// replaces it with `with`.
     SuggestCpReplacement { id: String, dead: HostId, with: HostId },
+    /// Starts handing voter `from`'s place to `to` (the membership
+    /// controller does it). Fails with `AlreadyExists` while one is in progress.
+    StartCpHandoff { from: HostId, to: HostId },
+    /// Ends the hand-off in progress, done or given up, as `message` says.
+    EndCpHandoff { message: String },
     /// Creates or replaces a network. Changing the VLAN or MTU of one in use
     /// is allowed; the network controller rolls the change out.
     UpsertNetwork { network: LogicalNetwork },

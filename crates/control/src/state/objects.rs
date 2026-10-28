@@ -390,8 +390,22 @@ pub enum CpMode {
 pub struct CpInfo {
     pub voters: BTreeSet<HostId>,
     pub mode: CpMode,
+    /// A hand-off of a live voter's place in progress, if any.
+    #[serde(default)]
+    pub handoff: Option<CpHandoff>,
     #[ts(type = "number")]
     pub version: u64,
+}
+
+/// Voter `from` hands its place to `to`: `to` joins (a learner, then a
+/// voter), and once it runs a K3s server, `from` leaves.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct CpHandoff {
+    pub from: HostId,
+    pub to: HostId,
+    #[ts(type = "number")]
+    pub since: SimTime,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]

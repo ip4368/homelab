@@ -101,7 +101,7 @@ function initialState(): UiState {
       rollouts: {},
       alerts: {},
       events: [],
-      cp: { voters: [], mode: 'Suggest', version: 0 },
+      cp: { voters: [], mode: 'Suggest', handoff: null, version: 0 },
       metrics: {},
       deployments: {},
       pods: {},

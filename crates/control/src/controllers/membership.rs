@@ -12,13 +12,19 @@
 //!   host is down, so the controller never takes away a live member.
 //! * `CpQuorumAtRisk` is raised while the live voters are down to a bare quorum.
 //!
+//! * **Hand-off** (`ApiOp::HandOffCp`) moves a live voter's place to a
+//!   host the user picks: the host joins as a learner and is promoted, and
+//!   once it runs a K3s server (so etcd never runs short of a member while
+//!   it installs), the old voter is removed. It ends, recorded as an event,
+//!   once the old voter is gone, or when the new host can no longer join.
+//!
 //! Nothing changes while a config change is uncommitted. Candidates are
 //! `Ready`, control-plane-eligible hosts, MS-01s first, then hosts on an
 //! access switch (rack) no voter uses, then by id. The control-plane role
-//! follows the committed voters.
+//! follows the committed voters: it is not the user's to set.
 
 use super::{Action, Volatile};
-use crate::proto::{mgmt, Msg};
+use crate::proto::{mgmt, KubePhase, KubeRole, Msg};
 use crate::raft::{MemberChange, RaftNode};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, CpMode, HostObj, Lifecycle, ObjectRef};
@@ -75,6 +81,7 @@ pub fn run(state: &ClusterState, v: &Volatile, raft: &RaftMembers, now: SimTime)
     let mut actions = quorum_alert(state, v, raft);
     actions.extend(suggestions(state, v, raft, now));
     actions.extend(roles(state));
+    actions.extend(end_handoff(state, raft));
     let change = next_change(state, v, raft, now);
     match &change {
         Some(MemberChange::AddLearner(h)) => actions.push(start_replica(h, raft)),
@@ -125,6 +132,59 @@ pub fn check_replace(state: &ClusterState, raft: &RaftMembers, dead: &HostId, wi
     Ok(())
 }
 
+/// Why the leader refuses to hand voter `from`'s place to `to`, if it does.
+pub fn check_handoff(state: &ClusterState, raft: &RaftMembers, from: &HostId, to: &HostId) -> Result<(), String> {
+    if raft.pending || !raft.learners.is_empty() || state.cp.handoff.is_some() {
+        return Err("a control-plane membership change is in progress".into());
+    }
+    if !raft.voters.contains(from) {
+        return Err(format!("{from} is not a control-plane voter"));
+    }
+    if let Some(d) = raft.voters.iter().find(|v| down(state, v)) {
+        return Err(format!("control-plane voter {d} is down: replace it first"));
+    }
+    if !candidates(state, raft).contains(to) {
+        return Err(format!("{to} cannot join the control plane (it must be Ready, eligible and not a member)"));
+    }
+    Ok(())
+}
+
+/// Why setting (`wanted`) or clearing host `id`'s control-plane role by
+/// hand is refused: the role follows the voters.
+pub fn control_plane_role_refused(id: &HostId, wanted: bool) -> String {
+    if wanted {
+        format!("the control-plane role follows the control-plane voters, and {id} is not one: hand a voter's place to it instead")
+    } else {
+        format!("the control-plane role follows the control-plane voters, and {id} is one: hand its place to another host instead")
+    }
+}
+
+/// Whether `id`'s host runs a K3s server, as voters do, or the cluster has
+/// no Kubernetes to wait for.
+fn serves_kube(state: &ClusterState, id: &HostId) -> bool {
+    let running = |h: &HostObj| h.kube.as_ref().is_some_and(|k| k.role == Some(KubeRole::Server) && k.phase == KubePhase::Running);
+    state.kube.is_none() || state.hosts.get(id).is_some_and(running)
+}
+
+/// Ends the hand-off in progress once its old voter is gone, or once its
+/// new host is no member and can no longer join.
+fn end_handoff(state: &ClusterState, raft: &RaftMembers) -> Option<Action> {
+    let h = state.cp.handoff.as_ref()?;
+    if raft.pending {
+        return None;
+    }
+    let message = if !raft.voters.contains(&h.from) && raft.voters.contains(&h.to) {
+        format!("{} handed its control-plane place to {}", h.from, h.to)
+    } else if !raft.voters.contains(&h.from) {
+        format!("gave up handing {}'s control-plane place to {}: {} left the control plane first", h.from, h.to, h.from)
+    } else if !raft.is_member(&h.to) && !candidates(state, raft).contains(&h.to) {
+        format!("gave up handing {}'s control-plane place to {}: {} cannot join (it must be Ready, eligible and not a member)", h.from, h.to, h.to)
+    } else {
+        return None;
+    };
+    Some(Action::Propose(Command::EndCpHandoff { message }))
+}
+
 /// Whether the state knows `h`'s host and it is not up (up: `Ready`, or
 /// cordoned, draining or drained, which still run the replica). A member
 /// the state has no host for is not judged.
@@ -161,6 +221,14 @@ fn next_change(state: &ClusterState, v: &Volatile, raft: &RaftMembers, now: SimT
         let downed = raft.voters.iter().filter_map(|h| state.hosts.get(h).filter(|_| down(state, h)));
         if let Some(h) = downed.min_by_key(|h| (h.last_transition, h.id.clone())).map(|h| &h.id) {
             return Some(MemberChange::Remove(h.clone()));
+        }
+    }
+    if let Some(h) = state.cp.handoff.as_ref().filter(|h| raft.voters.contains(&h.from)) {
+        if raft.voters.contains(&h.to) && serves_kube(state, &h.to) {
+            return Some(MemberChange::Remove(h.from.clone()));
+        }
+        if !raft.is_member(&h.to) && candidates(state, raft).contains(&h.to) {
+            return Some(MemberChange::AddLearner(h.to.clone()));
         }
     }
     let replace = state.cp.mode == CpMode::Auto && raft.voters.iter().any(|h| dead(state, h, now));
@@ -450,6 +518,98 @@ mod tests {
         let (s, _) = state(CpMode::Suggest);
         let solo = RaftMembers { voters: ids(&["v1"]), ..Default::default() };
         assert!(quorum_alert(&s, &v, &solo).is_empty());
+    }
+
+    fn k3s(s: &mut ClusterState, id: &str, role: KubeRole, phase: KubePhase) {
+        let status = crate::proto::KubeStatus {
+            role: Some(role),
+            phase,
+            node_ready: true,
+            labels: Default::default(),
+            storage_disks: vec![],
+            version: "v1".into(),
+            detail: None,
+            etcd_members: BTreeSet::new(),
+            etcd_unread: None,
+            etcd_unstarted: BTreeSet::new(),
+            storage_off: BTreeSet::new(),
+        };
+        s.apply(0, Command::RecordKube { id: hid(id), status }).unwrap();
+    }
+
+    fn last_event(s: &ClusterState) -> String {
+        s.events.values().last().unwrap().message.clone()
+    }
+
+    #[test]
+    fn only_a_live_voter_hands_off_and_only_to_a_candidate_with_no_change_in_progress() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        assert_eq!(check_handoff(&s, &raft, &hid("v1"), &hid("mini-1")), Ok(()));
+        assert!(check_handoff(&s, &raft, &hid("mini-2"), &hid("mini-1")).is_err(), "mini-2 is no voter");
+        assert!(check_handoff(&s, &raft, &hid("v1"), &hid("v2")).is_err(), "v2 is a member already");
+        assert!(check_handoff(&s, &raft, &hid("v1"), &hid("pi-1")).is_err(), "a Pi 5 is not eligible");
+        set_lifecycle(&mut s, "v3", Lifecycle::NotReady, 0);
+        assert_eq!(check_handoff(&s, &raft, &hid("v1"), &hid("mini-1")), Err("control-plane voter v3 is down: replace it first".into()));
+        set_lifecycle(&mut s, "v3", Lifecycle::Ready, 0);
+        raft.learners.insert(hid("ms01-9"));
+        assert!(check_handoff(&s, &raft, &hid("v1"), &hid("mini-1")).is_err(), "a learner is joining");
+        raft.learners.clear();
+        s.apply(0, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        assert!(check_handoff(&s, &raft, &hid("v2"), &hid("mini-2")).is_err(), "one hand-off at a time");
+    }
+
+    #[test]
+    fn a_handoff_adds_the_chosen_host_and_removes_the_old_voter_once_the_new_one_runs_a_k3s_server() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        let v = Volatile::new(0, 1);
+        s.apply(0, Command::SetKube { token: "t".into(), init_host: hid("v1") }).unwrap();
+        for id in ["v1", "v2", "v3"] {
+            k3s(&mut s, id, KubeRole::Server, KubePhase::Running);
+        }
+        k3s(&mut s, "mini-1", KubeRole::Agent, KubePhase::Running);
+        s.apply(0, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        assert_eq!(last_event(&s), "handing v1's control-plane place to mini-1");
+
+        let plan = step(&mut s, &v, &raft, 1000);
+        assert_eq!(plan.change, Some(MemberChange::AddLearner(hid("mini-1"))), "the chosen host, not the best candidate (ms01-9)");
+        assert_eq!(started(&plan), [hid("mini-1")]);
+        raft.learners.insert(hid("mini-1"));
+        raft.caught_up.insert(hid("mini-1"));
+        assert_eq!(step(&mut s, &v, &raft, 2000).change, Some(MemberChange::Promote(hid("mini-1"))));
+        raft.learners.clear();
+        raft.voters.insert(hid("mini-1"));
+        s.apply_membership(raft.voters.clone());
+
+        // mini-1 is reinstalling as a K3s server: v1 stays, so etcd is never a member short.
+        k3s(&mut s, "mini-1", KubeRole::Server, KubePhase::Installing);
+        let plan = step(&mut s, &v, &raft, 3000);
+        assert_eq!(plan.change, None);
+        assert!(s.hosts[&hid("mini-1")].roles.contains(&Role::ControlPlane), "the role follows the voters");
+        k3s(&mut s, "mini-1", KubeRole::Server, KubePhase::Running);
+        assert_eq!(step(&mut s, &v, &raft, 4000).change, Some(MemberChange::Remove(hid("v1"))));
+        raft.voters.remove(&hid("v1"));
+        s.apply_membership(raft.voters.clone());
+
+        let plan = step(&mut s, &v, &raft, 5000);
+        assert_eq!(plan.change, None, "done: four voters were never the target");
+        assert_eq!(s.cp.handoff, None);
+        assert_eq!(last_event(&s), "v1 handed its control-plane place to mini-1");
+        assert!(!s.hosts[&hid("v1")].roles.contains(&Role::ControlPlane));
+    }
+
+    #[test]
+    fn a_handoff_whose_new_host_goes_down_before_it_joins_is_given_up() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        let v = Volatile::new(0, 1);
+        s.apply(0, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        assert_eq!(step(&mut s, &v, &raft, 1000).change, Some(MemberChange::AddLearner(hid("mini-1"))));
+        raft.learners.insert(hid("mini-1"));
+        set_lifecycle(&mut s, "mini-1", Lifecycle::NotReady, 2000);
+        assert_eq!(step(&mut s, &v, &raft, 3000).change, Some(MemberChange::Remove(hid("mini-1"))), "a dead learner goes");
+        raft.learners.clear();
+        assert_eq!(step(&mut s, &v, &raft, 4000).change, None, "v1 stays");
+        assert_eq!(s.cp.handoff, None);
+        assert!(last_event(&s).starts_with("gave up handing v1's control-plane place to mini-1: mini-1 cannot join"), "{}", last_event(&s));
     }
 
     #[test]

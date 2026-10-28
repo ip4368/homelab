@@ -48,7 +48,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, clock: Partial<ClockInfo> = 
     volume_status: [],
     alerts: [],
     events: [],
-    cp: { voters: ['cp-1'], mode: 'Suggest', version: 1 },
+    cp: { voters: ['cp-1'], mode: 'Suggest', handoff: null, version: 1 },
     metrics: {},
     ...over,
   }
@@ -125,7 +125,7 @@ describe('store', () => {
           { type: 'Event', ...event(3) },
           { type: 'Token', token: 't', expires_at: 9, version: 2 },
           { type: 'Rule', id: 'r', profile: 'Pi5', roles: ['Compute'], template: null, version: 2 },
-          { type: 'Cp', voters: ['cp-1', 'cp-2'], mode: 'Auto', version: 2 },
+          { type: 'Cp', voters: ['cp-1', 'cp-2'], mode: 'Auto', handoff: null, version: 2 },
         ],
       }),
     )
@@ -134,7 +134,7 @@ describe('store', () => {
     expect(v.events.map((e) => e.seq)).toEqual([3])
     expect(v.tokens.t.expires_at).toBe(9)
     expect(v.rules.r.profile).toBe('Pi5')
-    expect(v.cp).toEqual({ voters: ['cp-1', 'cp-2'], mode: 'Auto', version: 2 })
+    expect(v.cp).toEqual({ voters: ['cp-1', 'cp-2'], mode: 'Auto', handoff: null, version: 2 })
 
     s.applyMessage(delta({ removed: [{ kind: 'Alert', id: 'al1' }, { kind: 'Token', id: 't' }, { kind: 'Rule', id: 'r' }] }))
     const after = s.getState().view

@@ -83,7 +83,7 @@ impl ClusterState {
             volume_status: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
-            cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, version: 0 },
+            cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, handoff: None, version: 0 },
             kube: None,
             next_event_seq: 1,
             tombstones: Vec::new(),
@@ -270,20 +270,29 @@ impl ClusterState {
                 alert.message = message;
                 alert.version = v;
             }
-            Command::Event { entity, message } => {
-                let seq = self.next_event_seq;
-                self.next_event_seq += 1;
-                self.events.insert(seq, Event { seq, at, entity, message, version: v });
-                while self.events.len() > EVENT_RING {
-                    self.events.pop_first();
-                }
-            }
+            Command::Event { entity, message } => self.event(at, v, entity, message),
             Command::SetCp { voters, mode } => {
-                self.cp = CpInfo { voters, mode, version: v };
+                self.cp = CpInfo { voters, mode, handoff: None, version: v };
             }
             Command::SetCpMode { mode } => {
                 self.cp.mode = mode;
                 self.cp.version = v;
+            }
+            Command::StartCpHandoff { from, to } => {
+                if self.cp.handoff.is_some() {
+                    return Err(ApplyError::AlreadyExists);
+                }
+                let message = format!("handing {from}'s control-plane place to {to}");
+                self.cp.handoff = Some(CpHandoff { from, to, since: at });
+                self.cp.version = v;
+                self.event(at, v, ObjectRef::cp(), message);
+            }
+            Command::EndCpHandoff { message } => {
+                if self.cp.handoff.take().is_none() {
+                    return Err(ApplyError::NotFound);
+                }
+                self.cp.version = v;
+                self.event(at, v, ObjectRef::cp(), message);
             }
             Command::UpsertNetwork { network } => self.upsert_network(v, network),
             Command::DeleteNetwork { id } => {
@@ -416,6 +425,15 @@ impl ClusterState {
         }
         self.version = v;
         Ok(())
+    }
+
+    fn event(&mut self, at: SimTime, v: u64, entity: ObjectRef, message: String) {
+        let seq = self.next_event_seq;
+        self.next_event_seq += 1;
+        self.events.insert(seq, Event { seq, at, entity, message, version: v });
+        while self.events.len() > EVENT_RING {
+            self.events.pop_first();
+        }
     }
 
     /// Applies a committed Raft config entry: the CP voters become `voters`.

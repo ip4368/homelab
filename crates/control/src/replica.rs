@@ -11,7 +11,7 @@ use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport}
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle, NetworkResult, ObjectKind};
-use model::{HostId, Inventory};
+use model::{HostId, Inventory, Role};
 use std::collections::BTreeSet;
 
 pub const RAFT_TICK_MS: u64 = 100;
@@ -230,6 +230,13 @@ impl CpReplica {
                     }
                 }
             }
+            Handling::HandOffCp { from: leaving, to } => {
+                if let Err(e) = membership::check_handoff(&self.state, &RaftMembers::of(raft), &leaving, &to) {
+                    return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Err(e) });
+                }
+                let cmd = Command::StartCpHandoff { from: leaving, to };
+                (raft.propose(mono, LogCmd { at: now, cmd }).expect("checked leadership above"), serde_json::Value::Null)
+            }
         };
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
@@ -353,6 +360,8 @@ enum Handling {
     Propose(Box<Command>, serde_json::Value),
     /// Add `with` as a CP learner, to replace `dead`; answer once that commits.
     ReplaceCpMember { dead: HostId, with: HostId },
+    /// Record a hand-off of `from`'s CP place to `to`, if the membership allows it.
+    HandOffCp { from: HostId, to: HostId },
 }
 
 /// How the leader of `term` handles `op`, given its state.
@@ -382,6 +391,9 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::PauseRollout { id } => Command::PauseRollout { id, reason: "paused by the user".into(), failed: vec![] },
         ApiOp::ResumeRollout { id } => Command::ResumeRollout { id },
         ApiOp::AbortRollout { id } => Command::AbortRollout { id },
+        ApiOp::ApproveHost { id, roles } | ApiOp::SetRoles { id, roles } if roles.contains(&Role::ControlPlane) != state.cp.voters.contains(&id) => {
+            return Handling::Answer(ApiResult::Err(membership::control_plane_role_refused(&id, roles.contains(&Role::ControlPlane))));
+        }
         ApiOp::ApproveHost { id, roles } => Command::ApproveHost { id, roles },
         ApiOp::SetRoles { id, roles } => Command::SetRoles { id, roles },
         ApiOp::SetLabels { id, labels } => Command::SetLabels { id, labels },
@@ -412,6 +424,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
+        ApiOp::HandOffCp { from, to } => return Handling::HandOffCp { from, to },
         ApiOp::GetSeries { entity, metrics } => {
             let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
             return Handling::Answer(result);
