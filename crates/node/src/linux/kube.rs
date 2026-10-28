@@ -15,12 +15,12 @@
 //! 3. On a server, writes the Longhorn `HelmChart` manifest K3s deploys.
 //! 4. Labels the node, and on a storage host gives Longhorn its data disks
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
-//!    Longhorn to use it).
+//!    Longhorn to use it). A host that stores no more loses that label.
 //!
 //! On a server, it also reads etcd's members (K3s's `/db/info`) for the
 //! status, and does the work the leader asks of it for the cluster
 //! ([`KubeAdmin`]): it deletes the nodes of dead members, so K3s removes
-//! them from etcd.
+//! them from etcd, and keeps Longhorn off the disks of hosts that do not store.
 //!
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
@@ -54,6 +54,9 @@ const EVERY: Duration = Duration::from_secs(10);
 const BACKOFF: Duration = Duration::from_secs(20);
 const LONGHORN_DISK_LABEL: &str = "node.longhorn.io/create-default-disk";
 const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
+/// On a Longhorn node: the disks the control plane took out of scheduling
+/// because the host does not store, to give back once it does.
+const STORAGE_OFF_ANNOTATION: &str = "homelab.io/storage-off";
 /// A K3s server's certificates: its CA and the admin's client certificate.
 const SERVER_TLS: &str = "/var/lib/rancher/k3s/server/tls";
 
@@ -108,6 +111,53 @@ spec:
     )
 }
 
+/// The node names of the etcd members in K3s's `/db/info`: a member is named
+/// `<node>-<8 hex digits>`; one that has not started yet has no name.
+pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
+    let v: serde_json::Value = serde_json::from_str(db_info).map_err(|e| format!("read etcd's members: {e}"))?;
+    let names = v["members"].as_array().ok_or("etcd's members: no list")?.iter().filter_map(|m| m["name"].as_str()).filter(|n| !n.is_empty());
+    Ok(names
+        .map(|n| match n.rsplit_once('-') {
+            Some((node, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) => HostId::from(node),
+            _ => HostId::from(n),
+        })
+        .collect())
+}
+
+/// Whether a node (`kubectl get node -o json`) is `Ready`.
+fn node_ready(node: &serde_json::Value) -> bool {
+    node["status"]["conditions"].as_array().into_iter().flatten().any(|c| c["type"] == "Ready" && c["status"] == "True")
+}
+
+/// The merge patches, by Longhorn node, that keep Longhorn off the disks of
+/// the nodes in `off` and give back those it was kept off before, from the
+/// list of Longhorn's nodes: a listed node's schedulable disks are turned
+/// off and noted in [`STORAGE_OFF_ANNOTATION`]; the noted disks of a node no
+/// longer listed are turned on again, and the note dropped.
+pub fn storage_off_patches(nodes: &serde_json::Value, off: &BTreeSet<HostId>) -> Vec<(String, serde_json::Value)> {
+    let mut out = vec![];
+    for n in nodes["items"].as_array().into_iter().flatten() {
+        let Some(name) = n["metadata"]["name"].as_str() else { continue };
+        let noted: BTreeSet<String> = n["metadata"]["annotations"][STORAGE_OFF_ANNOTATION].as_str().unwrap_or("").split(',').filter(|d| !d.is_empty()).map(String::from).collect();
+        let disks = n["spec"]["disks"].as_object();
+        let set = |names: &BTreeSet<String>, on: bool| -> serde_json::Map<String, serde_json::Value> {
+            names.iter().map(|d| (d.clone(), serde_json::json!({ "allowScheduling": on }))).collect()
+        };
+        if off.contains(&HostId::from(name)) {
+            let on: BTreeSet<String> = disks.into_iter().flatten().filter(|(_, d)| d["allowScheduling"] == true).map(|(k, _)| k.clone()).collect();
+            if on.is_empty() {
+                continue;
+            }
+            let note = noted.union(&on).cloned().collect::<Vec<_>>().join(",");
+            out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: note } }, "spec": { "disks": set(&on, false) } })));
+        } else if !noted.is_empty() {
+            let back: BTreeSet<String> = noted.into_iter().filter(|d| disks.is_some_and(|m| m.contains_key(d))).collect();
+            out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: null } }, "spec": { "disks": set(&back, true) } })));
+        }
+    }
+    out
+}
+
 /// The install script's arguments for `spec` on `host`: the role, how it
 /// finds the cluster, and the node's name, address, interface and labels.
 pub fn install_args(spec: &KubeSpec, host: &HostId, vip: Ipv4Addr, iface: &str) -> Vec<String> {
@@ -157,24 +207,6 @@ pub fn disks_annotation(disks: &[String], mnt: &Path) -> String {
     serde_json::Value::Array(entries).to_string()
 }
 
-/// The node names of the etcd members in K3s's `/db/info`: a member is named
-/// `<node>-<8 hex digits>`; one that has not started yet has no name.
-pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
-    let v: serde_json::Value = serde_json::from_str(db_info).map_err(|e| format!("read etcd's members: {e}"))?;
-    let names = v["members"].as_array().ok_or("etcd's members: no list")?.iter().filter_map(|m| m["name"].as_str()).filter(|n| !n.is_empty());
-    Ok(names
-        .map(|n| match n.rsplit_once('-') {
-            Some((node, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) => HostId::from(node),
-            _ => HostId::from(n),
-        })
-        .collect())
-}
-
-/// Whether a node (`kubectl get node -o json`) is `Ready`.
-fn node_ready(node: &serde_json::Value) -> bool {
-    node["status"]["conditions"].as_array().into_iter().flatten().any(|c| c["type"] == "Ready" && c["status"] == "True")
-}
-
 #[derive(Debug, Default)]
 struct Shared {
     want: Option<KubeSpec>,
@@ -196,7 +228,8 @@ impl Kube {
     pub fn start(host: HostId, vip: Ipv4Addr, paths: Paths) -> Self {
         let kube = Self { shared: Arc::new((Mutex::new(Shared::default()), Condvar::new())) };
         let k = kube.clone();
-        let spawned = std::thread::Builder::new().name("kube".into()).spawn(move || Worker { host, vip, paths, applied: None }.run(&k));
+        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new() };
+        let spawned = std::thread::Builder::new().name("kube".into()).spawn(move || worker.run(&k));
         if let Err(e) = spawned {
             eprintln!("homelabd: start the kubernetes worker: {e}");
         }
@@ -261,6 +294,8 @@ struct Worker {
     paths: Paths,
     /// The spec whose labels and disks the node has been given.
     applied: Option<KubeSpec>,
+    /// The hosts whose Longhorn disks this server last kept Longhorn off.
+    storage_off: BTreeSet<HostId>,
 }
 
 impl Worker {
@@ -277,6 +312,7 @@ impl Worker {
                     eprintln!("homelabd: kubernetes: for the cluster: {e}");
                 }
                 status.etcd_members = self.etcd_members();
+                status.storage_off.clone_from(&self.storage_off);
             }
             wait = if ok { EVERY } else { BACKOFF };
             if let Ok(b) = serde_json::to_vec(&status) {
@@ -310,6 +346,7 @@ impl Worker {
             version: o.version.clone(),
             detail,
             etcd_members: o.etcd_members.clone(),
+            storage_off: if o.role == Some(KubeRole::Server) { self.storage_off.clone() } else { BTreeSet::new() },
         }
     }
 
@@ -389,8 +426,9 @@ impl Worker {
 
     /// Does `admin` with this server's admin access: deletes the nodes of
     /// the dead etcd members asked (of `members`), so K3s removes them, but
-    /// never a node that is `Ready`.
-    fn admin(&self, admin: &KubeAdmin, members: &BTreeSet<HostId>) -> Result<(), String> {
+    /// never a node that is `Ready`; then keeps Longhorn off the disks of
+    /// the hosts listed, and gives back the others'.
+    fn admin(&mut self, admin: &KubeAdmin, members: &BTreeSet<HostId>) -> Result<(), String> {
         for m in admin.remove_etcd_members.iter().filter(|m| members.contains(*m) && **m != self.host) {
             let node = match self.kubectl(KubeRole::Server, &["get", "node", m.as_str(), "-o", "json"]) {
                 Ok(json) => serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("read node {m}: {e}"))?,
@@ -407,6 +445,13 @@ impl Worker {
             eprintln!("homelabd: kubernetes: removing {m}'s etcd member (deleting its node)");
             self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"])?;
         }
+        let json = self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "get", "nodes.longhorn.io", "-o", "json"])?;
+        let nodes: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read Longhorn's nodes: {e}"))?;
+        for (node, patch) in storage_off_patches(&nodes, &admin.storage_off) {
+            eprintln!("homelabd: kubernetes: Longhorn disks of {node}: {patch}");
+            self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "patch", "nodes.longhorn.io", &node, "--type", "merge", "-p", &patch.to_string()])?;
+        }
+        self.storage_off.clone_from(&admin.storage_off);
         Ok(())
     }
 
@@ -475,7 +520,10 @@ impl Worker {
         let current: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read node {node}: {e}"))?;
         let mut args: Vec<String> = vec!["label".into(), "node".into(), node.into(), "--overwrite".into()];
         args.extend(spec.labels.iter().map(|(k, v)| format!("{k}={v}")));
-        let stale = current["metadata"]["labels"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| k.starts_with(control::controllers::kube::LABEL_PREFIX) && !spec.labels.contains_key(*k));
+        // Homelab labels the host no longer has, and Longhorn's disk label on a host that stores no more.
+        let stale = current["metadata"]["labels"].as_object().into_iter().flatten().map(|(k, _)| k).filter(|k| {
+            (k.starts_with(control::controllers::kube::LABEL_PREFIX) && !spec.labels.contains_key(*k)) || (*k == LONGHORN_DISK_LABEL && spec.storage_disks.is_empty())
+        });
         args.extend(stale.map(|k| format!("{k}-")));
         self.kubectl(spec.role, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
         if spec.storage_disks.is_empty() {
@@ -617,5 +665,29 @@ mod tests {
         assert!(node_ready(&ready));
         let gone = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}});
         assert!(!node_ready(&gone));
+    }
+
+    #[test]
+    fn longhorn_is_kept_off_the_disks_of_hosts_that_do_not_store_and_given_them_back() {
+        let node = |name: &str, disks: &[(&str, bool)], noted: Option<&str>| {
+            let disks: serde_json::Map<String, serde_json::Value> = disks.iter().map(|(d, on)| (d.to_string(), serde_json::json!({ "allowScheduling": on, "path": format!("/mnt/{d}") }))).collect();
+            let annotations = noted.map(|n| serde_json::json!({ STORAGE_OFF_ANNOTATION: n })).unwrap_or(serde_json::json!({}));
+            serde_json::json!({ "metadata": { "name": name, "annotations": annotations }, "spec": { "disks": disks } })
+        };
+        let nodes = serde_json::json!({ "items": [
+            node("ms01-01", &[("nvme0", true), ("nvme1", true)], None),
+            node("ms01-05", &[("nvme0", true), ("nvme1", false)], None),
+            node("ms01-06", &[("nvme0", false)], Some("nvme0")),
+            node("minipc-01", &[("nvme0", false)], None),
+        ] });
+        let off: BTreeSet<HostId> = [HostId::from("ms01-05"), HostId::from("minipc-01")].into();
+        let patches = storage_off_patches(&nodes, &off);
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        assert_eq!(patches[0].0, "ms01-05");
+        assert_eq!(patches[0].1, serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: "nvme0" } }, "spec": { "disks": { "nvme0": { "allowScheduling": false } } } }), "a disk turned off by hand is not noted");
+        assert_eq!(patches[1].0, "ms01-06", "it stores again: its disk comes back");
+        assert_eq!(patches[1].1, serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: null } }, "spec": { "disks": { "nvme0": { "allowScheduling": true } } } }));
+        let done = serde_json::json!({ "items": [node("ms01-05", &[("nvme0", false), ("nvme1", false)], Some("nvme0"))] });
+        assert!(storage_off_patches(&done, &off).is_empty(), "nothing left to do");
     }
 }

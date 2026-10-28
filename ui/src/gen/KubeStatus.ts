@@ -31,4 +31,9 @@ detail: string | null,
 /**
  * On a server: the etcd members, by node name (the host's id).
  */
-etcd_members: Array<HostId>, };
+etcd_members: Array<HostId>, 
+/**
+ * On a server: the hosts whose Longhorn disks it last took out of
+ * scheduling ([`KubeAdmin::storage_off`]).
+ */
+storage_off: Array<HostId>, };

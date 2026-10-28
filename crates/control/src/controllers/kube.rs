@@ -13,7 +13,10 @@
 //!   target: membership is about to make one of them a voter, and a voter
 //!   runs a server.
 //! * A host whose storage role is held for a network problem gives Longhorn
-//!   no disks.
+//!   no disks, and nor does any other host without an active storage role:
+//!   a running server is asked to take such a host's Longhorn disks out of
+//!   scheduling ([`KubeAdmin::storage_off`]), and to give them back once the
+//!   host stores again.
 //!
 //! Replacing a dead server, etcd's way: remove the dead member, then add the
 //! new one.
@@ -106,6 +109,11 @@ fn up(state: &ClusterState, id: &HostId) -> bool {
     state.hosts.get(id).is_some_and(member)
 }
 
+/// Whether `h` keeps Longhorn replicas: it has the storage role, not held.
+fn stores(h: &HostObj) -> bool {
+    h.roles.contains(&Role::Storage) && !h.net.held_roles.contains_key(&Role::Storage)
+}
+
 fn runs_server(status: Option<&KubeStatus>) -> bool {
     status.is_some_and(|s| s.role == Some(KubeRole::Server) && s.phase == crate::proto::KubePhase::Running)
 }
@@ -174,23 +182,26 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
             return None;
         }
     }
-    let storage = h.roles.contains(&Role::Storage) && !h.net.held_roles.contains_key(&Role::Storage);
-    let storage_disks = if storage { h.inventory.disks.iter().filter(|d| !d.failed).map(|d| d.name.clone()).collect() } else { vec![] };
+    let storage_disks = if stores(h) { h.inventory.disks.iter().filter(|d| !d.failed).map(|d| d.name.clone()).collect() } else { vec![] };
     Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels: node_labels(h), storage_disks })
 }
 
 /// What a running server is to do for the cluster now, sent to the first
-/// up host running one: remove the etcd member [`etcd_removal`] picks.
-/// Asked while there is one, at most every [`KUBE_RESEND_MS`].
+/// up host running one: remove the etcd member [`etcd_removal`] picks, and
+/// keep Longhorn off the disks of member hosts that do not store. Asked
+/// while there is a member to remove or the server has not applied that
+/// set of hosts, at most every [`KUBE_RESEND_MS`].
 fn admin(state: &ClusterState, v: &Volatile, status: &impl Fn(&HostId) -> Option<KubeStatus>, now: SimTime) -> Option<Action> {
     let via = state.hosts.keys().find(|id| up(state, id) && runs_server(status(id).as_ref()))?;
     let members = etcd_members(state, status);
     let remove_etcd_members: BTreeSet<HostId> = etcd_removal(state, &members, status).into_iter().cloned().collect();
-    if remove_etcd_members.is_empty() || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
+    let storage_off: BTreeSet<HostId> = state.hosts.values().filter(|h| member(h) && !stores(h)).map(|h| h.id.clone()).collect();
+    let applied = status(via).is_some_and(|s| s.storage_off == storage_off);
+    if (remove_etcd_members.is_empty() && applied) || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
         return None;
     }
     let to = Endpoint::new(Addr::Host(via.clone()), Svc::Agent);
-    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(KubeAdmin { remove_etcd_members })))
+    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(KubeAdmin { remove_etcd_members, storage_off })))
 }
 
 pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
@@ -260,6 +271,10 @@ mod tests {
         s.apply(0, Command::SetLifecycle { id: hid(id), lifecycle: Lifecycle::Ready }).unwrap();
     }
 
+    fn storage() -> model::NetworkId {
+        model::NetworkId::from("storage")
+    }
+
     fn running(role: KubeRole) -> KubeStatus {
         KubeStatus {
             role: Some(role),
@@ -270,6 +285,7 @@ mod tests {
             version: "v1".into(),
             detail: None,
             etcd_members: BTreeSet::new(),
+            storage_off: BTreeSet::new(),
         }
     }
 
@@ -307,6 +323,11 @@ mod tests {
 
     fn down(s: &mut ClusterState, id: &str) {
         s.apply(0, Command::SetLifecycle { id: hid(id), lifecycle: Lifecycle::NotReady }).unwrap();
+    }
+
+    fn hold_storage(s: &mut ClusterState, id: &str, held: bool) {
+        let held_roles = if held { [(Role::Storage, storage())].into() } else { BTreeMap::new() };
+        s.apply(0, Command::AssessNetwork { id: hid(id), issues: vec![], fixes: vec![], held_roles, drift: false }).unwrap();
     }
 
     fn sent(actions: &[Action]) -> BTreeMap<HostId, KubeSpec> {
@@ -402,7 +423,7 @@ mod tests {
         let cmd: LogCmd = serde_json::from_str(logged).expect("the first release's RecordKube replays");
         let Command::RecordKube { status, .. } = cmd.cmd else { panic!("{cmd:?}") };
         assert_eq!((status.phase, status.detail), (KubePhase::Installing, None));
-        assert!(status.etcd_members.is_empty());
+        assert!(status.etcd_members.is_empty() && status.storage_off.is_empty());
     }
 
     #[test]
@@ -414,7 +435,7 @@ mod tests {
         // Membership replaced it with ms01-04.
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]) };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), storage_off: BTreeSet::new() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)], "through the first running server");
         assert!(!sent(&actions).contains_key(&hid("ms01-04")), "the replacement waits for the dead member to go");
         v.kube_admin_sent = Some(0);
@@ -473,6 +494,27 @@ mod tests {
         assert!(!join_blocked(&s, &set(&["ms01-01", "ms01-02"]), &status));
         assert!(!join_blocked(&s, &set(&["ms01-01"]), &status), "the second server joins the first");
         assert!(!join_blocked(&s, &BTreeSet::new(), &status), "servers that report no members do not stop a join");
+    }
+
+    #[test]
+    fn longhorn_keeps_off_the_disks_of_hosts_that_do_not_store() {
+        let (mut s, mut v) = three_servers();
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "every host stores");
+        hold_storage(&mut s, "ms01-04", true);
+        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), storage_off: set(&["ms01-04"]) };
+        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want.clone())]);
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off = want.storage_off;
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "the server applied it");
+
+        // The network is fixed: the disks are given back.
+        hold_storage(&mut s, "ms01-04", false);
+        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), storage_off: BTreeSet::new() })]);
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off.clear();
+        // A host without the storage role never stores.
+        let mut roles = s.hosts[&hid("ms01-04")].roles.clone();
+        roles.remove(&Role::Storage);
+        s.apply(0, Command::SetRoles { id: hid("ms01-04"), roles }).unwrap();
+        assert_eq!(asked(&run(&s, &v, 0))[0].1.storage_off, set(&["ms01-04"]));
     }
 
     #[test]

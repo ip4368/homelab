@@ -271,14 +271,19 @@ pub struct World {
 }
 
 /// The stand-in for what the cluster's Kubernetes keeps beyond each host's
-/// node (each host's is [`HostHw::kube`]): etcd's members. It keeps etcd's
-/// rules, and notes whatever the control plane asked for that breaks them.
+/// node (each host's is [`HostHw::kube`]): etcd's members, and the hosts
+/// whose Longhorn disks are out of scheduling. It keeps etcd's rules, and
+/// notes whatever the control plane asked for that breaks them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct KubeWorld {
     /// The etcd members, by host.
     pub etcd: BTreeSet<HostId>,
     /// Every change to the members, in order.
     pub etcd_log: Vec<EtcdChange>,
+    /// Hosts whose Longhorn disks take no new replicas.
+    pub storage_off: BTreeSet<HostId>,
+    /// The `storage_off` each server last applied, by server.
+    pub storage_off_applied: BTreeMap<HostId, BTreeSet<HostId>>,
     /// What the control plane asked for against etcd's rules: a live member
     /// removed, a change without a quorum, a join etcd refused. Tests expect none.
     pub violations: Vec<String>,
@@ -356,7 +361,8 @@ impl World {
     }
 
     /// `host`'s K3s server does `admin`: it removes the members asked (a
-    /// node that is Ready, its host on, it does not delete). Only a running
+    /// node that is Ready, its host on, it does not delete), and takes the
+    /// Longhorn disks of the hosts listed out of scheduling. Only a running
     /// server, an etcd member, does anything.
     pub fn kube_admin(&mut self, host: &HostId, admin: KubeAdmin) {
         if !self.etcd_runs(host) || !self.kube.etcd.contains(host) {
@@ -378,6 +384,8 @@ impl World {
             self.kube.etcd.remove(m);
             self.kube.etcd_log.push(EtcdChange::Removed(m.clone()));
         }
+        self.kube.storage_off.clone_from(&admin.storage_off);
+        self.kube.storage_off_applied.insert(host.clone(), admin.storage_off);
     }
 
     /// How `host`'s Kubernetes stands: what its spec asks once applied, but
@@ -396,6 +404,7 @@ impl World {
             version: "sim".into(),
             detail: (!joined).then(|| "waiting to join etcd".into()),
             etcd_members: if spec.role == KubeRole::Server && member { self.kube.etcd.clone() } else { BTreeSet::new() },
+            storage_off: self.kube.storage_off_applied.get(host).cloned().unwrap_or_default(),
         })
     }
 

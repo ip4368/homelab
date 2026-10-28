@@ -176,6 +176,9 @@ pub struct KubeAdmin {
     /// The server deletes their nodes, so K3s removes the members, but never
     /// a node that is `Ready`.
     pub remove_etcd_members: BTreeSet<HostId>,
+    /// Hosts whose Longhorn disks take no new replicas: they have no active
+    /// storage role. Disks this took from a host not listed are given back.
+    pub storage_off: BTreeSet<HostId>,
 }
 
 /// How a host's Kubernetes install stands.
@@ -213,6 +216,10 @@ pub struct KubeStatus {
     /// On a server: the etcd members, by node name (the host's id).
     #[serde(default)]
     pub etcd_members: BTreeSet<HostId>,
+    /// On a server: the hosts whose Longhorn disks it last took out of
+    /// scheduling ([`KubeAdmin::storage_off`]).
+    #[serde(default)]
+    pub storage_off: BTreeSet<HostId>,
 }
 
 impl KubeStatus {

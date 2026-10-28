@@ -707,6 +707,36 @@ fn criterion_5_vlan_removed() {
 }
 
 #[test]
+fn longhorn_keeps_off_the_disks_of_hosts_that_do_not_store() {
+    let mut e = settled_fleet(64);
+    let storing = |e: &Engine| -> BTreeSet<HostId> {
+        let hosts = &e.client_view().state.hosts;
+        hosts.values().filter(|h| !h.roles.contains(&Role::Storage)).map(|h| h.id.clone()).collect()
+    };
+    let off = |e: &Engine| e.fabric().world().kube.storage_off.clone();
+    let not_storing = storing(&e);
+    assert!(not_storing.contains(&hid("pi5-01")), "{not_storing:?}");
+    assert!(e.run_until(e.now() + 3 * 60_000, |e| off(e) == not_storing), "Longhorn off {:?}", off(&e));
+
+    // VLAN 20 leaves an MS-01's trunk: its storage role is held, and Longhorn keeps off its disks.
+    let h = hid("ms01-01");
+    let ports = |e: &Engine| -> Vec<(SwitchId, PortName, SwitchPortCfg)> {
+        ["core-1", "core-2"].iter().map(|s| (sid(s), PortName::from("p1"), e.fabric().world().topology.switches[&sid(s)].port(&PortName::from("p1")).unwrap().clone())).collect()
+    };
+    let original = ports(&e);
+    for (switch, port, mut cfg) in original.clone() {
+        let PortMode::Trunk { allowed, .. } = &mut cfg.mode else { panic!("an MS-01 bond port is a trunk") };
+        allowed.remove(&20);
+        e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
+    }
+    assert!(e.run_until(e.now() + 90_000, |e| off(e).contains(&h)), "{h} not taken off: {:?}", host_obj(&e, &h).map(|o| o.net.held_roles));
+    for (switch, port, cfg) in original {
+        e.fault(Fault::SetSwitchPort { switch, port, cfg }).unwrap();
+    }
+    assert!(e.run_until(e.now() + 90_000, |e| off(e) == not_storing), "{h}'s disks not given back: {:?}", off(&e));
+}
+
+#[test]
 fn a_degraded_port_raises_link_speed_low() {
     let mut e = settled_fleet(62);
     let ids = storage_iperf(&mut e, 2);
