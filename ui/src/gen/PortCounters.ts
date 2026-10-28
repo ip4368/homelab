@@ -2,6 +2,15 @@
 
 export type PortCounters = { rx_bytes: number, tx_bytes: number, rx_frames: number, tx_frames: number, 
 /**
+ * Bytes received on VLAN 20 (the storage network): Longhorn's
+ * replication traffic after it moves off the pod network.
+ */
+rx_vlan20_bytes: number, 
+/**
+ * Bytes sent on VLAN 20.
+ */
+tx_vlan20_bytes: number, 
+/**
  * Frames dropped for a VLAN the port does not carry.
  */
 drop_vlan: number, 

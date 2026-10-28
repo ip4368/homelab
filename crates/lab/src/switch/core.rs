@@ -62,6 +62,13 @@ pub struct PortCounters {
     pub rx_frames: u64,
     #[ts(type = "number")]
     pub tx_frames: u64,
+    /// Bytes received on VLAN 20 (the storage network): Longhorn's
+    /// replication traffic after it moves off the pod network.
+    #[ts(type = "number")]
+    pub rx_vlan20_bytes: u64,
+    /// Bytes sent on VLAN 20.
+    #[ts(type = "number")]
+    pub tx_vlan20_bytes: u64,
     /// Frames dropped for a VLAN the port does not carry.
     #[ts(type = "number")]
     pub drop_vlan: u64,
@@ -443,6 +450,9 @@ impl Core {
             p.counters.drop_mtu += 1;
             return;
         }
+        if vlan == 20 {
+            p.counters.rx_vlan20_bytes += f.len() as u64;
+        }
         let s = p.def.switch.clone();
         let from = match &p.def.cfg.lacp_group {
             Some(g) => Egress::Lag(g.clone()),
@@ -521,6 +531,9 @@ impl Core {
         }
         p.counters.tx_frames += 1;
         p.counters.tx_bytes += wire.len() as u64;
+        if vlan == 20 {
+            p.counters.tx_vlan20_bytes += wire.len() as u64;
+        }
         match p.def.peer.clone() {
             Peer::Switch { switch, port } if depth < 8 => {
                 if let Some(far) = self.port_id(&switch, &port) {
@@ -681,6 +694,20 @@ mod tests {
         assert_eq!(c.counters(0).drop_vlan, 1);
         let unknown = c.ingress(1, &frame(BCAST, B, Some(30), 100), now);
         assert!(unknown.is_empty(), "VLAN 30 is not allowed on the trunk");
+    }
+
+    #[test]
+    fn vlan_20_bytes_are_counted_where_they_cross() {
+        let now = Instant::now();
+        let mut c = lab(now);
+        let vlan20 = frame(BCAST, B, Some(20), 100);
+        c.ingress(1, &vlan20, now);
+        assert_eq!(c.counters(1).rx_vlan20_bytes, vlan20.len() as u64);
+        assert_eq!(c.counters(0).rx_vlan20_bytes, 0, "access port 1 never sees VLAN 20");
+        assert!(c.counters(4).tx_vlan20_bytes > 0 && c.counters(5).tx_vlan20_bytes > 0, "flooded onward on VLAN 20");
+        let mgmt = frame(BCAST, A, None, 100);
+        c.ingress(0, &mgmt, now);
+        assert_eq!(c.counters(0).rx_vlan20_bytes, 0, "mgmt (VLAN 1) is not VLAN 20");
     }
 
     #[test]
