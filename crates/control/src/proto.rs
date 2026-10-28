@@ -190,11 +190,17 @@ pub struct StorageNetwork {
 /// arrives; the leader sends another while work remains.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KubeAdmin {
-    /// Hosts whose etcd members go: each is down and no control-plane voter.
-    /// The server deletes their nodes, so K3s removes the members, and
-    /// removes a member with no node, or that never started, through etcd
-    /// itself; never one whose node is `Ready`.
+    /// Hosts whose etcd members go: each is no control-plane voter, and is
+    /// down or runs a K3s agent. The server deletes their nodes, so K3s
+    /// removes the members, and removes a member with no node, or that never
+    /// started, through etcd itself; never one whose node is `Ready`, unless
+    /// it is in `etcd_agents`.
     pub remove_etcd_members: BTreeSet<HostId>,
+    /// The hosts in `remove_etcd_members` that run a K3s agent: a server
+    /// that left without its member (deleting its own node failed). Their
+    /// `Ready` node is the agent's, which stays: the member goes through etcd.
+    #[serde(default)]
+    pub etcd_agents: BTreeSet<HostId>,
     /// The mgmt address of each host in `remove_etcd_members`, its member's
     /// peer address: how the server finds a member that never started, and
     /// so has no name.

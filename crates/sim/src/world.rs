@@ -284,6 +284,9 @@ pub struct KubeWorld {
     /// Hosts whose next join stalls: etcd adds the member, which never
     /// starts (a test's stand-in for a server that dies while joining).
     pub stall_joins: BTreeSet<HostId>,
+    /// Servers whose next leave fails to delete their own node: they become
+    /// agents, and their etcd member stays behind, run by nothing.
+    pub keep_member_on_leave: BTreeSet<HostId>,
     /// Every change to the members, in order.
     pub etcd_log: Vec<EtcdChange>,
     /// Hosts whose Longhorn disks take no new replicas.
@@ -304,6 +307,9 @@ pub enum EtcdChange {
     Joined(HostId),
     /// A server left, reinstalled as an agent (it deleted its own node).
     Left(HostId),
+    /// A server reinstalled as an agent, but deleting its own node failed:
+    /// its member stays.
+    LeftBehind(HostId),
     /// A server removed another's member (it deleted that node).
     Removed(HostId),
     /// etcd added a server's member, which never started.
@@ -345,10 +351,15 @@ impl World {
     pub fn apply_kube(&mut self, host: &HostId, spec: KubeSpec) {
         let Some(hw) = self.hosts.get_mut(host) else { return };
         let (role, init) = (spec.role, spec.init);
+        // Only a server reinstalling as an agent deletes its node, so its member leaves.
+        let was_server = hw.kube.as_ref().is_some_and(|k| k.role == KubeRole::Server);
         hw.kube = Some(spec);
         let member = self.kube.etcd.contains(host);
         match role {
-            KubeRole::Agent if member => {
+            KubeRole::Agent if member && was_server && self.kube.keep_member_on_leave.remove(host) => {
+                self.kube.etcd_log.push(EtcdChange::LeftBehind(host.clone()));
+            }
+            KubeRole::Agent if member && was_server => {
                 self.kube.etcd.remove(host);
                 let (n, live) = (self.etcd_size(), self.etcd_live());
                 if n > 0 && live <= n / 2 {
@@ -377,7 +388,8 @@ impl World {
     }
 
     /// `host`'s K3s server does `admin`: it removes the members asked (a
-    /// node that is Ready, its host on, it does not delete; one that never
+    /// node that is Ready, its host on, it does not delete, unless the host
+    /// runs an agent and the member was left behind; one that never
     /// started it finds by its peer address, which must be the host's), and
     /// takes the Longhorn disks of the hosts listed out of scheduling. Only
     /// a running server, an etcd member, does anything.
@@ -390,7 +402,12 @@ impl World {
             if !self.kube.etcd.contains(m) && !unstarted {
                 continue;
             }
-            if self.hosts.get(m).is_some_and(|hw| hw.powered) {
+            let agent = self.hosts.get(m).and_then(|hw| hw.kube.as_ref()).is_some_and(|k| k.role == KubeRole::Agent);
+            if admin.etcd_agents.contains(m) && !agent {
+                self.kube.violations.push(format!("{host} was asked to remove {m}'s etcd member as an agent's, but {m} runs a server"));
+                continue;
+            }
+            if self.hosts.get(m).is_some_and(|hw| hw.powered) && !agent {
                 self.kube.violations.push(format!("{host} was asked to remove {m}'s etcd member while its host runs"));
                 continue;
             }

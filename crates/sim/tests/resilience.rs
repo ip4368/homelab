@@ -674,6 +674,37 @@ fn the_leader_hands_its_control_plane_place_to_a_host_the_user_picks() {
 }
 
 #[test]
+fn a_server_that_leaves_its_etcd_member_behind_as_it_becomes_an_agent_has_it_removed() {
+    use control::proto::{KubePhase, KubeRole};
+    use sim::world::EtcdChange;
+    let mut e = default_fleet(27);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        voters.len() == 5 && e.fabric().world().kube.etcd == *voters && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let s = &e.client_view().state;
+    let leader = e.true_leader().expect("a leader");
+    let from = s.cp.voters.iter().find(|v| **v != leader).unwrap().clone();
+    let ready_ms01 = |h: &&control::state::HostObj| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01;
+    let to = s.hosts.values().filter(ready_ms01).find(|h| !s.cp.voters.contains(&h.id)).expect("a spare MS-01").id.clone();
+    // Deleting its own node fails as `from` reinstalls as an agent.
+    e.fabric_mut().world_mut().kube.keep_member_on_leave.insert(from.clone());
+    let req = e.api(ApiOp::HandOffCp { from: from.clone(), to: to.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let handed = |e: &Engine| etcd_is_voters(e) && !e.client_view().state.cp.voters.contains(&from) && kube_of(e, &from) == Some((Some(KubeRole::Agent), KubePhase::Running));
+    assert!(e.run_until(e.now() + 3 * 60_000, handed), "etcd {:?}, log {:?}", e.fabric().world().kube.etcd, e.fabric().world().kube.etcd_log);
+    let kube = &e.fabric().world().kube;
+    let at = |c: EtcdChange| kube.etcd_log.iter().position(|l| *l == c);
+    let (behind, removed) = (at(EtcdChange::LeftBehind(from.clone())), at(EtcdChange::Removed(from.clone())));
+    assert!(behind.is_some() && behind < removed, "the member left behind is removed: {:?}", kube.etcd_log);
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
+    assert!(e.fabric().world().hosts[&from].powered, "while its host runs, as an agent");
+}
+
+#[test]
 fn a_replacement_that_dies_joining_etcd_leaves_a_member_that_goes_once_it_is_replaced_in_turn() {
     use control::proto::{KubePhase, KubeRole};
     use sim::world::EtcdChange;

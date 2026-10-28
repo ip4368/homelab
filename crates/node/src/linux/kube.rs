@@ -290,10 +290,13 @@ pub enum EtcdRemoval {
 
 /// The member of `members` that is `host`'s, found by its node, or by
 /// `peer` (the host's address) for one that never started; and how to
-/// remove it, given `host`'s node (`None` for none).
-pub fn member_removal(members: &[EtcdMember], host: &HostId, peer: Option<Ipv4Addr>, node: Option<&serde_json::Value>) -> Option<EtcdRemoval> {
+/// remove it, given `host`'s node (`None` for none). A host that runs a
+/// K3s agent (`agent`) has a node, the agent's, which stays: its member,
+/// left behind by its old server, goes through etcd.
+pub fn member_removal(members: &[EtcdMember], host: &HostId, peer: Option<Ipv4Addr>, node: Option<&serde_json::Value>, agent: bool) -> Option<EtcdRemoval> {
     let m = members.iter().find(|m| m.node.as_ref() == Some(host)).or_else(|| members.iter().find(|m| m.node.is_none() && peer.is_some() && m.peer == peer))?;
     Some(match node {
+        _ if agent => EtcdRemoval::ThroughEtcd(m.id),
         Some(n) if node_ready(n) => EtcdRemoval::Keep,
         Some(_) if m.node.is_some() => EtcdRemoval::DeleteNode,
         _ => EtcdRemoval::ThroughEtcd(m.id),
@@ -722,7 +725,7 @@ impl Worker {
                 Err(e) if e.contains("NotFound") => None,
                 Err(e) => return Err(e),
             };
-            match member_removal(&members, m, admin.etcd_peers.get(m).copied(), node.as_ref()) {
+            match member_removal(&members, m, admin.etcd_peers.get(m).copied(), node.as_ref(), admin.etcd_agents.contains(m)) {
                 None => {}
                 Some(EtcdRemoval::Keep) => eprintln!("homelabd: kubernetes: not removing {m}'s etcd member: its node is Ready"),
                 Some(EtcdRemoval::DeleteNode) => {
@@ -730,7 +733,7 @@ impl Worker {
                     self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"])?;
                 }
                 Some(EtcdRemoval::ThroughEtcd(id)) => {
-                    eprintln!("homelabd: kubernetes: removing {m}'s etcd member {id:x} through etcd (no node, or it never started)");
+                    eprintln!("homelabd: kubernetes: removing {m}'s etcd member {id:x} through etcd (no node, it never started, or its host runs an agent)");
                     self.remove_etcd_member(id)?;
                 }
             }
@@ -1029,17 +1032,18 @@ mod tests {
         let ready = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
         let not_ready = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}});
         let (dead, peer) = (HostId::from("ms01-03"), Some(Ipv4Addr::new(10, 0, 0, 4)));
-        assert_eq!(member_removal(&members, &dead, peer, Some(&not_ready)), Some(EtcdRemoval::DeleteNode));
-        assert_eq!(member_removal(&members, &dead, peer, Some(&ready)), Some(EtcdRemoval::Keep), "never a Ready node's");
-        assert_eq!(member_removal(&members, &dead, None, None), Some(EtcdRemoval::ThroughEtcd(2)), "its node is gone, the member stays");
+        assert_eq!(member_removal(&members, &dead, peer, Some(&not_ready), false), Some(EtcdRemoval::DeleteNode));
+        assert_eq!(member_removal(&members, &dead, peer, Some(&ready), false), Some(EtcdRemoval::Keep), "never a Ready node's");
+        assert_eq!(member_removal(&members, &dead, peer, Some(&ready), true), Some(EtcdRemoval::ThroughEtcd(2)), "an agent's Ready node stays; the member left behind goes");
+        assert_eq!(member_removal(&members, &dead, None, None, false), Some(EtcdRemoval::ThroughEtcd(2)), "its node is gone, the member stays");
 
         // Died joining: its member has no name, only its host's address.
         let joining = HostId::from("ms01-05");
-        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&not_ready)), Some(EtcdRemoval::ThroughEtcd(3)), "its old agent node would not lead K3s to it");
-        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&ready)), Some(EtcdRemoval::Keep));
-        assert_eq!(member_removal(&members, &joining, None, None), None, "no address, nothing to find it by");
-        assert_eq!(member_removal(&members, &HostId::from("ms01-01"), Some(Ipv4Addr::new(10, 0, 0, 9)), None), Some(EtcdRemoval::ThroughEtcd(1)), "by name first");
-        assert_eq!(member_removal(&members, &HostId::from("ms01-07"), Some(Ipv4Addr::new(10, 0, 0, 2)), None), None, "a started member is found by its name only");
+        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&not_ready), false), Some(EtcdRemoval::ThroughEtcd(3)), "its old agent node would not lead K3s to it");
+        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&ready), false), Some(EtcdRemoval::Keep));
+        assert_eq!(member_removal(&members, &joining, None, None, false), None, "no address, nothing to find it by");
+        assert_eq!(member_removal(&members, &HostId::from("ms01-01"), Some(Ipv4Addr::new(10, 0, 0, 9)), None, false), Some(EtcdRemoval::ThroughEtcd(1)), "by name first");
+        assert_eq!(member_removal(&members, &HostId::from("ms01-07"), Some(Ipv4Addr::new(10, 0, 0, 2)), None, false), None, "a started member is found by its name only");
     }
 
     #[test]
