@@ -167,6 +167,17 @@ pub struct KubeSpec {
     pub storage_disks: Vec<String>,
 }
 
+/// What the leader asks one running K3s server to do for the whole cluster,
+/// with its admin access. Each message is done once, as it stands when it
+/// arrives; the leader sends another while work remains.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeAdmin {
+    /// Hosts whose etcd members go: each is down and no control-plane voter.
+    /// The server deletes their nodes, so K3s removes the members, but never
+    /// a node that is `Ready`.
+    pub remove_etcd_members: BTreeSet<HostId>,
+}
+
 /// How a host's Kubernetes install stands.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -199,6 +210,9 @@ pub struct KubeStatus {
     /// in the Raft log, so a field added later must default for old entries.
     #[serde(default)]
     pub detail: Option<String>,
+    /// On a server: the etcd members, by node name (the host's id).
+    #[serde(default)]
+    pub etcd_members: BTreeSet<HostId>,
 }
 
 impl KubeStatus {
@@ -376,6 +390,8 @@ pub enum Msg {
     Metrics { host: HostId, sample: MetricSample },
     /// Leader to agent: run this of Kubernetes (a repeat changes nothing).
     Kube(KubeSpec),
+    /// Leader to the agent of a host running a K3s server: do this for the cluster.
+    KubeAdmin(KubeAdmin),
     /// Agent to the VIP: how its Kubernetes stands, when that changes and
     /// every [`crate::agent::KUBE_REPORT_MS`] regardless.
     KubeStatus { host: HostId, status: KubeStatus },

@@ -6,7 +6,7 @@
 use crate::fabric::Fabric;
 use crate::world::{HostHw, World};
 use control::client::{ClientActor, ClusterView, CLIENT};
-use control::proto::{ApiOp, ApiResult, InstanceSpec, KubePhase, KubeRole, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
+use control::proto::{ApiOp, ApiResult, InstanceSpec, KubeAdmin, KubeRole, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::replica::CpReplica;
 use control::runtime::{Actor, Addr, Ctx, Endpoint, HostOs, HostUsage, SimTime, SwitchConfig, SwitchOs, Svc};
@@ -287,20 +287,15 @@ impl HostOs for EngineCtx<'_> {
         self.core.spawns.push((Endpoint::new(Addr::Host(host), Svc::Cp), Box::new(replica)));
     }
     fn apply_kube(&mut self, spec: KubeSpec) {
-        self.hw_mut().kube = Some(spec);
+        let host = self.host_id();
+        self.workloads().apply_kube(&host, spec);
+    }
+    fn kube_admin(&mut self, admin: KubeAdmin) {
+        let host = self.host_id();
+        self.workloads().kube_admin(&host, admin);
     }
     fn kube_status(&self) -> Option<KubeStatus> {
-        let hw = self.hw().expect(NO_HOST);
-        let spec = hw.kube.as_ref()?;
-        Some(KubeStatus {
-            role: Some(spec.role),
-            phase: KubePhase::Running,
-            node_ready: hw.powered,
-            labels: spec.labels.clone(),
-            storage_disks: spec.storage_disks.clone(),
-            version: "sim".into(),
-            detail: None,
-        })
+        self.world().kube_status(&self.host_id())
     }
     fn kubeconfig(&self) -> Option<String> {
         let hw = self.hw().expect(NO_HOST);

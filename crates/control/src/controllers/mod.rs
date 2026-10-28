@@ -147,6 +147,8 @@ pub struct Volatile {
     pub kube_status: BTreeMap<HostId, KubeStatus>,
     /// When each host was last sent its Kubernetes spec.
     pub kube_sent: BTreeMap<HostId, SimTime>,
+    /// When a K3s server was last sent work for the cluster ([`crate::proto::KubeAdmin`]).
+    pub kube_admin_sent: Option<SimTime>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -185,6 +187,7 @@ impl Volatile {
             directory_sent: None,
             kube_status: BTreeMap::new(),
             kube_sent: BTreeMap::new(),
+            kube_admin_sent: None,
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -362,6 +365,9 @@ impl Volatile {
             }
             (Addr::Host(id), Msg::Kube(_)) => {
                 self.kube_sent.insert(id.clone(), now);
+            }
+            (Addr::Host(_), Msg::KubeAdmin(_)) => {
+                self.kube_admin_sent = Some(now);
             }
             (Addr::Host(id), Msg::StopInstance(instance)) => {
                 self.instance_stopped.insert((id.clone(), instance.clone()), now);

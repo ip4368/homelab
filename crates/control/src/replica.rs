@@ -510,6 +510,7 @@ impl Actor for CpReplica {
             | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. }
             | Msg::Kube(_)
+            | Msg::KubeAdmin(_)
             | Msg::Directory { .. } => {}
         }
     }

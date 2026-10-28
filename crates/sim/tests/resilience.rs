@@ -282,6 +282,9 @@ fn every_ready_host_runs_kubernetes_with_servers_on_the_voters() {
     let s = &e.client_view().state;
     let servers: BTreeSet<HostId> = s.hosts.values().filter(|h| h.kube.as_ref().unwrap().role == Some(KubeRole::Server)).map(|h| h.id.clone()).collect();
     assert_eq!(servers, s.cp.voters, "the K3s servers are the CP voters");
+    let kube = &e.fabric().world().kube;
+    assert_eq!(kube.etcd, s.cp.voters, "every server is an etcd member");
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
     let pi = &s.hosts[&hid("pi5-01")];
     assert_eq!(pi.kube.as_ref().unwrap().labels.get("homelab.io/transcode").map(String::as_str), Some("true"));
 
@@ -575,6 +578,55 @@ fn auto_replace_dead_member() {
     assert!(!voters.contains(&dead), "the dead member was replaced: {voters:?}");
     assert_eq!(raft_voters(&e), voters);
     assert!(!e.client_view().state.hosts[&dead].roles.contains(&Role::ControlPlane), "the dead host lost the role");
+}
+
+/// Each host's Kubernetes as the client sees it: (role, phase).
+fn kube_of(e: &Engine, h: &HostId) -> Option<(Option<control::proto::KubeRole>, control::proto::KubePhase)> {
+    e.client_view().state.hosts.get(h)?.kube.as_ref().map(|k| (k.role, k.phase.clone()))
+}
+
+#[test]
+fn replacing_a_dead_k3s_server_removes_its_etcd_member_then_adds_the_new_one() {
+    use control::proto::{KubePhase, KubeRole};
+    use sim::world::EtcdChange;
+    let mut e = default_fleet(24);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        voters.len() == 5 && e.fabric().world().kube.etcd == *voters && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let (dead, _) = kill_follower_voter(&mut e);
+    assert!(e.run_until(e.now() + 60_000, |e| lifecycle(e, &dead) == Some(Lifecycle::NotReady)), "{dead} never went NotReady");
+    assert_eq!(e.fabric().world().kube.etcd.len(), 5, "a dead voter keeps its member until it is replaced");
+
+    // Take the replacement at once, rather than 10 min on: an MS-01 that runs a K3s agent.
+    let s = &e.client_view().state;
+    let ready_ms01 = |h: &&control::state::HostObj| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01;
+    let with = s.hosts.values().filter(ready_ms01).find(|h| !s.cp.voters.contains(&h.id)).expect("a spare MS-01").id.clone();
+    assert_eq!(kube_of(&e, &with), Some((Some(KubeRole::Agent), KubePhase::Running)));
+    let req = e.api(ApiOp::ReplaceCpMember { dead: dead.clone(), with: with.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let replaced = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        voters.contains(&with) && !voters.contains(&dead) && etcd_is_voters(e)
+    };
+    assert!(e.run_until(e.now() + 3 * 60_000, replaced), "etcd {:?}, {with}: {:?}", e.fabric().world().kube.etcd, kube_of(&e, &with));
+    let kube = &e.fabric().world().kube;
+    assert!(!e.fabric().world().hosts[&dead].powered, "etcd lists exactly the live servers while {dead} is still off");
+    let at = |c: EtcdChange| kube.etcd_log.iter().position(|l| *l == c);
+    let (removed, joined) = (at(EtcdChange::Removed(dead.clone())), at(EtcdChange::Joined(with.clone())));
+    assert!(removed.is_some() && removed < joined, "remove the dead member, then add the new one: {:?}", kube.etcd_log);
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
+
+    // The dead host comes back: it reinstalls as an agent; etcd keeps the voters.
+    e.fault(Fault::RestoreHost { host: dead.clone() }).unwrap();
+    let agent = |e: &Engine| lifecycle(e, &dead) == Some(Lifecycle::Ready) && kube_of(e, &dead) == Some((Some(KubeRole::Agent), KubePhase::Running));
+    assert!(e.run_until(e.now() + 2 * 60_000, agent), "{dead}: {:?} {:?}", lifecycle(&e, &dead), kube_of(&e, &dead));
+    assert!(etcd_is_voters(&e), "etcd {:?}", e.fabric().world().kube.etcd);
+    let kube = &e.fabric().world().kube;
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
 }
 
 #[test]

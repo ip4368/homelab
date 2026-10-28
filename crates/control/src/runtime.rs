@@ -1,7 +1,7 @@
 //! The runtime interface: what an [`Actor`] can see and do. The simulator
 //! implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{InstanceSpec, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
+use crate::proto::{InstanceSpec, KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -129,6 +129,9 @@ pub trait HostOs {
     /// installs it, reinstalls it as the other role, labels the node and
     /// gives Longhorn its disks. A repeat of the spec in hand changes nothing.
     fn apply_kube(&mut self, _spec: KubeSpec) {}
+    /// Does `admin` for the cluster with this host's K3s server, in the
+    /// background; nothing on a host that runs none.
+    fn kube_admin(&mut self, _admin: KubeAdmin) {}
     /// How the host's Kubernetes stands now; `None` if this host has none to report.
     fn kube_status(&self) -> Option<KubeStatus> {
         None

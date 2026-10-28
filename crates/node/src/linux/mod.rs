@@ -14,7 +14,7 @@ pub mod store;
 pub mod sysfs;
 
 use crate::runtime::{NodeOs, VipControl};
-use control::proto::{InstanceSpec, KubeSpec, KubeStatus, LogCmd, ReplicaReport};
+use control::proto::{InstanceSpec, KubeAdmin, KubeSpec, KubeStatus, LogCmd, ReplicaReport};
 use control::raft::{Durable, DurableOp};
 use control::runtime::{HostOs, HostUsage, SimTime};
 use model::network::{bootstrap_config, HostNetworkConfig, LldpNeighbor, LogicalNetwork};
@@ -451,6 +451,12 @@ impl HostOs for LinuxOs {
     fn apply_kube(&mut self, spec: KubeSpec) {
         if let Some(k) = &self.kube {
             k.want(spec);
+        }
+    }
+
+    fn kube_admin(&mut self, admin: KubeAdmin) {
+        if let Some(k) = &self.kube {
+            k.admin(admin);
         }
     }
 

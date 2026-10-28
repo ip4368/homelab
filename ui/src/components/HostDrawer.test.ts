@@ -36,6 +36,7 @@ describe('host drawer kubernetes', () => {
     storage_disks: ['nvme0'],
     version: 'v1.36.5+k3s1',
     detail: null,
+    etcd_members: [],
     ...over,
   })
   it('says what the host runs and how far it got', () => {

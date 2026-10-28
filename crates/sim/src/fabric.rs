@@ -18,7 +18,7 @@ use crate::engine::Deliver;
 use crate::topology::Node;
 use crate::traffic::Traffic;
 use crate::world::{HostHw, World};
-use control::proto::InstanceSpec;
+use control::proto::{InstanceSpec, KubeAdmin, KubeSpec};
 use control::runtime::{Addr, Endpoint, SimTime};
 use model::{HostId, NetworkId, PortName, SwitchId};
 use rand::{Rng, SeedableRng};
@@ -135,6 +135,17 @@ impl Fabric {
     /// (attachments are evaluated per query), so this keeps them.
     pub fn host_mut(&mut self, id: &HostId) -> Option<&mut HostHw> {
         self.world.hosts.get_mut(id)
+    }
+
+    /// `host` runs `spec` of Kubernetes ([`World::apply_kube`]). Kubernetes
+    /// never feeds the cached switch graphs, so this keeps them.
+    pub fn apply_kube(&mut self, host: &HostId, spec: KubeSpec) {
+        self.world.apply_kube(host, spec);
+    }
+
+    /// `host`'s K3s server does `admin` ([`World::kube_admin`]); keeps the cached graphs.
+    pub fn kube_admin(&mut self, host: &HostId, admin: KubeAdmin) {
+        self.world.kube_admin(host, admin);
     }
 
     /// The world's flows. Traffic never feeds the cached switch graphs, so this keeps them.

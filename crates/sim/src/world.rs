@@ -6,7 +6,7 @@
 use crate::topology::{Node, Topology};
 use crate::traffic::{FlowEnd, FlowKind, Traffic};
 use crate::truth::TruthAlerts;
-use control::proto::{InstanceSpec, KubeSpec, LogCmd, ReplicaReport, UsageProfile};
+use control::proto::{InstanceSpec, KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus, LogCmd, ReplicaReport, UsageProfile};
 use control::raft::Durable;
 use control::runtime::{HostUsage, SimTime, SwitchConfig};
 use model::network::{
@@ -266,6 +266,35 @@ pub struct World {
     pub traffic: Traffic,
     /// Alerts the simulator raises from ground truth (e.g. split brain).
     pub truth_alerts: TruthAlerts,
+    /// The cluster's Kubernetes beyond each host's own node.
+    pub kube: KubeWorld,
+}
+
+/// The stand-in for what the cluster's Kubernetes keeps beyond each host's
+/// node (each host's is [`HostHw::kube`]): etcd's members. It keeps etcd's
+/// rules, and notes whatever the control plane asked for that breaks them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct KubeWorld {
+    /// The etcd members, by host.
+    pub etcd: BTreeSet<HostId>,
+    /// Every change to the members, in order.
+    pub etcd_log: Vec<EtcdChange>,
+    /// What the control plane asked for against etcd's rules: a live member
+    /// removed, a change without a quorum, a join etcd refused. Tests expect none.
+    pub violations: Vec<String>,
+}
+
+/// A change to etcd's members.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EtcdChange {
+    /// The first server started etcd.
+    Started(HostId),
+    /// A server joined.
+    Joined(HostId),
+    /// A server left, reinstalled as an agent (it deleted its own node).
+    Left(HostId),
+    /// A server removed another's member (it deleted that node).
+    Removed(HostId),
 }
 
 impl World {
@@ -277,7 +306,97 @@ impl World {
             hosts: BTreeMap::new(),
             traffic: Traffic::default(),
             truth_alerts: TruthAlerts::default(),
+            kube: KubeWorld::default(),
         }
+    }
+
+    /// Whether `host`'s etcd member would run: the host is on and runs a K3s server.
+    fn etcd_runs(&self, host: &HostId) -> bool {
+        self.hosts.get(host).is_some_and(|hw| hw.powered && hw.kube.as_ref().is_some_and(|k| k.role == KubeRole::Server))
+    }
+
+    /// The etcd members that run.
+    fn etcd_live(&self) -> usize {
+        self.kube.etcd.iter().filter(|m| self.etcd_runs(m)).count()
+    }
+
+    /// `host` runs `spec` of Kubernetes from now on (installed at once). A
+    /// server starts etcd (`init`) or joins it, if etcd takes it: the members
+    /// that run and it must be a quorum of all with it. A host that leaves
+    /// etcd, reinstalled as an agent, deletes its own node first.
+    pub fn apply_kube(&mut self, host: &HostId, spec: KubeSpec) {
+        let Some(hw) = self.hosts.get_mut(host) else { return };
+        let (role, init) = (spec.role, spec.init);
+        hw.kube = Some(spec);
+        let member = self.kube.etcd.contains(host);
+        match role {
+            KubeRole::Agent if member => {
+                self.kube.etcd.remove(host);
+                let (n, live) = (self.kube.etcd.len(), self.etcd_live());
+                if n > 0 && live <= n / 2 {
+                    self.kube.violations.push(format!("{host} left etcd with {live} of {n} members running"));
+                }
+                self.kube.etcd_log.push(EtcdChange::Left(host.clone()));
+            }
+            KubeRole::Server if init && self.kube.etcd.is_empty() => {
+                self.kube.etcd.insert(host.clone());
+                self.kube.etcd_log.push(EtcdChange::Started(host.clone()));
+            }
+            KubeRole::Server if !member => {
+                let (n, live) = (self.kube.etcd.len() + 1, self.etcd_live() + 1);
+                if init || live <= n / 2 {
+                    self.kube.violations.push(format!("etcd refused {host} (init {init}): {live} of {n} members would run"));
+                } else {
+                    self.kube.etcd.insert(host.clone());
+                    self.kube.etcd_log.push(EtcdChange::Joined(host.clone()));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `host`'s K3s server does `admin`: it removes the members asked (a
+    /// node that is Ready, its host on, it does not delete). Only a running
+    /// server, an etcd member, does anything.
+    pub fn kube_admin(&mut self, host: &HostId, admin: KubeAdmin) {
+        if !self.etcd_runs(host) || !self.kube.etcd.contains(host) {
+            return;
+        }
+        for m in &admin.remove_etcd_members {
+            if !self.kube.etcd.contains(m) {
+                continue;
+            }
+            if self.hosts.get(m).is_some_and(|hw| hw.powered) {
+                self.kube.violations.push(format!("{host} was asked to remove {m}'s etcd member while its host runs"));
+                continue;
+            }
+            let (n, live) = (self.kube.etcd.len(), self.etcd_live());
+            if live <= n / 2 {
+                self.kube.violations.push(format!("{host} was asked to remove {m} with {live} of {n} members running"));
+                continue;
+            }
+            self.kube.etcd.remove(m);
+            self.kube.etcd_log.push(EtcdChange::Removed(m.clone()));
+        }
+    }
+
+    /// How `host`'s Kubernetes stands: what its spec asks once applied, but
+    /// a server etcd has not taken is still installing.
+    pub fn kube_status(&self, host: &HostId) -> Option<KubeStatus> {
+        let hw = self.hosts.get(host)?;
+        let spec = hw.kube.as_ref()?;
+        let member = self.kube.etcd.contains(host);
+        let joined = spec.role == KubeRole::Agent || member;
+        Some(KubeStatus {
+            role: Some(spec.role),
+            phase: if joined { KubePhase::Running } else { KubePhase::Installing },
+            node_ready: hw.powered && joined,
+            labels: if joined { spec.labels.clone() } else { BTreeMap::new() },
+            storage_disks: if joined { spec.storage_disks.clone() } else { vec![] },
+            version: "sim".into(),
+            detail: (!joined).then(|| "waiting to join etcd".into()),
+            etcd_members: if spec.role == KubeRole::Server && member { self.kube.etcd.clone() } else { BTreeSet::new() },
+        })
     }
 
     /// The speed `host`'s NIC `port` negotiates, in Mbit/s: its own (or the

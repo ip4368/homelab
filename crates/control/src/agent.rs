@@ -330,6 +330,11 @@ impl Actor for HostAgent {
                     os.apply_kube(spec);
                 }
             }
+            Msg::KubeAdmin(admin) if self.token.is_none() => {
+                if let Some(os) = ctx.host() {
+                    os.kube_admin(admin);
+                }
+            }
             _ => {}
         }
     }

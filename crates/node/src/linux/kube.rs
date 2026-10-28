@@ -17,12 +17,17 @@
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
 //!    Longhorn to use it).
 //!
+//! On a server, it also reads etcd's members (K3s's `/db/info`) for the
+//! status, and does the work the leader asks of it for the cluster
+//! ([`KubeAdmin`]): it deletes the nodes of dead members, so K3s removes
+//! them from etcd.
+//!
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
 use super::{sh, LinuxVip, Paths};
-use control::proto::{KubePhase, KubeRole, KubeSpec, KubeStatus};
+use control::proto::{KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus};
 use model::HostId;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -49,6 +54,8 @@ const EVERY: Duration = Duration::from_secs(10);
 const BACKOFF: Duration = Duration::from_secs(20);
 const LONGHORN_DISK_LABEL: &str = "node.longhorn.io/create-default-disk";
 const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
+/// A K3s server's certificates: its CA and the admin's client certificate.
+const SERVER_TLS: &str = "/var/lib/rancher/k3s/server/tls";
 
 pub fn status_path(paths: &Paths) -> PathBuf {
     paths.run.join("kube.json")
@@ -150,10 +157,30 @@ pub fn disks_annotation(disks: &[String], mnt: &Path) -> String {
     serde_json::Value::Array(entries).to_string()
 }
 
+/// The node names of the etcd members in K3s's `/db/info`: a member is named
+/// `<node>-<8 hex digits>`; one that has not started yet has no name.
+pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
+    let v: serde_json::Value = serde_json::from_str(db_info).map_err(|e| format!("read etcd's members: {e}"))?;
+    let names = v["members"].as_array().ok_or("etcd's members: no list")?.iter().filter_map(|m| m["name"].as_str()).filter(|n| !n.is_empty());
+    Ok(names
+        .map(|n| match n.rsplit_once('-') {
+            Some((node, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) => HostId::from(node),
+            _ => HostId::from(n),
+        })
+        .collect())
+}
+
+/// Whether a node (`kubectl get node -o json`) is `Ready`.
+fn node_ready(node: &serde_json::Value) -> bool {
+    node["status"]["conditions"].as_array().into_iter().flatten().any(|c| c["type"] == "Ready" && c["status"] == "True")
+}
+
 #[derive(Debug, Default)]
 struct Shared {
     want: Option<KubeSpec>,
-    /// A new spec arrived since the worker last looked.
+    /// Work for the cluster the leader asked for, not done yet.
+    admin: Option<KubeAdmin>,
+    /// A new spec or work arrived since the worker last looked.
     changed: bool,
     status: Option<KubeStatus>,
 }
@@ -187,6 +214,15 @@ impl Kube {
         }
     }
 
+    /// Asks for `admin` to be done once, in place of any not done yet.
+    pub fn admin(&self, admin: KubeAdmin) {
+        let (lock, cv) = &*self.shared;
+        let mut s = lock.lock().expect("kube lock");
+        s.admin = Some(admin);
+        s.changed = true;
+        cv.notify_one();
+    }
+
     pub fn status(&self) -> Option<KubeStatus> {
         self.shared.0.lock().expect("kube lock").status.clone()
     }
@@ -195,13 +231,14 @@ impl Kube {
         self.shared.0.lock().expect("kube lock").status = Some(status);
     }
 
-    /// The spec in hand, after waiting up to `wait` for a new one.
-    fn next(&self, wait: Duration) -> Option<KubeSpec> {
+    /// The spec in hand and the work asked for, after waiting up to `wait`
+    /// for something new.
+    fn next(&self, wait: Duration) -> (Option<KubeSpec>, Option<KubeAdmin>) {
         let (lock, cv) = &*self.shared;
         let s = lock.lock().expect("kube lock");
         let (mut s, _) = cv.wait_timeout_while(s, wait, |s| !s.changed).expect("kube lock");
         s.changed = false;
-        s.want.clone()
+        (s.want.clone(), s.admin.take())
     }
 }
 
@@ -214,6 +251,8 @@ struct Observed {
     unregistered: Option<String>,
     node_ready: bool,
     version: String,
+    /// On a server: etcd's members, by node.
+    etcd_members: BTreeSet<HostId>,
 }
 
 struct Worker {
@@ -228,8 +267,17 @@ impl Worker {
     fn run(mut self, kube: &Kube) {
         let mut wait = Duration::ZERO;
         loop {
-            let want = kube.next(wait);
-            let (status, ok) = self.step(want.as_ref(), kube);
+            let (want, admin) = kube.next(wait);
+            let (mut status, ok) = self.step(want.as_ref(), kube);
+            if let Some(admin) = admin
+                && status.role == Some(KubeRole::Server)
+                && status.phase == KubePhase::Running
+            {
+                if let Err(e) = self.admin(&admin, &status.etcd_members) {
+                    eprintln!("homelabd: kubernetes: for the cluster: {e}");
+                }
+                status.etcd_members = self.etcd_members();
+            }
             wait = if ok { EVERY } else { BACKOFF };
             if let Ok(b) = serde_json::to_vec(&status) {
                 let _ = std::fs::create_dir_all(&self.paths.run);
@@ -253,7 +301,16 @@ impl Worker {
             Some(a) if phase == KubePhase::Running => (a.labels.clone(), a.storage_disks.clone()),
             _ => (BTreeMap::new(), vec![]),
         };
-        KubeStatus { role: o.role, phase, node_ready: o.node_ready, labels, storage_disks, version: o.version.clone(), detail }
+        KubeStatus {
+            role: o.role,
+            phase,
+            node_ready: o.node_ready,
+            labels,
+            storage_disks,
+            version: o.version.clone(),
+            detail,
+            etcd_members: o.etcd_members.clone(),
+        }
     }
 
     /// One pass toward `want`: the status after it, and whether it went
@@ -317,7 +374,40 @@ impl Worker {
             Err("not running".into())
         };
         let node_ready = ready.as_deref().map(str::trim) == Ok("True");
-        Observed { role, active, unregistered: ready.err(), node_ready, version }
+        let etcd_members = if r == KubeRole::Server && active { self.etcd_members() } else { BTreeSet::new() };
+        Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members }
+    }
+
+    /// etcd's members, from this host's K3s server (`/db/info` answers the
+    /// admin on loopback); none if it does not answer.
+    fn etcd_members(&self) -> BTreeSet<HostId> {
+        let tls = |f: &str| format!("{SERVER_TLS}/{f}");
+        let (ca, cert, key) = (tls("server-ca.crt"), tls("client-admin.crt"), tls("client-admin.key"));
+        let info = sh("curl", &["-fsS", "--max-time", "5", "--cacert", &ca, "--cert", &cert, "--key", &key, "https://127.0.0.1:6443/db/info"]);
+        info.map_err(|e| e.to_string()).and_then(|i| etcd_member_nodes(&i)).unwrap_or_default()
+    }
+
+    /// Does `admin` with this server's admin access: deletes the nodes of
+    /// the dead etcd members asked (of `members`), so K3s removes them, but
+    /// never a node that is `Ready`.
+    fn admin(&self, admin: &KubeAdmin, members: &BTreeSet<HostId>) -> Result<(), String> {
+        for m in admin.remove_etcd_members.iter().filter(|m| members.contains(*m) && **m != self.host) {
+            let node = match self.kubectl(KubeRole::Server, &["get", "node", m.as_str(), "-o", "json"]) {
+                Ok(json) => serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("read node {m}: {e}"))?,
+                Err(e) if e.contains("NotFound") => {
+                    eprintln!("homelabd: kubernetes: {m} is in etcd but has no node to delete");
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            if node_ready(&node) {
+                eprintln!("homelabd: kubernetes: not removing {m}'s etcd member: its node is Ready");
+                continue;
+            }
+            eprintln!("homelabd: kubernetes: removing {m}'s etcd member (deleting its node)");
+            self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"])?;
+        }
+        Ok(())
     }
 
     fn kubectl(&self, role: KubeRole, args: &[&str]) -> Result<String, String> {
@@ -515,5 +605,17 @@ mod tests {
         assert_eq!(v[0]["allowScheduling"], true);
         assert!(longhorn_manifest().contains(&format!("version: {LONGHORN_VERSION}")));
         assert!(longhorn_manifest().contains("createDefaultDiskLabeledNodes: true"));
+    }
+
+    #[test]
+    fn etcd_members_are_named_by_node() {
+        let info = r#"{"members":[{"ID":1,"name":"ms01-01-da0049ba","peerURLs":["https://10.0.0.2:2380"]},{"ID":2,"name":"ms01-02-5e7f1e24"},{"ID":3,"name":"","peerURLs":["https://10.0.0.9:2380"]},{"ID":4,"name":"odd-name"}]}"#;
+        let got: Vec<String> = etcd_member_nodes(info).unwrap().into_iter().map(|h| h.to_string()).collect();
+        assert_eq!(got, ["ms01-01", "ms01-02", "odd-name"], "a member not started yet has no name");
+        assert!(etcd_member_nodes("forbidden").is_err());
+        let ready = serde_json::json!({"status": {"conditions": [{"type": "MemoryPressure", "status": "False"}, {"type": "Ready", "status": "True"}]}});
+        assert!(node_ready(&ready));
+        let gone = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}});
+        assert!(!node_ready(&gone));
     }
 }
