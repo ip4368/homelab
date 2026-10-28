@@ -31,6 +31,9 @@
 //!   member is still to go, or a dead voter still to leave the control
 //!   plane, or while etcd would be short of a quorum until it starts
 //!   ([`join_blocked`]).
+//! * A member that has not started has no name yet: servers report it by
+//!   peer address, which is its host's mgmt address. One whose server died
+//!   while joining goes like any dead member.
 //! * Servers report etcd's members, or why they could not read them. While
 //!   no server can, the members are unknown: nothing is removed and no
 //!   server joins.
@@ -44,6 +47,7 @@ use crate::state::{ClusterState, Command, HostObj, Lifecycle};
 use model::network::NetworkPurpose;
 use model::{eligible, HostId, NetworkId, Role};
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv4Addr;
 
 /// How long the controller waits for a host to run its spec before sending
 /// it again, and for a server to do the cluster's work before asking again.
@@ -136,15 +140,17 @@ pub fn storage_network(state: &ClusterState) -> Option<(NetworkId, StorageNetwor
     Some((n.id.clone(), StorageNetwork { subnet: n.subnet, pods }))
 }
 
-/// The etcd members, as the servers on up hosts report them; `None` while
-/// servers run but none of them could read the members.
+/// The etcd members, as the servers on up hosts report them, a member that
+/// has not started by the host with its peer address; `None` while servers
+/// run but none of them could read the members.
 pub fn etcd_members(state: &ClusterState, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> Option<BTreeSet<HostId>> {
     let reports: Vec<KubeStatus> = state.hosts.keys().filter(|id| up(state, id)).filter_map(|id| status(id).filter(|s| runs_server(Some(s)))).collect();
     let read: Vec<&KubeStatus> = reports.iter().filter(|s| s.etcd_unread.is_none()).collect();
     if read.is_empty() && !reports.is_empty() {
         return None;
     }
-    Some(read.into_iter().flat_map(|s| s.etcd_members.iter().cloned()).collect())
+    let by_peer = |ip: &Ipv4Addr| state.hosts.values().find(|h| h.ips.get(&mgmt()) == Some(ip)).map(|h| h.id.clone());
+    Some(read.into_iter().flat_map(|s| s.etcd_members.iter().cloned().chain(s.etcd_unstarted.iter().filter_map(by_peer))).collect())
 }
 
 /// The members whose hosts are up and run their server.
@@ -225,13 +231,14 @@ fn admin(state: &ClusterState, v: &Volatile, status: &impl Fn(&HostId) -> Option
     let via = state.hosts.keys().find(|id| up(state, id) && runs_server(status(id).as_ref()))?;
     let members = etcd_members(state, status).unwrap_or_default();
     let remove_etcd_members: BTreeSet<HostId> = etcd_removal(state, &members, status).into_iter().cloned().collect();
+    let etcd_peers = remove_etcd_members.iter().filter_map(|m| Some((m.clone(), *state.hosts.get(m)?.ips.get(&mgmt())?))).collect();
     let storage_off: BTreeSet<HostId> = state.hosts.values().filter(|h| member(h) && !stores(h)).map(|h| h.id.clone()).collect();
     let applied = status(via).is_some_and(|s| s.storage_off == storage_off);
     if (remove_etcd_members.is_empty() && applied) || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
         return None;
     }
     let to = Endpoint::new(Addr::Host(via.clone()), Svc::Agent);
-    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(KubeAdmin { remove_etcd_members, storage_off })))
+    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(KubeAdmin { remove_etcd_members, etcd_peers, storage_off })))
 }
 
 pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
@@ -319,6 +326,7 @@ mod tests {
             detail: None,
             etcd_members: BTreeSet::new(),
             etcd_unread: None,
+            etcd_unstarted: BTreeSet::new(),
             storage_off: BTreeSet::new(),
         }
     }
@@ -461,6 +469,38 @@ mod tests {
     }
 
     #[test]
+    fn a_member_that_never_started_counts_by_its_peer_address_and_goes_like_any_dead_one() {
+        let (mut s, mut v) = three_servers();
+        let peer = |s: &ClusterState, id: &str| s.hosts[&hid(id)].ips[&mgmt()];
+        // ms01-03 died while joining: etcd added its member, which never started.
+        let joining = KubeStatus { etcd_unstarted: [peer(&s, "ms01-03")].into(), ..server_seeing(&["ms01-01", "ms01-02"]) };
+        for id in ["ms01-01", "ms01-02"] {
+            v.kube_status.insert(hid(id), joining.clone());
+        }
+        v.kube_status.remove(&hid("ms01-03"));
+        down(&mut s, "ms01-03");
+        let status = |id: &HostId| v.kube_status.get(id).cloned();
+        assert_eq!(etcd_members(&s, &status), Some(set(&["ms01-01", "ms01-02", "ms01-03"])));
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "a voter's member stays, started or not");
+
+        // Membership replaced it with ms01-04: the unstarted member goes, by its peer address, before ms01-04 joins.
+        s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
+        let actions = run(&s, &v, 0);
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer(&s, "ms01-03"))].into(), storage_off: BTreeSet::new() };
+        assert_eq!(asked(&actions), [(hid("ms01-01"), want)]);
+        assert!(!sent(&actions).contains_key(&hid("ms01-04")));
+
+        // ms01-04's own member, added but not started yet, is no reason for it to wait.
+        let joined = KubeStatus { etcd_unstarted: [peer(&s, "ms01-04")].into(), ..server_seeing(&["ms01-01", "ms01-02"]) };
+        for id in ["ms01-01", "ms01-02"] {
+            v.kube_status.insert(hid(id), joined.clone());
+        }
+        let actions = run(&s, &v, 0);
+        assert_eq!(sent(&actions)[&hid("ms01-04")].role, KubeRole::Server);
+        assert!(asked(&actions).is_empty(), "a live host's member stays");
+    }
+
+    #[test]
     fn while_no_server_can_read_etcds_members_none_is_removed_and_no_server_joins() {
         let (mut s, mut v) = three_servers();
         down(&mut s, "ms01-03");
@@ -491,7 +531,8 @@ mod tests {
         // Membership replaced it with ms01-04.
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), storage_off: BTreeSet::new() };
+        let peer = s.hosts[&hid("ms01-03")].ips[&mgmt()];
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer)].into(), storage_off: BTreeSet::new() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)], "through the first running server");
         assert!(!sent(&actions).contains_key(&hid("ms01-04")), "the replacement waits for the dead member to go");
         v.kube_admin_sent = Some(0);
@@ -557,14 +598,14 @@ mod tests {
         let (mut s, mut v) = three_servers();
         assert!(asked(&run(&s, &v, 0)).is_empty(), "every host stores");
         hold_storage(&mut s, "ms01-04", true);
-        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), storage_off: set(&["ms01-04"]) };
+        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), storage_off: set(&["ms01-04"]) };
         assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want.clone())]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off = want.storage_off;
         assert!(asked(&run(&s, &v, 0)).is_empty(), "the server applied it");
 
         // The network is fixed: the disks are given back.
         hold_storage(&mut s, "ms01-04", false);
-        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), storage_off: BTreeSet::new() })]);
+        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), storage_off: BTreeSet::new() })]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off.clear();
         // A host without the storage role never stores.
         let mut roles = s.hosts[&hid("ms01-04")].roles.clone();

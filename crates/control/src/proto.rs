@@ -191,9 +191,15 @@ pub struct StorageNetwork {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KubeAdmin {
     /// Hosts whose etcd members go: each is down and no control-plane voter.
-    /// The server deletes their nodes, so K3s removes the members, but never
-    /// a node that is `Ready`.
+    /// The server deletes their nodes, so K3s removes the members, and
+    /// removes a member with no node, or that never started, through etcd
+    /// itself; never one whose node is `Ready`.
     pub remove_etcd_members: BTreeSet<HostId>,
+    /// The mgmt address of each host in `remove_etcd_members`, its member's
+    /// peer address: how the server finds a member that never started, and
+    /// so has no name.
+    #[serde(default)]
+    pub etcd_peers: BTreeMap<HostId, Ipv4Addr>,
     /// Hosts whose Longhorn disks take no new replicas: they have no active
     /// storage role. Disks this took from a host not listed are given back.
     pub storage_off: BTreeSet<HostId>,
@@ -238,6 +244,11 @@ pub struct KubeStatus {
     /// `etcd_members` says nothing of them.
     #[serde(default)]
     pub etcd_unread: Option<String>,
+    /// On a server: the etcd members that have not started, which etcd
+    /// names only once they do, by peer address (a K3s server's is its
+    /// mgmt address).
+    #[serde(default)]
+    pub etcd_unstarted: BTreeSet<Ipv4Addr>,
     /// On a server: the hosts whose Longhorn disks it last took out of
     /// scheduling ([`KubeAdmin::storage_off`]).
     #[serde(default)]

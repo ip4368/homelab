@@ -630,6 +630,50 @@ fn replacing_a_dead_k3s_server_removes_its_etcd_member_then_adds_the_new_one() {
 }
 
 #[test]
+fn a_replacement_that_dies_joining_etcd_leaves_a_member_that_goes_once_it_is_replaced_in_turn() {
+    use control::proto::{KubePhase, KubeRole};
+    use sim::world::EtcdChange;
+    let mut e = default_fleet(25);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let (voters, kube) = (&e.client_view().state.cp.voters, &e.fabric().world().kube);
+        voters.len() == 5 && kube.etcd == *voters && kube.unstarted.is_empty() && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let spare = |e: &Engine| {
+        let s = &e.client_view().state;
+        let h = s.hosts.values().find(|h| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01 && !s.cp.voters.contains(&h.id));
+        h.expect("a spare MS-01").id.clone()
+    };
+    let replace = |e: &mut Engine, dead: &HostId, with: &HostId| {
+        assert!(e.run_until(e.now() + 60_000, |e| lifecycle(e, dead) == Some(Lifecycle::NotReady)), "{dead} never went NotReady");
+        let req = e.api(ApiOp::ReplaceCpMember { dead: dead.clone(), with: with.clone() });
+        e.run_for(2000);
+        assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    };
+
+    // The replacement dies while joining: etcd added its member, which never starts.
+    let (dead, _) = kill_follower_voter(&mut e);
+    let with = spare(&e);
+    e.fabric_mut().world_mut().kube.stall_joins.insert(with.clone());
+    replace(&mut e, &dead, &with);
+    let stalled = |e: &Engine| e.fabric().world().kube.unstarted.contains(&with) && kube_of(e, &with) == Some((Some(KubeRole::Server), KubePhase::Installing));
+    assert!(e.run_until(e.now() + 3 * 60_000, stalled), "{with}: {:?}, {:?}", kube_of(&e, &with), e.fabric().world().kube.etcd_log);
+    e.fault(Fault::KillHost { host: with.clone() }).unwrap();
+
+    // Replaced in turn: its unstarted member goes, found by its address, and then the next one joins.
+    let next = spare(&e);
+    replace(&mut e, &with, &next);
+    let replaced = |e: &Engine| e.client_view().state.cp.voters.contains(&next) && etcd_is_voters(e);
+    assert!(e.run_until(e.now() + 3 * 60_000, replaced), "etcd {:?}, unstarted {:?}, {next}: {:?}", e.fabric().world().kube.etcd, e.fabric().world().kube.unstarted, kube_of(&e, &next));
+    let kube = &e.fabric().world().kube;
+    let at = |c: EtcdChange| kube.etcd_log.iter().position(|l| *l == c);
+    let order = [at(EtcdChange::Removed(dead.clone())), at(EtcdChange::Stalled(with.clone())), at(EtcdChange::Removed(with.clone())), at(EtcdChange::Joined(next.clone()))];
+    assert!(order.iter().all(Option::is_some) && order.is_sorted(), "{:?}", kube.etcd_log);
+    assert!(kube.violations.is_empty(), "{:?}", kube.violations);
+}
+
+#[test]
 fn suggest_mode_only_alerts() {
     let mut e = default_fleet(23);
     let (dead, killed_at) = kill_follower_voter(&mut e);

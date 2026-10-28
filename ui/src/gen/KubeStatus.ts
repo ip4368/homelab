@@ -38,6 +38,12 @@ etcd_members: Array<HostId>,
  */
 etcd_unread: string | null, 
 /**
+ * On a server: the etcd members that have not started, which etcd
+ * names only once they do, by peer address (a K3s server's is its
+ * mgmt address).
+ */
+etcd_unstarted: Array<string>, 
+/**
  * On a server: the hosts whose Longhorn disks it last took out of
  * scheduling ([`KubeAdmin::storage_off`]).
  */

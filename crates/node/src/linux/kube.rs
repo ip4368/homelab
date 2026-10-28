@@ -221,17 +221,83 @@ pub fn storage_attachment(master: &str, net: &StorageNetwork) -> String {
     serde_json::to_string_pretty(&conf).expect("a CNI config serializes") + "\n"
 }
 
-/// The node names of the etcd members in K3s's `/db/info`: a member is named
-/// `<node>-<8 hex digits>`; one that has not started yet has no name.
-pub fn etcd_member_nodes(db_info: &str) -> Result<BTreeSet<HostId>, String> {
+/// An etcd member, as K3s's `/db/info` lists it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EtcdMember {
+    pub id: u64,
+    /// Its node: a member is named `<node>-<8 hex digits>`; `None` for one
+    /// that has not started yet, which has no name.
+    pub node: Option<HostId>,
+    /// The address its peers reach it at (its server's node address).
+    pub peer: Option<Ipv4Addr>,
+}
+
+/// The etcd members in K3s's `/db/info`.
+pub fn etcd_members_in(db_info: &str) -> Result<Vec<EtcdMember>, String> {
     let v: serde_json::Value = serde_json::from_str(db_info).map_err(|e| format!("read etcd's members: {e}"))?;
-    let names = v["members"].as_array().ok_or("etcd's members: no list")?.iter().filter_map(|m| m["name"].as_str()).filter(|n| !n.is_empty());
-    Ok(names
-        .map(|n| match n.rsplit_once('-') {
-            Some((node, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) => HostId::from(node),
-            _ => HostId::from(n),
+    let members = v["members"].as_array().ok_or("etcd's members: no list")?;
+    let node = |n: &str| match n.rsplit_once('-') {
+        Some((node, id)) if id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()) => HostId::from(node),
+        _ => HostId::from(n),
+    };
+    // A peer URL is `https://<address>:2380`.
+    let peer = |m: &serde_json::Value| m["peerURLs"][0].as_str()?.split_once("://")?.1.rsplit_once(':')?.0.parse().ok();
+    members
+        .iter()
+        .map(|m| {
+            let id = m["ID"].as_u64().ok_or_else(|| format!("etcd's members: no ID in {m}"))?;
+            Ok(EtcdMember { id, node: m["name"].as_str().filter(|n| !n.is_empty()).map(node), peer: peer(m) })
         })
-        .collect())
+        .collect()
+}
+
+/// What a status says of `members`: the nodes of those that started, and
+/// the peer addresses of those that have not.
+fn by_node_and_peer(members: &[EtcdMember]) -> (BTreeSet<HostId>, BTreeSet<Ipv4Addr>) {
+    let nodes = members.iter().filter_map(|m| m.node.clone()).collect();
+    let unstarted = members.iter().filter(|m| m.node.is_none()).filter_map(|m| m.peer).collect();
+    (nodes, unstarted)
+}
+
+/// etcd's `Cluster.MemberRemove` request for member `id`, framed for gRPC:
+/// uncompressed, the message's length, then the message (field 1, the ID,
+/// a varint).
+pub fn member_remove_request(id: u64) -> Vec<u8> {
+    let mut msg = vec![0x08];
+    let mut v = id;
+    while v >= 0x80 {
+        msg.push((v & 0x7f) as u8 | 0x80);
+        v >>= 7;
+    }
+    msg.push(v as u8);
+    let mut out = vec![0];
+    out.extend((msg.len() as u32).to_be_bytes());
+    out.extend(msg);
+    out
+}
+
+/// How a server removes a dead host's etcd member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtcdRemoval {
+    /// Its node is `Ready`: it is not removed.
+    Keep,
+    /// Delete its node, and K3s removes the member.
+    DeleteNode,
+    /// Remove member `id` through etcd itself: it has no node to delete, or
+    /// never started, so K3s would not find it by its node.
+    ThroughEtcd(u64),
+}
+
+/// The member of `members` that is `host`'s, found by its node, or by
+/// `peer` (the host's address) for one that never started; and how to
+/// remove it, given `host`'s node (`None` for none).
+pub fn member_removal(members: &[EtcdMember], host: &HostId, peer: Option<Ipv4Addr>, node: Option<&serde_json::Value>) -> Option<EtcdRemoval> {
+    let m = members.iter().find(|m| m.node.as_ref() == Some(host)).or_else(|| members.iter().find(|m| m.node.is_none() && peer.is_some() && m.peer == peer))?;
+    Some(match node {
+        Some(n) if node_ready(n) => EtcdRemoval::Keep,
+        Some(_) if m.node.is_some() => EtcdRemoval::DeleteNode,
+        _ => EtcdRemoval::ThroughEtcd(m.id),
+    })
 }
 
 /// What a status says of etcd's members read as `read`: the members, or
@@ -424,8 +490,8 @@ struct Observed {
     unregistered: Option<String>,
     node_ready: bool,
     version: String,
-    /// On a server: etcd's members, by node.
-    etcd_members: BTreeSet<HostId>,
+    /// On a server: etcd's members.
+    etcd_members: Vec<EtcdMember>,
     /// On a server: why etcd's members could not be read.
     etcd_unread: Option<String>,
 }
@@ -450,10 +516,12 @@ impl Worker {
                 && status.role == Some(KubeRole::Server)
                 && status.phase == KubePhase::Running
             {
-                if let Err(e) = self.admin(&admin, &status.etcd_members) {
+                if let Err(e) = self.admin(&admin) {
                     eprintln!("homelabd: kubernetes: for the cluster: {e}");
                 }
-                (status.etcd_members, status.etcd_unread) = split(self.etcd_members());
+                let (members, unread) = split(self.etcd_members());
+                (status.etcd_members, status.etcd_unstarted) = by_node_and_peer(&members);
+                status.etcd_unread = unread;
                 status.storage_off.clone_from(&self.storage_off);
             }
             wait = if ok { EVERY } else { BACKOFF };
@@ -479,6 +547,7 @@ impl Worker {
             Some(a) if phase == KubePhase::Running => (a.labels.clone(), a.storage_disks.clone()),
             _ => (BTreeMap::new(), vec![]),
         };
+        let (etcd_members, etcd_unstarted) = by_node_and_peer(&o.etcd_members);
         KubeStatus {
             role: o.role,
             phase,
@@ -487,8 +556,9 @@ impl Worker {
             storage_disks,
             version: o.version.clone(),
             detail,
-            etcd_members: o.etcd_members.clone(),
+            etcd_members,
             etcd_unread: o.etcd_unread.clone(),
+            etcd_unstarted,
             storage_off: if o.role == Some(KubeRole::Server) { self.storage_off.clone() } else { BTreeSet::new() },
         }
     }
@@ -565,17 +635,42 @@ impl Worker {
             Err("not running".into())
         };
         let node_ready = ready.as_deref().map(str::trim) == Ok("True");
-        let (etcd_members, etcd_unread) = if r == KubeRole::Server && active { split(self.etcd_members()) } else { (BTreeSet::new(), None) };
+        let (etcd_members, etcd_unread) = if r == KubeRole::Server && active { split(self.etcd_members()) } else { (vec![], None) };
         Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members, etcd_unread }
     }
 
     /// etcd's members, from this host's K3s server (`/db/info` answers the
     /// admin on loopback).
-    fn etcd_members(&self) -> Result<BTreeSet<HostId>, String> {
+    fn etcd_members(&self) -> Result<Vec<EtcdMember>, String> {
         let tls = |f: &str| format!("{SERVER_TLS}/{f}");
         let (ca, cert, key) = (tls("server-ca.crt"), tls("client-admin.crt"), tls("client-admin.key"));
         let info = sh("curl", &["-fsS", "--max-time", "5", "--cacert", &ca, "--cert", &cert, "--key", &key, "https://127.0.0.1:6443/db/info"]);
-        info.map_err(|e| e.to_string()).and_then(|i| etcd_member_nodes(&i))
+        info.map_err(|e| e.to_string()).and_then(|i| etcd_members_in(&i))
+    }
+
+    /// Removes etcd member `id` through etcd's own gRPC API on loopback
+    /// (K3s enables no JSON gateway), with K3s's etcd client certificate;
+    /// then checks that etcd no longer lists it. etcd refuses a removal
+    /// that would cost it its quorum.
+    fn remove_etcd_member(&self, id: u64) -> Result<(), String> {
+        let tls = |f: &str| format!("{SERVER_TLS}/etcd/{f}");
+        let (ca, cert, key) = (tls("server-ca.crt"), tls("client.crt"), tls("client.key"));
+        let body = self.paths.run.join("etcd-member-remove.grpc");
+        let _ = std::fs::create_dir_all(&self.paths.run);
+        std::fs::write(&body, member_remove_request(id)).map_err(|e| format!("write {}: {e}", body.display()))?;
+        let data = format!("@{}", body.display());
+        // A refusal comes in the response's headers; success in its trailers.
+        let answer = sh("curl", &[
+            "-sS", "--http2", "--max-time", "10", "--cacert", &ca, "--cert", &cert, "--key", &key,
+            "-H", "content-type: application/grpc", "-H", "te: trailers", "--data-binary", &data, "-o", "/dev/null",
+            "-w", "%{http_code} %header{grpc-status} %header{grpc-message}", "https://127.0.0.1:2379/etcdserverpb.Cluster/MemberRemove",
+        ]);
+        let _ = std::fs::remove_file(&body);
+        let answer = answer.map_err(|e| e.to_string())?;
+        if self.etcd_members()?.iter().any(|m| m.id == id) {
+            return Err(format!("etcd still lists member {id:x} (it answered {})", answer.trim()));
+        }
+        Ok(())
     }
 
     /// Writes this host's config of the storage network attachment where
@@ -608,26 +703,37 @@ impl Worker {
         }
     }
 
-    /// Does `admin` with this server's admin access: deletes the nodes of
-    /// the dead etcd members asked (of `members`), so K3s removes them, but
-    /// never a node that is `Ready`; then keeps Longhorn off the disks of
-    /// the hosts listed, and gives back the others'.
-    fn admin(&mut self, admin: &KubeAdmin, members: &BTreeSet<HostId>) -> Result<(), String> {
-        for m in admin.remove_etcd_members.iter().filter(|m| members.contains(*m) && **m != self.host) {
+    /// Does `admin` with this server's admin access: removes the dead etcd
+    /// members asked ([`member_removal`]), never one whose node is `Ready`;
+    /// then keeps Longhorn off the disks of the hosts listed, and gives
+    /// back the others'.
+    fn admin(&mut self, admin: &KubeAdmin) -> Result<(), String> {
+        let members = match admin.remove_etcd_members.is_empty() {
+            true => vec![],
+            // Nothing to find the members in; the disks need no members.
+            false => self.etcd_members().unwrap_or_else(|e| {
+                eprintln!("homelabd: kubernetes: no etcd member removed: {e}");
+                vec![]
+            }),
+        };
+        for m in admin.remove_etcd_members.iter().filter(|m| **m != self.host) {
             let node = match self.kubectl(KubeRole::Server, &["get", "node", m.as_str(), "-o", "json"]) {
-                Ok(json) => serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("read node {m}: {e}"))?,
-                Err(e) if e.contains("NotFound") => {
-                    eprintln!("homelabd: kubernetes: {m} is in etcd but has no node to delete");
-                    continue;
-                }
+                Ok(json) => Some(serde_json::from_str::<serde_json::Value>(&json).map_err(|e| format!("read node {m}: {e}"))?),
+                Err(e) if e.contains("NotFound") => None,
                 Err(e) => return Err(e),
             };
-            if node_ready(&node) {
-                eprintln!("homelabd: kubernetes: not removing {m}'s etcd member: its node is Ready");
-                continue;
+            match member_removal(&members, m, admin.etcd_peers.get(m).copied(), node.as_ref()) {
+                None => {}
+                Some(EtcdRemoval::Keep) => eprintln!("homelabd: kubernetes: not removing {m}'s etcd member: its node is Ready"),
+                Some(EtcdRemoval::DeleteNode) => {
+                    eprintln!("homelabd: kubernetes: removing {m}'s etcd member (deleting its node)");
+                    self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"])?;
+                }
+                Some(EtcdRemoval::ThroughEtcd(id)) => {
+                    eprintln!("homelabd: kubernetes: removing {m}'s etcd member {id:x} through etcd (no node, or it never started)");
+                    self.remove_etcd_member(id)?;
+                }
             }
-            eprintln!("homelabd: kubernetes: removing {m}'s etcd member (deleting its node)");
-            self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"])?;
         }
         let json = self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "get", "nodes.longhorn.io", "-o", "json"])?;
         let nodes: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read Longhorn's nodes: {e}"))?;
@@ -891,15 +997,49 @@ mod tests {
     }
 
     #[test]
-    fn etcd_members_are_named_by_node() {
-        let info = r#"{"members":[{"ID":1,"name":"ms01-01-da0049ba","peerURLs":["https://10.0.0.2:2380"]},{"ID":2,"name":"ms01-02-5e7f1e24"},{"ID":3,"name":"","peerURLs":["https://10.0.0.9:2380"]},{"ID":4,"name":"odd-name"}]}"#;
-        let got: Vec<String> = etcd_member_nodes(info).unwrap().into_iter().map(|h| h.to_string()).collect();
-        assert_eq!(got, ["ms01-01", "ms01-02", "odd-name"], "a member not started yet has no name");
-        assert!(etcd_member_nodes("forbidden").is_err());
+    fn etcd_members_are_named_by_node_and_found_by_peer_address_until_they_start() {
+        let info = r#"{"members":[{"ID":17713283624853434543,"name":"ms01-01-da0049ba","peerURLs":["https://10.0.0.2:2380"]},{"ID":2,"name":"ms01-02-5e7f1e24"},{"ID":3,"peerURLs":["https://10.0.0.9:2380"],"isLearner":true},{"ID":4,"name":"odd-name"}]}"#;
+        let members = etcd_members_in(info).unwrap();
+        let ip = |s: &str| Some(s.parse::<Ipv4Addr>().unwrap());
+        assert_eq!(members[0], EtcdMember { id: 17713283624853434543, node: Some(HostId::from("ms01-01")), peer: ip("10.0.0.2") }, "IDs are full 64-bit");
+        assert_eq!(members[2], EtcdMember { id: 3, node: None, peer: ip("10.0.0.9") }, "a member not started yet has no name");
+        let (nodes, unstarted) = by_node_and_peer(&members);
+        assert_eq!(nodes.iter().map(|h| h.as_str()).collect::<Vec<_>>(), ["ms01-01", "ms01-02", "odd-name"]);
+        assert_eq!(unstarted, [ip("10.0.0.9").unwrap()].into());
+        assert!(etcd_members_in("forbidden").is_err());
+        assert!(etcd_members_in(r#"{"members":[{"name":"no-id"}]}"#).is_err());
         let ready = serde_json::json!({"status": {"conditions": [{"type": "MemoryPressure", "status": "False"}, {"type": "Ready", "status": "True"}]}});
         assert!(node_ready(&ready));
         let gone = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}});
         assert!(!node_ready(&gone));
+    }
+
+    #[test]
+    fn a_member_remove_request_is_framed_for_grpc() {
+        assert_eq!(member_remove_request(1), [0, 0, 0, 0, 2, 0x08, 0x01]);
+        assert_eq!(member_remove_request(300), [0, 0, 0, 0, 3, 0x08, 0xac, 0x02]);
+        let big = member_remove_request(u64::MAX);
+        assert_eq!((big.len(), big[4], big[15]), (16, 11, 0x01), "ten varint bytes, the last holding the top bit");
+    }
+
+    #[test]
+    fn a_dead_member_goes_with_its_node_or_through_etcd_when_k3s_cannot_find_it_by_one() {
+        let info = r#"{"members":[{"ID":1,"name":"ms01-01-da0049ba","peerURLs":["https://10.0.0.2:2380"]},{"ID":2,"name":"ms01-03-5e7f1e24","peerURLs":["https://10.0.0.4:2380"]},{"ID":3,"peerURLs":["https://10.0.0.9:2380"]}]}"#;
+        let members = etcd_members_in(info).unwrap();
+        let ready = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "True"}]}});
+        let not_ready = serde_json::json!({"status": {"conditions": [{"type": "Ready", "status": "Unknown"}]}});
+        let (dead, peer) = (HostId::from("ms01-03"), Some(Ipv4Addr::new(10, 0, 0, 4)));
+        assert_eq!(member_removal(&members, &dead, peer, Some(&not_ready)), Some(EtcdRemoval::DeleteNode));
+        assert_eq!(member_removal(&members, &dead, peer, Some(&ready)), Some(EtcdRemoval::Keep), "never a Ready node's");
+        assert_eq!(member_removal(&members, &dead, None, None), Some(EtcdRemoval::ThroughEtcd(2)), "its node is gone, the member stays");
+
+        // Died joining: its member has no name, only its host's address.
+        let joining = HostId::from("ms01-05");
+        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&not_ready)), Some(EtcdRemoval::ThroughEtcd(3)), "its old agent node would not lead K3s to it");
+        assert_eq!(member_removal(&members, &joining, Some(Ipv4Addr::new(10, 0, 0, 9)), Some(&ready)), Some(EtcdRemoval::Keep));
+        assert_eq!(member_removal(&members, &joining, None, None), None, "no address, nothing to find it by");
+        assert_eq!(member_removal(&members, &HostId::from("ms01-01"), Some(Ipv4Addr::new(10, 0, 0, 9)), None), Some(EtcdRemoval::ThroughEtcd(1)), "by name first");
+        assert_eq!(member_removal(&members, &HostId::from("ms01-07"), Some(Ipv4Addr::new(10, 0, 0, 2)), None), None, "a started member is found by its name only");
     }
 
     #[test]

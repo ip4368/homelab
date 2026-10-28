@@ -278,6 +278,12 @@ pub struct World {
 pub struct KubeWorld {
     /// The etcd members, by host.
     pub etcd: BTreeSet<HostId>,
+    /// Members etcd added whose server never started them (it died while
+    /// joining): they count toward etcd's quorum, and have no name.
+    pub unstarted: BTreeSet<HostId>,
+    /// Hosts whose next join stalls: etcd adds the member, which never
+    /// starts (a test's stand-in for a server that dies while joining).
+    pub stall_joins: BTreeSet<HostId>,
     /// Every change to the members, in order.
     pub etcd_log: Vec<EtcdChange>,
     /// Hosts whose Longhorn disks take no new replicas.
@@ -300,6 +306,8 @@ pub enum EtcdChange {
     Left(HostId),
     /// A server removed another's member (it deleted that node).
     Removed(HostId),
+    /// etcd added a server's member, which never started.
+    Stalled(HostId),
 }
 
 impl World {
@@ -325,6 +333,11 @@ impl World {
         self.kube.etcd.iter().filter(|m| self.etcd_runs(m)).count()
     }
 
+    /// All etcd members, started or not.
+    fn etcd_size(&self) -> usize {
+        self.kube.etcd.len() + self.kube.unstarted.len()
+    }
+
     /// `host` runs `spec` of Kubernetes from now on (installed at once). A
     /// server starts etcd (`init`) or joins it, if etcd takes it: the members
     /// that run and it must be a quorum of all with it. A host that leaves
@@ -337,7 +350,7 @@ impl World {
         match role {
             KubeRole::Agent if member => {
                 self.kube.etcd.remove(host);
-                let (n, live) = (self.kube.etcd.len(), self.etcd_live());
+                let (n, live) = (self.etcd_size(), self.etcd_live());
                 if n > 0 && live <= n / 2 {
                     self.kube.violations.push(format!("{host} left etcd with {live} of {n} members running"));
                 }
@@ -347,10 +360,13 @@ impl World {
                 self.kube.etcd.insert(host.clone());
                 self.kube.etcd_log.push(EtcdChange::Started(host.clone()));
             }
-            KubeRole::Server if !member => {
-                let (n, live) = (self.kube.etcd.len() + 1, self.etcd_live() + 1);
+            KubeRole::Server if !member && !self.kube.unstarted.contains(host) => {
+                let (n, live) = (self.etcd_size() + 1, self.etcd_live() + 1);
                 if init || live <= n / 2 {
                     self.kube.violations.push(format!("etcd refused {host} (init {init}): {live} of {n} members would run"));
+                } else if self.kube.stall_joins.remove(host) {
+                    self.kube.unstarted.insert(host.clone());
+                    self.kube.etcd_log.push(EtcdChange::Stalled(host.clone()));
                 } else {
                     self.kube.etcd.insert(host.clone());
                     self.kube.etcd_log.push(EtcdChange::Joined(host.clone()));
@@ -361,27 +377,35 @@ impl World {
     }
 
     /// `host`'s K3s server does `admin`: it removes the members asked (a
-    /// node that is Ready, its host on, it does not delete), and takes the
-    /// Longhorn disks of the hosts listed out of scheduling. Only a running
-    /// server, an etcd member, does anything.
+    /// node that is Ready, its host on, it does not delete; one that never
+    /// started it finds by its peer address, which must be the host's), and
+    /// takes the Longhorn disks of the hosts listed out of scheduling. Only
+    /// a running server, an etcd member, does anything.
     pub fn kube_admin(&mut self, host: &HostId, admin: KubeAdmin) {
         if !self.etcd_runs(host) || !self.kube.etcd.contains(host) {
             return;
         }
         for m in &admin.remove_etcd_members {
-            if !self.kube.etcd.contains(m) {
+            let unstarted = self.kube.unstarted.contains(m);
+            if !self.kube.etcd.contains(m) && !unstarted {
                 continue;
             }
             if self.hosts.get(m).is_some_and(|hw| hw.powered) {
                 self.kube.violations.push(format!("{host} was asked to remove {m}'s etcd member while its host runs"));
                 continue;
             }
-            let (n, live) = (self.kube.etcd.len(), self.etcd_live());
+            let peer = self.hosts.get(m).and_then(|hw| hw.kube.as_ref()).map(|k| k.node_ip);
+            if unstarted && (peer.is_none() || admin.etcd_peers.get(m).copied() != peer) {
+                self.kube.violations.push(format!("{host} was asked to remove {m}'s unstarted member without its peer address"));
+                continue;
+            }
+            let (n, live) = (self.etcd_size(), self.etcd_live());
             if live <= n / 2 {
                 self.kube.violations.push(format!("{host} was asked to remove {m} with {live} of {n} members running"));
                 continue;
             }
             self.kube.etcd.remove(m);
+            self.kube.unstarted.remove(m);
             self.kube.etcd_log.push(EtcdChange::Removed(m.clone()));
         }
         self.kube.storage_off.clone_from(&admin.storage_off);
@@ -405,6 +429,11 @@ impl World {
             detail: (!joined).then(|| "waiting to join etcd".into()),
             etcd_members: if spec.role == KubeRole::Server && member { self.kube.etcd.clone() } else { BTreeSet::new() },
             etcd_unread: None,
+            etcd_unstarted: if spec.role == KubeRole::Server && member {
+                self.kube.unstarted.iter().filter_map(|u| Some(self.hosts.get(u)?.kube.as_ref()?.node_ip)).collect()
+            } else {
+                BTreeSet::new()
+            },
             storage_off: self.kube.storage_off_applied.get(host).cloned().unwrap_or_default(),
         })
     }

@@ -38,6 +38,7 @@ describe('host drawer kubernetes', () => {
     detail: null,
     etcd_members: [],
     etcd_unread: null,
+    etcd_unstarted: [],
     storage_off: [],
     ...over,
   })
