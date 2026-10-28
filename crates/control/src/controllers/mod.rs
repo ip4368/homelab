@@ -376,7 +376,7 @@ impl Volatile {
     }
 }
 
-pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<Action> {
+pub fn run_all(state: &ClusterState, volatile: &Volatile, members: &membership::RaftMembers, now: SimTime) -> Vec<Action> {
     let mut out = health::run(state, volatile, now);
     out.extend(join::run(state, volatile));
     out.extend(network::run(state, volatile, now));
@@ -387,6 +387,6 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(scheduler::run(state, volatile, now));
     out.extend(failover::run(state, volatile, now));
     out.extend(directory::run(state, volatile, now));
-    out.extend(kube::run(state, volatile, now));
+    out.extend(kube::run(state, volatile, members, now));
     out
 }

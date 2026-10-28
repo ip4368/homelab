@@ -14,12 +14,14 @@
 //!   runs a server.
 //! * A host whose storage role is held for a network problem gives Longhorn
 //!   no disks.
-//! * A replaced dead server (down, no longer a voter) has its etcd member
-//!   removed by the live servers (`KubeSpec.etcd_remove`, via `kubectl
-//!   delete node`, which K3s turns into an etcd removal), once its Raft
-//!   replacement is done. Never a live member, and never without quorum.
+//! * A dead server being replaced has its etcd member removed by the live
+//!   servers (`KubeSpec.etcd_remove`, via `kubectl delete node`, which K3s
+//!   turns into an etcd removal), once the replacement is decided (a learner
+//!   stands ready) and again once the Raft swap is done, so the new server
+//!   joins a cluster without the dead member. Never a live member, and never
+//!   without quorum.
 
-use super::membership::target_size;
+use super::membership::{target_size, RaftMembers};
 use super::{Action, Volatile};
 use crate::bootstrap::profile_prefix;
 use crate::proto::{mgmt, KubeRole, KubeSpec, KubeStatus, Msg};
@@ -98,24 +100,31 @@ fn runs_server(status: Option<&KubeStatus>) -> bool {
 }
 
 /// Dead K3s servers whose etcd members live servers must remove: hosts that
-/// were servers (their last status says so), are down (`NotReady`), and are
-/// no longer voters (their Raft replacement is done). Empty while etcd lacks
-/// quorum (live servers are not a majority of all known server members),
-/// since a removal could not commit then anyway. Sorted for a deterministic
-/// spec. Liveness in Kubernetes itself (a `Ready` node) is checked by the
-/// worker at removal time, since the last status here is stale once the
-/// host is down.
-pub fn etcd_remove(state: &ClusterState, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> Vec<HostId> {
-    let is_server = |id: &HostId| status(id).is_some_and(|s| s.role == Some(KubeRole::Server));
-    let live: usize = state.hosts.values().filter(|h| member(h) && runs_server(status(&h.id).as_ref())).count();
-    let total = state.hosts.keys().filter(|id| is_server(id)).count();
+/// ran servers (their last status says `Running`), are down (`NotReady`),
+/// and either are no longer voters (their Raft replacement is done) or are
+/// still voters with a learner standing by (their replacement is decided:
+/// etcd refuses a new member while the dead one is still listed, so the
+/// dead member goes first and the new server joins cleanly). Growth (voters
+/// below target) never removes a voter. Empty while etcd lacks quorum (live
+/// `Running` servers are not a majority of all `Running` members: a host
+/// still `Installing` is not a member yet), since a removal could not commit
+/// then anyway. Sorted for a deterministic spec. Liveness in Kubernetes
+/// itself (a `Ready` node) is checked by the worker at removal time, since
+/// the last status here is stale once the host is down.
+pub fn etcd_remove(state: &ClusterState, members: &RaftMembers, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> Vec<HostId> {
+    let ran_server = |id: &HostId| runs_server(status(id).as_ref());
+    let live: usize = state.hosts.values().filter(|h| member(h) && ran_server(&h.id)).count();
+    let total = state.hosts.keys().filter(|id| ran_server(id)).count();
     if total == 0 || live < total / 2 + 1 {
         return vec![];
     }
+    // A replacement decided but not yet swapped: the voters are at target
+    // and a learner (the replacement) is catching up.
+    let replacing = state.cp.voters.len() >= target_size(state) && !members.learners.is_empty();
     let mut dead: Vec<HostId> = state
         .hosts
         .values()
-        .filter(|h| h.lifecycle == Lifecycle::NotReady && !state.cp.voters.contains(&h.id) && is_server(&h.id))
+        .filter(|h| h.lifecycle == Lifecycle::NotReady && ran_server(&h.id) && (!state.cp.voters.contains(&h.id) || replacing))
         .map(|h| h.id.clone())
         .collect();
     dead.sort();
@@ -123,8 +132,15 @@ pub fn etcd_remove(state: &ClusterState, status: &impl Fn(&HostId) -> Option<Kub
 }
 
 /// What `id` should run of Kubernetes now, or `None` for nothing yet (see
-/// the module docs). `status` is each host's latest reported status.
-pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> Option<KubeStatus>) -> Option<KubeSpec> {
+/// the module docs). `status` is each host's latest reported status,
+/// `members` the Raft voters and learners (a learner marks a replacement
+/// decided, whose dead member goes from etcd first).
+pub fn desired(
+    state: &ClusterState,
+    members: &RaftMembers,
+    id: &HostId,
+    status: &impl Fn(&HostId) -> Option<KubeStatus>,
+) -> Option<KubeSpec> {
     let kube = state.kube.as_ref()?;
     let h = state.hosts.get(id)?;
     if !member(h) {
@@ -150,11 +166,11 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
     // Only live servers remove etcd members (agents lack the RBAC), and
     // never themselves.
     let etcd_remove =
-        if role == KubeRole::Server { etcd_remove(state, status).into_iter().filter(|d| d != id).collect() } else { vec![] };
+        if role == KubeRole::Server { etcd_remove(state, members, status).into_iter().filter(|d| d != id).collect() } else { vec![] };
     Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels: node_labels(h), storage_disks, etcd_remove })
 }
 
-pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
+pub fn run(state: &ClusterState, v: &Volatile, members: &RaftMembers, now: SimTime) -> Vec<Action> {
     let mut out: Vec<Action> = v
         .kube_status
         .iter()
@@ -163,7 +179,7 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         .collect();
     let status = |id: &HostId| v.kube_status.get(id).cloned().or_else(|| state.hosts.get(id)?.kube.clone());
     for id in state.hosts.keys() {
-        let Some(spec) = desired(state, id, &status) else { continue };
+        let Some(spec) = desired(state, members, id, &status) else { continue };
         // `satisfies` ignores `etcd_remove` (a task, not state): a Running
         // server with removals to do still gets its spec.
         let removal = !spec.etcd_remove.is_empty();
@@ -239,9 +255,10 @@ mod tests {
 
     #[test]
     fn the_first_host_starts_kubernetes_and_others_wait_for_a_running_server() {
+        let members = RaftMembers::default();
         let s = cluster(&[("pi5-01", ProfileId::Pi5)]);
         let v = Volatile::new(0, 1);
-        let specs = sent(&run(&s, &v, 0));
+        let specs = sent(&run(&s, &v, &members, 0));
         let first = &specs[&hid("ms01-01")];
         assert_eq!((first.role, first.init, first.token.as_str()), (KubeRole::Server, true, "s3cret"));
         assert_eq!(first.node_ip.to_string(), "10.0.0.2", "its static mgmt address");
@@ -252,7 +269,7 @@ mod tests {
 
         let mut v = Volatile::new(0, 1);
         v.kube_status.insert(hid("ms01-01"), running(KubeRole::Server));
-        let specs = sent(&run(&s, &v, 0));
+        let specs = sent(&run(&s, &v, &members, 0));
         let pi = &specs[&hid("pi5-01")];
         assert_eq!((pi.role, pi.init), (KubeRole::Agent, false));
         assert!(pi.storage_disks.is_empty(), "the seed Pi rule has no storage role");
@@ -261,52 +278,56 @@ mod tests {
 
     #[test]
     fn an_eligible_host_waits_while_the_control_plane_grows_then_follows_its_role() {
+        let members = RaftMembers::default();
         let mut s = cluster(&[("ms01-02", ProfileId::Ms01)]);
         let mut v = Volatile::new(0, 1);
         v.kube_status.insert(hid("ms01-01"), running(KubeRole::Server));
-        assert!(!sent(&run(&s, &v, 0)).contains_key(&hid("ms01-02")), "it may become a voter");
+        assert!(!sent(&run(&s, &v, &members, 0)).contains_key(&hid("ms01-02")), "it may become a voter");
         s.apply_membership([hid("ms01-01"), hid("ms01-02")].into());
         let mut roles = s.hosts[&hid("ms01-02")].roles.clone();
         roles.insert(Role::ControlPlane);
         s.apply(0, Command::SetRoles { id: hid("ms01-02"), roles }).unwrap();
-        let spec = &sent(&run(&s, &v, 0))[&hid("ms01-02")];
+        let spec = &sent(&run(&s, &v, &members, 0))[&hid("ms01-02")];
         assert_eq!((spec.role, spec.init), (KubeRole::Server, false), "a voter joins as a server");
     }
 
     #[test]
     fn a_new_voter_is_a_server_before_its_role_catches_up() {
+        let members = RaftMembers::default();
         let mut s = cluster(&[("ms01-02", ProfileId::Ms01), ("ms01-03", ProfileId::Ms01)]);
         let mut v = Volatile::new(0, 1);
         v.kube_status.insert(hid("ms01-01"), running(KubeRole::Server));
         // The third voter's config committed; membership has not yet given it the role.
         s.apply_membership([hid("ms01-01"), hid("ms01-02"), hid("ms01-03")].into());
         assert!(!s.hosts[&hid("ms01-03")].roles.contains(&Role::ControlPlane));
-        let specs = sent(&run(&s, &v, 0));
+        let specs = sent(&run(&s, &v, &members, 0));
         assert_eq!(specs[&hid("ms01-03")].role, KubeRole::Server, "not an agent, to be reinstalled a second later");
     }
 
     #[test]
     fn a_host_running_its_spec_is_left_alone_and_one_that_is_not_is_resent_after_a_pause() {
+        let members = RaftMembers::default();
         let s = cluster(&[]);
         let mut v = Volatile::new(0, 1);
-        let spec = desired(&s, &hid("ms01-01"), &|_| None).unwrap();
+        let spec = desired(&s, &members, &hid("ms01-01"), &|_| None).unwrap();
         v.kube_sent.insert(hid("ms01-01"), 1000);
-        assert!(sent(&run(&s, &v, 1000 + KUBE_RESEND_MS - 1)).is_empty(), "sent a moment ago");
-        assert_eq!(sent(&run(&s, &v, 1000 + KUBE_RESEND_MS)).len(), 1);
+        assert!(sent(&run(&s, &v, &members, 1000 + KUBE_RESEND_MS - 1)).is_empty(), "sent a moment ago");
+        assert_eq!(sent(&run(&s, &v, &members, 1000 + KUBE_RESEND_MS)).len(), 1);
         let done = KubeStatus { labels: spec.labels.clone(), storage_disks: spec.storage_disks.clone(), ..running(KubeRole::Server) };
         v.kube_status.insert(hid("ms01-01"), done.clone());
-        let actions = run(&s, &v, 1000 + KUBE_RESEND_MS);
+        let actions = run(&s, &v, &members, 1000 + KUBE_RESEND_MS);
         assert!(sent(&actions).is_empty());
         assert_eq!(actions, [Action::Propose(Command::RecordKube { id: hid("ms01-01"), status: done })], "what it reports is recorded");
     }
 
     #[test]
     fn a_held_storage_role_gives_longhorn_no_disks_and_no_storage_label() {
+        let members = RaftMembers::default();
         let mut s = cluster(&[]);
         let h = s.hosts[&hid("ms01-01")].clone();
         let held = [(Role::Storage, model::NetworkId::from("storage"))].into();
         s.apply(0, Command::AssessNetwork { id: h.id.clone(), issues: vec![], fixes: vec![], held_roles: held, drift: false }).unwrap();
-        let spec = desired(&s, &h.id, &|_| None).unwrap();
+        let spec = desired(&s, &members, &h.id, &|_| None).unwrap();
         assert!(spec.storage_disks.is_empty());
         assert!(!spec.labels.contains_key("homelab.io/storage"), "workloads selecting storage hosts go elsewhere");
         assert_eq!(spec.labels["homelab.io/vm"], "true", "its other roles stay");
@@ -358,19 +379,28 @@ mod tests {
 
     #[test]
     fn a_replaced_dead_server_is_removed_from_etcd_by_the_live_servers() {
+        let members = RaftMembers::default();
         let (mut s, mut st) = three_voters();
-        // ms01-03 goes down and is replaced by ms01-04 (Raft done): 01, 02
-        // live servers, 04 a new live server, 03 down and no longer a voter.
+        // ms01-03 goes down; a learner (ms01-04) stands by: the dead voter
+        // goes from etcd first, so the new server joins cleanly.
         s.apply(0, Command::SetLifecycle { id: hid("ms01-03"), lifecycle: Lifecycle::NotReady }).unwrap();
+        let replacing = RaftMembers { learners: [hid("ms01-04")].into(), ..Default::default() };
+        assert_eq!(etcd_remove(&s, &replacing, &|id| st.get(id).cloned()), [hid("ms01-03")]);
+        // Raft done (03 out, 04 in) and 04 a live server: 03 goes again, so
+        // a removal missed while its node still read Ready is retried.
         s.apply_membership([hid("ms01-01"), hid("ms01-02"), hid("ms01-04")].into());
         st.insert(hid("ms01-04"), running(KubeRole::Server));
+        assert_eq!(etcd_remove(&s, &members, &|id| st.get(id).cloned()), [hid("ms01-03")]);
+        // 04 still Installing (not a member yet) does not stop the removal.
+        st.insert(hid("ms01-04"), KubeStatus { phase: KubePhase::Installing, ..running(KubeRole::Server) });
+        assert_eq!(etcd_remove(&s, &members, &|id| st.get(id).cloned()), [hid("ms01-03")]);
+        st.insert(hid("ms01-04"), running(KubeRole::Server));
         let status = |id: &HostId| st.get(id).cloned();
-        assert_eq!(etcd_remove(&s, &status), [hid("ms01-03")]);
-        let spec_01 = desired(&s, &hid("ms01-01"), &status).unwrap();
+        let spec_01 = desired(&s, &members, &hid("ms01-01"), &status).unwrap();
         assert_eq!(spec_01.etcd_remove, [hid("ms01-03")]);
-        let spec_04 = desired(&s, &hid("ms01-04"), &status).unwrap();
+        let spec_04 = desired(&s, &members, &hid("ms01-04"), &status).unwrap();
         assert_eq!((spec_04.role, spec_04.etcd_remove.as_slice()), (KubeRole::Server, [hid("ms01-03")].as_slice()));
-        let pi = desired(&s, &hid("pi5-01"), &status).unwrap();
+        let pi = desired(&s, &members, &hid("pi5-01"), &status).unwrap();
         assert_eq!((pi.role, pi.etcd_remove.as_slice()), (KubeRole::Agent, [].as_slice()), "agents never remove");
 
         // A Running server with a removal to do still gets its spec.
@@ -386,29 +416,34 @@ mod tests {
             ..running(KubeRole::Server)
         };
         v.kube_status.insert(hid("ms01-01"), done);
-        let specs = sent(&run(&s, &v, 0));
+        let specs = sent(&run(&s, &v, &members, 0));
         assert_eq!(specs[&hid("ms01-01")].etcd_remove, [hid("ms01-03")]);
         assert!(!specs.contains_key(&hid("ms01-03")), "the dead host gets nothing");
     }
 
     #[test]
     fn etcd_removal_never_takes_a_live_member_or_breaks_quorum() {
+        let members = RaftMembers::default();
         let (mut s, mut st) = three_voters();
-        // Still a voter (replacement not done): nothing, even down.
+        // Still a voter with no learner (no replacement decided): nothing, even down.
         s.apply(0, Command::SetLifecycle { id: hid("ms01-03"), lifecycle: Lifecycle::NotReady }).unwrap();
-        assert!(etcd_remove(&s, &|id| st.get(id).cloned()).is_empty());
+        assert!(etcd_remove(&s, &members, &|id| st.get(id).cloned()).is_empty());
+        // Growth (voters below target) never removes a voter, even with a learner.
+        let growing = RaftMembers { learners: [hid("ms01-02")].into(), ..Default::default() };
+        s.apply_membership([hid("ms01-01"), hid("ms01-03")].into());
+        assert!(etcd_remove(&s, &growing, &|id| st.get(id).cloned()).is_empty(), "growth is not a replacement");
+        s.apply_membership([hid("ms01-01"), hid("ms01-02"), hid("ms01-03")].into());
         // Back up (live): nothing, even no longer a voter.
         s.apply_membership([hid("ms01-01"), hid("ms01-02"), hid("ms01-04")].into());
         s.apply(0, Command::SetLifecycle { id: hid("ms01-03"), lifecycle: Lifecycle::Ready }).unwrap();
-        assert!(etcd_remove(&s, &|id| st.get(id).cloned()).is_empty(), "a live host is never removed");
+        assert!(etcd_remove(&s, &members, &|id| st.get(id).cloned()).is_empty(), "a live host is never removed");
         // Down again, but an agent (never a server): nothing.
         s.apply(0, Command::SetLifecycle { id: hid("ms01-03"), lifecycle: Lifecycle::NotReady }).unwrap();
         st.insert(hid("ms01-03"), running(KubeRole::Agent));
-        assert!(etcd_remove(&s, &|id| st.get(id).cloned()).is_empty());
+        assert!(etcd_remove(&s, &members, &|id| st.get(id).cloned()).is_empty());
         // Down as a server, but etcd without quorum (only 1 live of 3): nothing.
         st.insert(hid("ms01-03"), running(KubeRole::Server));
-        st.remove(&hid("ms01-02"));
         s.apply(0, Command::SetLifecycle { id: hid("ms01-02"), lifecycle: Lifecycle::NotReady }).unwrap();
-        assert!(etcd_remove(&s, &|id| st.get(id).cloned()).is_empty(), "1 live of 3 has no quorum");
+        assert!(etcd_remove(&s, &members, &|id| st.get(id).cloned()).is_empty(), "1 live of 3 has no quorum");
     }
 }

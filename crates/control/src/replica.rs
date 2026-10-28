@@ -171,8 +171,9 @@ impl CpReplica {
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         v.forget_silent_removed(&self.state, now);
-        let mut actions = controllers::run_all(&self.state, v, now);
-        let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
+        let members = RaftMembers::of(raft);
+        let mut actions = controllers::run_all(&self.state, v, &members, now);
+        let plan = membership::run(&self.state, v, &members, now);
         v.last_run = Some(now);
         actions.extend(plan.actions);
         if let Some(change) = plan.change {
