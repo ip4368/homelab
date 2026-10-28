@@ -63,5 +63,10 @@ mod tests {
         assert_eq!(allocate(&mgmt, &used), None, "everything below the reserved block is used, the rest is reserved");
         mgmt.reserved.clear();
         assert_eq!(allocate(&mgmt, &used), Some(first_reserved));
+
+        let storage = net("storage");
+        assert_eq!(storage.reserved, vec![crate::network::STORAGE_RESERVED], "Longhorn's pods take these");
+        let used: BTreeSet<Ipv4Addr> = storage.subnet.hosts().filter(|a| *a < ip("10.20.3.0")).collect();
+        assert_eq!(allocate(&storage, &used), None, "hosts never get a pod address");
     }
 }
