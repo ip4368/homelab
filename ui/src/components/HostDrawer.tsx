@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { op } from '../api'
+import { ineligibleReason } from '../eligibility'
 import type { HostNet } from '../gen/HostNet'
 import type { HostObj } from '../gen/HostObj'
 import type { NicState } from '../gen/NicState'
@@ -8,6 +9,7 @@ import { podTone, podsOn, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
 import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
+import { HandoffDialog, handoffChoices } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
@@ -124,6 +126,35 @@ function Kubernetes({ host }: { host: HostObj }) {
           )}
         </p>
       )}
+    </div>
+  )
+}
+
+function ControlPlane({ host }: { host: HostObj }) {
+  const cp = useStore((s) => s.view.cp)
+  const hosts = useStore((s) => s.view.hosts)
+  const [open, setOpen] = useState(false)
+  const voter = cp.voters.includes(host.id)
+  const handoff = cp.handoff
+  const reason = ineligibleReason(host.profile, 'ControlPlane')
+  const offered = useMemo(() => handoffChoices(host, cp, hosts).length > 0, [host, cp, hosts])
+  return (
+    <div className="section">
+      <h4>Control plane</h4>
+      <p className={voter ? 'ok' : 'muted'}>
+        {voter ? 'Voter: runs a control-plane replica and a K3s server (API + etcd).' : reason ? `Cannot join: ${reason}.` : 'Not a voter.'}
+      </p>
+      {handoff && (
+        <p className="warn" role="status">
+          Handing {handoff.from}'s place to {handoff.to}.
+        </p>
+      )}
+      {(handoff || offered) && (
+        <div className="actions">
+          <button onClick={() => setOpen(true)}>{handoff ? 'Show progress' : voter ? 'Hand off…' : 'Take over…'}</button>
+        </div>
+      )}
+      {open && <HandoffDialog host={host} onClose={() => setOpen(false)} />}
     </div>
   )
 }
@@ -251,6 +282,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
       </div>
       <Inventory host={host} />
       <Kubernetes host={host} />
+      <ControlPlane host={host} />
       <div className="section">
         <h4>Lifecycle</h4>
         <div className="actions">

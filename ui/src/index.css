@@ -627,6 +627,74 @@ label.inline {
   color: var(--muted);
 }
 
+.handoff-dialog {
+  width: min(560px, 94vw);
+}
+
+.handoff-plan {
+  border-collapse: collapse;
+  margin: 8px 0;
+  width: 100%;
+}
+
+.handoff-plan th {
+  text-align: left;
+  font-weight: normal;
+  color: var(--muted);
+  padding: 2px 8px 2px 0;
+}
+
+.handoff-plan td {
+  padding: 4px 8px 4px 0;
+  border-top: 1px solid var(--border);
+}
+
+.handoff-steps {
+  list-style: none;
+  margin: 6px 0;
+  padding: 0;
+}
+
+.handoff-steps li {
+  display: flex;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.handoff-steps .step-mark {
+  width: 14px;
+  text-align: center;
+}
+
+.handoff-steps .step-done .step-mark {
+  color: var(--ok);
+}
+
+.handoff-steps .step-active {
+  font-weight: 600;
+}
+
+.handoff-steps .step-active .step-mark {
+  color: var(--warn);
+}
+
+.handoff-steps .step-active .muted {
+  font-weight: normal;
+}
+
+.handoff-steps .step-pending {
+  color: var(--muted);
+}
+
+.handoff-notes {
+  margin: 8px 0;
+  padding-left: 18px;
+}
+
+.handoff-notes li {
+  margin: 3px 0;
+}
+
 .form-grid.wide {
   grid-template-columns: 110px 1fr;
   margin: 8px 0;

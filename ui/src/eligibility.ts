@@ -25,6 +25,14 @@ export function ineligibleReason(p: HardwareProfile, r: Role): string | null {
   }
 }
 
+/**
+ * Why role `r` is not set by hand, or null when it is: the control-plane
+ * role follows the control-plane voters, and the server refuses changes to it.
+ */
+export function fixedRoleReason(r: Role): string | null {
+  return r === 'ControlPlane' ? 'the control-plane role follows the control-plane voters: hand a voter its place in the Control plane section' : null
+}
+
 export function eligibleRoles(p: HardwareProfile): Role[] {
   return ALL_ROLES.filter((r) => ineligibleReason(p, r) === null)
 }
