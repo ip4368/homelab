@@ -64,4 +64,14 @@ mod tests {
         mgmt.reserved.clear();
         assert_eq!(allocate(&mgmt, &used), Some(first_reserved));
     }
+
+    #[test]
+    fn ipam_never_hands_a_host_a_longhorn_pod_address() {
+        let storage = net("storage");
+        assert_eq!(storage.reserved, vec![crate::network::STORAGE_PODS_RESERVED]);
+        // Everything below 10.20.3.0 used: nothing allocatable (the top /24
+        // is the pods', the broadcast is unusable).
+        let used: BTreeSet<Ipv4Addr> = storage.subnet.hosts().filter(|a| *a < ip("10.20.3.0")).collect();
+        assert_eq!(allocate(&storage, &used), None);
+    }
 }

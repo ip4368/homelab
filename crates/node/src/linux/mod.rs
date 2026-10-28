@@ -263,8 +263,10 @@ impl LinuxOs {
                 let _ = sh("ip", &["link", "del", name]);
             }
         }
-        // Bonds and VLANs left from before this process started, not in the new config.
-        for name in existing.iter().filter(|n| (n.starts_with("bond") || n.contains('.')) && !netdevs.contains_key(*n)) {
+        // Bonds and VLANs left from before this process started, not in the new config
+        // (`storage0` is the storage VLAN's fixed name; `bond0.20` is what it
+        // used to be called).
+        for name in existing.iter().filter(|n| (n.starts_with("bond") || n.contains('.') || n.starts_with("storage")) && !netdevs.contains_key(*n)) {
             let _ = sh("ip", &["link", "del", name]);
         }
         sh("networkctl", &["reload"])?;

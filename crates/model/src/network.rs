@@ -77,6 +77,11 @@ pub struct LogicalNetwork {
 pub const MGMT_RESERVED: IpRange =
     IpRange { first: Ipv4Addr::new(10, 0, 3, 100), last: Ipv4Addr::new(10, 0, 3, 255) };
 
+/// The `storage` block kept out of host IPAM for Longhorn pods' second
+/// interfaces (Multus + Whereabouts on VLAN 20): the last /24 of the /22.
+pub const STORAGE_PODS_RESERVED: IpRange =
+    IpRange { first: Ipv4Addr::new(10, 20, 3, 0), last: Ipv4Addr::new(10, 20, 3, 255) };
+
 /// The seed networks every cluster starts with (Global Constraints table).
 pub fn seed_networks() -> Vec<LogicalNetwork> {
     let net = |id: &str, purpose, vlan, subnet: &str, mtu| LogicalNetwork {
@@ -90,7 +95,7 @@ pub fn seed_networks() -> Vec<LogicalNetwork> {
     };
     vec![
         LogicalNetwork { reserved: vec![MGMT_RESERVED], dns: vec![Ipv4Addr::new(10, 0, 0, 1)], ..net("mgmt", NetworkPurpose::Mgmt, 1, "10.0.0.0/22", 1500) },
-        net("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000),
+        LogicalNetwork { reserved: vec![STORAGE_PODS_RESERVED], ..net("storage", NetworkPurpose::Storage, 20, "10.20.0.0/22", 9000) },
         net("migration", NetworkPurpose::Migration, 30, "10.30.0.0/22", 9000),
         net("vm-lan", NetworkPurpose::Vm, 100, "10.100.0.0/22", 1500),
         net("vm-iot", NetworkPurpose::Vm, 110, "10.110.0.0/24", 1500),

@@ -31,9 +31,15 @@ impl File {
 /// out are still brought up (with no addresses) so their carrier and LLDP
 /// can be seen. An untagged attachment without an address uses DHCP.
 /// Fails if `cfg` attaches a network `networks` does not define.
+/// The host interface carrying the `storage` network (VLAN 20): the same
+/// name on every host, so Multus's `NetworkAttachmentDefinition` (master
+/// `storage0`) fits all storage hosts whatever their bond or NIC is called.
+pub const STORAGE_IFACE: &str = "storage0";
+
 pub fn render(cfg: &HostNetworkConfig, networks: &BTreeMap<NetworkId, LogicalNetwork>, nics: &[String]) -> Result<Vec<File>, String> {
     let mut files = vec![];
     let mut used = vec![];
+    let mut storage_n = 0u32;
     for link in &cfg.links {
         let iface = match &link.kind {
             LinkKind::Single(port) => port.to_string(),
@@ -58,7 +64,15 @@ pub fn render(cfg: &HostNetworkConfig, networks: &BTreeMap<NetworkId, LogicalNet
             let def = || networks.get(&a.network).ok_or_else(|| format!("network {} is not defined", a.network));
             if a.tagged {
                 let n = def()?;
-                let vif = format!("{iface}.{}", n.vlan);
+                // The storage VLAN keeps one name everywhere (`storage0`,
+                // then `storage1`…), so one Multus attachment fits all hosts.
+                let vif = if a.network.as_str() == "storage" {
+                    let name = if storage_n == 0 { STORAGE_IFACE.into() } else { format!("storage{storage_n}") };
+                    storage_n += 1;
+                    name
+                } else {
+                    format!("{iface}.{}", n.vlan)
+                };
                 writeln!(net, "VLAN={vif}").expect("writing to a String");
                 let netdev = format!("[NetDev]\nName={vif}\nKind=vlan\nMTUBytes={}\n\n[VLAN]\nId={}\n", n.mtu.min(link.mtu), n.vlan);
                 files.push(File::new(format!("{vif}.netdev"), netdev));
@@ -172,12 +186,13 @@ mod tests {
             assert!(file(&files, &format!("{m}.network")).contains("Bond=bond0"));
         }
         let bond_net = file(&files, "bond0.network");
-        for vif in ["bond0.20", "bond0.30", "bond0.100", "bond0.110"] {
+        for vif in ["storage0", "bond0.30", "bond0.100", "bond0.110"] {
             assert!(bond_net.contains(&format!("VLAN={vif}")), "{bond_net}");
         }
-        let storage = file(&files, "bond0.20.netdev");
+        let storage = file(&files, "storage0.netdev");
         assert!(storage.contains("Id=20") && storage.contains("MTUBytes=9000"), "{storage}");
-        assert!(file(&files, "bond0.20.network").contains("Address=10.20.0.2/22"));
+        assert!(storage.contains("Name=storage0"), "{storage}");
+        assert!(file(&files, "storage0.network").contains("Address=10.20.0.2/22"));
         assert!(file(&files, "bond0.100.netdev").contains("MTUBytes=1500"), "a VLAN gets its network's MTU");
         assert!(!file(&files, "bond0.100.network").contains("Address="), "VM networks address guests, not the host");
         let eth0 = file(&files, "eth0.network");
@@ -185,7 +200,14 @@ mod tests {
         assert!(eth0.contains("DNS=10.0.0.1"), "the mgmt network's resolver: {eth0}");
         assert!(!eth0.contains("DHCP"), "{eth0}");
         assert!(file(&files, "eth1.network").contains("ActivationPolicy=up"), "the unused NIC still comes up");
-        assert_eq!(netdevs(&files).keys().collect::<Vec<_>>(), ["bond0", "bond0.100", "bond0.110", "bond0.20", "bond0.30"]);
+        assert_eq!(netdevs(&files).keys().collect::<Vec<_>>(), ["bond0", "bond0.100", "bond0.110", "bond0.30", "storage0"]);
+        // The mini PC's storage rides on another link but keeps the same name.
+        let mini = seed_templates().into_iter().find(|t| t.id == "minipc-standard").unwrap();
+        let ips = [(NetworkId::from("storage"), "10.20.0.5".parse().unwrap())].into();
+        let cfg = render_template(&mini, None, &ips);
+        let files = render(&cfg, &networks(), &nics(&["eth0"])).unwrap();
+        assert!(file(&files, "eth0.network").contains("VLAN=storage0"));
+        assert!(file(&files, "storage0.netdev").contains("Id=20"));
     }
 
     #[test]
@@ -202,7 +224,7 @@ mod tests {
         };
         let files = render(&cfg, &nets, &nics(&["eth0", "eth1"])).unwrap();
         assert!(file(&files, "bond1.netdev").contains("Mode=active-backup"));
-        assert!(file(&files, "bond1.20.netdev").contains("MTUBytes=1500"));
+        assert!(file(&files, "storage0.netdev").contains("MTUBytes=1500"));
     }
 
     #[test]
