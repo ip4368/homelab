@@ -165,6 +165,13 @@ pub struct KubeSpec {
     /// The data disks Longhorn keeps replicas on; empty on a host without an
     /// active storage role.
     pub storage_disks: Vec<String>,
+    /// Dead K3s servers whose etcd members this host (a live server) must
+    /// remove via `kubectl delete node`. Only ever set on live servers, only
+    /// for hosts that are down and no longer voters, and only while etcd
+    /// keeps quorum. Agents ignore it (their kubelet credentials cannot
+    /// delete other nodes).
+    #[serde(default)]
+    pub etcd_remove: Vec<HostId>,
 }
 
 /// How a host's Kubernetes install stands.
