@@ -28,8 +28,9 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 | Longhorn install | A K3s `HelmChart` manifest (chart repo `charts.longhorn.io`, pinned version) written by every K3s server into `/var/lib/rancher/k3s/server/manifests/`. | It uses K3s's own addon mechanism and is idempotent. |
 | Longhorn disks | Storage hosts annotate and label their own node: `node.longhorn.io/default-disks-config` listing `/mnt/<disk>` for each data disk, then `node.longhorn.io/create-default-disk=config`. Longhorn runs with `createDefaultDiskLabeledNodes`. | Only storage-role hosts store data, and only on their data disks. |
 | Longhorn on node loss | `nodeDownPodDeletionPolicy: delete-both-statefulset-and-deployment-pod`. | A pod with a volume on a dead node restarts elsewhere instead of hanging in `Terminating`. |
-| Storage network | **First on the pod network (mgmt).** Moving Longhorn to VLAN 20 needs Multus and is a follow-up (§8). | Fewer moving parts until the base stack works. |
-| Versions | K3s `v1.36.5+k3s1` (stable channel), Longhorn `1.13.0` (needs Kubernetes ≥ 1.34). | Current stable releases, pinned so a lab run is repeatable. |
+| Storage network | **VLAN 20 through Multus.** Every K3s server installs the `rke2-multus` chart and applies a `NetworkAttachmentDefinition` (`longhorn-system/storage-net`): a macvlan on the host's `storage0` interface (the storage VLAN's fixed name on every template), with pod addresses from `10.20.3.0/24` via Whereabouts. Longhorn's `storage-network` setting points at it. A host whose storage role is held still gives Longhorn no disks. | Replication leaves the management pod network for the jumbo storage VLAN. One attachment fits all hosts because the interface name is fixed. |
+| Replacing a dead server | **Raft and etcd together.** Once Raft has swapped a down voter out, the live K3s servers delete its node (`KubeSpec.etcd_remove`), which K3s turns into an etcd removal. Never a live member, never without quorum; the new server joins cleanly, and a host that comes back after losing its vote reinstalls as an agent. | etcd no longer runs with a missing member while the dead host is gone. |
+| Versions | K3s `v1.36.5+k3s1` (stable channel), Longhorn `1.13.0` (needs Kubernetes ≥ 1.34), Multus chart `rke2-multus v4.2.410`. | Current stable releases, pinned so a lab run is repeatable. |
 | How a machine is installed | **`install.sh`** (served next to the `homelabd` binary): `init` on the first machine, `join <vip> <token>` on the others, `upgrade` to replace the binary. The lab's "technician" runs these over SSH on a plain Debian 13 machine. | This is exactly what a person does at home. |
 | Node config | `/etc/homelab/node.json` is `{host, vip, token}`. The host defaults to the hostname. The mgmt prefix is taken from the interface that holds the VIP's subnet. Switch management addresses come from **LLDP's Management Address TLV**, as real switches send it, instead of a static table. | Joining needs only the VIP and a token. |
 | DNS | `LogicalNetwork.dns` (the mgmt network's resolvers, default its `.1`). networkd renders `DNS=` with the static address. | A host on a static address still needs DNS to pull images. |
@@ -48,12 +49,13 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 **model**
 - `LogicalNetwork.dns: Vec<Ipv4Addr>`. The seed mgmt network uses `[10.0.0.1]`.
 - `LldpNeighbor.mgmt_ip: Option<Ipv4Addr>`.
+- `STORAGE_PODS_RESERVED` (`10.20.3.0/24`): the seed storage network keeps its top /24 out of host IPAM for Longhorn pods' second interfaces.
 
 **control**
-- `proto`: `KubeSpec`, `KubeStatus`, `Msg::Kube(KubeSpec)` (leader to agent), `Msg::KubeStatus { host, status }` (agent to the VIP, on change and every 30 s).
+- `proto`: `KubeSpec`, `KubeStatus`, `Msg::Kube(KubeSpec)` (leader to agent), `Msg::KubeStatus { host, status }` (agent to the VIP, on change and every 30 s). `KubeSpec.etcd_remove` lists dead, replaced servers for live servers to delete.
 - `state`: `ClusterState.kube: Option<KubeCluster { token, init_host }>` and `HostObj.kube: Option<KubeStatus>`. New commands `SetKube` and `RecordKube`.
-- `controllers::kube`: computes the desired spec for each `Ready` host and sends it while the host's reported status does not match. It never acts without quorum, like every controller.
-- `HostOs::apply_kube` and `kube_status`. The sim's world makes them a stand-in that is "installed" after a short delay.
+- `controllers::kube`: computes the desired spec for each `Ready` host and sends it while the host's reported status does not match. It never acts without quorum, like every controller. It lists a down, de-voted ex-server in every live server's `etcd_remove` while etcd keeps quorum.
+- `HostOs::apply_kube` and `kube_status`. The sim's world makes them a stand-in that is "installed" after a short delay. The stand-in deletes a dead server's install when a live server's spec names it.
 - `ApiOp::GetKubeconfig`: the leader answers with its own K3s server's admin kubeconfig (`HostOs::kubeconfig`), pointed at the VIP. Nothing is written, and the kubeconfig never enters the Raft log or the state clients sync.
 - `bootstrap::seeded_durable` takes the K3s token and records the init host.
 - The runtime resolves `Addr::Switch` from the LLDP management addresses in the replica's state.
@@ -63,10 +65,12 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - `LinuxOs` K3s supervisor. It runs on a worker thread and does these steps:
   - prerequisites: `open-iscsi`, `nfs-common`, `iscsid`;
   - the K3s install script and binary of the pinned release, each checked against a pinned sha256 (the script then runs with `INSTALL_K3S_SKIP_DOWNLOAD`), role-specific;
-  - the Longhorn manifest on servers;
-  - node labels and annotations for Longhorn disks;
+  - on servers: the Multus manifest, the storage `NetworkAttachmentDefinition` once Multus is ready, then the Longhorn manifest (with `storageNetwork`), patching a live setting on upgrades;
+  - on servers: deleting the nodes in `spec.etcd_remove` (never its own, never a Ready one);
+  - node labels and annotations for Longhorn disks (none when the storage role is held);
   - status from `k3s kubectl get node`.
   It reinstalls when the role changes, and before uninstalling a server it deletes its own node so that its etcd member is removed.
+- networkd names the storage VLAN interface `storage0` on every template (it used to be `<link>.20`), so one Multus attachment fits all storage hosts.
 
 **lab**
 - Plain-OS cloud-init: hostname, SSH key, NIC names, DHCP on `eth0`, chrony to the router, and the guest agent (the lab's "BMC"). No homelabd and no apt proxy.
@@ -75,12 +79,14 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - `LLDP` frames carry each switch's management address.
 - `/api/lab/kubeconfig` asks the control plane for the kubeconfig (`ApiOp::GetKubeconfig`), so it works without the lab too.
 - The binary server publishes `homelabd.sha256` beside `homelabd`, and `install.sh` refuses a binary that does not match it.
+- The switch counts bytes per port on VLAN 20 (`rx_vlan20_bytes`, `tx_vlan20_bytes`), so the e2e run can watch replica traffic cross the storage VLAN.
 
 **server and UI**
 - The host drawer shows the K3s role and phase and whether the node is Ready. The top bar shows the K3s node count.
 
 **e2e**
 - Talks to the Kubernetes API at `https://<vip>:6443` with the admin kubeconfig, using `node:https` (no dependencies).
+- `POST /api/ops` runs a control-plane replacement for K7.
 
 ## 5. Success criteria (added to the lab's §10)
 
@@ -90,6 +96,8 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 - **K4 Host failure:** power off the pod's host. The pod restarts on another host, still reads the token it wrote, and Longhorn rebuilds the lost replica onto another storage host. When the host is powered back on it rejoins as Ready.
 - **K5 Leader failover:** power off the homelabd leader, which is also a K3s server. The Kubernetes API answers through the VIP again within the bound, and etcd keeps quorum.
 - **K6 Reboot:** reset a K3s server. It comes back Ready with its etcd member intact.
+- **K7 Replacement:** power off a K3s server and replace it (`ReplaceCpMember`). The new server joins cleanly, the dead node's etcd member is removed, and etcd lists exactly the live servers. The dead host, powered back on, rejoins as an agent.
+- **K8 Storage network:** Longhorn's `storage-network` is `longhorn-system/storage-net` (a macvlan on `storage0` via Multus), every running instance-manager carries an interface in `10.20.3.0/24`, and a replicated 64 MiB write moves bytes across VLAN 20.
 
 ## 6. Phasing
 
@@ -110,9 +118,9 @@ The end-to-end run validates the whole stack the way it would run at home: real 
 
 ## 8. Follow-ups (not in this phase)
 
-- Longhorn's storage network on VLAN 20 through Multus (a `NetworkAttachmentDefinition` on each host's storage VLAN interface).
-- Replacing a dead control-plane member end to end, including its etcd member.
 - Showing K8s pods and Longhorn volumes in the Workloads view in place of the stand-ins.
+
+Done since: Longhorn's storage network on VLAN 20 through Multus (K8), and replacing a dead control-plane member end to end, including its etcd member (K7).
 
 ## 9. Findings on the VM lab (2026-10-27)
 

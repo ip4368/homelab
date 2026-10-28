@@ -49,8 +49,11 @@ The machine asks to join. If an auto-approve rule matches its hardware it is app
 - Control-plane hosts join as **K3s servers** (embedded etcd). homelabd keeps 3 control-plane members, or 5 above 50 hosts, and prefers MS-01s.
 - Every other host joins as a **K3s agent**.
 - Hosts with the storage role give Longhorn their data disks. A host whose storage VLAN is misconfigured gives none until the network is fixed.
+- Longhorn replicates over the **storage VLAN** (VLAN 20), not the pod network: Multus gives every Longhorn pod a second interface on the host's `storage0` interface, with addresses from `10.20.3.0/24` (kept out of host IPAM).
 
 Machines can be joined in any order and at any time.
+
+Replacing a dead control-plane member (the UI's suggestion, or automatic) also removes its etcd member: once Raft has swapped the voter, the live K3s servers delete its node, which K3s turns into an etcd removal, and the new server joins cleanly. A live member is never removed, and never without quorum.
 
 ## Using the cluster
 
@@ -87,6 +90,8 @@ The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with 
 curl -fsSL <url>/install.sh | sudo sh -s -- upgrade
 ```
 
+Upgrading from before the storage network (Longhorn on the pod network) moves replication to VLAN 20: homelabd installs Multus, applies the `storage-net` attachment and patches Longhorn's `storage-network` setting. Longhorn blocks the setting while volumes are attached, so scale workloads down first (or leave them: the worker keeps retrying every pass until they are detached).
+
 ## Starting over on a machine
 
 ```sh
@@ -99,7 +104,5 @@ Remove the host in the UI first, so the cluster forgets it.
 
 ## Not covered yet
 
-- Longhorn's traffic uses the pod network (on mgmt), not the storage VLAN. Moving it to VLAN 20 needs Multus.
 - ARM machines (Pi 5, RK3588): the installer is x86_64-only for now.
 - Authentication: homelabd's API and its node-to-node messages are unauthenticated: anyone who can reach the management network can get a join token or an admin kubeconfig. Keep the management network trusted.
-- When a dead control-plane member is replaced, its etcd member is removed only once the replacement is done and the dead host comes back or is removed.
