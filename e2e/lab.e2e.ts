@@ -1,13 +1,14 @@
 // End-to-end validation of the cluster manager on the real VM lab.
 //
 // Talks only to the server's public interfaces: the WebSocket (the control
-// plane's view and the lab's ground truth) and `POST /api/lab/fault` (things
-// done to hardware). Each step is a success criterion of the real VM lab
-// design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
-// Kubernetes criteria K1–K6 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
-// §5, checked against the cluster's Kubernetes API through the VIP with the
-// admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
-// get it with `sudo homelabd kubeconfig`).
+// plane's view and the lab's ground truth), `POST /api/lab/fault` (things
+// done to hardware) and `POST /api/ops` (a control-plane replacement).
+// Each step is a success criterion of the real VM lab design
+// (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
+// Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
+// (§5 for K1–K6, §8 for K7–K8), checked against the cluster's Kubernetes API
+// through the VIP with the admin kubeconfig `GET /api/lab/kubeconfig` hands
+// out (as an admin would get it with `sudo homelabd kubeconfig`).
 //
 //   node e2e/lab.e2e.ts [--only 3a,4]     (LAB_URL defaults to http://127.0.0.1:8080)
 //
@@ -554,6 +555,160 @@ function ms01Follower(s: Seen): string {
   return id
 }
 
+/** Runs a control-plane operation; its `Ok` value, or the refusal. */
+async function apiOp(op: unknown): Promise<unknown> {
+  const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(op) })
+  if (!res.ok) throw new Failed(`POST /api/ops: ${res.status} ${await res.text()}`)
+  const body = (await res.json()) as { Ok?: unknown; Err?: string } | string
+  if (typeof body === 'object' && body !== null && 'Ok' in body) return body.Ok
+  throw new Failed(`operation refused: ${JSON.stringify(body)}`)
+}
+
+/** All bytes the lab's switches took in on VLAN 20 (the storage network). */
+function vlan20Rx(s: Seen): number {
+  return s.truth.ports.reduce((n, p) => n + (p.counters.rx_vlan20_bytes ?? 0), 0)
+}
+
+await step('K8', 'Storage network: Longhorn replicates over VLAN 20 (Multus), and the traffic crosses it', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const setting = await k.must(`${LH}/settings/storage-network`)
+  if (setting.value !== 'longhorn-system/storage-net') throw new Failed(`storage-network is ${JSON.stringify(setting.value)}`)
+  note(`Longhorn setting storage-network is ${setting.value}`)
+  const nad = await k.must('/apis/k8s.cni.cncf.io/v1/namespaces/longhorn-system/network-attachment-definitions/storage-net')
+  const config = nad.spec?.config as string
+  if (!config?.includes('"master": "storage0"') || !config.includes('"type": "macvlan"') || !config.includes('10.20.3.0/24')) {
+    throw new Failed(`storage-net attachment is not a macvlan on storage0 with 10.20.3.0/24: ${(config ?? '').slice(0, 200)}`)
+  }
+  note('storage-net is a macvlan on storage0 (VLAN 20) with pod addresses from 10.20.3.0/24')
+  const multus = await k.must('/apis/apps/v1/namespaces/kube-system/daemonsets/multus')
+  if (!(multus.status?.numberReady > 0) || multus.status.numberReady !== multus.status.desiredNumberScheduled) {
+    throw new Failed(`Multus not ready: ${multus.status?.numberReady}/${multus.status?.desiredNumberScheduled}`)
+  }
+  note(`Multus ready on ${multus.status.numberReady} nodes`)
+  const ims: Obj[] = (await k.must('/api/v1/namespaces/longhorn-system/pods')).items.filter((p: Obj) => p.metadata.name.startsWith('instance-manager-'))
+  const running = ims.filter((p) => p.status.phase === 'Running')
+  if (running.length === 0) throw new Failed(`no running instance-managers (of ${ims.length})`)
+  for (const p of running) {
+    const status = p.metadata.annotations?.['k8s.v1.cni.cncf.io/network-status'] as string | undefined
+    const nets: Obj[] = status ? JSON.parse(status) : []
+    if (!nets.some((n) => n.name === 'longhorn-system/storage-net' && (n.ips as string[] | undefined)?.some((ip) => ip.startsWith('10.20.3.')))) {
+      throw new Failed(`${p.metadata.name}@${p.spec.nodeName} has no storage-net interface in 10.20.3.0/24`)
+    }
+  }
+  note(`${running.length} running instance-managers each carry a storage-net interface in 10.20.3.0/24`)
+
+  // A 64 MiB write, replicated twice: the bytes must cross VLAN 20.
+  const run = Math.random().toString(36).slice(2, 8)
+  const ns = 'e2e'
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  await k.create('/apis/storage.k8s.io/v1/storageclasses', {
+    metadata: { name: 'e2e-k8' },
+    provisioner: 'driver.longhorn.io',
+    reclaimPolicy: 'Delete',
+    parameters: { numberOfReplicas: '2', staleReplicaTimeout: '30', dataLocality: 'best-effort' },
+  })
+  const pvc = `k8-${run}`
+  await k.create(`/api/v1/namespaces/${ns}/persistentvolumeclaims`, {
+    metadata: { name: pvc },
+    spec: { accessModes: ['ReadWriteOnce'], storageClassName: 'e2e-k8', resources: { requests: { storage: '1Gi' } } },
+  })
+  const storing: string[] = ((await k.must(`${LH}/nodes`)).items as Obj[])
+    .filter((n) => Object.keys(n.spec.disks ?? {}).length > 0)
+    .map((n) => n.metadata.name)
+  if (storing.length < 2) throw new Failed(`only ${storing.length} storage hosts: ${storing}`)
+  const app = `k8-writer-${run}`
+  await k.create(`/apis/apps/v1/namespaces/${ns}/deployments`, {
+    metadata: { name: app },
+    spec: {
+      replicas: 1,
+      strategy: { type: 'Recreate' },
+      selector: { matchLabels: { app } },
+      template: {
+        metadata: { labels: { app } },
+        spec: {
+          terminationGracePeriodSeconds: 5,
+          affinity: { nodeAffinity: { requiredDuringSchedulingIgnoredDuringExecution: { nodeSelectorTerms: [{ matchExpressions: [{ key: 'kubernetes.io/hostname', operator: 'In', values: storing }] }] } } },
+          containers: [
+            {
+              name: 'writer',
+              image: 'busybox:1.37',
+              command: ['sh', '-c', 'dd if=/dev/urandom of=/data/big bs=1M count=64 && sync && echo done && exec sleep 1000000'],
+              volumeMounts: [{ name: 'data', mountPath: '/data' }],
+            },
+          ],
+          volumes: [{ name: 'data', persistentVolumeClaim: { claimName: pvc } }],
+        },
+      },
+    },
+  })
+  try {
+    const before = vlan20Rx(watch.seen!)
+    const written = await waitAsync('the 64 MiB write done', 10 * 60_000, async () => {
+      const pods: Obj[] = (await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)).items
+      const p = pods.find((p) => p.status.phase === 'Running' && !p.metadata.deletionTimestamp)
+      if (!p) return `pods: ${pods.map((p) => `${p.metadata.name}=${p.status.phase}`).join(', ') || 'none'}`
+      const log = await k.get(`/api/v1/namespaces/${ns}/pods/${p.metadata.name}/log`)
+      return log.text.includes('done') ? { node: p.spec.nodeName as string } : `log: ${log.text.slice(0, 80)}`
+    })
+    await sleep(5000)
+    const delta = vlan20Rx(watch.seen!) - before
+    note(`K8: ${written.value.node} wrote 64 MiB; ${(delta / 1048576).toFixed(1)} MiB crossed VLAN 20 meanwhile`)
+    if (delta < 10 * 1048576) throw new Failed(`only ${(delta / 1048576).toFixed(1)} MiB crossed VLAN 20 during the replicated write`)
+  } finally {
+    await k.delete(`/apis/apps/v1/namespaces/${ns}/deployments/${app}`)
+    await k.delete(`/api/v1/namespaces/${ns}/persistentvolumeclaims/${pvc}`)
+    await k.delete('/apis/storage.k8s.io/v1/storageclasses/e2e-k8')
+  }
+})
+
+await step('K7', 'Control-plane replacement: power off a K3s server, replace it, and etcd lists exactly the live servers', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const s0 = watch.seen!
+  const dead = ms01Follower(s0)
+  // The replacement: Ready, not a voter, an MS-01 without held roles where one exists.
+  const candidates = [...s0.hosts.values()]
+    .filter((h) => h.lifecycle === 'Ready' && !s0.cp.voters.includes(h.id))
+    .sort((a, b) => Number(b.id.startsWith('ms01')) - Number(a.id.startsWith('ms01')) || Number(Object.keys(a.net.held_roles).length === 0) - Number(Object.keys(b.net.held_roles).length === 0) || (a.id < b.id ? -1 : 1))
+  const with_ = candidates[0]?.id
+  if (!with_) throw new Failed('no Ready non-voter to replace with')
+  const k = await kube()
+  const off = now()
+  await fault({ PowerOff: { vm: dead } })
+  note(`powered off ${dead} (a K3s server and voter); ${with_} will take its place`)
+  await waitFor(`${dead} NotReady in homelabd`, 120_000, (s) => s.hosts.get(dead)?.lifecycle === 'NotReady')
+  await apiOp({ ReplaceCpMember: { dead, with: with_ } })
+  const swapped = await waitFor(`voters without ${dead}, with ${with_}`, 5 * 60_000, (s) => s.cp.voters.length === 3 && !s.cp.voters.includes(dead) && s.cp.voters.includes(with_))
+  note(`Raft swapped the voter ${secs(swapped.ms)} after the operation (voters [${[...watch.seen!.cp.voters].sort()}])`)
+  const joined = await waitAsync(`${with_} a Ready K3s server and ${dead}'s node gone`, 10 * 60_000, async () => {
+    const nodes: Obj[] = (await k.must('/api/v1/nodes')).items
+    const w = nodes.find((n) => n.metadata.name === with_)
+    const gone = !nodes.some((n) => n.metadata.name === dead)
+    return w && isReady(w) && w.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true' && gone && w
+      ? { servers: nodes.filter((n) => n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true').map((n) => n.metadata.name).sort() }
+      : `${with_}: ${w ? `Ready ${isReady(w)}, control-plane ${w.metadata.labels['node-role.kubernetes.io/control-plane']}` : 'absent'}; ${dead} ${gone ? 'gone' : 'still listed'}`
+  })
+  note(`${with_} joined as a server; ${dead}'s node is gone (${secs(joined.ms)}); K3s servers [${joined.value.servers}]`)
+  const voters = [...watch.seen!.cp.voters].sort().join()
+  if (joined.value.servers.join() !== voters) throw new Failed(`K3s servers [${joined.value.servers}] are not the voters [${voters}]`)
+  const etcd = await waitAsync('etcd listing exactly the live servers', 5 * 60_000, async () => {
+    const nodes: Obj[] = (await k.must('/api/v1/nodes')).items
+    const labelled = nodes.filter((n) => n.metadata.labels['node-role.kubernetes.io/etcd'] === 'true').map((n) => n.metadata.name).sort()
+    // K3s labels its etcd members; if it ever stops, the control-plane nodes are the same set.
+    const members = labelled.length > 0 ? labelled : nodes.filter((n) => n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true').map((n) => n.metadata.name).sort()
+    return (members.join() === voters && { members, via: labelled.length > 0 ? 'node-role.kubernetes.io/etcd' : 'node-role.kubernetes.io/control-plane (no etcd label set)' }) || `[${members}] via etcd label, voters [${voters}]`
+  })
+  note(`K7: etcd lists exactly the live servers [${etcd.value.members}] (via ${etcd.value.via}), ${secs(now() - off)} after the power-off`)
+  await fault({ PowerOn: { vm: dead } })
+  const back = await healthy(10 * 60_000)
+  const kb = await kubeHealthy(10 * 60_000)
+  const n = await k.must(`/api/v1/nodes/${dead}`)
+  if (n.metadata.labels['node-role.kubernetes.io/control-plane'] === 'true') throw new Failed(`${dead} came back as a server`)
+  note(`powered ${dead} back on: Ready in homelabd after ${secs(back.ms)}, a Ready agent node ${secs(kb.ms)} after that`)
+})
+
 await step('6a', 'Network: unplug one bond member; the bond degrades and the host keeps its other member', async (note) => {
   await healthy(5 * 60_000)
   const host = ms01Follower(watch.seen!)
@@ -570,7 +725,7 @@ await step('6a', 'Network: unplug one bond member; the bond degrades and the hos
     const [sfp0] = portsOf(s, host, ['sfp0'])
     if (!sfp0.link_up || sfp0.counters.rx_frames <= before) throw new Failed(`sfp0 carries nothing (link ${sfp0.link_up})`)
     // Ready says little here (management runs on eth0), and these frames are
-    // LACP and LLDP; data over the bond is measured once workloads run (phase E).
+    // LACP and LLDP; data over the bond (replica traffic on VLAN 20) is measured in K8.
     note(`${host} stays Ready; sfp0 (${sfp0.switch} ${sfp0.port}) is up and received ${sfp0.counters.rx_frames - before} frames in 15 s`)
   } finally {
     await fault({ Replug: { vm: host, nic: 'sfp1' } })
@@ -610,7 +765,7 @@ await step('6b', 'Network: remove VLAN 20 from a host\'s switch ports; a mismatc
     const drops = () => portsOf(watch.seen!, host, ['sfp0', 'sfp1']).reduce((n, p) => n + p.counters.drop_vlan, 0)
     const before = drops()
     await sleep(10_000)
-    note(`frames dropped at the switch for VLAN 20 not allowed, in 10 s: ${drops() - before} (storage traffic itself is measured once workloads run, phase E)`)
+    note(`frames dropped at the switch for VLAN 20 not allowed, in 10 s: ${drops() - before} (replica traffic over VLAN 20 is measured in K8)`)
   } finally {
     await set(trunk)
   }
