@@ -323,6 +323,18 @@ pub enum ApiOp {
     /// as a learner, is promoted once caught up, then `dead` is removed.
     /// Answered once `with` is a learner.
     ReplaceCpMember { dead: HostId, with: HostId },
+    /// Adds eligible host `with` to the control plane: it joins as a
+    /// learner and is promoted once caught up, leaving the voters one over
+    /// target until the host it replaces is removed. Answered once `with`
+    /// is a learner. The first half of a graceful move; the second is
+    /// [`ApiOp::RemoveCpMember`].
+    AddCpMember { with: HostId },
+    /// Removes CP voter `dead`, live or down: its control-plane role goes
+    /// with the committed voters, and its K3s server reinstalls as an
+    /// agent (deleting its node first, which removes its etcd member).
+    /// Refused while that would leave fewer voters than the target, or
+    /// while too few voters are up to stay quorate without it.
+    RemoveCpMember { dead: HostId },
     /// Reads the leader's metrics history (nothing is written). The result
     /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
     /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.

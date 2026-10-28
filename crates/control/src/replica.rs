@@ -11,7 +11,7 @@ use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport}
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, Lifecycle, NetworkResult, ObjectKind};
-use model::{HostId, Inventory};
+use model::{HostId, Inventory, Role};
 use std::collections::BTreeSet;
 
 pub const RAFT_TICK_MS: u64 = 100;
@@ -230,6 +230,28 @@ impl CpReplica {
                     }
                 }
             }
+            Handling::AddCpMember { with } => {
+                let members = RaftMembers::of(raft);
+                let added = membership::check_add(&self.state, &members, &with)
+                    .and_then(|()| raft.add_learner(with.clone()).map_err(|e| e.to_string()));
+                match added {
+                    Err(e) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Err(e) }),
+                    Ok(index) => {
+                        let agent = Endpoint::new(Addr::Host(with), Svc::Agent);
+                        ctx.send(agent, mgmt(), Msg::StartCpReplica { voters: members.voters });
+                        (index, serde_json::Value::Null)
+                    }
+                }
+            }
+            Handling::RemoveCpMember { dead } => {
+                let members = RaftMembers::of(raft);
+                let removed = membership::check_remove(&self.state, &members, &dead)
+                    .and_then(|()| raft.remove(dead.clone()).map_err(|e| e.to_string()));
+                match removed {
+                    Err(e) => return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::Err(e) }),
+                    Ok(index) => (index, serde_json::Value::Null),
+                }
+            }
         };
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
@@ -353,6 +375,10 @@ enum Handling {
     Propose(Box<Command>, serde_json::Value),
     /// Add `with` as a CP learner, to replace `dead`; answer once that commits.
     ReplaceCpMember { dead: HostId, with: HostId },
+    /// Add `with` as a CP learner; answer once that commits.
+    AddCpMember { with: HostId },
+    /// Remove CP voter `dead`; answer once that commits.
+    RemoveCpMember { dead: HostId },
 }
 
 /// How the leader of `term` handles `op`, given its state.
@@ -382,8 +408,22 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::PauseRollout { id } => Command::PauseRollout { id, reason: "paused by the user".into(), failed: vec![] },
         ApiOp::ResumeRollout { id } => Command::ResumeRollout { id },
         ApiOp::AbortRollout { id } => Command::AbortRollout { id },
-        ApiOp::ApproveHost { id, roles } => Command::ApproveHost { id, roles },
-        ApiOp::SetRoles { id, roles } => Command::SetRoles { id, roles },
+        ApiOp::ApproveHost { id, roles } => {
+            if state.hosts.contains_key(&id)
+                && let Err(e) = membership::check_roles(state, &id, None, &roles)
+            {
+                return Handling::Answer(ApiResult::Err(e));
+            }
+            Command::ApproveHost { id, roles }
+        }
+        ApiOp::SetRoles { id, roles } => {
+            if let Some(h) = state.hosts.get(&id)
+                && let Err(e) = membership::check_roles(state, &id, Some(&h.roles), &roles)
+            {
+                return Handling::Answer(ApiResult::Err(e));
+            }
+            Command::SetRoles { id, roles }
+        }
         ApiOp::SetLabels { id, labels } => Command::SetLabels { id, labels },
         ApiOp::Cordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Cordoned },
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
@@ -394,7 +434,14 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
         ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
-        ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
+        ApiOp::UpsertRule { id, profile, roles, template } => {
+            if roles.contains(&Role::ControlPlane) {
+                return Handling::Answer(ApiResult::Err(
+                    "auto-approve rules cannot grant the control-plane role: it follows control-plane membership".into(),
+                ));
+            }
+            Command::UpsertRule { id, profile, roles, template }
+        }
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
         ApiOp::DeleteNetwork { id } => Command::DeleteNetwork { id },
         ApiOp::DeleteTemplate { id } => Command::DeleteTemplate { id },
@@ -412,6 +459,8 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
+        ApiOp::AddCpMember { with } => return Handling::AddCpMember { with },
+        ApiOp::RemoveCpMember { dead } => return Handling::RemoveCpMember { dead },
         ApiOp::GetSeries { entity, metrics } => {
             let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
             return Handling::Answer(result);
@@ -1078,5 +1127,97 @@ mod tests {
         assert_eq!(v.instances[&hid("m1")], ["pod/web/0".to_string(), "vm/vm1".to_string()].into(), "and what the host runs");
         let held = ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copied_bytes: 400, copying: true };
         assert_eq!(v.replicas[&hid("m1")], [held], "and holds");
+    }
+
+    /// h1, a Ready voter with the control-plane role; m1 and m2, Ready
+    /// spares; p1, Pending. The Raft voters are h1..h3, as is the state's.
+    fn membership_hosts() -> Vec<Command> {
+        let mut cmds =
+            vec![Command::SetCp { voters: [hid("h1"), hid("h2"), hid("h3")].into(), mode: crate::state::CpMode::Suggest }];
+        for (id, p) in [("h1", ProfileId::Ms01), ("m1", ProfileId::Ms01), ("m2", ProfileId::MiniPc)] {
+            cmds.push(Command::AddPendingHost {
+                id: hid(id),
+                profile: profile(p, 0),
+                inventory: Inventory::from_profile(p, 0),
+                location: "rack-1".into(),
+            });
+            let mut roles = BTreeSet::from([Role::Compute]);
+            if id == "h1" {
+                roles.insert(Role::ControlPlane);
+            }
+            cmds.push(Command::ApproveHost { id: hid(id), roles });
+            cmds.push(Command::SetLifecycle { id: hid(id), lifecycle: Lifecycle::Provisioning });
+            cmds.push(Command::SetLifecycle { id: hid(id), lifecycle: Lifecycle::Ready });
+        }
+        cmds.push(Command::AddPendingHost {
+            id: hid("p1"),
+            profile: profile(ProfileId::Ms01, 0),
+            inventory: Inventory::from_profile(ProfileId::Ms01, 0),
+            location: "rack-1".into(),
+        });
+        cmds
+    }
+
+    fn ask(rig: &mut Rig, req: u64, op: ApiOp) -> Vec<(Endpoint, Msg)> {
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        rig.r.on_message(&mut rig.ctx, client, Msg::Api { req, op });
+        std::mem::take(&mut rig.ctx.sent)
+    }
+
+    fn refused(sent: &[(Endpoint, Msg)], req: u64) -> String {
+        let [(_, Msg::ApiResp { req: r, result: ApiResult::Err(e) })] = sent else { panic!("expected one refusal, got {sent:?}") };
+        assert_eq!(*r, req);
+        e.clone()
+    }
+
+    #[test]
+    fn the_control_plane_role_cannot_be_granted_by_hand_or_by_rule() {
+        let mut rig = Rig::new(membership_hosts());
+        rig.elect();
+        rig.ack();
+        let with_cp = BTreeSet::from([Role::Compute, Role::ControlPlane]);
+        let without_cp = BTreeSet::from([Role::Compute]);
+
+        let sent = ask(&mut rig, 1, ApiOp::SetRoles { id: hid("m1"), roles: with_cp.clone() });
+        assert!(refused(&sent, 1).contains("AddCpMember"), "{sent:?}");
+        let sent = ask(&mut rig, 2, ApiOp::SetRoles { id: hid("h1"), roles: without_cp.clone() });
+        assert!(refused(&sent, 2).contains("RemoveCpMember"), "{sent:?}");
+        let sent = ask(&mut rig, 3, ApiOp::ApproveHost { id: hid("p1"), roles: with_cp });
+        assert!(refused(&sent, 3).contains("AddCpMember"), "{sent:?}");
+        let sent =
+            ask(&mut rig, 4, ApiOp::UpsertRule { id: "r".into(), profile: ProfileId::Ms01, roles: [Role::ControlPlane].into(), template: None });
+        assert!(refused(&sent, 4).contains("auto-approve rules cannot grant"), "{sent:?}");
+        assert!(rig.proposed().is_empty(), "refusals propose nothing");
+
+        let sent = ask(&mut rig, 5, ApiOp::SetRoles { id: hid("m1"), roles: [Role::Compute, Role::Vm].into() });
+        assert!(sent.is_empty(), "other roles are proposed, answered on commit: {sent:?}");
+        assert!(matches!(rig.proposed().as_slice(), [Command::SetRoles { .. }]));
+    }
+
+    #[test]
+    fn add_cp_member_starts_a_learner_and_remove_needs_room_first() {
+        let mut rig = Rig::new(membership_hosts());
+        rig.elect();
+        rig.ack();
+        let sent = ask(&mut rig, 1, ApiOp::RemoveCpMember { dead: hid("m1") });
+        assert!(refused(&sent, 1).contains("not a control-plane voter"), "{sent:?}");
+        let sent = ask(&mut rig, 2, ApiOp::RemoveCpMember { dead: hid("h2") });
+        assert!(refused(&sent, 2).contains("add its replacement first"), "{sent:?}");
+
+        let sent = ask(&mut rig, 3, ApiOp::AddCpMember { with: hid("m1") });
+        assert_eq!(sent.len(), 1, "answered on commit, after starting the replica: {sent:?}");
+        let (to, msg) = &sent[0];
+        assert_eq!(*to, host_ep("m1", Svc::Agent));
+        assert!(matches!(msg, Msg::StartCpReplica { .. }), "{msg:?}");
+        assert!(rig.proposed().is_empty(), "a learner joins through a config entry, not a command");
+        rig.ack();
+        let sent = std::mem::take(&mut rig.ctx.sent);
+        assert_eq!(sent, [(Endpoint::new(Addr::Client, Svc::Client), Msg::ApiResp { req: 3, result: ApiResult::Ok(serde_json::Value::Null) })]);
+        assert_eq!(rig.r.learners(), [hid("m1")].into());
+
+        let sent = ask(&mut rig, 4, ApiOp::AddCpMember { with: hid("m2") });
+        assert!(refused(&sent, 4).contains("in progress"), "{sent:?}");
+        let sent = ask(&mut rig, 5, ApiOp::RemoveCpMember { dead: hid("h2") });
+        assert!(refused(&sent, 5).contains("in progress"), "{sent:?}");
     }
 }

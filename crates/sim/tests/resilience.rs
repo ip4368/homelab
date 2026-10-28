@@ -707,6 +707,53 @@ fn suggest_mode_only_alerts() {
     assert!(e.run_until(e.now() + 5000, |e| suggestion(e).is_none()), "the suggestion resolves once taken");
 }
 
+#[test]
+fn graceful_move_to_a_new_host() {
+    use control::proto::{KubePhase, KubeRole};
+    let mut e = default_fleet(26);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        voters.len() == 5 && e.fabric().world().kube.etcd == *voters && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let leader = e.true_leader().unwrap();
+    let from = e.client_view().state.cp.voters.iter().find(|v| **v != leader).unwrap().clone();
+    let s = &e.client_view().state;
+    let with = s.hosts.values().find(|h| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01 && !s.cp.voters.contains(&h.id)).expect("a spare MS-01").id.clone();
+    assert_eq!(kube_of(&e, &with), Some((Some(KubeRole::Agent), KubePhase::Running)));
+
+    // The role cannot be set by hand: it follows the membership.
+    let mut roles: BTreeSet<Role> = e.client_view().state.hosts[&with].roles.iter().copied().collect();
+    roles.insert(Role::ControlPlane);
+    let req = e.api(ApiOp::SetRoles { id: with.clone(), roles });
+    e.run_for(2000);
+    assert!(matches!(e.take_api_result(req), Some(ApiResult::Err(m)) if m.contains("AddCpMember")), "a manual grant is refused");
+
+    // Add: six voters until the old host goes, and the new one runs a server.
+    let req = e.api(ApiOp::AddCpMember { with: with.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    assert!(voters_reach(&mut e, 6, 60_000), "voters: {:?}", e.client_view().state.cp.voters);
+    assert!(e.client_view().state.cp.voters.contains(&with));
+    let server = |e: &Engine| kube_of(e, &with) == Some((Some(KubeRole::Server), KubePhase::Running));
+    assert!(e.run_until(e.now() + 3 * 60_000, server), "{with}: {:?}", kube_of(&e, &with));
+    assert!(e.client_view().state.hosts[&with].roles.contains(&Role::ControlPlane), "the role followed the voters");
+
+    // Remove: five voters again, the old host an agent, etcd the voters.
+    let req = e.api(ApiOp::RemoveCpMember { dead: from.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let moved = |e: &Engine| {
+        let v = &e.client_view().state.cp.voters;
+        v.len() == 5 && !v.contains(&from) && kube_of(e, &from) == Some((Some(KubeRole::Agent), KubePhase::Running)) && etcd_is_voters(e)
+    };
+    assert!(e.run_until(e.now() + 3 * 60_000, moved), "voters {:?}, {from}: {:?}, etcd {:?}", e.client_view().state.cp.voters, kube_of(&e, &from), e.fabric().world().kube.etcd);
+    assert_eq!(raft_voters(&e), e.client_view().state.cp.voters);
+    assert!(!e.client_view().state.hosts[&from].roles.contains(&Role::ControlPlane), "the old host lost the role");
+    assert!(e.fabric().world().kube.violations.is_empty(), "{:?}", e.fabric().world().kube.violations);
+}
+
 // ---- alerts ----
 
 fn open_alerts(e: &Engine, kind: &str) -> Vec<Alert> {

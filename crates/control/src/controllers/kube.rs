@@ -1,5 +1,5 @@
 //! Kubernetes (K3s): every member host on its final network runs K3s, a
-//! server (API server and etcd member) on control-plane hosts and an agent
+//! server (API server and etcd member) on control-plane voters and an agent
 //! everywhere else, and storage hosts give Longhorn their data disks. The
 //! controller works out what each host should run ([`desired`]), sends it
 //! until the host reports that it runs it, and records what hosts report.
@@ -192,8 +192,11 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
     }
     let node_ip = *h.ips.get(&mgmt())?;
     // A new voter gets the control-plane role a moment after its Raft config
-    // commits: in between it already counts toward the target.
-    let role = if h.roles.contains(&Role::ControlPlane) || state.cp.voters.contains(id) {
+    // commits: in between it already counts toward the target. The role alone
+    // never makes a server: it follows the voters, so a host with the role
+    // but no vote is waiting for the membership controller to take it away,
+    // not to install a server it would reinstall as an agent a second later.
+    let role = if state.cp.voters.contains(id) {
         KubeRole::Server
     } else if eligible(&h.profile, Role::ControlPlane).is_ok() && state.cp.voters.len() < target_size(state) {
         return None;
@@ -428,6 +431,22 @@ mod tests {
         assert!(!s.hosts[&hid("ms01-03")].roles.contains(&Role::ControlPlane));
         let specs = sent(&run(&s, &v, 0));
         assert_eq!(specs[&hid("ms01-03")].role, KubeRole::Server, "not an agent, to be reinstalled a second later");
+    }
+
+    #[test]
+    fn a_control_plane_role_without_a_vote_is_no_server() {
+        let mut s = cluster(&[("ms01-02", ProfileId::Ms01), ("ms01-03", ProfileId::Ms01)]);
+        let mut v = Volatile::new(0, 1);
+        v.kube_status.insert(hid("ms01-01"), running(KubeRole::Server));
+        s.apply_membership([hid("ms01-01"), hid("ms01-02"), hid("ms01-03")].into());
+        // The role without the vote (membership takes it away): an agent, not
+        // a server to be reinstalled a second later.
+        let mut roles = s.hosts[&hid("ms01-02")].roles.clone();
+        roles.insert(Role::ControlPlane);
+        s.apply(0, Command::SetRoles { id: hid("ms01-02"), roles }).unwrap();
+        s.apply_membership([hid("ms01-01"), hid("ms01-03"), hid("ms01-04")].into());
+        let specs = sent(&run(&s, &v, 0));
+        assert_eq!(specs[&hid("ms01-02")].role, KubeRole::Agent);
     }
 
     #[test]

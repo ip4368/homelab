@@ -10,7 +10,7 @@ use super::{Action, Volatile};
 use crate::runtime::{Addr, SimTime};
 use crate::state::{ClusterState, Command, HostObj, Lifecycle, NetState, ObjectRef};
 use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork, NetworkPurpose};
-use model::{allocate, eligible, HardwareProfile, HostId, Inventory, NetworkId};
+use model::{allocate, eligible, HardwareProfile, HostId, Inventory, NetworkId, Role};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
@@ -148,13 +148,20 @@ pub fn allocate_ips<'n>(
 
 /// Approval by the first rule (by id) for the host's profile, keeping only
 /// the roles the host is eligible for, plus an event per dropped role. The
-/// approval comes first, so once it applies the events are not asked for again.
+/// control-plane role is always dropped: it follows the voters, and a rule
+/// from before it was refused one still names it. The approval comes
+/// first, so once it applies the events are not asked for again.
 fn auto_approve(state: &ClusterState, host: &HostObj) -> Vec<Action> {
     let Some(rule) = state.rules.values().find(|r| r.profile == host.profile.id) else { return vec![] };
     let mut roles = BTreeSet::new();
     let mut events = vec![];
     for &role in &rule.roles {
-        match eligible(&host.profile, role) {
+        let keep = match eligible(&host.profile, role) {
+            Err(reason) => Err(reason),
+            Ok(()) if role == Role::ControlPlane => Err("the control-plane role follows control-plane membership".into()),
+            Ok(()) => Ok(()),
+        };
+        match keep {
             Ok(()) => {
                 roles.insert(role);
             }
@@ -265,6 +272,19 @@ mod tests {
             s.apply(0, c).unwrap();
         }
         assert_eq!(s.hosts[&hid("pi")].lifecycle, Lifecycle::Approved);
+    }
+
+    #[test]
+    fn rule_drops_the_control_plane_role_with_an_event() {
+        let mut s = with_token(1000);
+        let roles = [Role::ControlPlane, Role::Compute].into();
+        s.apply(0, Command::UpsertRule { id: "ms".into(), profile: ProfileId::Ms01, roles, template: None }).unwrap();
+        add(&mut s, "ms", ProfileId::Ms01, 0);
+        let cmds = proposals(&run(&s, &Volatile::new(0, 1)));
+        assert_eq!(cmds[0], Command::ApproveHost { id: hid("ms"), roles: [Role::Compute].into() });
+        let Command::Event { entity, message } = &cmds[1] else { panic!("{cmds:?}") };
+        assert_eq!(*entity, ObjectRef::host(&hid("ms")));
+        assert!(message.contains("dropped role ControlPlane"), "{message}");
     }
 
     fn ip(s: &str) -> Ipv4Addr {

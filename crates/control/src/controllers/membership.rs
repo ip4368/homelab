@@ -15,7 +15,10 @@
 //! Nothing changes while a config change is uncommitted. Candidates are
 //! `Ready`, control-plane-eligible hosts, MS-01s first, then hosts on an
 //! access switch (rack) no voter uses, then by id. The control-plane role
-//! follows the committed voters.
+//! follows the committed voters: it cannot be set by hand
+//! ([`check_roles`]), and a graceful move to a new host is
+//! `AddCpMember` (one voter over target until the old host goes) followed
+//! by `RemoveCpMember` once the new voter's K3s server runs.
 
 use super::{Action, Volatile};
 use crate::proto::{mgmt, Msg};
@@ -121,6 +124,73 @@ pub fn check_replace(state: &ClusterState, raft: &RaftMembers, dead: &HostId, wi
     }
     if !candidates(state, raft).contains(with) {
         return Err(format!("{with} cannot join the control plane (it must be Ready, eligible and not a member)"));
+    }
+    Ok(())
+}
+
+/// Why the leader refuses to add `with` to the control plane, if it does:
+/// while a change is in flight, unless it is a candidate, or while the
+/// voters already outnumber the target (one extra member at a time: remove
+/// the replaced host first).
+pub fn check_add(state: &ClusterState, raft: &RaftMembers, with: &HostId) -> Result<(), String> {
+    if raft.pending || !raft.learners.is_empty() {
+        return Err("a control-plane membership change is in progress".into());
+    }
+    if !candidates(state, raft).contains(with) {
+        return Err(format!("{with} cannot join the control plane (it must be Ready, eligible and not a member)"));
+    }
+    let target = target_size(state);
+    if raft.voters.len() > target {
+        return Err(format!(
+            "the control plane already has {} voters for a target of {target}: remove the replaced host first",
+            raft.voters.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Why the leader refuses to remove voter `dead` from the control plane, if
+/// it does: while a change is in flight, unless it is a voter, while that
+/// would leave fewer voters than the target (add the replacement first; a
+/// down member goes through `ReplaceCpMember` instead), or while the
+/// voters left up would be short of a quorum without it.
+pub fn check_remove(state: &ClusterState, raft: &RaftMembers, dead: &HostId) -> Result<(), String> {
+    if raft.pending || !raft.learners.is_empty() {
+        return Err("a control-plane membership change is in progress".into());
+    }
+    if !raft.voters.contains(dead) {
+        return Err(format!("{dead} is not a control-plane voter"));
+    }
+    let target = target_size(state);
+    if raft.voters.len() - 1 < target {
+        return Err(format!(
+            "removing {dead} would leave {} voters, fewer than the target of {target}: add its replacement first",
+            raft.voters.len() - 1
+        ));
+    }
+    let live_after = raft.voters.iter().filter(|v| *v != dead && !down(state, v)).count();
+    if live_after < (raft.voters.len() - 1) / 2 + 1 {
+        return Err(format!("too few control-plane voters are up to remove {dead} and stay quorate"));
+    }
+    Ok(())
+}
+
+/// Why the leader refuses to set `id`'s roles to `roles` by hand, if it
+/// does: the control-plane role follows the committed voters, so only a
+/// change that keeps it (`current`, or none for a host being approved) may
+/// disagree with them. Every other role is the caller's business.
+pub fn check_roles(
+    state: &ClusterState,
+    id: &HostId,
+    current: Option<&BTreeSet<Role>>,
+    roles: &BTreeSet<Role>,
+) -> Result<(), String> {
+    const MANAGED: &str = "the control-plane role follows control-plane membership: add or remove the host with AddCpMember/RemoveCpMember instead";
+    let voter = state.cp.voters.contains(id);
+    let want = roles.contains(&Role::ControlPlane);
+    let changing = current.is_none_or(|c| c.contains(&Role::ControlPlane) != want);
+    if want != voter && changing {
+        return Err(MANAGED.into());
     }
     Ok(())
 }
@@ -450,6 +520,64 @@ mod tests {
         let (s, _) = state(CpMode::Suggest);
         let solo = RaftMembers { voters: ids(&["v1"]), ..Default::default() };
         assert!(quorum_alert(&s, &v, &solo).is_empty());
+    }
+
+    #[test]
+    fn adding_and_removing_moves_a_live_member_to_a_new_host() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        let v = Volatile::new(0, 1);
+        assert_eq!(check_add(&s, &raft, &hid("ms01-9")), Ok(()));
+        assert!(check_add(&s, &raft, &hid("pi-1")).is_err(), "a Pi 5 is not eligible");
+        assert!(check_add(&s, &raft, &hid("v1")).is_err(), "already a voter");
+        raft.pending = true;
+        assert!(check_add(&s, &raft, &hid("ms01-9")).is_err(), "a change is in flight");
+        raft.pending = false;
+
+        // Added and promoted: four live voters over a target of three, which
+        // the controller leaves alone (nothing down to take away).
+        raft.voters.insert(hid("ms01-9"));
+        s.apply_membership(raft.voters.clone());
+        step(&mut s, &v, &raft, 1000);
+        assert!(s.hosts[&hid("ms01-9")].roles.contains(&Role::ControlPlane), "the role followed the voters");
+        assert_eq!(run(&s, &v, &raft, 2000).change, None, "four live voters are stable");
+        assert!(check_add(&s, &raft, &hid("mini-1")).is_err(), "one extra member at a time");
+
+        // A graceful removal needs the extra member first.
+        assert_eq!(check_remove(&s, &raft, &hid("v1")), Ok(()), "a live voter goes while four voters stay three");
+        raft.voters.remove(&hid("ms01-9"));
+        assert!(check_remove(&s, &raft, &hid("v1")).unwrap_err().contains("add its replacement first"));
+        raft.voters.insert(hid("ms01-9"));
+        assert!(check_remove(&s, &raft, &hid("mini-1")).is_err(), "no voter");
+        raft.learners.insert(hid("mini-1"));
+        assert!(check_remove(&s, &raft, &hid("v1")).is_err(), "a change is in flight");
+        raft.learners.clear();
+
+        // Two voters down: removing a live one would strand the last.
+        set_lifecycle(&mut s, "v2", Lifecycle::NotReady, 3000);
+        set_lifecycle(&mut s, "v3", Lifecycle::NotReady, 3000);
+        assert!(check_remove(&s, &raft, &hid("v1")).unwrap_err().contains("stay quorate"));
+        set_lifecycle(&mut s, "v2", Lifecycle::Ready, 3000);
+        set_lifecycle(&mut s, "v3", Lifecycle::Ready, 3000);
+        assert_eq!(check_remove(&s, &raft, &hid("v1")), Ok(()));
+    }
+
+    #[test]
+    fn the_control_plane_role_cannot_be_set_by_hand() {
+        let (s, _) = state(CpMode::Suggest);
+        let voter = s.hosts[&hid("v1")].roles.clone();
+        let spare = s.hosts[&hid("ms01-9")].roles.clone();
+        let without: BTreeSet<Role> = voter.iter().filter(|r| **r != Role::ControlPlane).copied().collect();
+        let mut with = spare.clone();
+        with.insert(Role::ControlPlane);
+        assert!(check_roles(&s, &hid("v1"), Some(&voter), &without).is_err(), "taking a voter's role");
+        assert!(check_roles(&s, &hid("ms01-9"), Some(&spare), &with).is_err(), "giving a non-voter the role");
+        assert!(check_roles(&s, &hid("ms01-9"), None, &with).is_err(), "approving a non-voter with the role");
+        assert_eq!(check_roles(&s, &hid("v1"), Some(&voter), &voter), Ok(()), "keeping the role");
+        let mut other = voter.clone();
+        other.insert(Role::Storage);
+        assert_eq!(check_roles(&s, &hid("v1"), Some(&voter), &other), Ok(()), "other roles are free");
+        // A new voter whose role has not caught up yet keeps it missing.
+        assert_eq!(check_roles(&s, &hid("v1"), Some(&without), &without), Ok(()));
     }
 
     #[test]
