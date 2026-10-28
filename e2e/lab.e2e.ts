@@ -600,8 +600,10 @@ await step('K8', 'Storage network: Longhorn replicates over VLAN 20 (Multus), an
   note(`${running.length} running instance-managers each carry a storage-net interface in 10.20.3.0/24`)
 
   // A 64 MiB write, replicated twice: the bytes must cross VLAN 20.
+  // Its own namespace: K4 deletes `e2e` just before, and a terminating
+  // namespace refuses new content.
   const run = Math.random().toString(36).slice(2, 8)
-  const ns = 'e2e'
+  const ns = 'e2e-k8'
   await k.create('/api/v1/namespaces', { metadata: { name: ns } })
   await k.create('/apis/storage.k8s.io/v1/storageclasses', {
     metadata: { name: 'e2e-k8' },
@@ -671,7 +673,7 @@ await step('K7', 'Control-plane replacement: power off a K3s server, replace it,
   // The replacement: Ready, not a voter, an MS-01 without held roles where one exists.
   const candidates = [...s0.hosts.values()]
     .filter((h) => h.lifecycle === 'Ready' && !s0.cp.voters.includes(h.id))
-    .sort((a, b) => Number(b.id.startsWith('ms01')) - Number(a.id.startsWith('ms01')) || Number(Object.keys(a.net.held_roles).length === 0) - Number(Object.keys(b.net.held_roles).length === 0) || (a.id < b.id ? -1 : 1))
+    .sort((a, b) => Number(b.id.startsWith('ms01')) - Number(a.id.startsWith('ms01')) || Number(Object.keys(b.net.held_roles).length === 0) - Number(Object.keys(a.net.held_roles).length === 0) || (a.id < b.id ? -1 : 1))
   const with_ = candidates[0]?.id
   if (!with_) throw new Failed('no Ready non-voter to replace with')
   const k = await kube()
