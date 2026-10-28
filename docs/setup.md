@@ -65,6 +65,17 @@ Machines can be joined in any order and at any time.
 - Longhorn's replication runs on the storage network (VLAN 20), not the management network. Multus gives Longhorn's instance managers a second interface (`lhnet1`), a macvlan on each host's own VLAN 20 interface, with an address from the storage network's reserved range. Longhorn runs only on hosts attached to the storage network (node label `homelab.io/storage-network=true`), so a pod with a Longhorn volume must run on one of them; every MS-01 and mini PC is.
 - Node labels: `homelab.io/profile=<profile>` and `homelab.io/<role>=true` for each of the host's roles (`control-plane`, `storage`, `compute`, `vm`, `transcode`), and `homelab.io/storage-network=true` on hosts attached to the storage network. Labels you set on a host in the UI are added to its node too, when Kubernetes accepts them.
 
+## Moving the control plane to another machine
+
+The control-plane role is not set by hand. It follows the control-plane voters, so the role checkbox is read-only and the API refuses changes to it. To move a live control-plane host's place to another machine (to retire or service the host), open either host in the UI. Its **Control plane** section offers **Hand off** on a voter and **Take over** on a Ready, eligible machine that is not a voter. Or submit:
+
+```sh
+curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
+  -d '{"HandOffCp": {"from": "<voter>", "to": "<machine>"}}'
+```
+
+The new machine joins the control plane, is promoted to a voter, and reinstalls K3s as a server. Only once that server runs does the old voter leave the control plane, so etcd never runs a member short. The old voter then reinstalls K3s as an agent, deleting its own node first so its etcd member leaves, and stays in the fleet. If the old voter leads the control plane, it steps down and the VIP moves to the new leader. The control plane refuses a hand-off while a voter is down (replace it first) or while another membership change is in progress. It gives up a hand-off, saying so in the events, if the new machine goes down before it joins.
+
 ## When a control-plane machine dies
 
 The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To take it, or to replace the host sooner, submit the operation the alert carries:
@@ -79,6 +90,8 @@ curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
 The replacement goes in etcd's recommended order: once the spare has taken the dead host's place as a control-plane voter, a running K3s server deletes the dead host's node, which removes its etcd member. Only then does the spare reinstall K3s as a server and join etcd. So etcd never counts a dead member while the spare joins. homelabd never removes a member whose node is still `Ready`, removes one at a time, and only while the members on running servers stay a quorum. A member K3s cannot find by a node goes through etcd's own API instead. That covers a dead server whose node was already deleted, and a server that died while joining, whose member never started and so has no name yet (it is found by its address). `sudo homelabd status` on a server lists etcd's members. If no server can read them, nothing is removed and no new server joins until one can, and the host's Kubernetes line in the UI says why.
 
 If the dead machine comes back afterwards, it reinstalls K3s as an agent.
+
+A server that reinstalls as an agent deletes its own node first, so its etcd member leaves. If that delete fails, the member stays behind with nothing to run it, and etcd loses a spare: with 4 members and 3 running, one more failure stops it. homelabd removes such a member through etcd's API (the node, now the agent's, stays), with the same one-at-a-time and quorum rules, and no new server joins until it is gone.
 
 ## Trying it out
 
