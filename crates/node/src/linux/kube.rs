@@ -10,8 +10,12 @@
 //!    [`K3S_VERSION`]'s release) and the K3s binary are checked against
 //!    pinned sha256 sums before anything runs. A host installed as the other role is
 //!    uninstalled first; a server deletes its own node before it goes, so
-//!    its etcd member leaves the cluster.
+//!    its etcd member leaves the cluster, and the uninstall waits (retried)
+//!    while that deletion fails, so the member is never orphaned by a
+//!    wobbling API. An already-gone node counts as deleted.
 //! 2. Starts the service if it stopped, and waits for the node to register.
+//!    A node that stays missing is remade by restarting K3s: the kubelet
+//!    registers its node once at startup and never makes it again.
 //! 3. On a server, writes the Longhorn `HelmChart` manifest K3s deploys.
 //! 4. Labels the node, and on a storage host gives Longhorn its data disks
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
@@ -39,7 +43,7 @@ use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const K3S_VERSION: &str = "v1.36.5+k3s1";
 /// The sha256 of [`K3S_VERSION`]'s amd64 `k3s` binary (the release's
@@ -59,6 +63,11 @@ const MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-longhorn.y
 const EVERY: Duration = Duration::from_secs(10);
 /// How long it waits after a failed step before trying again.
 const BACKOFF: Duration = Duration::from_secs(20);
+/// How long the node may stay missing before K3s is restarted to
+/// re-register it. Registration normally takes seconds; past this the
+/// kubelet is stuck (it registers once at startup) and only a restart
+/// makes the node again.
+const REGISTER_RETRY_AFTER: Duration = Duration::from_secs(3 * 60);
 const LONGHORN_DISK_LABEL: &str = "node.longhorn.io/create-default-disk";
 const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
 /// On a Longhorn node: the disks the control plane took out of scheduling
@@ -335,6 +344,25 @@ fn node_ready(node: &serde_json::Value) -> bool {
     node["status"]["conditions"].as_array().into_iter().flatten().any(|c| c["type"] == "Ready" && c["status"] == "True")
 }
 
+/// Whether a failed node lookup says the node object is gone, rather than
+/// the API being down: `Error from server (NotFound)` or
+/// `nodes "x" not found`.
+fn node_missing(why: &str) -> bool {
+    why.contains("NotFound") || why.contains("not found")
+}
+
+/// Whether the server's uninstall may go ahead after asking for its node's
+/// deletion: only once the node is gone, so K3s drops its etcd member.
+/// A missing node counts as deleted (a previous attempt took it, or it
+/// never registered); any other failure blocks the uninstall, retried.
+fn may_uninstall(deleted: &Result<String, String>) -> Result<(), String> {
+    match deleted {
+        Ok(_) => Ok(()),
+        Err(e) if node_missing(e) => Ok(()),
+        Err(e) => Err(format!("delete this server's node first, so its etcd member goes with it: {e}")),
+    }
+}
+
 /// The merge patches, by Longhorn node, that keep Longhorn off the disks of
 /// the nodes in `off` and give back those it was kept off before, from the
 /// list of Longhorn's nodes: a listed node's schedulable disks are turned
@@ -434,7 +462,7 @@ impl Kube {
     pub fn start(host: HostId, vip: Ipv4Addr, paths: Paths) -> Self {
         let kube = Self { shared: Arc::new((Mutex::new(Shared::default()), Condvar::new())) };
         let k = kube.clone();
-        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new() };
+        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new(), register_wait_since: None };
         let spawned = std::thread::Builder::new().name("kube".into()).spawn(move || worker.run(&k));
         if let Err(e) = spawned {
             eprintln!("homelabd: start the kubernetes worker: {e}");
@@ -504,6 +532,8 @@ struct Worker {
     applied: Option<KubeSpec>,
     /// The hosts whose Longhorn disks this server last kept Longhorn off.
     storage_off: BTreeSet<HostId>,
+    /// Since when the node has been continuously missing, if it is.
+    register_wait_since: Option<Instant>,
 }
 
 impl Worker {
@@ -592,6 +622,25 @@ impl Worker {
             // K3s restarts itself; this is for one stopped by hand, or not yet started.
             let _ = sh("systemctl", &["start", "--no-block", unit(spec.role)]);
             return (self.installing(&o, format!("starting {}", unit(spec.role))), true);
+        }
+        match &o.unregistered {
+            Some(why) if node_missing(why) => {
+                let now = Instant::now();
+                match self.register_wait_since {
+                    Some(since) if now.duration_since(since) >= REGISTER_RETRY_AFTER => {
+                        eprintln!("homelabd: kubernetes: the node is gone and the kubelet never makes it again: restarting {}", unit(spec.role));
+                        if let Err(e) = sh("systemctl", &["restart", unit(spec.role)]) {
+                            return (self.status(&o, KubePhase::Failed(e.to_string())), false);
+                        }
+                        self.register_wait_since = Some(now);
+                        return (self.installing(&o, format!("restarted {} to re-register the missing node", unit(spec.role))), true);
+                    }
+                    Some(_) => {}
+                    None => self.register_wait_since = Some(now),
+                }
+            }
+            Some(_) => self.register_wait_since = None,
+            None => self.register_wait_since = None,
         }
         if let Some(why) = &o.unregistered {
             return (self.installing(&o, format!("waiting for the node to register: {why}")), true);
@@ -758,8 +807,9 @@ impl Worker {
     fn install(&self, spec: &KubeSpec, installed: Option<KubeRole>) -> Result<(), String> {
         match installed {
             Some(KubeRole::Server) => {
+                let deleted = self.kubectl(KubeRole::Server, &["delete", "node", self.host.as_str(), "--wait=false"]);
+                may_uninstall(&deleted)?;
                 eprintln!("homelabd: kubernetes: leaving as a server to rejoin as {:?}", spec.role);
-                let _ = self.kubectl(KubeRole::Server, &["delete", "node", self.host.as_str(), "--wait=false"]);
                 sh("/usr/local/bin/k3s-uninstall.sh", &[]).map_err(|e| e.to_string())?;
             }
             Some(KubeRole::Agent) => {
@@ -1064,5 +1114,22 @@ mod tests {
         assert_eq!(patches[1].1, serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: null } }, "spec": { "disks": { "nvme0": { "allowScheduling": true } } } }));
         let done = serde_json::json!({ "items": [node("ms01-05", &[("nvme0", false), ("nvme1", false)], Some("nvme0"))] });
         assert!(storage_off_patches(&done, &off).is_empty(), "nothing left to do");
+    }
+
+    #[test]
+    fn uninstall_waits_for_the_node_to_go_but_not_for_one_already_gone() {
+        assert_eq!(may_uninstall(&Ok("node \"ms01-02\" deleted".into())), Ok(()));
+        assert_eq!(may_uninstall(&Err("Error from server (NotFound): nodes \"ms01-02\" not found".into())), Ok(()), "a previous attempt took it");
+        let down = Err("Error from server (ServiceUnavailable): the server is currently unable to handle the request".into());
+        assert!(may_uninstall(&down).unwrap_err().contains("etcd member"), "no orphaned member on a wobbling API");
+        assert!(may_uninstall(&Err("curl: (7) Failed to connect".into())).is_err());
+    }
+
+    #[test]
+    fn a_missing_node_is_told_from_a_down_api() {
+        assert!(node_missing("Error from server (NotFound): nodes \"ms01-02\" not found"));
+        assert!(node_missing("nodes \"ms01-02\" not found"));
+        assert!(!node_missing("Error from server (ServiceUnavailable): the server is currently unable to handle the request"));
+        assert!(!node_missing("curl: (7) Failed to connect to 10.0.3.253 port 6443"));
     }
 }
