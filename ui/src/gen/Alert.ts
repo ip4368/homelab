@@ -11,10 +11,6 @@ export type Alert = { id: string, severity: Severity, kind: string, entity: Obje
  */
 subject?: string, message: string, raised_at: number, resolved_at: number | null, 
 /**
- * Set when the alert matches an injected fault; lets the UI score detection.
- */
-ground_truth: boolean, 
-/**
  * An operation the UI offers as a button on the alert.
  */
 action?: ApiOp, version: number, };

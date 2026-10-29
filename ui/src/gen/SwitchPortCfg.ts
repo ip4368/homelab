@@ -2,7 +2,6 @@
 import type { PortMode } from "./PortMode";
 
 /**
- * Configuration of one switch port. This is the switch's ground truth in
- * the simulator and, from Task 12, what the switch reports when polled.
+ * Configuration of one switch port, as the switch reports it when polled.
  */
 export type SwitchPortCfg = { mode: PortMode, mtu: number, lacp_group: string | null, admin_up: boolean, };

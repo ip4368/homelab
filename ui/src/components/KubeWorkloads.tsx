@@ -32,7 +32,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
   const hosts = useMemo(() => [...new Set(kube.pods.flatMap((p) => (p.node ? [p.node] : [])))].sort(), [kube.pods])
 
   return (
-    <section className="kube-workloads">
+    <section className="workloads kube-workloads">
       <h3>Kubernetes</h3>
       <div className="fleet-bar">
         <label className="inline">

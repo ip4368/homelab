@@ -1,5 +1,5 @@
-//! Observation: what the control plane learns by listening, never by looking
-//! at the simulated world.
+//! Observation: what the control plane learns by listening: what agents
+//! report and what switches answer when polled.
 //!
 //! * Hosts: agents send their LLDP neighbours and inventory when they change;
 //!   the leader keeps the latest in [`Volatile::host_reports`] and writes
@@ -99,7 +99,6 @@ fn switch_alerts(state: &ClusterState, known: &BTreeSet<SwitchId>, v: &Volatile,
                     entity: ObjectRef::switch(id),
                     subject: None,
                     message: format!("{id} did not answer polls for {} s", SWITCH_UNREACHABLE_AFTER_MS / 1000),
-                    ground_truth: false,
                 }));
             }
         } else if let Some(a) = open.filter(|_| v.switch_reports.contains_key(id)) {
@@ -292,7 +291,6 @@ mod tests {
             entity: ObjectRef::switch(&sid("a")),
             subject: None,
             message: "a did not answer polls for 90 s".into(),
-            ground_truth: false,
         };
         assert_eq!(alert_kinds(run(&s, &v, 100_000 + SWITCH_UNREACHABLE_AFTER_MS + 1)), std::slice::from_ref(&raise));
         s.apply(0, raise).unwrap();

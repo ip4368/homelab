@@ -103,3 +103,19 @@ export function gib(bytes: number): string {
 export function podsOn(k: Pick<KubeView, 'pods'>, host: string): KubePod[] {
   return k.pods.filter((p) => p.node === host)
 }
+
+/**
+ * The pods `kubectl drain` still has to move off a host: all but DaemonSet
+ * pods, static pods (owned by their node) and pods that finished.
+ */
+export function podsToDrain(pods: KubePod[]): KubePod[] {
+  const stays = (p: KubePod) => p.owner?.startsWith('DaemonSet/') || p.owner?.startsWith('Node/')
+  return pods.filter((p) => !stays(p) && !['Succeeded', 'Failed', 'Completed'].includes(p.status))
+}
+
+/** The confirmation before removing `host`, given the pods on it. */
+export function removeHostPrompt(host: string, pods: KubePod[]): string {
+  const left = podsToDrain(pods).length
+  const what = left === 0 ? 'No pods need moving off it.' : `${left} pod${left === 1 ? '' : 's'} still run${left === 1 ? 's' : ''} on it: drain it first so they move off cleanly.`
+  return `Remove ${host}? ${what} It leaves the cluster for good; to bring it back, reinstall it with a new join token.`
+}

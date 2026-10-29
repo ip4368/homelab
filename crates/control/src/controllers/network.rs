@@ -257,7 +257,6 @@ fn alerts(state: &ClusterState, host: &HostObj, open: &[&Alert]) -> Vec<Action> 
                 entity: ObjectRef::host(id),
                 subject: None,
                 message,
-                ground_truth: false,
             }));
         }
     }
@@ -579,7 +578,6 @@ mod tests {
             entity: ObjectRef::host(&hid("m")),
             subject: None,
             message: message.into(),
-            ground_truth: false,
         };
         assert_eq!(proposals(&out), [raise("netmismatch-m-10000", "m: access-1 p7: add VLAN 20 to trunk allowed")]);
         assert!(proposals(&step(&mut s, &mut v, 12_000)).is_empty(), "one alert per incident");

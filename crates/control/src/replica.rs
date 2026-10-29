@@ -2,15 +2,14 @@
 //! applying its committed entries. The leader claims the VIP, answers the API
 //! and syncs, and runs the controllers; followers only replicate.
 
-use crate::controllers::drain;
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::rollout;
 use crate::controllers::membership::{self, RaftMembers};
 use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
-use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed, ReplicaReport};
+use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
-use crate::state::{ClusterState, Command, Lifecycle, NetworkResult, ObjectKind};
+use crate::state::{ClusterState, Command, Lifecycle, NetworkResult};
 use model::{HostId, Inventory, Role};
 use std::collections::BTreeSet;
 
@@ -170,7 +169,7 @@ impl CpReplica {
         let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
-        v.forget_silent_removed(&self.state, now);
+        v.forget_removed(&self.state);
         let mut actions = controllers::run_all(&self.state, v, now);
         let plan = membership::run(&self.state, v, &RaftMembers::of(raft), now);
         v.last_run = Some(now);
@@ -185,7 +184,6 @@ impl CpReplica {
                     if !v.may_propose(&cmd, now) {
                         continue;
                     }
-                    v.note_proposed(&self.state, &cmd, now);
                     if let Ok(index) = raft.propose(mono, LogCmd { at: now, cmd: cmd.clone() }) {
                         v.in_flight.insert(index, cmd);
                     }
@@ -284,23 +282,15 @@ impl CpReplica {
         observed_at: Option<SimTime>,
         observed: Option<Observed>,
         net_generation: u64,
-        instances: Vec<String>,
-        replicas: Vec<ReplicaReport>,
     ) {
         let now = ctx.now();
         let Some(v) = &mut self.volatile else { return };
-        v.last_heartbeat.insert(host.clone(), now);
+        // A host that was removed, or never joined, is ignored.
         if !self.state.hosts.contains_key(&host) {
-            // A removed host's agent runs on: it is told to stop and delete
-            // what it still runs and holds. A host that never joined is ignored.
-            if self.state.was_removed(ObjectKind::Host, host.as_str()) {
-                v.note_removed_host(host, instances.into_iter().collect(), replicas);
-            }
             return;
         }
+        v.last_heartbeat.insert(host.clone(), now);
         v.net_generation.insert(host.clone(), net_generation);
-        v.instances.insert(host.clone(), instances.into_iter().collect());
-        v.note_replicas(host.clone(), replicas, now);
         match observed {
             Some(observed) => {
                 let observed_at = observed_at.unwrap_or(now);
@@ -326,19 +316,6 @@ impl CpReplica {
             ctx.send(from, mgmt(), Msg::ConfirmNetwork { generation });
         }
         v.net_results.insert(host, (generation, result));
-    }
-
-    /// The target of a live migration says its incoming instance took over:
-    /// it runs the instance now, ahead of its next heartbeat. Only a host
-    /// whose heartbeat was heard is noted (a partial list is not made up).
-    fn on_migration_done(&mut self, from: Endpoint, instance: String) {
-        let Addr::Host(host) = from.addr else { return };
-        let Some(v) = &mut self.volatile else { return };
-        if from.svc == Svc::Agent
-            && let Some(running) = v.instances.get_mut(&host)
-        {
-            running.insert(instance);
-        }
     }
 
     fn on_sync(&mut self, ctx: &mut dyn Ctx, from: Endpoint, since: u64) {
@@ -400,28 +377,12 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::Cordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Cordoned },
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
         ApiOp::Drain { host } => Command::SetLifecycle { id: host, lifecycle: Lifecycle::Draining },
-        ApiOp::MigrateVm { vm, to } => match drain::migrate_command(state, v, &vm, to) {
-            Ok((cmd, to)) => return Handling::Propose(Box::new(cmd), serde_json::Value::String(to.to_string())),
-            Err(e) => return Handling::Answer(ApiResult::Err(e)),
-        },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
         ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
         ApiOp::DeleteNetwork { id } => Command::DeleteNetwork { id },
         ApiOp::DeleteTemplate { id } => Command::DeleteTemplate { id },
-        ApiOp::CreateDeployment { deployment } => match deployment.validate() {
-            Ok(()) => Command::CreateDeployment { deployment },
-            Err(e) => return Handling::Answer(ApiResult::Err(e)),
-        },
-        ApiOp::DeleteDeployment { id } => Command::DeleteDeployment { id },
-        ApiOp::CreateVm { vm } => Command::CreateVm { vm },
-        ApiOp::DeleteVm { id } => Command::DeleteVm { id },
-        ApiOp::CreateVolume { volume } => match volume.validate() {
-            Ok(()) => Command::CreateVolume { volume },
-            Err(e) => return Handling::Answer(ApiResult::Err(e)),
-        },
-        ApiOp::DeleteVolume { id } => Command::DeleteVolume { id },
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
         ApiOp::HandOffCp { from, to } => return Handling::HandOffCp { from, to },
@@ -480,8 +441,8 @@ impl Actor for CpReplica {
                 let outs = self.raft().step(ctx.monotonic_ms(), peer, m);
                 self.handle(ctx, outs);
             }
-            Msg::Heartbeat { host, observed_at, observed, net_generation, instances, replicas, .. } => {
-                self.on_heartbeat(ctx, from, host, observed_at, observed, net_generation, instances, replicas)
+            Msg::Heartbeat { host, observed_at, observed, net_generation, .. } => {
+                self.on_heartbeat(ctx, from, host, observed_at, observed, net_generation)
             }
             Msg::NetworkStatus { generation, result } => self.on_network_status(ctx, from, generation, result),
             Msg::SwitchReport { switch, model, ports, mlag_peer } => {
@@ -500,7 +461,6 @@ impl Actor for CpReplica {
                     v.note_sample(host, sample);
                 }
             }
-            Msg::MigrationDone { instance } => self.on_migration_done(from, instance),
             Msg::KubeStatus { host, status } => {
                 if let Some(v) = &mut self.volatile
                     && self.state.hosts.contains_key(&host)
@@ -519,12 +479,6 @@ impl Actor for CpReplica {
             | Msg::ConfirmNetwork { .. }
             | Msg::ReportRequest
             | Msg::SwitchPoll
-            | Msg::StartInstance(_)
-            | Msg::StopInstance(_)
-            | Msg::MigrateIn { .. }
-            | Msg::AbortMigration(_)
-            | Msg::CreateReplica { .. }
-            | Msg::DeleteReplica { .. }
             | Msg::StartCpReplica { .. }
             | Msg::Kube(_)
             | Msg::KubeAdmin(_)
@@ -681,7 +635,6 @@ mod tests {
             entity: ObjectRef::host(&hid("h9")),
             subject: None,
             message: "down".into(),
-            ground_truth: false,
         }
     }
 
@@ -782,81 +735,23 @@ mod tests {
         assert_eq!(rig.proposed(), before, "a read proposes nothing");
     }
 
-    #[test]
-    fn a_removed_host_is_still_told_to_stop_what_it_runs() {
-        let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
-        rig.elect();
-        rig.ack();
-        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
-        assert_eq!(sent_to_h9(&mut rig), (1, 1), "h9 runs an instance and holds a replica nothing wants");
-        rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
-        rig.advance(crate::controllers::scheduler::RESEND_MS);
-        // Forgetting what h9 runs would leave its VMs running beside their restarted copies.
-        assert_eq!(sent_to_h9(&mut rig), (1, 1), "a removed host still runs and holds what it did until told otherwise");
-    }
-
-    /// The (StopInstance, DeleteReplica) counts the controllers send h9 in one run.
-    fn sent_to_h9(rig: &mut Rig) -> (usize, usize) {
-        rig.controllers();
-        let sent = std::mem::take(&mut rig.ctx.sent);
-        let to_h9 = |want: fn(&Msg) -> bool| sent.iter().filter(|(to, m)| *to == host_ep("h9", Svc::Agent) && want(m)).count();
-        (to_h9(|m| matches!(m, Msg::StopInstance(_))), to_h9(|m| matches!(m, Msg::DeleteReplica { .. })))
-    }
-
-    fn h9_heartbeat(rig: &mut Rig, instances: &[&str], volumes: &[&str]) {
-        let replicas = volumes.iter().map(|v| ReplicaReport { volume: (*v).into(), disk: "nvme0".into(), pct: 100, copied_bytes: 0, copying: false }).collect();
-        let instances = instances.iter().map(|i| (*i).into()).collect();
-        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0, instances, replicas };
+    fn h9_heartbeat(rig: &mut Rig) {
+        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 0 };
         rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), hb);
     }
 
-    fn knows_h9(rig: &Rig) -> bool {
-        let v = rig.r.volatile.as_ref().unwrap();
-        v.instances.contains_key(&hid("h9")) || v.replicas.contains_key(&hid("h9")) || v.last_heartbeat.contains_key(&hid("h9"))
-    }
-
     #[test]
-    fn a_removed_host_is_cleaned_up_until_it_reports_nothing() {
-        use crate::controllers::scheduler::RESEND_MS;
-        let mut rig = Rig::new(orphaned_alert());
-        rig.elect();
-        rig.ack();
-        // h9 was removed before this leader heard from it: its heartbeats still count.
-        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
-        assert_eq!(sent_to_h9(&mut rig), (1, 1));
-        rig.advance(RESEND_MS);
-        h9_heartbeat(&mut rig, &[], &["gone"]);
-        assert_eq!(sent_to_h9(&mut rig), (0, 1), "the replica is still there");
-        rig.advance(RESEND_MS);
-        h9_heartbeat(&mut rig, &[], &[]);
-        assert_eq!(sent_to_h9(&mut rig), (0, 0));
-        assert!(!knows_h9(&rig), "nothing left on h9: forgotten");
-        rig.advance(RESEND_MS);
-        assert_eq!(sent_to_h9(&mut rig), (0, 0), "and not sent anything again");
-    }
-
-    #[test]
-    fn a_removed_host_that_falls_silent_is_forgotten() {
+    fn a_removed_host_is_forgotten_and_its_heartbeats_ignored() {
         let mut rig = Rig::new(orphaned_alert()[..1].to_vec());
         rig.elect();
         rig.ack();
-        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
+        h9_heartbeat(&mut rig);
+        assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("h9")));
         rig.r.state.apply(0, Command::RemoveHost { id: hid("h9") }).unwrap();
-        assert_eq!(sent_to_h9(&mut rig), (1, 1));
-        rig.advance(NOT_READY_AFTER_MS);
-        assert_eq!(sent_to_h9(&mut rig), (1, 1), "silent for no longer than a member may be before NotReady");
-        rig.advance(1);
-        assert_eq!(sent_to_h9(&mut rig), (0, 0), "silent for longer: powered off, or gone for good");
-        assert!(!knows_h9(&rig));
-    }
-
-    #[test]
-    fn a_host_that_never_joined_is_not_cleaned_up() {
-        let mut rig = Rig::new(vec![]);
-        rig.elect();
-        rig.ack();
-        h9_heartbeat(&mut rig, &["vm/x"], &["gone"]);
-        assert_eq!(sent_to_h9(&mut rig), (0, 0), "not this cluster's to touch");
+        rig.controllers();
+        assert!(!rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("h9")), "forgotten");
+        h9_heartbeat(&mut rig);
+        assert!(!rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("h9")), "and not heard again");
     }
 
     #[test]
@@ -921,7 +816,7 @@ mod tests {
 
         rig.elect();
         rig.ack();
-        let sample = MetricSample { at: 1234, cpu_pct: 42.0, ram_pct: 1.0, temp_c: 30.0, disk_pct: Default::default(), port_rx_bps: Default::default(), port_tx_bps: Default::default(), instances: 0 };
+        let sample = MetricSample { at: 1234, cpu_pct: 42.0, ram_pct: 1.0, temp_c: Some(30.0), disk_pct: Default::default(), port_rx_bps: Default::default(), port_tx_bps: Default::default() };
         rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), Msg::Metrics { host: hid("h9"), sample });
         let log = rig.r.log_len();
         rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 2, op: get("cpu_pct") });
@@ -939,7 +834,7 @@ mod tests {
     }
 
     fn heartbeat(at: Option<SimTime>, observed: Option<Observed>) -> Msg {
-        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed, net_generation: 0, instances: vec![], replicas: vec![] }
+        Msg::Heartbeat { host: hid("m1"), lifecycle_seen: 0, observed_at: at, observed, net_generation: 0 }
     }
 
     #[test]
@@ -976,33 +871,10 @@ mod tests {
             observed_at: Some(1),
             observed: Some(observed(true)),
             net_generation: 0,
-            instances: vec!["vm/x".into()],
-            replicas: vec![],
         };
         assert!(hb(&mut rig, stranger).is_empty());
         assert!(!rig.r.volatile.as_ref().unwrap().host_reports.contains_key(&hid("zz")));
-        assert!(!rig.r.volatile.as_ref().unwrap().instances.contains_key(&hid("zz")));
-        assert!(rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")), "still a heartbeat");
-    }
-
-    #[test]
-    fn migration_done_only_adds_to_a_heard_hosts_instances() {
-        let add = Command::AddPendingHost {
-            id: hid("m1"),
-            profile: profile(ProfileId::MiniPc, 0),
-            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
-            location: "rack-1".into(),
-        };
-        let mut rig = Rig::new(vec![add]);
-        rig.elect();
-        rig.ack();
-        let agent = host_ep("m1", Svc::Agent);
-        let done = Msg::MigrationDone { instance: "vm/vm1".into() };
-        rig.r.on_message(&mut rig.ctx, agent.clone(), done.clone());
-        assert!(!rig.r.volatile.as_ref().unwrap().instances.contains_key(&hid("m1")), "no partial list before a heartbeat");
-        rig.r.on_message(&mut rig.ctx, agent.clone(), heartbeat(None, None));
-        rig.r.on_message(&mut rig.ctx, agent, done);
-        assert_eq!(rig.r.volatile.as_ref().unwrap().instances[&hid("m1")], ["vm/vm1".to_string()].into());
+        assert!(!rig.r.volatile.as_ref().unwrap().last_heartbeat.contains_key(&hid("zz")));
     }
 
     #[test]
@@ -1086,14 +958,9 @@ mod tests {
             observed_at: None,
             observed: None,
             net_generation: 7,
-            instances: vec!["vm/vm1".into(), "pod/web/0".into()],
-            replicas: vec![ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copied_bytes: 400, copying: true }],
         };
         rig.r.on_message(&mut rig.ctx, agent, hb);
         let v = rig.r.volatile.as_ref().unwrap();
         assert_eq!(v.net_generation[&hid("m1")], 7, "heartbeats carry the running generation");
-        assert_eq!(v.instances[&hid("m1")], ["pod/web/0".to_string(), "vm/vm1".to_string()].into(), "and what the host runs");
-        let held = ReplicaReport { volume: "disk1".into(), disk: "nvme0".into(), pct: 40, copied_bytes: 400, copying: true };
-        assert_eq!(v.replicas[&hid("m1")], [held], "and holds");
     }
 }

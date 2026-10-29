@@ -5,11 +5,9 @@
 mod command;
 mod objects;
 mod rollout;
-mod workload;
 
 pub use command::{ApplyError, Command};
 pub use objects::*;
-pub use workload::UNSCHEDULED;
 
 use crate::controllers::alerts::AlertKind;
 use crate::controllers::join::UNKNOWN_LOCATION;
@@ -37,15 +35,6 @@ pub struct ClusterState {
     pub switches: BTreeMap<SwitchId, SwitchObj>,
     /// Every rollout, done ones included; at most one is not done.
     pub rollouts: BTreeMap<String, Rollout>,
-    pub deployments: BTreeMap<String, DeploymentObj>,
-    /// Keyed by `(deployment, idx)`.
-    pub pods: BTreeMap<(String, u32), PodObj>,
-    pub vms: BTreeMap<String, VmObj>,
-    /// Keyed by VM id.
-    pub vm_status: BTreeMap<String, VmStatusObj>,
-    pub volumes: BTreeMap<String, VolumeObj>,
-    /// Keyed by volume id.
-    pub volume_status: BTreeMap<String, VolumeStatusObj>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -75,12 +64,6 @@ impl ClusterState {
             templates: BTreeMap::new(),
             switches: BTreeMap::new(),
             rollouts: BTreeMap::new(),
-            deployments: BTreeMap::new(),
-            pods: BTreeMap::new(),
-            vms: BTreeMap::new(),
-            vm_status: BTreeMap::new(),
-            volumes: BTreeMap::new(),
-            volume_status: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, handoff: None, version: 0 },
@@ -214,7 +197,7 @@ impl ClusterState {
                 }
                 self.tombstone(v, ObjectKind::Host, id.to_string());
             }
-            Command::RaiseAlert { id, kind, entity, subject, message, ground_truth } => {
+            Command::RaiseAlert { id, kind, entity, subject, message } => {
                 let severity = AlertKind::parse(&kind).ok_or_else(|| ApplyError::UnknownAlertKind(kind.clone()))?.severity();
                 if self.alerts.contains_key(&id) || self.open_alert(&kind, &entity, subject.as_deref()).is_some() {
                     return Err(ApplyError::AlreadyExists);
@@ -228,7 +211,6 @@ impl ClusterState {
                     message,
                     raised_at: at,
                     resolved_at: None,
-                    ground_truth,
                     action: None,
                     version: v,
                 };
@@ -248,7 +230,6 @@ impl ClusterState {
                     message: format!("control-plane member {dead} has been down for over 10 min; replace it with {with}"),
                     raised_at: at,
                     resolved_at: None,
-                    ground_truth: false,
                     action: Some(crate::proto::ApiOp::ReplaceCpMember { dead, with }),
                     version: v,
                 };
@@ -409,15 +390,6 @@ impl ClusterState {
             Command::PauseRollout { id, reason, failed } => self.pause_rollout(v, &id, reason, failed)?,
             Command::ResumeRollout { id } => self.resume_rollout(v, &id)?,
             Command::AbortRollout { id } => self.abort_rollout(v, &id)?,
-            Command::CreateDeployment { deployment } => self.create_deployment(v, deployment)?,
-            Command::DeleteDeployment { id } => self.delete_deployment(v, &id)?,
-            Command::CreateVm { vm } => self.create_vm(at, v, vm)?,
-            Command::DeleteVm { id } => self.delete_vm(v, &id)?,
-            Command::CreateVolume { volume } => self.create_volume(v, volume)?,
-            Command::DeleteVolume { id } => self.delete_volume(v, &id)?,
-            Command::SetPodStatus { deployment, idx, host, phase } => self.set_pod_status(v, deployment, idx, host, phase)?,
-            Command::SetVmStatus { id, host, phase } => self.set_vm_status(at, v, &id, host, phase)?,
-            Command::SetVolumeStatus { id, replicas, health } => self.set_volume_status(v, &id, replicas, health)?,
             Command::SetKube { token, init_host } => {
                 if self.kube.is_some() {
                     return Err(ApplyError::AlreadyExists);
@@ -471,12 +443,6 @@ impl ClusterState {
         upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
         upserts.extend(self.switches.values().filter(|o| o.version > v).cloned().map(Object::Switch));
         upserts.extend(self.rollouts.values().filter(|o| o.version > v).cloned().map(Object::Rollout));
-        upserts.extend(self.deployments.values().filter(|o| o.version > v).cloned().map(Object::Deployment));
-        upserts.extend(self.pods.values().filter(|o| o.version > v).cloned().map(Object::Pod));
-        upserts.extend(self.vms.values().filter(|o| o.version > v).cloned().map(Object::Vm));
-        upserts.extend(self.vm_status.values().filter(|o| o.version > v).cloned().map(Object::VmStatus));
-        upserts.extend(self.volumes.values().filter(|o| o.version > v).cloned().map(Object::Volume));
-        upserts.extend(self.volume_status.values().filter(|o| o.version > v).cloned().map(Object::VolumeStatus));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
@@ -747,7 +713,6 @@ mod tests {
             entity: host_ref("h1"),
             subject: None,
             message: "m".into(),
-            ground_truth: false,
         })
         .unwrap();
         s.apply(5, Command::Event { entity: host_ref("h1"), message: "e".into() }).unwrap();
@@ -883,12 +848,11 @@ mod tests {
             entity: host_ref("h1"),
             subject: None,
             message: "no heartbeat".into(),
-            ground_truth: true,
         };
         s.apply(10, raise()).unwrap();
         assert_eq!(s.apply(11, raise()), Err(ApplyError::AlreadyExists));
         let a = &s.alerts["down-h1"];
-        assert_eq!((a.raised_at, a.resolved_at, a.ground_truth, a.severity), (10, None, true, Severity::Critical));
+        assert_eq!((a.raised_at, a.resolved_at, a.severity), (10, None, Severity::Critical));
         s.apply(15, Command::SetAlertMessage { id: "down-h1".into(), message: "still nothing".into() }).unwrap();
         assert_eq!((s.alerts["down-h1"].message.as_str(), s.alerts["down-h1"].version), ("still nothing", s.version));
         s.apply(20, Command::ResolveAlert { id: "down-h1".into() }).unwrap();
@@ -900,7 +864,7 @@ mod tests {
     }
 
     fn raise(id: &str, kind: &str, entity: ObjectRef, subject: Option<&str>) -> Command {
-        Command::RaiseAlert { id: id.into(), kind: kind.into(), entity, subject: subject.map(Into::into), message: "m".into(), ground_truth: false }
+        Command::RaiseAlert { id: id.into(), kind: kind.into(), entity, subject: subject.map(Into::into), message: "m".into() }
     }
 
     #[test]
@@ -908,7 +872,7 @@ mod tests {
         let mut s = ClusterState::new();
         assert_eq!(s.apply(1, raise("x", "Gremlins", host_ref("h1"), None)), Err(ApplyError::UnknownAlertKind("Gremlins".into())));
         s.apply(1, raise("p", "PortDown", host_ref("h1"), Some("sfp0"))).unwrap();
-        s.apply(1, raise("v", "VolumeFaulted", ObjectRef::volume("data"), None)).unwrap();
+        s.apply(1, raise("v", "HostDown", host_ref("h2"), None)).unwrap();
         assert_eq!((s.alerts["p"].severity, s.alerts["v"].severity), (Severity::Warning, Severity::Critical));
         assert_eq!(s.alerts["p"].subject.as_deref(), Some("sfp0"));
     }

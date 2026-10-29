@@ -14,9 +14,7 @@ describe('fetchMetrics', () => {
     expect(f).toHaveBeenCalledWith('/api/metrics?entity=host%3Ams01-01&m=cpu_pct%2Cram_pct')
   })
 
-  it('reports a paused simulation (409) apart from other failures', async () => {
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'simulation paused' }), { status: 409 })))
-    await expect(fetchMetrics('fleet', ['cpu_pct'])).resolves.toEqual({ paused: true })
+  it('reports the server\'s error, or the network\'s', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ error: 'control plane unavailable' }), { status: 503 })))
     await expect(fetchMetrics('fleet', ['cpu_pct'])).resolves.toEqual({ error: 'control plane unavailable' })
     vi.stubGlobal('fetch', vi.fn(async () => Promise.reject(new TypeError('network down'))))
@@ -34,29 +32,27 @@ describe('startPolling', () => {
     expect(fetchOnce).toHaveBeenCalledTimes(1)
     await vi.advanceTimersByTimeAsync(15_000)
     expect(fetchOnce, 'the first fetch is still out').toHaveBeenCalledTimes(1)
-    answers[0]({ paused: true })
+    answers[0]({ error: 'unavailable' })
     await vi.advanceTimersByTimeAsync(5000)
     expect(fetchOnce).toHaveBeenCalledTimes(2)
-    expect(applied).toEqual([{ paused: true }])
+    expect(applied).toEqual([{ error: 'unavailable' }])
     stop()
     answers[1]({ error: 'late' })
     await vi.advanceTimersByTimeAsync(10_000)
-    expect(applied, 'nothing is applied once stopped').toEqual([{ paused: true }])
+    expect(applied, 'nothing is applied once stopped').toEqual([{ error: 'unavailable' }])
     expect(fetchOnce).toHaveBeenCalledTimes(2)
     vi.useRealTimers()
   })
 })
 
 describe('foldOutcome', () => {
-  it('keeps the last series while paused or failing, and says why', () => {
+  it('keeps the last series while failing, and says why', () => {
     const first = reply(1000, [[1000, 3]])
     let v: MetricsView = { reply: null, note: null }
-    v = foldOutcome(v, { paused: true })
-    expect(v).toEqual({ reply: null, note: 'paused' })
+    v = foldOutcome(v, { error: 'no leader' })
+    expect(v).toEqual({ reply: null, note: 'no leader' })
     v = foldOutcome(v, { ok: first })
     expect(v).toEqual({ reply: first, note: null })
-    v = foldOutcome(v, { paused: true })
-    expect(v).toEqual({ reply: first, note: 'paused' })
     v = foldOutcome(v, { error: 'control plane unavailable' })
     expect(v).toEqual({ reply: first, note: 'control plane unavailable' })
   })

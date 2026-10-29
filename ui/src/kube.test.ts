@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, filterKube, gib, podTone, replicaLabel, volumeHosts, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, filterKube, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, volumeHosts, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return { namespace, name, owner, node, status, ready: 1, containers: 1, restarts: 0, created: 0 }
@@ -66,5 +66,24 @@ describe('kube', () => {
   it('formats ages and sizes like kubectl', () => {
     expect([age(0, 45_000), age(0, 12 * 60_000), age(0, 3 * 3_600_000), age(0, 3 * 86_400_000), age(null, 1)]).toEqual(['45s', '12m', '3h', '3d', ''])
     expect([gib(2 ** 31), gib(1.5 * 2 ** 30)]).toEqual(['2 GiB', '1.5 GiB'])
+  })
+})
+
+describe('draining', () => {
+  const pods = [
+    pod('demo', 'web-1', 'a', 'Deployment/web'),
+    pod('longhorn-system', 'longhorn-manager-x', 'a', 'DaemonSet/longhorn-manager'),
+    pod('kube-system', 'static', 'a', 'Node/a'),
+    pod('demo', 'job-1', 'a', 'Job/job', 'Completed'),
+    pod('demo', 'postgres-0', 'a', 'StatefulSet/postgres', 'Pending'),
+  ]
+
+  it('leaves DaemonSet, static and finished pods, as kubectl drain does', () => {
+    expect(podsToDrain(pods).map((p) => p.name)).toEqual(['web-1', 'postgres-0'])
+  })
+
+  it('says what removing a host leaves behind', () => {
+    expect(removeHostPrompt('a', pods)).toContain('2 pods still run on it: drain it first')
+    expect(removeHostPrompt('a', pods.slice(1, 4))).toContain('No pods need moving off it.')
   })
 })

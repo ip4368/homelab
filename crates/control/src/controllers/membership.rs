@@ -297,7 +297,6 @@ fn quorum_alert(state: &ClusterState, v: &Volatile, raft: &RaftMembers) -> Vec<A
                 entity: ObjectRef::cp(),
                 subject: None,
                 message,
-                ground_truth: false,
             })]
         }
         _ => vec![],
@@ -557,7 +556,7 @@ mod tests {
             etcd_members: BTreeSet::new(),
             etcd_unread: None,
             etcd_unstarted: BTreeSet::new(),
-            storage_off: BTreeSet::new(),
+            ..Default::default()
         };
         s.apply(0, Command::RecordKube { id: hid(id), status }).unwrap();
     }

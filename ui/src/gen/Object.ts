@@ -2,18 +2,12 @@
 import type { Alert } from "./Alert";
 import type { AutoApproveRule } from "./AutoApproveRule";
 import type { CpInfo } from "./CpInfo";
-import type { DeploymentObj } from "./DeploymentObj";
 import type { Event } from "./Event";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
 import type { NetworkObj } from "./NetworkObj";
-import type { PodObj } from "./PodObj";
 import type { Rollout } from "./Rollout";
 import type { SwitchObj } from "./SwitchObj";
 import type { TemplateObj } from "./TemplateObj";
-import type { VmObj } from "./VmObj";
-import type { VmStatusObj } from "./VmStatusObj";
-import type { VolumeObj } from "./VolumeObj";
-import type { VolumeStatusObj } from "./VolumeStatusObj";
 
-export type Object = { "type": "Host" } & HostObj | { "type": "Token" } & JoinToken | { "type": "Rule" } & AutoApproveRule | { "type": "Alert" } & Alert | { "type": "Event" } & Event | { "type": "Cp" } & CpInfo | { "type": "Network" } & NetworkObj | { "type": "Template" } & TemplateObj | { "type": "Switch" } & SwitchObj | { "type": "Rollout" } & Rollout | { "type": "Deployment" } & DeploymentObj | { "type": "Vm" } & VmObj | { "type": "Volume" } & VolumeObj | { "type": "Pod" } & PodObj | { "type": "VmStatus" } & VmStatusObj | { "type": "VolumeStatus" } & VolumeStatusObj;
+export type Object = { "type": "Host" } & HostObj | { "type": "Token" } & JoinToken | { "type": "Rule" } & AutoApproveRule | { "type": "Alert" } & Alert | { "type": "Event" } & Event | { "type": "Cp" } & CpInfo | { "type": "Network" } & NetworkObj | { "type": "Template" } & TemplateObj | { "type": "Switch" } & SwitchObj | { "type": "Rollout" } & Rollout;

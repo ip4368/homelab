@@ -1,7 +1,7 @@
-//! The runtime interface: what an [`Actor`] can see and do. The simulator
-//! implements [`Ctx`]; control code only ever talks to this trait.
+//! The runtime interface: what an [`Actor`] can see and do. The host
+//! runtime (`node`) implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{InstanceSpec, KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
+use crate::proto::{KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Simulated time in milliseconds since the start of the run.
+/// Time in milliseconds: Unix wall-clock time on a real host.
 pub type SimTime = u64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -53,6 +53,8 @@ impl Endpoint {
 pub struct HostUsage {
     pub cpu_pct: f32,
     pub ram_pct: f32,
+    /// The hottest temperature sensor; `None` if the host has none.
+    pub temp_c: Option<f32>,
     /// Per disk name; failed disks are absent.
     pub disk_pct: BTreeMap<String, f32>,
     /// Per port name: (rx, tx) bits per second.
@@ -91,36 +93,6 @@ pub trait HostOs {
     /// Records on disk that this host joined the cluster, so its agent boots
     /// as a member from now on instead of joining with a token.
     fn mark_joined(&mut self);
-    /// Runs `spec`: its resource usage shows in [`HostOs::usage`] and its flows
-    /// go on the wire. Starting an instance that runs with the same spec
-    /// changes nothing; a different spec replaces it.
-    fn start_instance(&mut self, spec: InstanceSpec);
-    fn stop_instance(&mut self, id: &str);
-    /// The ids of the instances running now (not those migrating in).
-    fn instances(&self) -> Vec<String>;
-    /// Starts `spec` as the target of a live migration from `from`: an
-    /// incoming instance whose memory is copied over the `migration` network.
-    /// Once the copy is complete it runs (it is listed in
-    /// [`HostOs::instances`]) and `from`'s instance ends. An instance the host
-    /// already has, incoming or running, changes nothing; `stop_instance`
-    /// gives an incoming one up. The incoming instance is given up, never
-    /// completed, once the clock reaches `deadline` or once `from` no longer
-    /// runs it.
-    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId, deadline: SimTime);
-    /// Gives up instance `id` if it is migrating in; one that runs is left alone.
-    fn abort_migration(&mut self, id: &str);
-    /// The ids of the instances migrating in now.
-    fn migrations(&self) -> Vec<String>;
-    /// Starts holding a replica of `volume` on the disk with most room for
-    /// it, copied over the storage network from `source`'s replica, or empty
-    /// (complete at once) when `None`. A volume the host already holds keeps
-    /// its replica; an incomplete one whose copy was interrupted resumes
-    /// copying from `source`. The disk the replica is on, or `None` if no
-    /// disk can hold it.
-    fn create_replica(&mut self, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String>;
-    /// Every replica the host holds, with how much of it is copied.
-    fn replicas(&self) -> Vec<ReplicaReport>;
-    fn delete_replica(&mut self, volume: &str);
     /// Starts a CP replica on this host with empty Raft state that knows
     /// `voters`, unless the host already holds CP state (its replica runs, or
     /// resumes from disk on boot).
@@ -162,13 +134,13 @@ pub trait Ctx {
     fn now(&self) -> SimTime;
     /// Milliseconds on a clock that never steps, for Raft's election and
     /// lease timing. On a real host `now` is wall time, which chrony may step
-    /// backwards; sim time is already monotonic, hence the default.
+    /// backwards; a test's clock is already monotonic, hence the default.
     fn monotonic_ms(&self) -> SimTime {
         self.now()
     }
     fn me(&self) -> Endpoint;
     fn send(&mut self, to: Endpoint, net: NetworkId, msg: Msg);
-    /// Fire `on_timer(token)` on this actor `after_ms` of sim-time from now.
+    /// Fire `on_timer(token)` on this actor `after_ms` from now.
     fn set_timer(&mut self, after_ms: u64, token: u64);
     fn rand_u64(&mut self) -> u64;
     /// Claim the VIP for this endpoint (control-plane leader only).
@@ -180,8 +152,8 @@ pub trait Ctx {
     }
 }
 
-/// `Send` so a whole simulation can be moved onto a server thread; `Any` so
-/// the simulator can reach a concrete actor (e.g. the UI client) by type.
+/// `Send` so an actor can run on its runtime's thread; `Any` so the runtime
+/// can reach a concrete actor (e.g. the UI client) by type.
 pub trait Actor: Any + Send {
     fn on_start(&mut self, ctx: &mut dyn Ctx);
     fn on_message(&mut self, ctx: &mut dyn Ctx, from: Endpoint, msg: Msg);

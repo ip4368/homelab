@@ -38,7 +38,6 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
                     entity: ObjectRef::host(id),
                     subject: None,
                     message: format!("{id} sent no heartbeat for {} s", NOT_READY_AFTER_MS / 1000),
-                    ground_truth: false,
                 }));
             }
         } else if v.last_heartbeat.contains_key(id) {
@@ -144,7 +143,6 @@ mod tests {
                     entity: ObjectRef::host(&hid("h1")),
                     subject: None,
                     message: "h1 sent no heartbeat for 40 s".into(),
-                    ground_truth: false,
                 },
             ]
         );

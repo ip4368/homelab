@@ -47,4 +47,18 @@ etcd_unstarted: Array<string>,
  * On a server: the hosts whose Longhorn disks it last took out of
  * scheduling ([`KubeAdmin::storage_off`]).
  */
-storage_off: Array<HostId>, };
+storage_off: Array<HostId>, 
+/**
+ * On a server: the hosts whose nodes it last cordoned ([`KubeAdmin::cordon`]).
+ */
+cordoned: Array<HostId>, 
+/**
+ * On a server: the hosts it was asked to drain whose nodes hold
+ * nothing but DaemonSet and static pods any more ([`KubeAdmin::drain`]).
+ */
+drained: Array<HostId>, 
+/**
+ * On a server: why the pods of a host it was asked to drain could not
+ * all be evicted yet, by host.
+ */
+drain_blocked: { [key in HostId]: string }, };

@@ -34,36 +34,27 @@ use std::collections::{BTreeMap, BTreeSet};
 pub enum AlertKind {
     HostDown,
     CpQuorumAtRisk,
-    VolumeFaulted,
-    /// Ground truth only: the simulator's, never the control plane's.
-    VmSplitBrain,
     BondDegraded,
     PortDown,
     NetworkMismatch,
     NetworkApplyFailed,
-    VolumeDegraded,
     DiskUsageHigh,
     LinkSpeedLow,
-    InsufficientStorageHosts,
     SwitchUnreachable,
     CpReplacementSuggested,
     DrainBlocked,
 }
 
 impl AlertKind {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 11] = [
         Self::HostDown,
         Self::CpQuorumAtRisk,
-        Self::VolumeFaulted,
-        Self::VmSplitBrain,
         Self::BondDegraded,
         Self::PortDown,
         Self::NetworkMismatch,
         Self::NetworkApplyFailed,
-        Self::VolumeDegraded,
         Self::DiskUsageHigh,
         Self::LinkSpeedLow,
-        Self::InsufficientStorageHosts,
         Self::SwitchUnreachable,
         Self::CpReplacementSuggested,
         Self::DrainBlocked,
@@ -74,16 +65,12 @@ impl AlertKind {
         match self {
             Self::HostDown => "HostDown",
             Self::CpQuorumAtRisk => "CpQuorumAtRisk",
-            Self::VolumeFaulted => "VolumeFaulted",
-            Self::VmSplitBrain => "VmSplitBrain",
             Self::BondDegraded => "BondDegraded",
             Self::PortDown => "PortDown",
             Self::NetworkMismatch => "NetworkMismatch",
             Self::NetworkApplyFailed => "NetworkApplyFailed",
-            Self::VolumeDegraded => "VolumeDegraded",
             Self::DiskUsageHigh => "DiskUsageHigh",
             Self::LinkSpeedLow => "LinkSpeedLow",
-            Self::InsufficientStorageHosts => "InsufficientStorageHosts",
             Self::SwitchUnreachable => "SwitchUnreachable",
             Self::CpReplacementSuggested => "CpReplacementSuggested",
             Self::DrainBlocked => "DrainBlocked",
@@ -96,15 +83,13 @@ impl AlertKind {
 
     pub const fn severity(self) -> Severity {
         match self {
-            Self::HostDown | Self::CpQuorumAtRisk | Self::VolumeFaulted | Self::VmSplitBrain => Severity::Critical,
+            Self::HostDown | Self::CpQuorumAtRisk => Severity::Critical,
             Self::BondDegraded
             | Self::PortDown
             | Self::NetworkMismatch
             | Self::NetworkApplyFailed
-            | Self::VolumeDegraded
             | Self::DiskUsageHigh
             | Self::LinkSpeedLow
-            | Self::InsufficientStorageHosts
             | Self::SwitchUnreachable
             | Self::CpReplacementSuggested
             | Self::DrainBlocked => Severity::Warning,
@@ -295,7 +280,6 @@ fn reconcile(state: &ClusterState, host: &HostObj, v: &Volatile, wanted: &[Condi
             entity: entity.clone(),
             subject: Some(c.subject.clone()),
             message: c.message.clone(),
-            ground_truth: false,
         }));
     }
     out
@@ -372,7 +356,6 @@ mod tests {
             entity: ObjectRef::host(&hid("m")),
             subject: Some(subject.into()),
             message: message.into(),
-            ground_truth: false,
         }
     }
 
@@ -382,9 +365,8 @@ mod tests {
         use crate::controllers::membership::{CP_QUORUM_AT_RISK, CP_REPLACEMENT_SUGGESTED};
         use crate::controllers::network::{NETWORK_APPLY_FAILED, NETWORK_MISMATCH};
         use crate::controllers::observe::SWITCH_UNREACHABLE;
-        use crate::controllers::storage::{INSUFFICIENT_STORAGE_HOSTS, VOLUME_DEGRADED, VOLUME_FAULTED};
         let severity = |kind: &str| AlertKind::parse(kind).unwrap_or_else(|| panic!("{kind} is not in the set")).severity();
-        for kind in [HOST_DOWN, CP_QUORUM_AT_RISK, VOLUME_FAULTED, "VmSplitBrain"] {
+        for kind in [HOST_DOWN, CP_QUORUM_AT_RISK] {
             assert_eq!(severity(kind), Severity::Critical, "{kind}");
         }
         for kind in [
@@ -392,12 +374,11 @@ mod tests {
             PORT_DOWN,
             NETWORK_MISMATCH,
             NETWORK_APPLY_FAILED,
-            VOLUME_DEGRADED,
             DISK_USAGE_HIGH,
             LINK_SPEED_LOW,
-            INSUFFICIENT_STORAGE_HOSTS,
             SWITCH_UNREACHABLE,
             CP_REPLACEMENT_SUGGESTED,
+            crate::controllers::drain::DRAIN_BLOCKED,
         ] {
             assert_eq!(severity(kind), Severity::Warning, "{kind}");
         }
@@ -459,11 +440,10 @@ mod tests {
             at,
             cpu_pct: 1.0,
             ram_pct: 1.0,
-            temp_c: 30.0,
+            temp_c: Some(30.0),
             disk_pct: disk_pct.iter().map(|(d, p)| (d.to_string(), *p)).collect(),
             port_rx_bps: Default::default(),
             port_tx_bps: Default::default(),
-            instances: 0,
         }
     }
 
@@ -513,7 +493,6 @@ mod tests {
             entity: ObjectRef::switch(&SwitchId::from("core-2")),
             subject: None,
             message: "core-2 did not answer polls".into(),
-            ground_truth: false,
         };
         s.apply(95_000, unreachable).unwrap();
         let reworded = proposals(run(&s, &v));

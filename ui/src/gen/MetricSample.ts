@@ -3,7 +3,11 @@
 /**
  * One host's resource sample, sent by its agent every metrics interval.
  */
-export type MetricSample = { at: number, cpu_pct: number, ram_pct: number, temp_c: number, 
+export type MetricSample = { at: number, cpu_pct: number, ram_pct: number, 
+/**
+ * The hottest sensor; `None` if the host has none (a VM, say).
+ */
+temp_c: number | null, 
 /**
  * Per disk name.
  */
@@ -11,4 +15,4 @@ disk_pct: { [key in string]: number },
 /**
  * Per port name.
  */
-port_rx_bps: { [key in string]: number }, port_tx_bps: { [key in string]: number }, instances: number, };
+port_rx_bps: { [key in string]: number }, port_tx_bps: { [key in string]: number }, };

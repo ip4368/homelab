@@ -139,7 +139,6 @@ function unhealthy(s: Seen): string | null {
   if (s.cp.voters.length !== 3) return `${s.cp.voters.length} voters`
   if (!s.leader) return 'no leader'
   if (s.truth.vip_holders.length !== 1 || s.truth.vip_holders[0] !== s.leader) return `VIP held by [${s.truth.vip_holders}], leader ${s.leader}`
-  if (s.truth.split_brain_vms.length) return `split brain: ${s.truth.split_brain_vms}`
   return null
 }
 
@@ -807,6 +806,64 @@ await step('K8', 'Replace a K3s server: power one off, replace it; etcd lists ex
   if (typeof after === 'string' || after.join() !== voters().join()) throw new Failed(`after ${victim} came back, etcd lists [${after}], voters [${voters()}]`)
   const h = watch.seen!.hosts.get(victim)
   note(`${victim} powered on: Ready ${secs(back.ms)} later, a K3s ${h?.kube?.role === 'Agent' ? 'agent' : h?.kube?.role} and every node Ready ${secs(kb.ms)} after that; etcd still lists [${after}]`)
+})
+
+await step('K9', 'Drain: a drained host\'s node is cordoned and its pods move off; uncordoning gives the node back', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-drain'
+  const app = `web-${Math.random().toString(36).slice(2, 8)}`
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  const op = async (body: unknown) => {
+    const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    if (!res.ok) throw new Failed(`${JSON.stringify(body)}: ${res.status} ${await res.text()}`)
+  }
+  let victim: string | null = null
+  try {
+    await k.create(`/apis/apps/v1/namespaces/${ns}/deployments`, {
+      metadata: { name: app },
+      spec: {
+        replicas: 2,
+        selector: { matchLabels: { app } },
+        template: {
+          metadata: { labels: { app } },
+          spec: { terminationGracePeriodSeconds: 5, containers: [{ name: 'web', image: 'busybox:1.37', command: ['sh', '-c', 'exec sleep 1000000'] }] },
+        },
+      },
+    })
+    const pods = async () => ((await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)).items as Obj[]).filter((p) => !p.metadata.deletionTimestamp)
+    const placed = await waitAsync(`${app}'s 2 pods running`, 5 * 60_000, async () => {
+      const ps = await pods()
+      const running = ps.filter((p) => p.status.phase === 'Running')
+      return (running.length === 2 && running.map((p) => p.spec.nodeName as string)) || `${ps.map((p) => `${p.metadata.name}@${p.spec.nodeName}=${p.status.phase}`)}`
+    })
+    // Not the homelabd leader: draining it would also move the VIP's K3s server work around.
+    victim = placed.value.find((n) => n !== watch.seen!.leader) ?? placed.value[0]
+    note(`${app}'s pods run on ${placed.value.join(' and ')}; draining ${victim}`)
+    const asked = now()
+    await op({ Drain: { host: victim } })
+    const drained = await waitFor(`${victim} Drained`, 5 * 60_000, (s) => s.hosts.get(victim!)?.lifecycle === 'Drained')
+    const node = await k.must(`/api/v1/nodes/${victim}`)
+    if (node.spec.unschedulable !== true) throw new Failed(`${victim} is Drained but its node is schedulable`)
+    const left = (await pods()).filter((p) => p.spec.nodeName === victim)
+    if (left.length) throw new Failed(`${victim} is Drained but ${left.map((p) => p.metadata.name)} still run there`)
+    const moved = await waitAsync(`${app}'s 2 pods running off ${victim}`, 5 * 60_000, async () => {
+      const ps = (await pods()).filter((p) => p.status.phase === 'Running')
+      return (ps.length === 2 && ps.every((p) => p.spec.nodeName !== victim) && ps.map((p) => p.spec.nodeName as string)) || `${ps.map((p) => `${p.metadata.name}@${p.spec.nodeName}`)}`
+    })
+    note(`${victim} Drained ${secs(drained.ms)} after the drain was asked for, its node cordoned; the pods run on ${moved.value.join(' and ')} (${secs(now() - asked)})`)
+    await op({ Uncordon: { id: victim } })
+    const back = await waitAsync(`${victim}'s node schedulable again`, 2 * 60_000, async () => {
+      const n = await k.must(`/api/v1/nodes/${victim}`)
+      return n.spec.unschedulable !== true || 'still cordoned'
+    })
+    victim = null
+    note(`uncordoned: the node is schedulable ${secs(back.ms)} later`)
+  } finally {
+    if (victim) await op({ Uncordon: { id: victim } }).catch(() => {})
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
 })
 
 watch.close()

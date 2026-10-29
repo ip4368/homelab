@@ -40,6 +40,9 @@ describe('host drawer kubernetes', () => {
     etcd_unread: null,
     etcd_unstarted: [],
     storage_off: [],
+    cordoned: [],
+    drained: [],
+    drain_blocked: {},
     ...over,
   })
   it('says what the host runs and how far it got', () => {

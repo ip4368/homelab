@@ -12,8 +12,4 @@ export type LabTruth = { vms: Array<VmTruth>, switches: Array<SwitchTruth>, port
 /**
  * Every guest holding the VIP address now: more than one is a split.
  */
-vip_holders: Array<HostId>, 
-/**
- * VM instances running on more than one guest at once.
- */
-split_brain_vms: Array<string>, at: number, };
+vip_holders: Array<HostId>, at: number, };

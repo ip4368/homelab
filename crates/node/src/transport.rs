@@ -1,5 +1,5 @@
 //! The real network between nodes: TCP connections carrying [`Wire`]
-//! frames. Like the simulator's fabric it is lossy: `send` never blocks or
+//! frames. It is lossy: `send` never blocks or
 //! fails, and a message that cannot be delivered (no address, the peer
 //! unreachable, its queue full, the connection dying) is dropped. Raft,
 //! heartbeats and the controllers' resends already live with loss.

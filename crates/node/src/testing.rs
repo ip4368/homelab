@@ -2,9 +2,9 @@
 //! tests: enough for an agent and a CP replica, with no hardware at all.
 
 use crate::runtime::NodeOs;
-use control::proto::{InstanceSpec, LogCmd, ReplicaReport};
+use control::proto::LogCmd;
 use control::raft::{Durable, DurableOp};
-use control::runtime::{HostOs, HostUsage, SimTime};
+use control::runtime::{HostOs, HostUsage};
 use model::network::{HostNetworkConfig, LldpNeighbor};
 use model::{HostId, Inventory, ProfileId};
 use std::collections::BTreeSet;
@@ -49,23 +49,6 @@ impl HostOs for MemOs {
         }
     }
     fn mark_joined(&mut self) {}
-    fn start_instance(&mut self, _: InstanceSpec) {}
-    fn stop_instance(&mut self, _: &str) {}
-    fn instances(&self) -> Vec<String> {
-        vec![]
-    }
-    fn migrate_in(&mut self, _: InstanceSpec, _: HostId, _: SimTime) {}
-    fn abort_migration(&mut self, _: &str) {}
-    fn migrations(&self) -> Vec<String> {
-        vec![]
-    }
-    fn create_replica(&mut self, _: &str, _: u32, _: Option<HostId>) -> Option<String> {
-        None
-    }
-    fn replicas(&self) -> Vec<ReplicaReport> {
-        vec![]
-    }
-    fn delete_replica(&mut self, _: &str) {}
     fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
         if self.cp.is_none() {
             self.cp = Some(Durable::new(voters.clone()));

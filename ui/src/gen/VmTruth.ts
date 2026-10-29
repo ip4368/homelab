@@ -17,10 +17,6 @@ disks: Array<string>, failed_disks: Array<string>,
  */
 holds_vip: boolean, 
 /**
- * Workload instances the guest really runs (`homelab-inst-*` units).
- */
-instances: Array<string>, 
-/**
  * Guest clock minus lab host clock, when the guest agent answered.
  */
 clock_offset_ms: number | null, 

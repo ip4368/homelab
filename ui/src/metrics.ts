@@ -1,24 +1,23 @@
 /**
  * Metric series from `GET /api/metrics`, which reads the leader's in-memory
- * history: it answers 409 while the simulation is paused, and a new leader
- * starts empty (`since` says from when it has data). The UI keeps showing
- * the last series it got through both.
+ * history: a new leader starts empty (`since` says from when it has data).
+ * The UI keeps showing the last series it got while a fetch fails.
  */
 import { formatClock } from './clock'
 
 export interface MetricsReply {
-  /** Sim ms from which the leader has metrics. */
+  /** Unix ms from which the leader has metrics. */
   since: number
-  /** Per metric name: [sim ms, value] points, oldest first. */
+  /** Per metric name: [Unix ms, value] points, oldest first. */
   series: Record<string, [number, number][]>
 }
 
-export type MetricsOutcome = { ok: MetricsReply } | { paused: true } | { error: string }
+export type MetricsOutcome = { ok: MetricsReply } | { error: string }
 
 /** What a chart shows: the last series fetched, and why it may be stale. */
 export interface MetricsView {
   reply: MetricsReply | null
-  /** 'paused', an error, or null when `reply` is fresh. */
+  /** Why `reply` is stale, or null when it is fresh. */
   note: string | null
 }
 
@@ -28,7 +27,6 @@ export async function fetchMetrics(entity: string, metrics: string[]): Promise<M
     const res = await fetch(`/api/metrics?${query}`)
     const json: unknown = await res.json().catch(() => null)
     if (res.ok) return { ok: json as MetricsReply }
-    if (res.status === 409) return { paused: true }
     const error = (json as { error?: unknown } | null)?.error
     return { error: typeof error === 'string' ? error : `HTTP ${res.status}` }
   } catch (e) {
@@ -63,7 +61,7 @@ export function startPolling(fetchOnce: () => Promise<MetricsOutcome>, apply: (o
 /** Folds a fetch's outcome in: a reply replaces the series, anything else keeps them and says why. */
 export function foldOutcome(prev: MetricsView, outcome: MetricsOutcome): MetricsView {
   if ('ok' in outcome) return { reply: outcome.ok, note: null }
-  return { reply: prev.reply, note: 'paused' in outcome ? 'paused' : outcome.error }
+  return { reply: prev.reply, note: outcome.error }
 }
 
 /** uPlot's data shape: timestamps, then each series on them. */

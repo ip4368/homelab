@@ -11,7 +11,6 @@
 pub mod alerts;
 pub mod directory;
 pub mod drain;
-pub mod failover;
 pub mod health;
 pub mod join;
 pub mod kube;
@@ -19,15 +18,13 @@ pub mod membership;
 pub mod network;
 pub mod observe;
 pub mod rollout;
-pub mod scheduler;
-pub mod storage;
 
 use crate::metrics::MetricsStore;
-use crate::proto::{KubeStatus, MetricSample, Msg, Observed, ReplicaReport};
+use crate::proto::{KubeStatus, MetricSample, Msg, Observed};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
-use model::{HostId, NetworkId, PortName, ReplicaState, SwitchId, VolumeHealth};
+use model::{HostId, NetworkId, PortName, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A controller command that applied with an error is not proposed again for this long.
@@ -115,32 +112,6 @@ pub struct Volatile {
     pub pending_joins: BTreeMap<u64, PendingJoin>,
     /// When a "join rejected" event was last recorded, per host.
     pub join_rejected_at: BTreeMap<HostId, SimTime>,
-    /// The instances each host's agent last said it runs. A removed host's
-    /// are kept until it reports nothing or falls silent
-    /// ([`Volatile::note_removed_host`], [`Volatile::forget_silent_removed`]).
-    pub instances: BTreeMap<HostId, BTreeSet<String>>,
-    /// The volume replicas each host's agent last said it holds; likewise.
-    pub replicas: BTreeMap<HostId, Vec<ReplicaReport>>,
-    /// The host each instance was last sent `StartInstance` or `MigrateIn` to, and when.
-    pub instance_started: BTreeMap<String, (HostId, SimTime)>,
-    /// When each (volume, host) was last sent `CreateReplica`.
-    pub replica_created: BTreeMap<(String, HostId), SimTime>,
-    /// When each (host, instance) was last sent `StopInstance`.
-    pub instance_stopped: BTreeMap<(HostId, String), SimTime>,
-    /// When each (volume, host) was last sent `DeleteReplica`.
-    pub replica_deleted: BTreeMap<(String, HostId), SimTime>,
-    /// For each copy onto a host, by (volume, host): the bytes its host last
-    /// reported copied, and since when that has stood. Starts at 0 when the
-    /// first `CreateReplica` with a source is sent; dropped once complete,
-    /// and when a status placing that target afresh or marking it stale is proposed.
-    pub copy_progress: BTreeMap<(String, HostId), (u64, SimTime)>,
-    /// The source each copy onto a host, by (volume, host), was last sent `CreateReplica` with.
-    pub copy_source: BTreeMap<(String, HostId), HostId>,
-    /// The sources a copy onto a host, by (volume, host), stalled from: the
-    /// storage controller tries the other healthy replicas first, for that
-    /// copy and (less strongly) for the volume's other copies. Forgotten
-    /// once the volume is proposed healthy.
-    pub failed_sources: BTreeMap<(String, HostId), BTreeSet<HostId>>,
     /// The address directory last sent to the agents, and when.
     pub directory_sent: Option<(directory::Directory, SimTime)>,
     /// Each host's latest Kubernetes status report.
@@ -175,15 +146,6 @@ impl Volatile {
             pending: BTreeMap::new(),
             pending_joins: BTreeMap::new(),
             join_rejected_at: BTreeMap::new(),
-            instances: BTreeMap::new(),
-            replicas: BTreeMap::new(),
-            instance_started: BTreeMap::new(),
-            replica_created: BTreeMap::new(),
-            instance_stopped: BTreeMap::new(),
-            replica_deleted: BTreeMap::new(),
-            copy_progress: BTreeMap::new(),
-            copy_source: BTreeMap::new(),
-            failed_sources: BTreeMap::new(),
             directory_sent: None,
             kube_status: BTreeMap::new(),
             kube_sent: BTreeMap::new(),
@@ -230,81 +192,10 @@ impl Volatile {
         self.metrics.insert(host, sample);
     }
 
-    /// Files the replicas `host`'s heartbeat lists, noting when each copy's
-    /// reported bytes last moved ([`Volatile::copy_progress`]).
-    pub fn note_replicas(&mut self, host: HostId, replicas: Vec<ReplicaReport>, now: SimTime) {
-        for r in &replicas {
-            let key = (r.volume.clone(), host.clone());
-            if r.pct >= 100 {
-                self.copy_progress.remove(&key);
-                self.copy_source.remove(&key);
-            } else if self.copy_progress.get(&key).is_none_or(|(bytes, _)| *bytes != r.copied_bytes) {
-                self.copy_progress.insert(key, (r.copied_bytes, now));
-            }
-        }
-        self.replicas.insert(host, replicas);
-    }
-
-    /// Notes a controller proposal about to be made on `state`: a volume
-    /// status that places a copy on a host afresh, or marks a replica stale,
-    /// forgets that copy's progress and source, so an earlier copy's clock
-    /// never makes a new one look stalled; a copy marked stale while stalled
-    /// counts against its source ([`Volatile::failed_sources`]). A status
-    /// that makes the volume healthy forgets its failed sources.
-    pub fn note_proposed(&mut self, state: &ClusterState, cmd: &Command, now: SimTime) {
-        let Command::SetVolumeStatus { id, replicas, health } = cmd else { return };
-        let before = state.volume_status.get(id).map_or(&[][..], |s| &s.status.replicas[..]);
-        for r in replicas {
-            let was_live = before.iter().any(|b| b.host == r.host && b.state != ReplicaState::Stale);
-            let placed = matches!(r.state, ReplicaState::Seeding | ReplicaState::Rebuilding { .. }) && !was_live;
-            let staled = r.state == ReplicaState::Stale && was_live;
-            let key = (id.clone(), r.host.clone());
-            if staled {
-                self.note_source_failed(&key, now);
-            }
-            if placed || staled {
-                self.copy_progress.remove(&key);
-                self.copy_source.remove(&key);
-            }
-        }
-        if *health == VolumeHealth::Healthy {
-            self.failed_sources.retain(|(volume, _), _| volume != id);
-        }
-    }
-
-    /// Counts the copy `key` (volume, target) against its source if it has
-    /// stalled ([`storage::REBUILD_STALL_MS`] without progress).
-    fn note_source_failed(&mut self, key: &(String, HostId), now: SimTime) {
-        let stalled = self.copy_progress.get(key).is_some_and(|(_, since)| now.saturating_sub(*since) > storage::REBUILD_STALL_MS);
-        if let Some(source) = self.copy_source.get(key).filter(|_| stalled) {
-            self.failed_sources.entry(key.clone()).or_default().insert(source.clone());
-        }
-    }
-
-    /// Files the heartbeat of a host that was removed: what it still runs and
-    /// holds, for the controllers to stop and delete. Once it reports
-    /// nothing, it is forgotten.
-    pub fn note_removed_host(&mut self, host: HostId, instances: BTreeSet<String>, replicas: Vec<ReplicaReport>) {
-        if instances.is_empty() && replicas.is_empty() {
-            self.forget_host(&host);
-        } else {
-            self.instances.insert(host.clone(), instances);
-            self.replicas.insert(host, replicas);
-        }
-    }
-
-    /// Forgets the hosts no longer in `state` that have not been heard from
-    /// for [`health::NOT_READY_AFTER_MS`] (powered off, or gone for good), so
-    /// they are not sent `StopInstance` and `DeleteReplica` forever.
-    pub fn forget_silent_removed(&mut self, state: &ClusterState, now: SimTime) {
-        let silent: BTreeSet<HostId> = self
-            .instances
-            .keys()
-            .chain(self.replicas.keys())
-            .filter(|h| !state.hosts.contains_key(*h) && now.saturating_sub(self.last_seen(h)) > health::NOT_READY_AFTER_MS)
-            .cloned()
-            .collect();
-        for h in &silent {
+    /// Forgets the hosts no longer in `state`.
+    pub fn forget_removed(&mut self, state: &ClusterState) {
+        let gone: BTreeSet<HostId> = self.last_heartbeat.keys().chain(self.host_reports.keys()).filter(|h| !state.hosts.contains_key(*h)).cloned().collect();
+        for h in &gone {
             self.forget_host(h);
         }
     }
@@ -318,12 +209,6 @@ impl Volatile {
         self.net_generation.remove(host);
         self.net_results.remove(host);
         self.net_pushed.remove(host);
-        self.instances.remove(host);
-        self.replicas.remove(host);
-        self.instance_stopped.retain(|(h, _), _| h != host);
-        self.replica_deleted.retain(|(_, h), _| h != host);
-        self.copy_progress.retain(|(_, h), _| h != host);
-        self.copy_source.retain(|(_, h), _| h != host);
         self.kube_status.remove(host);
         self.kube_sent.remove(host);
     }
@@ -338,25 +223,6 @@ impl Volatile {
             (Addr::Host(id), Msg::ApplyNetwork { generation, .. }) => {
                 self.net_pushed.insert(id.clone(), (*generation, now));
             }
-            (Addr::Host(id), Msg::StartInstance(spec) | Msg::MigrateIn { spec, .. }) => {
-                self.instance_started.insert(spec.id.clone(), (id.clone(), now));
-            }
-            (Addr::Host(id), Msg::CreateReplica { volume, source, .. }) => {
-                let key = (volume.clone(), id.clone());
-                self.replica_created.insert(key.clone(), now);
-                if let Some(source) = source {
-                    // A copy moved to another source counts against the old
-                    // one if it stalled there, and gets a fresh stall clock.
-                    if self.copy_source.get(&key).is_some_and(|old| old != source) {
-                        self.note_source_failed(&key, now);
-                        if let Some((_, since)) = self.copy_progress.get_mut(&key) {
-                            *since = now;
-                        }
-                    }
-                    self.copy_source.insert(key.clone(), source.clone());
-                    self.copy_progress.entry(key).or_insert((0, now));
-                }
-            }
             (Addr::Host(_), Msg::Directory { hosts }) => {
                 // One run sends it to every member: record it once, not once per member.
                 if self.directory_sent.as_ref().is_none_or(|(sent, at)| *at != now || sent != hosts) {
@@ -368,14 +234,6 @@ impl Volatile {
             }
             (Addr::Host(_), Msg::KubeAdmin(_)) => {
                 self.kube_admin_sent = Some(now);
-            }
-            (Addr::Host(id), Msg::StopInstance(instance)) => {
-                self.instance_stopped.insert((id.clone(), instance.clone()), now);
-            }
-            (Addr::Host(id), Msg::DeleteReplica { volume }) => {
-                self.replica_deleted.insert((volume.clone(), id.clone()), now);
-                self.copy_progress.remove(&(volume.clone(), id.clone()));
-                self.copy_source.remove(&(volume.clone(), id.clone()));
             }
             _ => {}
         }
@@ -389,9 +247,7 @@ pub fn run_all(state: &ClusterState, volatile: &Volatile, now: SimTime) -> Vec<A
     out.extend(observe::run(state, volatile, now));
     out.extend(alerts::run(state, volatile));
     out.extend(rollout::run(state, now));
-    out.extend(storage::run(state, volatile, now));
-    out.extend(scheduler::run(state, volatile, now));
-    out.extend(failover::run(state, volatile, now));
+    out.extend(drain::run(state, volatile));
     out.extend(directory::run(state, volatile, now));
     out.extend(kube::run(state, volatile, now));
     out

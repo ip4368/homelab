@@ -2,26 +2,20 @@
 import type { Alert } from "./Alert";
 import type { AutoApproveRule } from "./AutoApproveRule";
 import type { CpInfo } from "./CpInfo";
-import type { DeploymentObj } from "./DeploymentObj";
 import type { Event } from "./Event";
 import type { HostId } from "./HostId";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
 import type { MetricSample } from "./MetricSample";
 import type { NetworkObj } from "./NetworkObj";
-import type { PodObj } from "./PodObj";
 import type { Rollout } from "./Rollout";
 import type { SwitchObj } from "./SwitchObj";
 import type { TemplateObj } from "./TemplateObj";
-import type { VmObj } from "./VmObj";
-import type { VmStatusObj } from "./VmStatusObj";
-import type { VolumeObj } from "./VolumeObj";
-import type { VolumeStatusObj } from "./VolumeStatusObj";
 
 /**
  * The client's whole view of the cluster, as lists.
  */
-export type ViewSnapshot = { version: number, leader: HostId | null, term: number, last_sync_at: number | null, hosts: Array<HostObj>, tokens: Array<JoinToken>, rules: Array<AutoApproveRule>, switches: Array<SwitchObj>, networks: Array<NetworkObj>, templates: Array<TemplateObj>, rollouts: Array<Rollout>, deployments: Array<DeploymentObj>, pods: Array<PodObj>, vms: Array<VmObj>, vm_status: Array<VmStatusObj>, volumes: Array<VolumeObj>, volume_status: Array<VolumeStatusObj>, alerts: Array<Alert>, events: Array<Event>, cp: CpInfo, 
+export type ViewSnapshot = { version: number, leader: HostId | null, term: number, last_sync_at: number | null, hosts: Array<HostObj>, tokens: Array<JoinToken>, rules: Array<AutoApproveRule>, switches: Array<SwitchObj>, networks: Array<NetworkObj>, templates: Array<TemplateObj>, rollouts: Array<Rollout>, alerts: Array<Alert>, events: Array<Event>, cp: CpInfo, 
 /**
  * Latest sample per host.
  */

@@ -87,7 +87,7 @@ pub struct DriverHandle {
 }
 
 fn empty_truth() -> LabTruth {
-    LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], split_brain_vms: vec![], at: 0 }
+    LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], at: 0 }
 }
 
 impl DriverHandle {

@@ -19,7 +19,7 @@ export interface Progress {
   active: boolean
 }
 
-/** Where a rollout stands, for display; `now` is sim ms. */
+/** Where a rollout stands, for display; `now` is Unix ms. */
 export function rolloutProgress(r: Rollout, now: number): Progress {
   const batches = Math.ceil(r.hosts.length / Math.max(1, r.batch_size))
   const state = r.state

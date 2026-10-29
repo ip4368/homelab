@@ -233,7 +233,7 @@ fn init(args: &Args, config: &Path) -> Result<(), String> {
     // now: in a moment the machine moves to its static address, and an SSH
     // session to the address it has now goes with it.
     let join_token = format!("{:016x}", rand::random::<u64>());
-    let seed = SeedHost { id: host.clone(), inventory: os.inventory(), location: UNKNOWN_LOCATION.into(), running: None };
+    let seed = SeedHost { id: host.clone(), inventory: os.inventory(), location: UNKNOWN_LOCATION.into() };
     let now = wall_ms();
     let mut durable = seeded_durable(&[seed], &[host.clone()].into(), &kube_token, now);
     let cmd = Command::CreateJoinToken { token: join_token.clone(), ttl_ms: JOIN_TOKEN_TTL_MS };

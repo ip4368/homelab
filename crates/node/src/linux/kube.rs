@@ -27,7 +27,8 @@
 //! On a server, it also reads etcd's members (K3s's `/db/info`) for the
 //! status, and does the work the leader asks of it for the cluster
 //! ([`KubeAdmin`]): it deletes the nodes of dead members, so K3s removes
-//! them from etcd, and keeps Longhorn off the disks of hosts that do not store.
+//! them from etcd, keeps Longhorn off the disks of hosts that do not store,
+//! and cordons and drains the nodes of hosts being serviced.
 //!
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
@@ -64,6 +65,12 @@ const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
 /// On a Longhorn node: the disks the control plane took out of scheduling
 /// because the host does not store, to give back once it does.
 const STORAGE_OFF_ANNOTATION: &str = "homelab.io/storage-off";
+/// On a node: the control plane cordoned it, so uncordons it once its host
+/// is `Ready` again. A node cordoned by hand has none, and is left alone.
+const CORDONED_ANNOTATION: &str = "homelab.io/cordoned";
+/// How long one `kubectl drain` waits for its pods to go; the next request
+/// from the leader drains again.
+const DRAIN_TIMEOUT: &str = "30s";
 /// Longhorn's storage network: the `NetworkAttachmentDefinition` (in
 /// `longhorn-system`) and the name of each host's config for it.
 pub const STORAGE_ATTACHMENT: &str = "homelab-storage";
@@ -367,6 +374,50 @@ pub fn storage_off_patches(nodes: &serde_json::Value, off: &BTreeSet<HostId>) ->
     out
 }
 
+/// The merge patches, by node, that cordon the nodes of the hosts in
+/// `cordon` and uncordon those the control plane cordoned before, from the
+/// list of nodes (`kubectl get nodes -o json`): a listed node that is
+/// schedulable is cordoned and noted in [`CORDONED_ANNOTATION`]; a noted
+/// node no longer listed is uncordoned, and the note dropped. A node
+/// cordoned by hand is not noted, so stays cordoned.
+pub fn cordon_patches(nodes: &serde_json::Value, cordon: &BTreeSet<HostId>) -> Vec<(String, serde_json::Value)> {
+    let mut out = vec![];
+    for n in nodes["items"].as_array().into_iter().flatten() {
+        let Some(name) = n["metadata"]["name"].as_str() else { continue };
+        let noted = !n["metadata"]["annotations"][CORDONED_ANNOTATION].is_null();
+        let unschedulable = n["spec"]["unschedulable"] == true;
+        if cordon.contains(&HostId::from(name)) {
+            if !unschedulable {
+                out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: "true" } }, "spec": { "unschedulable": true } })));
+            }
+        } else if noted {
+            out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: null } }, "spec": { "unschedulable": null } })));
+        }
+    }
+    out
+}
+
+/// The pods in `pods` (`kubectl get pods -o json`, those of one node) that
+/// a drain must still move: all but DaemonSet pods, static (mirror) pods,
+/// and pods that finished.
+pub fn pods_left_to_drain(pods: &serde_json::Value) -> Vec<String> {
+    let pods = pods["items"].as_array().into_iter().flatten();
+    pods.filter(|p| !matches!(p["status"]["phase"].as_str(), Some("Succeeded" | "Failed")))
+        .filter(|p| p["metadata"]["annotations"]["kubernetes.io/config.mirror"].is_null())
+        .filter(|p| !p["metadata"]["ownerReferences"].as_array().into_iter().flatten().any(|o| o["kind"] == "DaemonSet"))
+        .filter_map(|p| Some(format!("{}/{}", p["metadata"]["namespace"].as_str()?, p["metadata"]["name"].as_str()?)))
+        .collect()
+}
+
+/// Why a `kubectl drain` that failed could not evict everything, from its
+/// error: the eviction Kubernetes refused (a PodDisruptionBudget, say), or
+/// else the error's last line.
+pub fn drain_refusal(err: &str) -> String {
+    let lines: Vec<&str> = err.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let refused = lines.iter().find(|l| l.contains("Cannot evict"));
+    refused.or(lines.last()).map_or_else(|| "kubectl drain failed".into(), |l| l.to_string())
+}
+
 /// The install script's arguments for `spec` on `host`: the role, how it
 /// finds the cluster, and the node's name, address, interface and labels.
 pub fn install_args(spec: &KubeSpec, host: &HostId, vip: Ipv4Addr, iface: &str) -> Vec<String> {
@@ -437,7 +488,7 @@ impl Kube {
     pub fn start(host: HostId, vip: Ipv4Addr, paths: Paths) -> Self {
         let kube = Self { shared: Arc::new((Mutex::new(Shared::default()), Condvar::new())) };
         let k = kube.clone();
-        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new() };
+        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new(), drains: Drains::default() };
         let spawned = std::thread::Builder::new().name("kube".into()).spawn(move || worker.run(&k));
         if let Err(e) = spawned {
             eprintln!("homelabd: start the kubernetes worker: {e}");
@@ -507,6 +558,19 @@ struct Worker {
     applied: Option<KubeSpec>,
     /// The hosts whose Longhorn disks this server last kept Longhorn off.
     storage_off: BTreeSet<HostId>,
+    /// How the cordons and drains this server was last asked for stand.
+    drains: Drains,
+}
+
+/// How the cordons and drains a server was asked for stand, for its status.
+#[derive(Debug, Clone, Default)]
+struct Drains {
+    /// The hosts whose nodes it cordoned.
+    cordoned: BTreeSet<HostId>,
+    /// The hosts asked to be drained whose nodes are empty.
+    drained: BTreeSet<HostId>,
+    /// Why the others' pods could not all be evicted yet.
+    blocked: BTreeMap<HostId, String>,
 }
 
 impl Worker {
@@ -522,10 +586,16 @@ impl Worker {
                 if let Err(e) = self.admin(&admin) {
                     eprintln!("homelabd: kubernetes: for the cluster: {e}");
                 }
+                if let Err(e) = self.cordon_and_drain(&admin) {
+                    eprintln!("homelabd: kubernetes: cordon and drain: {e}");
+                }
                 let (members, unread) = split(self.etcd_members());
                 (status.etcd_members, status.etcd_unstarted) = by_node_and_peer(&members);
                 status.etcd_unread = unread;
                 status.storage_off.clone_from(&self.storage_off);
+                status.cordoned.clone_from(&self.drains.cordoned);
+                status.drained.clone_from(&self.drains.drained);
+                status.drain_blocked.clone_from(&self.drains.blocked);
             }
             wait = if ok { EVERY } else { BACKOFF };
             if let Ok(b) = serde_json::to_vec(&status) {
@@ -551,6 +621,8 @@ impl Worker {
             _ => (BTreeMap::new(), vec![]),
         };
         let (etcd_members, etcd_unstarted) = by_node_and_peer(&o.etcd_members);
+        let server = o.role == Some(KubeRole::Server);
+        let drains = if server { self.drains.clone() } else { Drains::default() };
         KubeStatus {
             role: o.role,
             phase,
@@ -562,7 +634,10 @@ impl Worker {
             etcd_members,
             etcd_unread: o.etcd_unread.clone(),
             etcd_unstarted,
-            storage_off: if o.role == Some(KubeRole::Server) { self.storage_off.clone() } else { BTreeSet::new() },
+            storage_off: if server { self.storage_off.clone() } else { BTreeSet::new() },
+            cordoned: drains.cordoned,
+            drained: drains.drained,
+            drain_blocked: drains.blocked,
         }
     }
 
@@ -746,6 +821,41 @@ impl Worker {
             self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "patch", "nodes.longhorn.io", &node, "--type", "merge", "-p", &patch.to_string()])?;
         }
         self.storage_off.clone_from(&admin.storage_off);
+        Ok(())
+    }
+
+    /// Cordons the nodes of the hosts `admin` lists and uncordons those it
+    /// cordoned before ([`cordon_patches`]), then drains the nodes it asks
+    /// to (`kubectl drain`, for up to [`DRAIN_TIMEOUT`]), noting which are
+    /// empty and why the others are not.
+    fn cordon_and_drain(&mut self, admin: &KubeAdmin) -> Result<(), String> {
+        let json = self.kubectl(KubeRole::Server, &["get", "nodes", "-o", "json"])?;
+        let nodes: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read the nodes: {e}"))?;
+        for (node, patch) in cordon_patches(&nodes, &admin.cordon) {
+            eprintln!("homelabd: kubernetes: node {node}: {patch}");
+            self.kubectl(KubeRole::Server, &["patch", "node", &node, "--type", "merge", "-p", &patch.to_string()])?;
+        }
+        let has_node = |h: &HostId| nodes["items"].as_array().into_iter().flatten().any(|n| n["metadata"]["name"] == h.as_str());
+        let mut drains = Drains { cordoned: admin.cordon.clone(), ..Drains::default() };
+        for host in &admin.drain {
+            if !has_node(host) {
+                drains.drained.insert(host.clone());
+                continue;
+            }
+            let timeout = format!("--timeout={DRAIN_TIMEOUT}");
+            let drained = self.kubectl(KubeRole::Server, &["drain", host.as_str(), "--ignore-daemonsets", "--delete-emptydir-data", &timeout]);
+            let selector = format!("spec.nodeName={host}");
+            let pods = self.kubectl(KubeRole::Server, &["get", "pods", "--all-namespaces", "--field-selector", &selector, "-o", "json"])?;
+            let pods: serde_json::Value = serde_json::from_str(&pods).map_err(|e| format!("read {host}'s pods: {e}"))?;
+            let left = pods_left_to_drain(&pods);
+            if left.is_empty() {
+                drains.drained.insert(host.clone());
+            } else if let Err(e) = drained {
+                eprintln!("homelabd: kubernetes: draining {host}: {} left: {e}", left.join(", "));
+                drains.blocked.insert(host.clone(), drain_refusal(&e));
+            }
+        }
+        self.drains = drains;
         Ok(())
     }
 
@@ -1069,5 +1179,49 @@ mod tests {
         assert_eq!(patches[1].1, serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: null } }, "spec": { "disks": { "nvme0": { "allowScheduling": true } } } }));
         let done = serde_json::json!({ "items": [node("ms01-05", &[("nvme0", false), ("nvme1", false)], Some("nvme0"))] });
         assert!(storage_off_patches(&done, &off).is_empty(), "nothing left to do");
+    }
+
+    #[test]
+    fn nodes_are_cordoned_for_their_hosts_and_only_those_cordoned_so_are_uncordoned() {
+        let node = |name: &str, unschedulable: bool, noted: bool| {
+            let annotations = if noted { serde_json::json!({ CORDONED_ANNOTATION: "true" }) } else { serde_json::json!({}) };
+            serde_json::json!({ "metadata": { "name": name, "annotations": annotations }, "spec": { "unschedulable": unschedulable } })
+        };
+        let nodes = serde_json::json!({ "items": [
+            node("ms01-01", false, false),
+            node("ms01-02", true, true),
+            node("ms01-03", true, false),
+            node("ms01-04", true, true),
+        ] });
+        let cordon: BTreeSet<HostId> = [HostId::from("ms01-01"), HostId::from("ms01-04")].into();
+        let patches = cordon_patches(&nodes, &cordon);
+        let cordoned = serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: "true" } }, "spec": { "unschedulable": true } });
+        let uncordoned = serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: null } }, "spec": { "unschedulable": null } });
+        assert_eq!(patches, [("ms01-01".to_string(), cordoned), ("ms01-02".to_string(), uncordoned)], "ms01-03 was cordoned by hand; ms01-04 is already");
+    }
+
+    #[test]
+    fn a_drain_leaves_daemonset_static_and_finished_pods() {
+        let pod = |name: &str, owner: Option<&str>, mirror: bool, phase: &str| {
+            let owners: Vec<serde_json::Value> = owner.into_iter().map(|k| serde_json::json!({ "kind": k, "name": "x" })).collect();
+            let annotations = if mirror { serde_json::json!({ "kubernetes.io/config.mirror": "abc" }) } else { serde_json::json!({}) };
+            serde_json::json!({ "metadata": { "name": name, "namespace": "demo", "ownerReferences": owners, "annotations": annotations }, "status": { "phase": phase } })
+        };
+        let pods = serde_json::json!({ "items": [
+            pod("web-1", Some("ReplicaSet"), false, "Running"),
+            pod("longhorn-manager-x", Some("DaemonSet"), false, "Running"),
+            pod("static", None, true, "Running"),
+            pod("job-1", Some("Job"), false, "Succeeded"),
+            pod("postgres-0", Some("StatefulSet"), false, "Pending"),
+        ] });
+        assert_eq!(pods_left_to_drain(&pods), ["demo/web-1", "demo/postgres-0"]);
+        assert!(pods_left_to_drain(&serde_json::json!({ "items": [] })).is_empty());
+    }
+
+    #[test]
+    fn a_refused_drain_says_which_eviction_kubernetes_refused() {
+        let err = "k3s kubectl drain ms01-02: evicting pod demo/postgres-0\nerror when evicting pods/\"postgres-0\" -n \"demo\" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.\nerror: unable to drain node \"ms01-02\" due to error: global timeout reached: 30s";
+        assert_eq!(drain_refusal(err), "error when evicting pods/\"postgres-0\" -n \"demo\" (will retry after 5s): Cannot evict pod as it would violate the pod's disruption budget.");
+        assert_eq!(drain_refusal("k3s kubectl drain x: \nerror: timed out\n"), "error: timed out");
     }
 }

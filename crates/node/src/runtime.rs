@@ -1,9 +1,7 @@
-//! The real runtime: what the simulator's engine is for simulated hosts.
-//! A [`Node`] owns the actors of one machine (a host's agent and CP
+//! The runtime: a [`Node`] owns the actors of one machine (a host's agent and CP
 //! replica, or the UI client) and drives them from one task: messages from
 //! the [`Transport`], timers on the monotonic clock, and commands from
-//! whoever embeds it. It implements [`Ctx`]; the actors cannot tell it from
-//! the simulator.
+//! whoever embeds it. It implements [`Ctx`].
 //!
 //! Beyond `Ctx`, the node does what a real host's plumbing would: it holds
 //! the VIP exactly while its CP replica leads, keeps the transport's address
@@ -409,7 +407,6 @@ mod tests {
                 id: id.clone(),
                 inventory: Inventory::from_profile(ProfileId::Ms01, 0),
                 location: "lab".into(),
-                running: None,
             }],
             &voters,
             "test-token",

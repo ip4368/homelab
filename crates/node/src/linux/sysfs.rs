@@ -145,6 +145,17 @@ impl Sys {
         if total == 0 { 0.0 } else { 100.0 * (total - avail.min(total)) as f32 / total as f32 }
     }
 
+    /// The hottest thermal zone, in °C; `None` on a machine with none (a VM).
+    pub fn temp_c(&self) -> Option<f32> {
+        let zones = fs::read_dir(self.path("/sys/class/thermal")).ok()?;
+        zones
+            .flatten()
+            .filter(|z| z.file_name().to_string_lossy().starts_with("thermal_zone"))
+            .filter_map(|z| read(&z.path().join("temp"))?.parse::<i64>().ok())
+            .map(|milli| milli as f32 / 1000.0)
+            .reduce(f32::max)
+    }
+
     /// Cumulative (rx, tx) bytes through `nic`.
     pub fn nic_bytes(&self, nic: &str) -> (u64, u64) {
         let stat = |s: &str| read(&self.path(&format!("/sys/class/net/{nic}/statistics/{s}"))).and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -288,6 +299,15 @@ mod tests {
         assert_eq!(disks, [("nvme0", DiskKind::Nvme, 64, false), ("nvme1", DiskKind::Nvme, 64, false)]);
         assert_eq!(t.sys().disks()[0].dev, "vdb");
         assert!((t.sys().ram_used_pct() - 50.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn temperature_is_the_hottest_thermal_zone_and_none_without_one() {
+        let t = Tree::new("thermal");
+        ms01_vm(&t);
+        assert_eq!(t.sys().temp_c(), None, "a VM has no sensor");
+        t.put("/sys/class/thermal/thermal_zone0/temp", "41500\n").put("/sys/class/thermal/thermal_zone1/temp", "57000\n").put("/sys/class/thermal/cooling_device0/cur_state", "3\n");
+        assert_eq!(t.sys().temp_c(), Some(57.0));
     }
 
     #[test]

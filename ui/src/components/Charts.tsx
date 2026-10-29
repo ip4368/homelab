@@ -11,7 +11,7 @@ const HEIGHT = 140
 const SERIES = ['#2a78d6', '#eb6834']
 const GRID = '#eceef2'
 const AXIS_TEXT = '#667085'
-/** Sim-time tick steps, in ms. */
+/** Time-axis tick steps, in ms. */
 const TIME_STEPS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600].map((s) => s * 1000)
 /** Rows in a chart's table view. */
 const TABLE_ROWS = 6
@@ -144,8 +144,8 @@ function ChartTable({ spec, data }: { spec: ChartSpec; data: Aligned }) {
 /**
  * CPU, RAM and port throughput of `entity` (`host:<id>` or `fleet`), from the
  * leader's metrics history, refreshed every [`POLL_MS`] while shown. While
- * the simulation is paused or the control plane does not answer, the last
- * series stay on screen with a note saying so.
+ * the control plane does not answer, the last series stay on screen with a
+ * note saying so.
  */
 export function Charts({ entity, title, row = false }: { entity: string; title: string; row?: boolean }) {
   const view = useMetrics(entity)
@@ -155,16 +155,10 @@ export function Charts({ entity, title, row = false }: { entity: string; title: 
       <div className="charts-head">
         <h4>{title}</h4>
         {view.reply && <span className="muted">{metricsSince(view.reply.since)}</span>}
-        {view.note === 'paused' ? (
-          <span className="muted" role="status">
-            paused: showing the metrics last fetched
+        {view.note && (
+          <span className="warn" role="status">
+            {view.note}
           </span>
-        ) : (
-          view.note && (
-            <span className="warn" role="status">
-              {view.note}
-            </span>
-          )
         )}
       </div>
       <div className={row ? 'charts-row' : 'charts-col'}>

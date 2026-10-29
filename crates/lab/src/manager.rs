@@ -98,8 +98,6 @@ pub struct VmTruth {
     pub failed_disks: Vec<String>,
     /// Whether the guest holds the VIP address (from inside, via the guest agent).
     pub holds_vip: bool,
-    /// Workload instances the guest really runs (`homelab-inst-*` units).
-    pub instances: Vec<String>,
     /// Guest clock minus lab host clock, when the guest agent answered.
     #[ts(type = "number | null")]
     pub clock_offset_ms: Option<i64>,
@@ -144,8 +142,6 @@ pub struct LabTruth {
     pub partitions: Vec<Vec<Member>>,
     /// Every guest holding the VIP address now: more than one is a split.
     pub vip_holders: Vec<HostId>,
-    /// VM instances running on more than one guest at once.
-    pub split_brain_vms: Vec<String>,
     #[ts(type = "number")]
     pub at: u64,
 }
@@ -323,7 +319,7 @@ impl Lab {
             installer: Mutex::new(BTreeMap::new()),
             daemons,
             faults: Mutex::new(()),
-            truth: Mutex::new(LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], split_brain_vms: vec![], at: 0 }),
+            truth: Mutex::new(LabTruth { vms: vec![], switches: vec![], ports: vec![], partitions: vec![], vip_holders: vec![], at: 0 }),
             last_counters: Mutex::new(None),
         });
         lab.cable_all();
@@ -767,30 +763,28 @@ impl Lab {
         let mut out = vec![];
         for (spec, files, unplugged, failed, booted) in vms {
             let power = self.power(&spec.id);
-            let (mut holds_vip, mut instances, mut clock_offset_ms, mut uptime_s) = (false, vec![], None, None);
-            let carry = |holds_vip: &mut bool, instances: &mut Vec<String>| {
+            let (mut holds_vip, mut clock_offset_ms, mut uptime_s) = (false, None, None);
+            let carry = |holds_vip: &mut bool| {
                 if let Some(prev) = before.get(&spec.id) {
                     *holds_vip = prev.holds_vip;
-                    instances.clone_from(&prev.instances);
                 }
             };
             // A frozen machine cannot change, and an unanswered QMP says
             // nothing: what it held when last seen, it holds now.
             if matches!(power, Power::Paused | Power::Unknown) {
-                carry(&mut holds_vip, &mut instances);
+                carry(&mut holds_vip);
             }
             if power == Power::Running {
                 let t = Duration::from_millis(800);
-                let script = "ip -4 -o addr; echo @@; systemctl list-units --plain --no-legend --state=active 'homelab-inst-*'; echo @@; cat /proc/uptime";
+                let script = "ip -4 -o addr; echo @@; cat /proc/uptime";
                 match qemu::guest_exec(&files, "/bin/sh", &["-c", script], t) {
                     Ok(out) => {
                         let mut parts = out.split("@@\n");
                         holds_vip = parts.next().is_some_and(|a| a.contains(&format!(" {VIP}/")));
-                        instances = parts.next().unwrap_or("").lines().filter_map(|l| l.split_whitespace().next()).filter_map(node::linux::instance_of_unit).collect();
                         uptime_s = parts.next().and_then(|u| u.split('.').next()?.trim().parse().ok());
                     }
                     // Silent but not booting: busy, not changed.
-                    Err(_) if booted.is_none_or(|at| at.elapsed() > BOOT_GRACE) => carry(&mut holds_vip, &mut instances),
+                    Err(_) if booted.is_none_or(|at| at.elapsed() > BOOT_GRACE) => carry(&mut holds_vip),
                     Err(_) => {}
                 }
                 let before = now_ms();
@@ -810,19 +804,11 @@ impl Lab {
                 disks: spec.disks.iter().map(|(d, _)| d.clone()).collect(),
                 failed_disks: failed.into_iter().collect(),
                 holds_vip,
-                instances,
                 clock_offset_ms,
                 uptime_s,
                 installer: self.installer.lock().expect("installer lock").get(&spec.id).cloned(),
             });
         }
-        let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
-        for v in &out {
-            for i in v.instances.iter().filter(|i| i.starts_with("vm/")) {
-                *seen.entry(i.as_str()).or_default() += 1;
-            }
-        }
-        let split_brain_vms = seen.into_iter().filter(|(_, n)| *n > 1).map(|(i, _)| i.to_string()).collect();
         let vip_holders = out.iter().filter(|v| v.holds_vip).map(|v| v.id.clone()).collect();
         let now = Instant::now();
         let (switches, ports, partitions) = self.switch.with(|c| {
@@ -851,7 +837,7 @@ impl Lab {
             *last = Some((now, counters));
             (switches, ports, c.partitions().iter().map(|g| g.iter().cloned().collect()).collect())
         });
-        *self.truth.lock().expect("truth lock") = LabTruth { vms: out, switches, ports, partitions, vip_holders, split_brain_vms, at: now_ms() };
+        *self.truth.lock().expect("truth lock") = LabTruth { vms: out, switches, ports, partitions, vip_holders, at: now_ms() };
     }
 
     pub fn truth(&self) -> LabTruth {

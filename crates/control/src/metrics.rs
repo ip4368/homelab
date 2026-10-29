@@ -31,12 +31,13 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::str::FromStr;
 use ts_rs::TS;
 
-/// Points kept per series: one sim-hour at the metrics interval.
+/// Points kept per series: an hour at the metrics interval.
 pub const HISTORY_POINTS: usize = 360;
 
 /// The metric names a series can be asked for. A host's `disk_pct` is its
-/// fullest disk; its port rates are summed over its ports.
-pub const METRICS: [&str; 7] = ["cpu_pct", "ram_pct", "temp_c", "disk_pct", "port_rx_bps", "port_tx_bps", "instances"];
+/// fullest disk; its port rates are summed over its ports. A host without
+/// a temperature sensor has no `temp_c` points, and rollups leave it out.
+pub const METRICS: [&str; 6] = ["cpu_pct", "ram_pct", "temp_c", "disk_pct", "port_rx_bps", "port_tx_bps"];
 
 /// What a series describes: one host, or a rollup over hosts.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -72,7 +73,6 @@ enum Metric {
     DiskPct,
     PortRxBps,
     PortTxBps,
-    Instances,
 }
 
 impl Metric {
@@ -84,14 +84,13 @@ impl Metric {
             "disk_pct" => Self::DiskPct,
             "port_rx_bps" => Self::PortRxBps,
             "port_tx_bps" => Self::PortTxBps,
-            "instances" => Self::Instances,
             _ => return Err(format!("unknown metric {name:?}: expected one of {}", METRICS.join(", "))),
         })
     }
 
     /// Whether a rollup sums this metric over hosts (else it averages).
     fn summed(self) -> bool {
-        matches!(self, Self::PortRxBps | Self::PortTxBps | Self::Instances)
+        matches!(self, Self::PortRxBps | Self::PortTxBps)
     }
 
     fn is_port_rate(self) -> bool {
@@ -101,14 +100,14 @@ impl Metric {
 
 /// One sample, compactly. `values` holds `disks` disk percentages, then
 /// `ports` receive rates, then `ports` transmit rates, each indexed like the
-/// ring's names; `NaN` where the sample had no value (e.g. a failed disk).
+/// ring's names; `NaN` where the sample had no value (e.g. a failed disk, or
+/// no temperature sensor).
 #[derive(Debug, Clone, PartialEq)]
 struct Row {
     at: SimTime,
     cpu_pct: f32,
     ram_pct: f32,
     temp_c: f32,
-    instances: u32,
     disks: u16,
     ports: u16,
     values: Box<[f32]>,
@@ -130,7 +129,6 @@ impl Row {
             Metric::DiskPct => self.values[..disks].iter().copied().filter(|v| !v.is_nan()).fold(0.0, f32::max).into(),
             Metric::PortRxBps => rates(disks),
             Metric::PortTxBps => rates(disks + n),
-            Metric::Instances => f64::from(self.instances),
         }
     }
 }
@@ -171,8 +169,7 @@ impl HostRing {
             at: s.at,
             cpu_pct: s.cpu_pct,
             ram_pct: s.ram_pct,
-            temp_c: s.temp_c,
-            instances: s.instances,
+            temp_c: s.temp_c.unwrap_or(f32::NAN),
             disks: u16::try_from(nd).expect("fewer than 65536 disks"),
             ports: u16::try_from(np).expect("fewer than 65536 ports"),
             values: values.into_boxed_slice(),
@@ -226,7 +223,7 @@ impl MetricsStore {
                     return Err(format!("unknown host {id}"));
                 }
                 let rows = self.hosts.get(id).into_iter().flat_map(|r| &r.rows);
-                return Ok(rows.map(|r| (r.at, r.value(metric, None))).collect());
+                return Ok(rows.map(|r| (r.at, r.value(metric, None))).filter(|(_, v)| !v.is_nan()).collect());
             }
             MetricEntity::Fleet => state.hosts.keys().filter_map(|id| self.member(id, None)).collect(),
             MetricEntity::Role(role) => {
@@ -285,7 +282,7 @@ fn ports_on<'a>(host: &'a HostObj, switch: &SwitchId) -> BTreeSet<&'a str> {
 fn rollup(members: &[Member], metric: Metric) -> Vec<(SimTime, f64)> {
     let per_member: Vec<BTreeMap<u64, f64>> = members
         .iter()
-        .map(|m| m.ring.rows.iter().map(|r| (r.at / METRICS_MS, r.value(metric, m.ports.as_ref()))).collect())
+        .map(|m| m.ring.rows.iter().map(|r| (r.at / METRICS_MS, r.value(metric, m.ports.as_ref()))).filter(|(_, v)| !v.is_nan()).collect())
         .collect();
     let complete_from = members
         .iter()
@@ -352,11 +349,10 @@ mod tests {
             at,
             cpu_pct,
             ram_pct: 50.0,
-            temp_c: 40.0,
+            temp_c: Some(40.0),
             disk_pct: [("nvme0".into(), 10.0), ("nvme1".into(), 30.0)].into(),
             port_rx_bps: BTreeMap::new(),
             port_tx_bps: BTreeMap::new(),
-            instances: 2,
         }
     }
 
@@ -399,7 +395,7 @@ mod tests {
         assert_eq!(host("port_rx_bps"), [(10_000, 4.0), (20_000, 1008.0)]);
         assert_eq!(host("port_tx_bps"), [(10_000, 2.0), (20_000, 504.0)]);
         assert_eq!(host("disk_pct"), [(10_000, 30.0), (20_000, 10.0)], "the failed disk drops out");
-        assert_eq!(host("instances"), [(10_000, 2.0), (20_000, 2.0)]);
+        assert_eq!(host("temp_c"), [(10_000, 40.0), (20_000, 40.0)]);
         let core = m.series(&s, &MetricEntity::Switch(sid("core-1")), "port_rx_bps").unwrap();
         assert_eq!(core, [(10_000, 0.0), (20_000, 1000.0)], "sfp0 had no rate before it appeared");
         assert_eq!(m.hosts[&hid("a")].ports, ["eth0", "sfp0"]);
@@ -418,12 +414,22 @@ mod tests {
         // c has not reported in the newest bucket yet: it counts with its last sample.
         let newest = (20.0 + 40.0 + 50.0) / 3.0;
         assert_eq!(m.series(&s, &MetricEntity::Fleet, "cpu_pct").unwrap(), [(10_000, 30.0), (20_000, newest)]);
-        assert_eq!(m.series(&s, &MetricEntity::Fleet, "instances").unwrap(), [(10_000, 6.0), (20_000, 6.0)], "counts add up");
         assert_eq!(m.series(&s, &MetricEntity::Role(Role::Storage), "cpu_pct").unwrap(), [(10_000, 30.0), (20_000, 35.0)]);
         assert_eq!(m.series(&s, &MetricEntity::Role(Role::Vm), "cpu_pct").unwrap(), []);
         // A sample is held for one interval only: a host gone silent drops out.
         m.record(hid("a"), sample(30_000, 30.0));
-        assert_eq!(m.series(&s, &MetricEntity::Fleet, "instances").unwrap()[2], (30_000, 4.0), "b held, c gone");
+        assert_eq!(m.series(&s, &MetricEntity::Fleet, "cpu_pct").unwrap()[2], (30_000, 35.0), "b held, c gone");
+    }
+
+    #[test]
+    fn a_host_without_a_temperature_sensor_has_no_temperature_and_rollups_leave_it_out() {
+        let s = state(&[("a", &[], &[]), ("vm", &[], &[])]);
+        let mut m = MetricsStore::new(0);
+        m.record(hid("a"), MetricSample { temp_c: Some(50.0), ..sample(10_000, 0.0) });
+        m.record(hid("vm"), MetricSample { temp_c: None, ..sample(10_000, 0.0) });
+        assert_eq!(m.series(&s, &MetricEntity::Host(hid("vm")), "temp_c").unwrap(), []);
+        assert_eq!(m.series(&s, &MetricEntity::Fleet, "temp_c").unwrap(), [(10_000, 50.0)], "not averaged with nothing");
+        assert_eq!(m.series(&s, &MetricEntity::Fleet, "cpu_pct").unwrap(), [(10_000, 0.0)]);
     }
 
     #[test]

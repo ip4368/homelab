@@ -1,13 +1,13 @@
 //! A freshly installed cluster: the Raft state its first replicas start
-//! from, like `k3s server --cluster-init`. The simulator seeds whole fleets
-//! with it; a real first host (`homelabd bootstrap`) seeds a fleet of one.
+//! from, like `k3s server --cluster-init`: the first host
+//! (`homelabd bootstrap`) seeds a fleet of one.
 
 use crate::controllers::join::allocate_ips;
 use crate::proto::LogCmd;
 use crate::raft::{Durable, Entry, EntryPayload};
 use crate::runtime::SimTime;
-use crate::state::{Command, CpMode, Lifecycle, NetworkResult};
-use model::{eligible, seed_networks, seed_templates, HardwareProfile, HostId, HostNetworkConfig, Inventory, ProfileId, Role};
+use crate::state::{Command, CpMode};
+use model::{eligible, seed_networks, seed_templates, HardwareProfile, HostId, Inventory, ProfileId, Role};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A host the cluster is installed with.
@@ -16,11 +16,6 @@ pub struct SeedHost {
     pub id: HostId,
     pub inventory: Inventory,
     pub location: String,
-    /// The network config the host already runs, addresses included: it is
-    /// recorded as applied (generation 1) and the host is `Ready`. `None`
-    /// provisions the host on its rule's template with addresses from IPAM,
-    /// for the network controller to push like it would for any new host.
-    pub running: Option<HostNetworkConfig>,
 }
 
 /// The Raft state of a freshly installed cluster: one term-1 log entry per
@@ -30,7 +25,8 @@ pub struct SeedHost {
 /// templates and the seed auto-approve rules (each naming its template), and
 /// adds every host at its location, approved with its rule's roles (those it
 /// is eligible for, plus `ControlPlane` for voters) and provisioned on its
-/// rule's template (see [`SeedHost::running`]).
+/// rule's template with addresses from IPAM, for the network controller to
+/// push like it would for any new host.
 pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, kube_token: &str, at: SimTime) -> Durable<LogCmd> {
     let mut cmds = vec![Command::SetCp { voters: voters.clone(), mode: CpMode::Suggest }];
     if let Some(first) = voters.first() {
@@ -50,10 +46,6 @@ pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, kube_token:
     }
     let mut taken = BTreeSet::new();
     for h in hosts {
-        let running_ips = h.running.iter().flat_map(|c| &c.attachments).filter_map(|a| a.ip);
-        taken.extend(running_ips);
-    }
-    for h in hosts {
         let profile = HardwareProfile::with_discovered(&h.inventory);
         let mut roles: BTreeSet<Role> =
             seed_rule_roles(profile.id).into_iter().filter(|&r| eligible(&profile, r).is_ok()).collect();
@@ -61,10 +53,7 @@ pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, kube_token:
             roles.insert(Role::ControlPlane);
         }
         let template = seed_rule_template(profile.id);
-        let ips = match &h.running {
-            Some(cfg) => cfg.attachments.iter().filter_map(|a| Some((a.network.clone(), a.ip?))).collect(),
-            None => allocate_ips(&templates[template].config, |n| networks.iter().find(|net| &net.id == n), &mut taken),
-        };
+        let ips = allocate_ips(&templates[template].config, |n| networks.iter().find(|net| &net.id == n), &mut taken);
         cmds.extend([
             Command::AddPendingHost {
                 id: h.id.clone(),
@@ -75,13 +64,6 @@ pub fn seeded_durable(hosts: &[SeedHost], voters: &BTreeSet<HostId>, kube_token:
             Command::ApproveHost { id: h.id.clone(), roles },
             Command::ProvisionHost { id: h.id.clone(), template: Some(template.into()), ips },
         ]);
-        if let Some(cfg) = &h.running {
-            cmds.extend([
-                Command::SetDesiredNetwork { id: h.id.clone(), config: cfg.clone() },
-                Command::RecordNetworkResult { id: h.id.clone(), generation: 1, result: NetworkResult::Applied },
-                Command::SetLifecycle { id: h.id.clone(), lifecycle: Lifecycle::Ready },
-            ]);
-        }
     }
     let mut d = Durable::new(voters.clone());
     d.term = 1;
@@ -125,7 +107,7 @@ pub fn profile_prefix(p: ProfileId) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ClusterState, NetState};
+    use crate::state::{ClusterState, Lifecycle, NetState};
     use model::NetworkId;
 
     fn replay(d: &Durable<LogCmd>) -> ClusterState {
@@ -143,7 +125,7 @@ mod tests {
         let id = HostId::from("ms01-1");
         let mut inventory = Inventory::from_profile(ProfileId::Ms01, 0);
         (inventory.cpu_threads, inventory.ram_gb) = (8, 16);
-        let host = SeedHost { id: id.clone(), inventory, location: "lab".into(), running: None };
+        let host = SeedHost { id: id.clone(), inventory, location: "lab".into() };
         let d = seeded_durable(&[host], &[id.clone()].into(), "t", 1_700_000_000_000);
         assert!(d.log.iter().all(|e| matches!(&e.payload, EntryPayload::Normal(c) if c.at == 1_700_000_000_000)));
         let s = replay(&d);
