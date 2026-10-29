@@ -23,6 +23,24 @@ There is no simulator any more: every host, NIC, disk, switch port and workload 
 real userspace switch or a real Kubernetes object. A lab from before the simulator's workloads were
 removed holds Raft log entries this version cannot read: `./lab.sh reset`, then `./lab.sh up`.
 
+## Who owns what
+
+homelabd keeps its own Raft control plane beside K3s on purpose: it does not depend on K3s, so it
+can still see, report and repair K3s when K3s breaks. The rule: **homelabd owns the machines and
+everything K3s stands on, and supervises K3s; K3s owns everything that runs on it.**
+
+| homelabd | K3s and Longhorn |
+|---|---|
+| Hosts: join, approval, roles, lifecycle, removal | Pods, scheduling, restarts, eviction timing |
+| Host networking and switches | PVCs, Longhorn volumes and replicas |
+| The VIP; which hosts are K3s servers; etcd membership | |
+| Installing K3s and Longhorn; `homelab.io/` node labels; which disks Longhorn may use | |
+| Starting cordon and drain | Evicting the pods |
+| Host metrics; K3s's health: alerts and safe repairs | |
+
+The full split, the two kinds of "down" (host NotReady, node not Ready) and how homelabd supervises
+K3s: [docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md](docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md).
+
 ## What runs where
 
 - **homelabd's control plane.** Control-plane replicas on the voters run hand-rolled Raft
@@ -107,8 +125,8 @@ node e2e/lab.e2e.ts [--only K4,K9]           # end to end, against a running lab
 
 ## Known limitations
 
-- **homelabd is a second control plane beside Kubernetes'.** Its own Raft log holds hosts, networks
-  and switches, and its leader holds the VIP the K3s API answers on.
+- **homelabd does not supervise K3s yet.** It shows each host's K3s state, but raises no alert
+  when K3s breaks and does not restart a hung K3s (the design above).
 - **Metrics history resets on leader failover.** The UI shows "metrics since …".
 - **Removing a host does not delete its Kubernetes node.** Drain it first.
 - **No real-system concerns.** There is no authentication or multi-user support.
