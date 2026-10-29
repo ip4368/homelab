@@ -326,6 +326,7 @@ mod tests {
         }
         // h1 was the only host cabled to access-1, and it is gone.
         s.apply(at, Command::RemoveHost { id: HostId::from("h1") }).unwrap();
+        s.apply(at, Command::ForgetHost { id: HostId::from("h1") }).unwrap();
         assert_eq!(alert_kinds(run(&s, &v, at + 1000)), [Command::ResolveAlert { id: "switchdown-access-1-1-0".into() }]);
     }
 }

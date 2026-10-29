@@ -367,6 +367,131 @@ pub fn storage_off_patches(nodes: &serde_json::Value, off: &BTreeSet<HostId>) ->
     out
 }
 
+/// The merge patches, by Longhorn node, that ask Longhorn to move every
+/// replica off the nodes in `evict` and take the request back from the
+/// rest, from the list of Longhorn's nodes.
+pub fn evict_patches(nodes: &serde_json::Value, evict: &BTreeSet<HostId>) -> Vec<(String, serde_json::Value)> {
+    let mut out = vec![];
+    for n in nodes["items"].as_array().into_iter().flatten() {
+        let Some(name) = n["metadata"]["name"].as_str() else { continue };
+        let want = evict.contains(&HostId::from(name));
+        if n["spec"]["evictionRequested"].as_bool() == Some(want) {
+            continue;
+        }
+        out.push((name.to_string(), serde_json::json!({ "spec": { "evictionRequested": want } })));
+    }
+    out
+}
+
+/// The hosts of `evict` that hold no Longhorn replicas, from the list of
+/// Longhorn's nodes: a host with no node is out (nothing to move), and one
+/// whose eviction is asked for and whose disks schedule none. Anything
+/// unreadable counts as still holding: eviction completes only on proof.
+pub fn evicted_hosts(nodes: &serde_json::Value, evict: &BTreeSet<HostId>) -> BTreeSet<HostId> {
+    let mut out = BTreeSet::new();
+    for h in evict {
+        let node = nodes["items"].as_array().into_iter().flatten().find(|n| n["metadata"]["name"] == h.as_str());
+        let Some(n) = node else {
+            out.insert(h.clone());
+            continue;
+        };
+        if n["spec"]["evictionRequested"].as_bool() == Some(true) && scheduled_replicas(n) == Some(0) {
+            out.insert(h.clone());
+        }
+    }
+    out
+}
+
+/// How many replicas Longhorn's node `n` schedules, or `None` when its
+/// status does not say in a shape read here: a count, or a map of them,
+/// per disk. A disk that names none schedules none.
+fn scheduled_replicas(n: &serde_json::Value) -> Option<u64> {
+    let mut total = 0u64;
+    for d in n["status"]["diskStatus"].as_object()?.values() {
+        let s = &d["scheduledReplica"];
+        if let Some(c) = s.as_u64() {
+            total += c;
+        } else if let Some(m) = s.as_object() {
+            total += m.len() as u64;
+        } else if !s.is_null() {
+            return None;
+        }
+    }
+    Some(total)
+}
+
+/// The `(device, dir)` pairs [`wipe_machine`] blanks, from `/proc/mounts`
+/// (`mounts`): every mount under `mnt` whose device is not the root
+/// filesystem's. Fails closed: without a root entry nothing is wiped.
+/// Mounts that are not devices (or name the root device, like an empty
+/// [`Paths::mnt`] dir) are not disks and are skipped.
+pub fn wipe_targets(mounts: &str, mnt: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut root = None;
+    let mut mounts_of: Vec<(String, String)> = vec![];
+    for line in mounts.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(dev), Some(dir)) = (parts.next(), parts.next()) else { continue };
+        // Mount table escapes a space as `\040`.
+        let dir = dir.replace("\\040", " ");
+        if dir == "/" {
+            root = Some(dev.to_string());
+        }
+        mounts_of.push((dev.to_string(), dir));
+    }
+    let Some(root) = root else { return Err("cannot find the root device; refusing to wipe".into()) };
+    Ok(mounts_of
+        .into_iter()
+        .filter(|(dev, dir)| {
+            let under = Path::new(dir) == mnt || Path::new(dir).starts_with(mnt);
+            under && dev != &root && dev.starts_with("/dev/")
+        })
+        .collect())
+}
+
+/// Blanks the machine for removal: uninstalls K3s, unmounts and
+/// signature-wipes every disk mounted under [`Paths::mnt`], and deletes
+/// the cluster state (the join marker, Raft store, network and disk
+/// records, the last Kubernetes status). The network stays up, and
+/// `/etc/homelab/node.json` stays for the next join. Fails without
+/// wiping anything it cannot prove is a managed data disk.
+pub fn wipe_machine(paths: &Paths) -> Result<(), String> {
+    for script in ["/usr/local/bin/k3s-uninstall.sh", "/usr/local/bin/k3s-agent-uninstall.sh"] {
+        if Path::new(script).exists() {
+            eprintln!("homelabd: wipe: {script}");
+            sh("sh", &[script]).map_err(|e| e.to_string())?;
+        }
+    }
+    let mounts = std::fs::read_to_string("/proc/mounts").map_err(|e| format!("read /proc/mounts: {e}"))?;
+    for (dev, dir) in wipe_targets(&mounts, &paths.mnt)? {
+        eprintln!("homelabd: wipe: blank {dev} ({dir})");
+        sh("umount", &[dir.as_str()]).map_err(|e| format!("unmount {dir}: {e}"))?;
+        sh("wipefs", &["-a", dev.as_str()]).map_err(|e| format!("wipe {dev}: {e}"))?;
+        let _ = std::fs::remove_dir(&dir);
+    }
+    let discard = |p: PathBuf| match std::fs::remove_file(&p) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("delete {}: {e}", p.display())),
+    };
+    for p in [
+        paths.state.join("joined"),
+        paths.state.join("disks.json"),
+        paths.state.join("net.json"),
+        paths.state.join("networks.json"),
+        paths.run.join("net.json"),
+        paths.run.join("networks.json"),
+        status_path(paths),
+    ] {
+        discard(p)?;
+    }
+    match std::fs::remove_dir_all(paths.state.join("raft")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("delete the Raft store: {e}")),
+    }
+    Ok(())
+}
+
 /// The install script's arguments for `spec` on `host`: the role, how it
 /// finds the cluster, and the node's name, address, interface and labels.
 pub fn install_args(spec: &KubeSpec, host: &HostId, vip: Ipv4Addr, iface: &str) -> Vec<String> {
@@ -421,6 +546,8 @@ struct Shared {
     want: Option<KubeSpec>,
     /// Work for the cluster the leader asked for, not done yet.
     admin: Option<KubeAdmin>,
+    /// The machine is to be wiped for removal.
+    wipe: bool,
     /// A new spec or work arrived since the worker last looked.
     changed: bool,
     status: Option<KubeStatus>,
@@ -437,7 +564,8 @@ impl Kube {
     pub fn start(host: HostId, vip: Ipv4Addr, paths: Paths) -> Self {
         let kube = Self { shared: Arc::new((Mutex::new(Shared::default()), Condvar::new())) };
         let k = kube.clone();
-        let worker = Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new() };
+        let worker =
+            Worker { host, vip, paths, applied: None, storage_off: BTreeSet::new(), evicted: BTreeSet::new(), nodes_deleted: BTreeSet::new(), wiping: false, wiped: false };
         let spawned = std::thread::Builder::new().name("kube".into()).spawn(move || worker.run(&k));
         if let Err(e) = spawned {
             eprintln!("homelabd: start the kubernetes worker: {e}");
@@ -463,6 +591,30 @@ impl Kube {
         s.admin = Some(admin);
         s.changed = true;
         cv.notify_one();
+    }
+
+    /// Asks for the machine to be wiped for removal. A repeat changes nothing.
+    pub fn request_wipe(&self) {
+        let (lock, cv) = &*self.shared;
+        let mut s = lock.lock().expect("kube lock");
+        if !s.wipe {
+            s.wipe = true;
+            s.changed = true;
+            cv.notify_one();
+        }
+    }
+
+    /// Takes the wipe request, if one waits.
+    fn take_wipe(&self) -> bool {
+        std::mem::replace(&mut self.shared.0.lock().expect("kube lock").wipe, false)
+    }
+
+    /// Drops the spec and work in hand: the machine was wiped, and nothing
+    /// it was asked for stands anymore.
+    fn clear(&self) {
+        let mut s = self.shared.0.lock().expect("kube lock");
+        s.want = None;
+        s.admin = None;
     }
 
     pub fn status(&self) -> Option<KubeStatus> {
@@ -492,6 +644,8 @@ struct Observed {
     /// Why the node does not look registered, if it does not.
     unregistered: Option<String>,
     node_ready: bool,
+    /// Whether the node is cordoned (scheduling disabled) in Kubernetes.
+    node_cordoned: bool,
     version: String,
     /// On a server: etcd's members.
     etcd_members: Vec<EtcdMember>,
@@ -507,6 +661,14 @@ struct Worker {
     applied: Option<KubeSpec>,
     /// The hosts whose Longhorn disks this server last kept Longhorn off.
     storage_off: BTreeSet<HostId>,
+    /// The hosts it last verified hold no Longhorn replicas.
+    evicted: BTreeSet<HostId>,
+    /// The hosts whose nodes it last verified gone from Kubernetes.
+    nodes_deleted: BTreeSet<HostId>,
+    /// A wipe is asked for and not done: nothing else runs meanwhile.
+    wiping: bool,
+    /// Wiped: a new spec (a rejoin) resumes the worker.
+    wiped: bool,
 }
 
 impl Worker {
@@ -514,8 +676,15 @@ impl Worker {
         let mut wait = Duration::ZERO;
         loop {
             let (want, admin) = kube.next(wait);
-            let (mut status, ok) = self.step(want.as_ref(), kube);
-            if let Some(admin) = admin
+            if kube.take_wipe() {
+                self.wiping = true;
+            }
+            // A wipe in hand starves everything else, including work for
+            // the cluster: the machine is leaving, and nothing it was asked
+            // for stands anymore once it is wiped.
+            let (mut status, ok) = if self.wiping { self.step_wipe(kube) } else { self.step(want.as_ref(), kube) };
+            if !self.wiping
+                && let Some(admin) = admin
                 && status.role == Some(KubeRole::Server)
                 && status.phase == KubePhase::Running
             {
@@ -526,6 +695,8 @@ impl Worker {
                 (status.etcd_members, status.etcd_unstarted) = by_node_and_peer(&members);
                 status.etcd_unread = unread;
                 status.storage_off.clone_from(&self.storage_off);
+                status.evicted.clone_from(&self.evicted);
+                status.nodes_deleted.clone_from(&self.nodes_deleted);
             }
             wait = if ok { EVERY } else { BACKOFF };
             if let Ok(b) = serde_json::to_vec(&status) {
@@ -533,6 +704,29 @@ impl Worker {
                 let _ = std::fs::write(status_path(&self.paths), b);
             }
             kube.set_status(status);
+        }
+    }
+
+    /// One pass toward wiped: the status after it, and whether it went
+    /// without error. Retried until it succeeds; then a new spec (a rejoin)
+    /// resumes the worker.
+    fn step_wipe(&mut self, kube: &Kube) -> (KubeStatus, bool) {
+        let o = self.observe();
+        match wipe_machine(&self.paths) {
+            Ok(()) => {
+                self.wiping = false;
+                self.wiped = true;
+                self.applied = None;
+                self.storage_off.clear();
+                self.evicted.clear();
+                self.nodes_deleted.clear();
+                kube.clear();
+                (self.status(&self.observe(), KubePhase::Wiped), true)
+            }
+            Err(e) => {
+                eprintln!("homelabd: kubernetes: wipe: {e}");
+                (self.status(&o, KubePhase::Failed(e)), false)
+            }
         }
     }
 
@@ -551,6 +745,7 @@ impl Worker {
             _ => (BTreeMap::new(), vec![]),
         };
         let (etcd_members, etcd_unstarted) = by_node_and_peer(&o.etcd_members);
+        let server_sets = o.role == Some(KubeRole::Server);
         KubeStatus {
             role: o.role,
             phase,
@@ -562,13 +757,21 @@ impl Worker {
             etcd_members,
             etcd_unread: o.etcd_unread.clone(),
             etcd_unstarted,
-            storage_off: if o.role == Some(KubeRole::Server) { self.storage_off.clone() } else { BTreeSet::new() },
+            storage_off: if server_sets { self.storage_off.clone() } else { BTreeSet::new() },
+            node_cordoned: o.node_cordoned,
+            evicted: if server_sets { self.evicted.clone() } else { BTreeSet::new() },
+            nodes_deleted: if server_sets { self.nodes_deleted.clone() } else { BTreeSet::new() },
         }
     }
 
     /// One pass toward `want`: the status after it, and whether it went
     /// without error.
     fn step(&mut self, want: Option<&KubeSpec>, kube: &Kube) -> (KubeStatus, bool) {
+        if self.wiped && want.is_none() {
+            return (self.status(&self.observe(), KubePhase::Wiped), true);
+        }
+        // A new spec after a wipe is a rejoin: work resumes.
+        self.wiped = false;
         let o = self.observe();
         let Some(spec) = want else {
             let status = match (o.role, o.active) {
@@ -639,8 +842,14 @@ impl Worker {
             Err("not running".into())
         };
         let node_ready = ready.as_deref().map(str::trim) == Ok("True");
+        let node_cordoned = active
+            && self
+                .kubectl(r, &["get", "node", self.host.as_str(), "-o", "jsonpath={.spec.unschedulable}"])
+                .as_deref()
+                .map(str::trim)
+                == Ok("true");
         let (etcd_members, etcd_unread) = if r == KubeRole::Server && active { split(self.etcd_members()) } else { (vec![], None) };
-        Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members, etcd_unread }
+        Observed { role, active, unregistered: ready.err(), node_ready, node_cordoned, version, etcd_members, etcd_unread }
     }
 
     /// etcd's members, from this host's K3s server (`/db/info` answers the
@@ -739,13 +948,51 @@ impl Worker {
                 }
             }
         }
+        for m in &admin.drain {
+            eprintln!("homelabd: kubernetes: draining node {m}");
+            match self.kubectl(KubeRole::Server, &["drain", m.as_str(), "--ignore-daemonsets", "--delete-emptydir-data", "--timeout=120s"]) {
+                Ok(_) => {}
+                // A node that is gone is drained.
+                Err(e) if e.contains("NotFound") => {}
+                Err(e) => return Err(format!("drain node {m}: {e}")),
+            }
+        }
+        for m in &admin.uncordon {
+            match self.kubectl(KubeRole::Server, &["uncordon", m.as_str()]) {
+                Ok(_) => {}
+                Err(e) if e.contains("NotFound") => {}
+                Err(e) => return Err(format!("uncordon node {m}: {e}")),
+            }
+        }
         let json = self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "get", "nodes.longhorn.io", "-o", "json"])?;
         let nodes: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read Longhorn's nodes: {e}"))?;
         for (node, patch) in storage_off_patches(&nodes, &admin.storage_off) {
             eprintln!("homelabd: kubernetes: Longhorn disks of {node}: {patch}");
             self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "patch", "nodes.longhorn.io", &node, "--type", "merge", "-p", &patch.to_string()])?;
         }
+        for (node, patch) in evict_patches(&nodes, &admin.evict) {
+            eprintln!("homelabd: kubernetes: Longhorn eviction of {node}: {patch}");
+            self.kubectl(KubeRole::Server, &["-n", "longhorn-system", "patch", "nodes.longhorn.io", &node, "--type", "merge", "-p", &patch.to_string()])?;
+        }
         self.storage_off.clone_from(&admin.storage_off);
+        self.evicted = evicted_hosts(&nodes, &admin.evict);
+        let mut deleted = BTreeSet::new();
+        for m in &admin.delete_nodes {
+            match self.kubectl(KubeRole::Server, &["get", "node", m.as_str()]) {
+                Ok(_) => match self.kubectl(KubeRole::Server, &["delete", "node", m.as_str(), "--wait=false"]) {
+                    Ok(_) => {}
+                    Err(e) if e.contains("NotFound") => {
+                        deleted.insert(m.clone());
+                    }
+                    Err(e) => return Err(e),
+                },
+                Err(e) if e.contains("NotFound") => {
+                    deleted.insert(m.clone());
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        self.nodes_deleted = deleted;
         Ok(())
     }
 
@@ -1069,5 +1316,60 @@ mod tests {
         assert_eq!(patches[1].1, serde_json::json!({ "metadata": { "annotations": { STORAGE_OFF_ANNOTATION: null } }, "spec": { "disks": { "nvme0": { "allowScheduling": true } } } }));
         let done = serde_json::json!({ "items": [node("ms01-05", &[("nvme0", false), ("nvme1", false)], Some("nvme0"))] });
         assert!(storage_off_patches(&done, &off).is_empty(), "nothing left to do");
+    }
+
+    #[test]
+    fn longhorn_eviction_is_asked_and_taken_back() {
+        let node = |name: &str, evicting: Option<bool>| {
+            let spec = evicting.map(|e| serde_json::json!({ "evictionRequested": e })).unwrap_or(serde_json::json!({}));
+            serde_json::json!({ "metadata": { "name": name }, "spec": spec })
+        };
+        let nodes = serde_json::json!({ "items": [node("ms01-04", None), node("ms01-05", Some(true)), node("ms01-06", Some(true))] });
+        let evict: BTreeSet<HostId> = [HostId::from("ms01-04"), HostId::from("ms01-05")].into();
+        let patches = evict_patches(&nodes, &evict);
+        assert_eq!(patches.len(), 2, "{patches:?}");
+        assert_eq!(patches[0], ("ms01-04".into(), serde_json::json!({ "spec": { "evictionRequested": true } })));
+        assert_eq!(patches[1], ("ms01-06".into(), serde_json::json!({ "spec": { "evictionRequested": false } })), "stores again: taken back");
+        let done = serde_json::json!({ "items": [node("ms01-04", Some(true)), node("ms01-05", Some(true)), node("ms01-06", Some(false))] });
+        assert!(evict_patches(&done, &evict).is_empty(), "nothing left to do");
+    }
+
+    #[test]
+    fn a_host_is_evicted_only_on_proof_it_holds_no_replicas() {
+        let node = |name: &str, evicting: bool, disks: serde_json::Value| {
+            serde_json::json!({ "metadata": { "name": name }, "spec": { "evictionRequested": evicting }, "status": { "diskStatus": disks } })
+        };
+        let nodes = serde_json::json!({ "items": [
+            node("counted", true, serde_json::json!({ "nvme0": { "scheduledReplica": 1 }, "nvme1": { "scheduledReplica": 0 } })),
+            node("mapped", true, serde_json::json!({ "nvme0": { "scheduledReplica": { "r1": {}, "r2": {} } } })),
+            node("empty", true, serde_json::json!({ "nvme0": { "scheduledReplica": 0 }, "nvme1": {} })),
+            node("unasked", false, serde_json::json!({ "nvme0": { "scheduledReplica": 0 } })),
+            node("unreadable", true, serde_json::json!({ "nvme0": { "scheduledReplica": "a lot" } })),
+            serde_json::json!({ "metadata": { "name": "no-status" }, "spec": { "evictionRequested": true } }),
+        ] });
+        let evict: BTreeSet<HostId> =
+            ["counted", "mapped", "empty", "unasked", "unreadable", "no-status", "no-node"].map(HostId::from).into();
+        assert_eq!(
+            evicted_hosts(&nodes, &evict),
+            ["empty", "no-node"].map(HostId::from).into_iter().collect::<BTreeSet<_>>(),
+            "only the empty and the gone: the unasked, the unreadable and the moving wait"
+        );
+    }
+
+    #[test]
+    fn wipe_targets_are_managed_disks_never_the_root() {
+        let mnt = Path::new("/mnt");
+        let mounts = "/dev/sda1 / ext4 rw 0 0\n/dev/nvme0n1 /mnt/nvme0 ext4 rw 0 0\n/dev/nvme1n1 /mnt/nvme1 ext4 rw 0 0\ntmpfs /mnt/scratch tmpfs rw 0 0\n";
+        assert_eq!(
+            wipe_targets(mounts, mnt).unwrap(),
+            [("/dev/nvme0n1".to_string(), "/mnt/nvme0".to_string()), ("/dev/nvme1n1".to_string(), "/mnt/nvme1".into())],
+            "data disks only: not the root, not what is not a device"
+        );
+        // An empty /mnt dir lives on the root device: skipped, not wiped.
+        let bare = "/dev/sda1 / ext4 rw 0 0\n/dev/sda1 /mnt/nvme0 ext4 rw 0 0\n";
+        assert!(wipe_targets(bare, mnt).unwrap().is_empty());
+        // No root entry: fail closed.
+        assert!(wipe_targets("/dev/nvme0n1 /mnt/nvme0 ext4 rw 0 0\n", mnt).is_err());
+        assert!(wipe_targets("", mnt).is_err());
     }
 }

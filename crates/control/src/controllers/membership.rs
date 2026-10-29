@@ -558,6 +558,9 @@ mod tests {
             etcd_unread: None,
             etcd_unstarted: BTreeSet::new(),
             storage_off: BTreeSet::new(),
+            node_cordoned: false,
+            evicted: BTreeSet::new(),
+            nodes_deleted: BTreeSet::new(),
         };
         s.apply(0, Command::RecordKube { id: hid(id), status }).unwrap();
     }

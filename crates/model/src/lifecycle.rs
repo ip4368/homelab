@@ -13,6 +13,11 @@ pub enum Lifecycle {
     Ready,
     NotReady,
     Cordoned,
+    /// Leaving the cluster: the controller drains its Kubernetes workloads,
+    /// evicts its Longhorn replicas, deletes its node and wipes the machine,
+    /// then forgets it. Only `RemoveHost` moves a host here, and only
+    /// `ForgetHost` deletes one from here.
+    Removing,
     Removed,
 }
 

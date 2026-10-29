@@ -106,6 +106,12 @@ pub trait HostOs {
     fn kube_status(&self) -> Option<KubeStatus> {
         None
     }
+    /// Wipes the machine for removal, in the background: uninstalls K3s,
+    /// blanks the data disks homelabd manages and deletes the cluster state
+    /// (the join marker, Raft store, network and disk records), and reports
+    /// [`crate::proto::KubePhase::Wiped`] when done. The network stays up.
+    /// A repeat changes nothing.
+    fn request_wipe(&mut self) {}
     /// An admin kubeconfig for the cluster's Kubernetes, pointed at the VIP;
     /// `None` unless this host runs a K3s server that wrote one.
     fn kubeconfig(&self) -> Option<String> {

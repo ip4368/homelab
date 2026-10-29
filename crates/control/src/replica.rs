@@ -125,7 +125,20 @@ impl CpReplica {
     fn apply_committed(&mut self, ctx: &mut dyn Ctx) {
         for e in self.raft().take_committed() {
             let result = match e.payload {
-                EntryPayload::Normal(LogCmd { at, cmd }) => Some(self.state.apply(at, cmd)),
+                EntryPayload::Normal(LogCmd { at, cmd }) => {
+                    let forget = match &cmd {
+                        Command::ForgetHost { id } => Some(id.clone()),
+                        _ => None,
+                    };
+                    let result = self.state.apply(at, cmd);
+                    if result.is_ok()
+                        && let Some(id) = forget
+                        && let Some(v) = &mut self.volatile
+                    {
+                        v.note_forget(&id);
+                    }
+                    Some(result)
+                }
                 EntryPayload::Config { voters, .. } => {
                     self.state.apply_membership(voters);
                     Some(Ok(()))
@@ -374,6 +387,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::Cordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Cordoned },
         ApiOp::Uncordon { id } => Command::SetLifecycle { id, lifecycle: Lifecycle::Ready },
         ApiOp::RemoveHost { id } => Command::RemoveHost { id },
+        ApiOp::ForgetHost { id } => Command::ForgetHost { id },
         ApiOp::SetHostOverride { id, config } => Command::SetHostOverride { host: id, config },
         ApiOp::UpsertRule { id, profile, roles, template } => Command::UpsertRule { id, profile, roles, template },
         ApiOp::DeleteRule { id } => Command::DeleteRule { id },
@@ -475,6 +489,7 @@ impl Actor for CpReplica {
             | Msg::ConfirmNetwork { .. }
             | Msg::ReportRequest
             | Msg::SwitchPoll
+            | Msg::WipeHost
             | Msg::StartCpReplica { .. }
             | Msg::Kube(_)
             | Msg::KubeAdmin(_)
@@ -621,6 +636,7 @@ mod tests {
             },
             raise("hostdown-h9-0-0"),
             Command::RemoveHost { id: hid("h9") },
+            Command::ForgetHost { id: hid("h9") },
         ]
     }
 
@@ -733,6 +749,17 @@ mod tests {
     }
 
     #[test]
+    fn heartbeats_from_unknown_hosts_note_liveness_and_nothing_else() {
+        let mut rig = Rig::new(vec![]);
+        rig.elect();
+        rig.ack();
+        let hb = Msg::Heartbeat { host: hid("h9"), lifecycle_seen: 0, observed_at: None, observed: None, net_generation: 3 };
+        rig.r.on_message(&mut rig.ctx, host_ep("h9", Svc::Agent), hb);
+        let v = rig.r.volatile.as_ref().unwrap();
+        assert!(v.last_heartbeat.contains_key(&hid("h9")), "still a heartbeat");
+        assert!(!v.net_generation.contains_key(&hid("h9")), "not this cluster's to track");
+        assert!(!v.host_reports.contains_key(&hid("h9")));
+    }
 
     #[test]
     fn identical_proposal_is_not_repeated_while_in_flight() {
@@ -754,6 +781,7 @@ mod tests {
         // h9 is Ready and silent, and an alert with the id health will pick
         // already exists (resolved), so its RaiseAlert keeps failing.
         let mut cmds = orphaned_alert();
+        cmds.pop();
         cmds.pop();
         cmds.push(Command::ApproveHost { id: hid("h9"), roles: [Role::Compute].into() });
         cmds.push(Command::SetLifecycle { id: hid("h9"), lifecycle: Lifecycle::Provisioning });

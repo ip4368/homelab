@@ -10,6 +10,9 @@
 //!   Kubernetes, pointed at the VIP (this host's own if it runs a K3s
 //!   server, else the control plane's leader's).
 //! - `homelabd status` prints what this host is and how its Kubernetes stands.
+//! - `homelabd wipe` uninstalls K3s, blanks its data disks and deletes its
+//!   cluster state, so it can join (or found) a cluster fresh. The daemon
+//!   must be stopped first.
 //! - `homelabd upgrade` installs this binary over the running one and restarts it.
 //! - `homelabd run` runs the host's agent, and its CP replica if the host
 //!   holds CP state, until killed (what the service runs).
@@ -27,7 +30,7 @@ use control::replica::{CpReplica, JOIN_TOKEN_TTL_MS};
 use control::state::Command;
 use control::runtime::{Addr, HostOs, Svc};
 use model::{HostId, SwitchId};
-use node::linux::kube::{admin_kubeconfig, status_path};
+use node::linux::kube::{admin_kubeconfig, status_path, wipe_machine};
 use node::linux::store::write_synced;
 use node::linux::{sh, LinuxOs, LinuxVip, Paths};
 use node::runtime::{wall_ms, Node, NodeConfig, NodeHandle};
@@ -81,6 +84,7 @@ const USAGE: &str = "usage:
   homelabd token [-q]                                   create a join token (on a member)
   homelabd kubeconfig                                   print an admin kubeconfig (on a member)
   homelabd status                                       what this host is and how its Kubernetes stands
+  homelabd wipe                                         uninstall K3s, blank data disks, forget the cluster
   homelabd upgrade                                      install this binary and restart the service
   homelabd run                                          run the daemon (the service does this)
 options: --config PATH (default /etc/homelab/node.json)";
@@ -135,6 +139,7 @@ fn main() -> ExitCode {
         Some("token") => token(&args, &config),
         Some("kubeconfig") => kubeconfig(&config),
         Some("status") => status(&config),
+        Some("wipe") => wipe(),
         Some("upgrade") => upgrade(),
         _ => return usage(),
     };
@@ -224,7 +229,7 @@ fn init(args: &Args, config: &Path) -> Result<(), String> {
     let cfg = NodeFile { host: host.clone(), token: None, vip, mgmt: mgmt_subnet(vip)?, source: args.opts.get("source").cloned(), switches: BTreeMap::new() };
     let mut os = LinuxOs::new(host.clone(), Paths::default());
     if os.load_cp().is_some() {
-        return Err(format!("{host} holds control-plane state from an earlier cluster; remove /var/lib/homelab to start over"));
+        return Err(format!("{host} holds control-plane state from an earlier cluster; `sudo homelabd wipe` clears this machine to start over"));
     }
     install_self()?;
     write_config(config, &cfg)?;
@@ -323,6 +328,15 @@ fn status(config: &Path) -> Result<(), String> {
         Ok(s) => println!("kubernetes: {}", s.trim()),
         Err(_) => println!("kubernetes: nothing yet (it comes once the host is Ready on its network)"),
     }
+    Ok(())
+}
+
+fn wipe() -> Result<(), String> {
+    if sh("systemctl", &["is-active", "--quiet", "homelabd"]).is_ok() {
+        return Err("stop homelabd first: sudo systemctl stop homelabd".into());
+    }
+    wipe_machine(&Paths::default())?;
+    println!("This machine holds no cluster state. `homelabd join VIP TOKEN` joins a cluster, `homelabd init --vip IP` starts one.");
     Ok(())
 }
 

@@ -119,6 +119,8 @@ pub struct Volatile {
     pub kube_sent: BTreeMap<HostId, SimTime>,
     /// When a K3s server was last sent work for the cluster ([`crate::proto::KubeAdmin`]).
     pub kube_admin_sent: Option<SimTime>,
+    /// When each host was last sent [`Msg::WipeHost`](crate::proto::Msg::WipeHost).
+    pub wipe_sent: BTreeMap<HostId, SimTime>,
     /// Controller proposals by log index, until they apply.
     pub in_flight: BTreeMap<u64, Command>,
     /// Controller proposals that applied with an error, and when.
@@ -149,6 +151,7 @@ impl Volatile {
             kube_status: BTreeMap::new(),
             kube_sent: BTreeMap::new(),
             kube_admin_sent: None,
+            wipe_sent: BTreeMap::new(),
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
         }
@@ -191,6 +194,16 @@ impl Volatile {
         self.metrics.insert(host, sample);
     }
 
+    /// A `ForgetHost` for `id` committed: drops this term's executor
+    /// reports about it, so a host that rejoins under the id is evicted
+    /// and deleted again on its next removal, never skipped on these.
+    pub fn note_forget(&mut self, id: &HostId) {
+        for s in self.kube_status.values_mut() {
+            s.evicted.remove(id);
+            s.nodes_deleted.remove(id);
+        }
+        self.wipe_sent.remove(id);
+    }
 
     /// Records that the replica sent `msg` to `to`, for controllers that pace
     /// themselves by when they last sent something.
@@ -213,6 +226,9 @@ impl Volatile {
             }
             (Addr::Host(_), Msg::KubeAdmin(_)) => {
                 self.kube_admin_sent = Some(now);
+            }
+            (Addr::Host(id), Msg::WipeHost) => {
+                self.wipe_sent.insert(id.clone(), now);
             }
             _ => {}
         }

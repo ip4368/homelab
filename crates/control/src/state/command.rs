@@ -27,7 +27,16 @@ pub enum Command {
     SetLifecycle { id: HostId, lifecycle: Lifecycle },
     SetRoles { id: HostId, roles: BTreeSet<Role> },
     SetLabels { id: HostId, labels: BTreeMap<String, String> },
+    /// Starts removing the host: it becomes `Removing`, and the controller
+    /// drains its Kubernetes workloads, evicts its Longhorn replicas,
+    /// deletes its node and wipes the machine before it is forgotten.
+    /// Fails with `CpVoter` on a control-plane voter.
     RemoveHost { id: HostId },
+    /// Deletes a `Removing` host and tombstones it, so it can rejoin fresh.
+    /// The controller proposes it once the host reports wiped; the operator
+    /// proposes it to force a removal the host never answers. Fails with
+    /// `NotFound`, or with `InvalidLifecycle` on a host that is not `Removing`.
+    ForgetHost { id: HostId },
     /// Raises an alert. `kind` must be an
     /// [`AlertKind`](crate::controllers::alerts::AlertKind), which sets the
     /// severity. Fails with `AlreadyExists` while an alert with the same

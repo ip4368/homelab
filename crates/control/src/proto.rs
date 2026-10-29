@@ -121,6 +121,21 @@ pub struct KubeAdmin {
     /// Hosts whose Longhorn disks take no new replicas: they have no active
     /// storage role. Disks this took from a host not listed are given back.
     pub storage_off: BTreeSet<HostId>,
+    /// Nodes to `kubectl drain`: cordoned hosts and hosts being removed
+    /// whose nodes are not cordoned yet. A node that is gone is done.
+    #[serde(default)]
+    pub drain: BTreeSet<HostId>,
+    /// Nodes to `kubectl uncordon`: Ready hosts whose nodes are still
+    /// cordoned (homelabd owns the cordon state: a hand cordon is reverted).
+    #[serde(default)]
+    pub uncordon: BTreeSet<HostId>,
+    /// Hosts whose Longhorn replicas move elsewhere: the `storage_off` set.
+    /// A host not listed has its eviction request taken back.
+    #[serde(default)]
+    pub evict: BTreeSet<HostId>,
+    /// Nodes to delete: hosts being removed whose replicas are evicted.
+    #[serde(default)]
+    pub delete_nodes: BTreeSet<HostId>,
 }
 
 /// How a host's Kubernetes install stands.
@@ -135,6 +150,9 @@ pub enum KubePhase {
     Running,
     /// The last attempt failed (it is retried); why.
     Failed(String),
+    /// Wiped on removal: K3s uninstalled, data disks blanked, cluster state
+    /// deleted. The controller forgets the host from here.
+    Wiped,
 }
 
 /// What a host's agent reports of its Kubernetes node.
@@ -171,6 +189,17 @@ pub struct KubeStatus {
     /// scheduling ([`KubeAdmin::storage_off`]).
     #[serde(default)]
     pub storage_off: BTreeSet<HostId>,
+    /// Whether this host's node is cordoned in Kubernetes.
+    #[serde(default)]
+    pub node_cordoned: bool,
+    /// On a server: the hosts of [`KubeAdmin::evict`] it verified hold no
+    /// Longhorn replicas (or have no Longhorn node left).
+    #[serde(default)]
+    pub evicted: BTreeSet<HostId>,
+    /// On a server: the hosts of [`KubeAdmin::delete_nodes`] whose nodes
+    /// are gone from Kubernetes.
+    #[serde(default)]
+    pub nodes_deleted: BTreeSet<HostId>,
 }
 
 impl KubeStatus {
@@ -193,6 +222,8 @@ pub enum ApiOp {
     /// Readies the host again.
     Uncordon { id: HostId },
     RemoveHost { id: HostId },
+    /// Deletes a `Removing` host at once, without waiting for its wipe.
+    ForgetHost { id: HostId },
     /// Sets, or with `None` clears, the host's hand-written network config.
     SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
     UpsertRule { id: String, profile: ProfileId, roles: BTreeSet<Role>, template: Option<String> },
@@ -320,6 +351,11 @@ pub enum Msg {
     Kube(KubeSpec),
     /// Leader to the agent of a host running a K3s server: do this for the cluster.
     KubeAdmin(KubeAdmin),
+    /// Leader to the agent of a `Removing` host whose Kubernetes side is
+    /// done: uninstall K3s, blank its data disks and delete its cluster
+    /// state, then report [`KubePhase::Wiped`]. A repeat changes nothing.
+    /// Sent to joining agents too: a host removed before it joined wipes.
+    WipeHost,
     /// Agent to the VIP: how its Kubernetes stands, when that changes and
     /// every [`crate::agent::KUBE_REPORT_MS`] regardless.
     KubeStatus { host: HostId, status: KubeStatus },

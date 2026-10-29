@@ -233,9 +233,10 @@ mod tests {
         let labels = [("a".into(), "b".into())].into();
         leader.apply(2, Command::SetLabels { id: HostId::from("h1"), labels }).unwrap();
         leader.apply(3, Command::RemoveHost { id: HostId::from("h2") }).unwrap();
+        leader.apply(4, Command::ForgetHost { id: HostId::from("h2") }).unwrap();
         view.merge(leader.changes_since(view.version));
         let ServerMsg::Delta { upserts, removed, version, .. } = conn.next(&published(&view, 30)) else { panic!() };
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
         assert!(matches!(upserts.as_slice(), [Object::Host(h)] if h.id == HostId::from("h1")), "{upserts:?}");
         assert_eq!(removed, [ObjectRef { kind: ObjectKind::Host, id: "h2".into() }]);
 

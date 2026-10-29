@@ -192,9 +192,22 @@ impl ClusterState {
                 if self.cp.voters.contains(&id) {
                     return Err(ApplyError::CpVoter);
                 }
-                if self.hosts.remove(&id).is_none() {
-                    return Err(ApplyError::NotFound);
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                // Idempotent: a repeat while it removes changes nothing.
+                if host.lifecycle == Lifecycle::Removing {
+                    return Ok(());
                 }
+                host.lifecycle = Lifecycle::Removing;
+                host.before_not_ready = None;
+                host.version = v;
+            }
+            Command::ForgetHost { id } => {
+                match self.hosts.get(&id).map(|h| h.lifecycle) {
+                    None => return Err(ApplyError::NotFound),
+                    Some(Lifecycle::Removing) => {}
+                    Some(_) => return Err(ApplyError::InvalidLifecycle),
+                }
+                self.hosts.remove(&id);
                 self.tombstone(v, ObjectKind::Host, id.to_string());
             }
             Command::RaiseAlert { id, kind, entity, subject, message, ground_truth } => {
@@ -758,18 +771,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_host_leaves_tombstone() {
+    fn remove_host_marks_removing_and_forget_host_leaves_tombstone() {
         let mut s = ClusterState::new();
         s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
         let v = s.version;
         s.apply(2, Command::RemoveHost { id: hid("h1") }).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Removing, "the object stays while the machine is wiped");
+        assert!(s.changes_since(v).removed.is_empty());
+        // a repeat while it removes is a no-op, and forgetting anything else is refused
+        s.apply(3, Command::RemoveHost { id: hid("h1") }).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Removing);
+        assert_eq!(s.apply(3, Command::ForgetHost { id: hid("zz") }), Err(ApplyError::NotFound));
+        s.apply(3, Command::ForgetHost { id: hid("h1") }).unwrap();
         assert!(s.hosts.is_empty());
         let c = s.changes_since(v);
         assert_eq!(c.removed, vec![host_ref("h1")]);
-        assert!(c.upserts.is_empty());
         // clients that already saw the removal are not told again
         assert!(s.changes_since(s.version).removed.is_empty());
-        assert_eq!(s.apply(3, Command::RemoveHost { id: hid("h1") }), Err(ApplyError::NotFound));
+        assert_eq!(s.apply(4, Command::RemoveHost { id: hid("h1") }), Err(ApplyError::NotFound));
     }
 
     #[test]
@@ -784,14 +803,18 @@ mod tests {
         assert!(s.hosts.contains_key(&hid("h1")) && s.version == v, "nothing changed");
         s.apply_membership(BTreeSet::new());
         s.apply(3, Command::RemoveHost { id: hid("h1") }).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Removing);
+        assert_eq!(s.apply(4, Command::ForgetHost { id: hid("h1") }).map(|()| s.hosts.contains_key(&hid("h1"))), Ok(false));
     }
 
     #[test]
-    fn readding_a_removed_host_drops_its_tombstone() {
+    fn readding_a_forgotten_host_drops_its_tombstone() {
         let mut s = ClusterState::new();
         s.apply(1, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        assert_eq!(s.apply(2, Command::ForgetHost { id: hid("h1") }), Err(ApplyError::InvalidLifecycle), "only Removing hosts are forgotten");
         s.apply(2, Command::RemoveHost { id: hid("h1") }).unwrap();
-        s.apply(3, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
+        s.apply(3, Command::ForgetHost { id: hid("h1") }).unwrap();
+        s.apply(4, add_cmd("h1", ProfileId::MiniPc, 0)).unwrap();
         let c = s.changes_since(0);
         assert!(c.removed.is_empty());
         assert_eq!(c.upserts.len(), 1);

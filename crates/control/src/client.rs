@@ -354,13 +354,15 @@ mod tests {
         let labels = [("a".into(), "b".into())].into();
         leader.apply(4, Command::SetLabels { id: HostId::from("h1"), labels }).unwrap();
         leader.apply(5, Command::RemoveHost { id: HostId::from("h2") }).unwrap();
-        leader.apply(6, Command::Event { entity: ObjectRef::cp(), message: "hi".into() }).unwrap();
+        leader.apply(6, Command::ForgetHost { id: HostId::from("h2") }).unwrap();
+        leader.apply(7, Command::Event { entity: ObjectRef::cp(), message: "hi".into() }).unwrap();
         let changes = leader.changes_since(since);
         assert_eq!(changes.upserts.len(), 2, "only what changed is sent: {changes:?}");
+        assert_eq!(changes.removed, [ObjectRef::host(&HostId::from("h2"))]);
         view.merge(changes);
 
-        assert_eq!(view.version, 6);
-        assert_eq!(view.state.version, 6);
+        assert_eq!(view.version, 7);
+        assert_eq!(view.state.version, 7);
         assert_eq!(view.state.hosts, leader.hosts);
         assert_eq!(view.state.tokens, leader.tokens);
         assert_eq!(view.state.events, leader.events);

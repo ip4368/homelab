@@ -386,6 +386,12 @@ impl HostOs for LinuxOs {
         }
     }
 
+    fn request_wipe(&mut self) {
+        if let Some(k) = &self.kube {
+            k.request_wipe();
+        }
+    }
+
     fn kube_status(&self) -> Option<KubeStatus> {
         self.kube.as_ref()?.status()
     }

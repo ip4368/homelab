@@ -233,6 +233,12 @@ impl Actor for HostAgent {
                 }
             }
             Msg::ReportRequest if self.token.is_none() => self.send_heartbeat(ctx, true),
+            // No member guard: a host removed before it joined still wipes.
+            Msg::WipeHost => {
+                if let Some(os) = ctx.host() {
+                    os.request_wipe();
+                }
+            }
             Msg::StartCpReplica { voters } if self.token.is_none() => {
                 if let Some(os) = ctx.host() {
                     os.spawn_cp_replica(voters);
@@ -294,6 +300,7 @@ mod tests {
         inventory: Inventory,
         /// The voters of every CP replica started.
         cp_spawned: Vec<BTreeSet<HostId>>,
+        wipe_requested: bool,
     }
 
     impl HostOs for FakeOs {
@@ -335,6 +342,9 @@ mod tests {
         fn mark_joined(&mut self) {
             self.joined = true;
         }
+        fn request_wipe(&mut self) {
+            self.wipe_requested = true;
+        }
         fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
             self.cp_spawned.push(voters);
         }
@@ -358,6 +368,7 @@ mod tests {
                 lldp: vec![neighbor("sw-1", "p1")],
                 inventory: Inventory::from_profile(ProfileId::Pi5, 1),
                 cp_spawned: vec![],
+                wipe_requested: false,
             };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
@@ -679,6 +690,21 @@ mod tests {
         assert_eq!(ctx.take_heartbeats(), [reporting(40_000, &ctx.os)]);
     }
 
+    #[test]
+    fn wipe_host_reaches_the_host_whether_it_joined_or_not() {
+        for joined in [true, false] {
+            let (mut a, mut ctx) =
+                if joined { member() } else { (HostAgent::new(Some("tok".into())), FakeCtx::new(HostNetworkConfig::default())) };
+            if !joined {
+                a.on_start(&mut ctx);
+            }
+            a.on_message(&mut ctx, VIP, Msg::WipeHost);
+            assert!(ctx.os.wipe_requested, "joined={joined}");
+            // A repeat changes nothing.
+            a.on_message(&mut ctx, VIP, Msg::WipeHost);
+            assert!(ctx.os.wipe_requested);
+        }
+    }
 
     #[test]
     fn start_cp_replica_reaches_the_host_of_a_member_only() {

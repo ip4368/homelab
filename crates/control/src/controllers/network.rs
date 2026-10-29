@@ -68,7 +68,8 @@ pub fn attached_networks(config: &HostNetworkConfig, networks: &[LogicalNetwork]
 
 /// Hosts the controller manages: provisioned and not removed.
 pub(crate) fn managed(lc: Lifecycle) -> bool {
-    !matches!(lc, Lifecycle::Pending | Lifecycle::Approved | Lifecycle::Removed)
+    // A host being removed keeps the network it has until it is wiped.
+    !matches!(lc, Lifecycle::Pending | Lifecycle::Approved | Lifecycle::Removing | Lifecycle::Removed)
 }
 
 /// The config `host` should run: the one a rollout pinned it to until the
@@ -645,6 +646,7 @@ mod tests {
         step(&mut s, &mut v, 0);
         assert_eq!(s.alerts.values().filter(|a| a.resolved_at.is_none()).count(), 1);
         s.apply(1, Command::RemoveHost { id: hid("m") }).unwrap();
+        s.apply(1, Command::ForgetHost { id: hid("m") }).unwrap();
         assert_eq!(proposals(&run(&s, &v, 1000)), [Command::ResolveAlert { id: "netmismatch-m-0".into() }]);
     }
 

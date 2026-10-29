@@ -198,6 +198,7 @@ mod tests {
         let cmds = proposals(run(&s, &v, now));
         apply_all(&mut s, now, cmds);
         s.apply(now, Command::RemoveHost { id: hid("h1") }).unwrap();
+        s.apply(now, Command::ForgetHost { id: hid("h1") }).unwrap();
         let cmds = proposals(run(&s, &v, now + 1000));
         assert_eq!(cmds, [Command::ResolveAlert { id: "hostdown-h1-1-0".into() }], "h2 stays down, h1's alert closes");
         apply_all(&mut s, now + 1000, cmds);

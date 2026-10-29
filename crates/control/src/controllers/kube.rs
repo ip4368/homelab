@@ -21,6 +21,26 @@
 //!   range for Longhorn's pods ([`storage_network`]): every host attached
 //!   to it gets it in its spec, with its own address there.
 //!
+//! homelabd owns the cordon state: a `Cordoned` host's node is `kubectl
+//! drained`, a `Ready` host's node is uncordoned, both by a running server
+//! ([`KubeAdmin::drain`], [`KubeAdmin::uncordon`]). A cordon by hand is
+//! reverted; cordon through homelabd instead.
+//!
+//! Removing a host (`Removing`, from `RemoveHost`) runs through Kubernetes
+//! before the machine is wiped: its node is drained, its Longhorn replicas
+//! are evicted elsewhere ([`KubeAdmin::evict`], verified empty before going
+//! on), its node is deleted, and only then is its agent told to wipe it
+//! ([`Msg::WipeHost`]). Wiped hosts are forgotten ([`Command::ForgetHost`]),
+//! and can rejoin fresh. A host that never ran K3s skips the Kubernetes
+//! side when no server runs to do it; a silent host waits for the operator's
+//! `ForgetHost`.
+//!
+//! The executor's `evicted` and `nodes_deleted` reports are trusted only
+//! from this term's live reports, never from recorded statuses: a host that
+//! rejoins under a removed id must be evicted and deleted again, never
+//! skipped on an old report. They are scrubbed when its forgetting commits
+//! ([`Volatile::note_forget`]).
+//!
 //! Replacing a dead server, etcd's way: remove the dead member, then add the
 //! new one.
 //! * Once a dead voter's host is no longer a control-plane voter (membership
@@ -41,10 +61,11 @@
 //!   no server can, the members are unknown: nothing is removed and no
 //!   server joins.
 
+use super::health::NOT_READY_AFTER_MS;
 use super::membership::target_size;
 use super::{Action, Volatile};
 use crate::bootstrap::profile_prefix;
-use crate::proto::{mgmt, KubeAdmin, KubeRole, KubeSpec, KubeStatus, Msg, StorageNetwork};
+use crate::proto::{mgmt, KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus, Msg, StorageNetwork};
 use crate::runtime::{Addr, Endpoint, SimTime, Svc};
 use crate::state::{ClusterState, Command, HostObj, Lifecycle};
 use model::network::NetworkPurpose;
@@ -124,6 +145,11 @@ fn member(h: &HostObj) -> bool {
 /// Whether `id`'s host is up: a member host the control plane hears from.
 fn up(state: &ClusterState, id: &HostId) -> bool {
     state.hosts.get(id).is_some_and(member)
+}
+
+/// Whether `id`'s host is being removed.
+fn removing(state: &ClusterState, id: &HostId) -> bool {
+    state.hosts.get(id).is_some_and(|h| h.lifecycle == Lifecycle::Removing)
 }
 
 /// Whether `h` keeps Longhorn replicas: it has the storage role, not held.
@@ -234,23 +260,90 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
 }
 
 /// What a running server is to do for the cluster now, sent to the first
-/// up host running one: remove the etcd member [`etcd_removal`] picks, and
-/// keep Longhorn off the disks of member hosts that do not store. Asked
-/// while there is a member to remove or the server has not applied that
-/// set of hosts, at most every [`KUBE_RESEND_MS`].
+/// up host running one: remove the etcd member [`etcd_removal`] picks, keep
+/// Longhorn off the disks of hosts that do not store, drain and uncordon
+/// nodes to their lifecycle, evict replicas off hosts that do not store,
+/// and delete the nodes of removed hosts whose replicas are evicted. Asked
+/// while anything is pending, at most every [`KUBE_RESEND_MS`].
 fn admin(state: &ClusterState, v: &Volatile, status: &impl Fn(&HostId) -> Option<KubeStatus>, now: SimTime) -> Option<Action> {
     let via = state.hosts.keys().find(|id| up(state, id) && runs_server(status(id).as_ref()))?;
     let members = etcd_members(state, status).unwrap_or_default();
     let remove_etcd_members: BTreeSet<HostId> = etcd_removal(state, &members, status).into_iter().cloned().collect();
     let etcd_peers = remove_etcd_members.iter().filter_map(|m| Some((m.clone(), *state.hosts.get(m)?.ips.get(&mgmt())?))).collect();
     let etcd_agents = remove_etcd_members.iter().filter(|m| up(state, m) && runs_agent(status(m).as_ref())).cloned().collect();
-    let storage_off: BTreeSet<HostId> = state.hosts.values().filter(|h| member(h) && !stores(h)).map(|h| h.id.clone()).collect();
+    let storage_off: BTreeSet<HostId> =
+        state.hosts.values().filter(|h| (member(h) && !stores(h)) || h.lifecycle == Lifecycle::Removing).map(|h| h.id.clone()).collect();
+    // Live reports only (see the module docs): a rejoined id is evicted and
+    // deleted again, never skipped on an old report.
+    let live = v.kube_status.get(via);
+    let evicted_by: BTreeSet<HostId> = live.map_or(Default::default(), |s| s.evicted.clone());
+    let deleted_by: BTreeSet<HostId> = live.map_or(Default::default(), |s| s.nodes_deleted.clone());
+    let cordoned = |id: &HostId| status(id).is_some_and(|s| s.node_cordoned);
+    let stored = |id: &HostId| status(id).is_some_and(|s| !s.storage_disks.is_empty());
+    let drain: BTreeSet<HostId> = state
+        .hosts
+        .values()
+        .filter(|h| {
+            (h.lifecycle == Lifecycle::Cordoned && !cordoned(&h.id))
+                || (h.lifecycle == Lifecycle::Removing && !deleted_by.contains(&h.id))
+        })
+        .map(|h| h.id.clone())
+        .collect();
+    let uncordon: BTreeSet<HostId> =
+        state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Ready && cordoned(&h.id)).map(|h| h.id.clone()).collect();
+    let evict: BTreeSet<HostId> = storage_off.iter().filter(|id| stored(id) || removing(state, id)).cloned().collect();
+    let delete: BTreeSet<HostId> =
+        state.hosts.keys().filter(|id| removing(state, id) && evicted_by.contains(*id)).cloned().collect();
     let applied = status(via).is_some_and(|s| s.storage_off == storage_off);
-    if (remove_etcd_members.is_empty() && applied) || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
+    let pending = !remove_etcd_members.is_empty()
+        || !applied
+        || !drain.is_empty()
+        || !uncordon.is_empty()
+        || evict.iter().any(|h| !evicted_by.contains(h))
+        || delete.iter().any(|h| !deleted_by.contains(h));
+    if !pending || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
         return None;
     }
     let to = Endpoint::new(Addr::Host(via.clone()), Svc::Agent);
-    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(KubeAdmin { remove_etcd_members, etcd_peers, etcd_agents, storage_off })))
+    let admin =
+        KubeAdmin { remove_etcd_members, etcd_peers, etcd_agents, storage_off, drain, uncordon, evict, delete_nodes: delete };
+    Some(Action::Send(to, mgmt(), Msg::KubeAdmin(admin)))
+}
+
+/// Tells the agents of `Removing` hosts whose Kubernetes side is done to
+/// wipe them, and forgets the wiped ones. A host whose node a live server
+/// verified gone is done (deletion is only asked once evicted, so its
+/// replicas are out); one that never ran K3s is done when no server runs
+/// to check, since there is nothing to clean; a silent host waits for the
+/// operator's `ForgetHost`. `deleted` is this term's live executor reports
+/// of deleted nodes, unioned (see the module docs on trusting them).
+fn removal(
+    state: &ClusterState,
+    v: &Volatile,
+    status: &impl Fn(&HostId) -> Option<KubeStatus>,
+    deleted: &BTreeSet<HostId>,
+    now: SimTime,
+) -> Vec<Action> {
+    let server_runs = state.hosts.keys().any(|o| up(state, o) && runs_server(status(o).as_ref()));
+    let heard = |id: &HostId| v.last_heartbeat.get(id).is_some_and(|at| now.saturating_sub(*at) <= NOT_READY_AFTER_MS);
+    let mut out = vec![];
+    for h in state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Removing) {
+        // The wipe is reported as a phase, recorded like any status: once
+        // `Wiped`, the host is forgotten from here, live or recorded.
+        if status(&h.id).is_some_and(|s| s.phase == KubePhase::Wiped) {
+            out.push(Action::Propose(Command::ForgetHost { id: h.id.clone() }));
+            continue;
+        }
+        let never_had_kube = status(&h.id).is_none_or(|s| s.role.is_none());
+        if !deleted.contains(&h.id) && (server_runs || !never_had_kube) {
+            continue;
+        }
+        if !heard(&h.id) || v.wipe_sent.get(&h.id).is_some_and(|at| now < at + KUBE_RESEND_MS) {
+            continue;
+        }
+        out.push(Action::Send(Endpoint::new(Addr::Host(h.id.clone()), Svc::Agent), mgmt(), Msg::WipeHost));
+    }
+    out
 }
 
 pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
@@ -272,6 +365,9 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         out.push(Action::Send(Endpoint::new(Addr::Host(id.clone()), Svc::Agent), mgmt(), Msg::Kube(spec)));
     }
     out.extend(admin(state, v, &status, now));
+    // Live executor reports only (see the module docs).
+    let deleted: BTreeSet<HostId> = v.kube_status.values().flat_map(|s| s.nodes_deleted.iter().cloned()).collect();
+    out.extend(removal(state, v, &status, &deleted, now));
     out
 }
 
@@ -340,6 +436,22 @@ mod tests {
             etcd_unread: None,
             etcd_unstarted: BTreeSet::new(),
             storage_off: BTreeSet::new(),
+            node_cordoned: false,
+            evicted: BTreeSet::new(),
+            nodes_deleted: BTreeSet::new(),
+        }
+    }
+
+    fn idle_admin() -> KubeAdmin {
+        KubeAdmin {
+            remove_etcd_members: BTreeSet::new(),
+            etcd_peers: BTreeMap::new(),
+            etcd_agents: BTreeSet::new(),
+            storage_off: BTreeSet::new(),
+            drain: BTreeSet::new(),
+            uncordon: BTreeSet::new(),
+            evict: BTreeSet::new(),
+            delete_nodes: BTreeSet::new(),
         }
     }
 
@@ -516,7 +628,7 @@ mod tests {
 
         v.kube_status.insert(hid("ms01-04"), running(KubeRole::Agent));
         let peer = s.hosts[&hid("ms01-04")].ips[&mgmt()];
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-04"]), etcd_peers: [(hid("ms01-04"), peer)].into(), etcd_agents: set(&["ms01-04"]), storage_off: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-04"]), etcd_peers: [(hid("ms01-04"), peer)].into(), etcd_agents: set(&["ms01-04"]), storage_off: BTreeSet::new(), ..idle_admin() };
         assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want)]);
 
         // ms01-04 takes ms01-03's place: it becomes a voter, so its member is
@@ -552,7 +664,7 @@ mod tests {
         // Membership replaced it with ms01-04: the unstarted member goes, by its peer address, before ms01-04 joins.
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer(&s, "ms01-03"))].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer(&s, "ms01-03"))].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), ..idle_admin() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)]);
         assert!(!sent(&actions).contains_key(&hid("ms01-04")));
 
@@ -598,7 +710,7 @@ mod tests {
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
         let peer = s.hosts[&hid("ms01-03")].ips[&mgmt()];
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer)].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer)].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), ..idle_admin() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)], "through the first running server");
         assert!(!sent(&actions).contains_key(&hid("ms01-04")), "the replacement waits for the dead member to go");
         v.kube_admin_sent = Some(0);
@@ -664,14 +776,14 @@ mod tests {
         let (mut s, mut v) = three_servers();
         assert!(asked(&run(&s, &v, 0)).is_empty(), "every host stores");
         hold_storage(&mut s, "ms01-04", true);
-        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: set(&["ms01-04"]) };
+        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: set(&["ms01-04"]), ..idle_admin() };
         assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want.clone())]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off = want.storage_off;
         assert!(asked(&run(&s, &v, 0)).is_empty(), "the server applied it");
 
         // The network is fixed: the disks are given back.
         hold_storage(&mut s, "ms01-04", false);
-        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new() })]);
+        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), ..idle_admin() })]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off.clear();
         // A host without the storage role never stores.
         let mut roles = s.hosts[&hid("ms01-04")].roles.clone();
@@ -711,5 +823,138 @@ mod tests {
         assert!(!valid_label("-lead", "x"));
         assert!(!valid_label("ok", "has space"));
         assert!(!valid_label("/name", "x"));
+    }
+
+    /// Hosts told to wipe, by host.
+    fn wiped(actions: &[Action]) -> Vec<HostId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Send(Endpoint { addr: Addr::Host(h), .. }, _, Msg::WipeHost) => Some(h.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn forgets(actions: &[Action]) -> Vec<HostId> {
+        actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::Propose(Command::ForgetHost { id }) => Some(id.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cordoned_hosts_are_drained_and_ready_hosts_uncordoned() {
+        let (mut s, mut v) = three_servers();
+        assert!(asked(&run(&s, &v, 0)).is_empty());
+        s.apply(0, Command::SetLifecycle { id: hid("ms01-04"), lifecycle: Lifecycle::Cordoned }).unwrap();
+        let admin = &asked(&run(&s, &v, 0))[0].1;
+        assert_eq!((&admin.drain, &admin.uncordon), (&set(&["ms01-04"]), &BTreeSet::new()));
+        v.kube_admin_sent = Some(0);
+
+        // The node drained: nothing to ask until it changes.
+        v.kube_status.get_mut(&hid("ms01-04")).unwrap().node_cordoned = true;
+        assert!(asked(&run(&s, &v, KUBE_RESEND_MS)).is_empty());
+
+        // Back to Ready while still cordoned: uncordon, including a cordon
+        // by hand, which homelabd owns and reverts.
+        s.apply(0, Command::SetLifecycle { id: hid("ms01-04"), lifecycle: Lifecycle::Ready }).unwrap();
+        let admin = &asked(&run(&s, &v, 2 * KUBE_RESEND_MS))[0].1;
+        assert_eq!((&admin.drain, &admin.uncordon), (&BTreeSet::new(), &set(&["ms01-04"])));
+        v.kube_status.get_mut(&hid("ms01-04")).unwrap().node_cordoned = false;
+        assert!(asked(&run(&s, &v, 3 * KUBE_RESEND_MS)).is_empty());
+    }
+
+    #[test]
+    fn removal_drains_evicts_deletes_wipes_and_forgets() {
+        let (mut s, mut v) = three_servers();
+        v.kube_status.get_mut(&hid("ms01-04")).unwrap().storage_disks = vec!["nvme0".into()];
+        v.last_heartbeat.insert(hid("ms01-04"), 0);
+        s.apply(0, Command::RemoveHost { id: hid("ms01-04") }).unwrap();
+
+        // Drain, take out of scheduling and evict; nothing deleted yet.
+        let admin = asked(&run(&s, &v, 0))[0].1.clone();
+        assert_eq!(admin.drain, set(&["ms01-04"]));
+        assert_eq!(admin.storage_off, set(&["ms01-04"]));
+        assert_eq!(admin.evict, set(&["ms01-04"]));
+        assert!(admin.delete_nodes.is_empty());
+        assert!(wiped(&run(&s, &v, 0)).is_empty(), "its replicas are still on it");
+        v.kube_admin_sent = Some(0);
+
+        // Replicas out and node gone, as the live executor reports: wipe.
+        let exec = v.kube_status.get_mut(&hid("ms01-01")).unwrap();
+        exec.storage_off = set(&["ms01-04"]);
+        exec.evicted = set(&["ms01-04"]);
+        let admin = asked(&run(&s, &v, KUBE_RESEND_MS))[0].1.clone();
+        assert_eq!(admin.delete_nodes, set(&["ms01-04"]));
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().nodes_deleted = set(&["ms01-04"]);
+        assert_eq!(wiped(&run(&s, &v, KUBE_RESEND_MS)), [hid("ms01-04")]);
+        assert!(forgets(&run(&s, &v, KUBE_RESEND_MS)).is_empty(), "not wiped yet");
+
+        // Wiped, live and recorded: forgotten.
+        let mut wiped_status = running(KubeRole::Agent);
+        wiped_status.phase = KubePhase::Wiped;
+        v.kube_status.insert(hid("ms01-04"), wiped_status.clone());
+        s.apply(KUBE_RESEND_MS, Command::RecordKube { id: hid("ms01-04"), status: wiped_status }).unwrap();
+        assert_eq!(forgets(&run(&s, &v, KUBE_RESEND_MS)), [hid("ms01-04")]);
+        // And still forgotten when only the record says so (a failover).
+        v.kube_status.remove(&hid("ms01-04"));
+        assert_eq!(forgets(&run(&s, &v, KUBE_RESEND_MS)), [hid("ms01-04")]);
+    }
+
+    #[test]
+    fn removal_trusts_only_live_executor_reports() {
+        let (mut s, mut v) = three_servers();
+        v.kube_status.get_mut(&hid("ms01-04")).unwrap().storage_disks = vec!["nvme0".into()];
+        v.last_heartbeat.insert(hid("ms01-04"), 0);
+        // An old term verified all this; this term heard nothing yet.
+        let mut stale = running(KubeRole::Server);
+        stale.evicted = set(&["ms01-04"]);
+        stale.nodes_deleted = set(&["ms01-04"]);
+        s.apply(0, Command::RecordKube { id: hid("ms01-01"), status: stale }).unwrap();
+        s.apply(0, Command::RemoveHost { id: hid("ms01-04") }).unwrap();
+        let admin = asked(&run(&s, &v, 0))[0].1.clone();
+        assert!(admin.delete_nodes.is_empty(), "a rejoined id is deleted again, never skipped");
+        assert!(wiped(&run(&s, &v, 0)).is_empty(), "and never wiped on an old report");
+        assert_eq!(admin.evict, set(&["ms01-04"]), "it is evicted again instead");
+    }
+
+    #[test]
+    fn removal_waits_for_a_silent_host_and_skips_kubernetes_it_never_had() {
+        let (mut s, mut v) = three_servers();
+        s.apply(0, Command::RemoveHost { id: hid("ms01-04") }).unwrap();
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().nodes_deleted = set(&["ms01-04"]);
+        assert!(wiped(&run(&s, &v, 0)).is_empty(), "silent: the operator forces it");
+        assert!(forgets(&run(&s, &v, 0)).is_empty());
+
+        // No server runs and it never ran K3s: nothing to clean, wipe at once.
+        for id in ["ms01-01", "ms01-02", "ms01-03"] {
+            down(&mut s, id);
+        }
+        v.kube_status.remove(&hid("ms01-04"));
+        v.last_heartbeat.insert(hid("ms01-04"), 0);
+        assert_eq!(wiped(&run(&s, &v, 0)), [hid("ms01-04")]);
+
+        // But a host that ran K3s waits for a server to clean up after it.
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().nodes_deleted.clear();
+        v.kube_status.insert(hid("ms01-04"), running(KubeRole::Agent));
+        assert!(wiped(&run(&s, &v, KUBE_RESEND_MS)).is_empty());
+    }
+
+    #[test]
+    fn note_forget_scrubs_executor_reports() {
+        let mut v = Volatile::new(0, 1);
+        let mut exec = running(KubeRole::Server);
+        exec.evicted = set(&["ms01-04"]);
+        exec.nodes_deleted = set(&["ms01-04"]);
+        v.kube_status.insert(hid("ms01-01"), exec);
+        v.wipe_sent.insert(hid("ms01-04"), 0);
+        v.note_forget(&hid("ms01-04"));
+        let exec = &v.kube_status[&hid("ms01-01")];
+        assert!(exec.evicted.is_empty() && exec.nodes_deleted.is_empty());
+        assert!(!v.wipe_sent.contains_key(&hid("ms01-04")));
     }
 }
