@@ -119,8 +119,8 @@ pub fn spare_port_cfg() -> SwitchPortCfg {
 }
 
 /// How a technician configures the port `nic` of a new `profile` machine
-/// lands on, to suit its seed template (as the simulator's technician does,
-/// with one core instead of an MLAG pair), optionally making `mistake`.
+/// lands on, to suit its seed template (with one core instead of an MLAG
+/// pair), optionally making `mistake`.
 pub fn technician_cfg(profile: ProfileId, host: &HostId, nic: &str, mistake: Option<Mistake>) -> SwitchPortCfg {
     let mut cfg = match (profile, nic) {
         (ProfileId::MiniPc, _) => SwitchPortCfg { mode: trunk(Some(MGMT_VLAN), &MINIPC_VLANS), ..spare_port_cfg() },

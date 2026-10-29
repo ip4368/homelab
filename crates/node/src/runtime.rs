@@ -1,9 +1,7 @@
-//! The real runtime: what the simulator's engine is for simulated hosts.
-//! A [`Node`] owns the actors of one machine (a host's agent and CP
-//! replica, or the UI client) and drives them from one task: messages from
-//! the [`Transport`], timers on the monotonic clock, and commands from
-//! whoever embeds it. It implements [`Ctx`]; the actors cannot tell it from
-//! the simulator.
+//! The runtime: a [`Node`] owns the actors of one machine (a host's agent
+//! and CP replica, or the UI client) and drives them from one task: messages
+//! from the [`Transport`], timers on the monotonic clock, and commands from
+//! whoever embeds it. It implements [`Ctx`].
 //!
 //! Beyond `Ctx`, the node does what a real host's plumbing would: it holds
 //! the VIP exactly while its CP replica leads, keeps the transport's address

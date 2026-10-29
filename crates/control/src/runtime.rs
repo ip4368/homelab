@@ -1,7 +1,7 @@
-//! The runtime interface: what an [`Actor`] can see and do. The simulator
-//! implements [`Ctx`]; control code only ever talks to this trait.
+//! The runtime interface: what an [`Actor`] can see and do. The node
+//! runtime implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{InstanceSpec, KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg, ReplicaReport};
+use crate::proto::{KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -91,36 +91,6 @@ pub trait HostOs {
     /// Records on disk that this host joined the cluster, so its agent boots
     /// as a member from now on instead of joining with a token.
     fn mark_joined(&mut self);
-    /// Runs `spec`: its resource usage shows in [`HostOs::usage`] and its flows
-    /// go on the wire. Starting an instance that runs with the same spec
-    /// changes nothing; a different spec replaces it.
-    fn start_instance(&mut self, spec: InstanceSpec);
-    fn stop_instance(&mut self, id: &str);
-    /// The ids of the instances running now (not those migrating in).
-    fn instances(&self) -> Vec<String>;
-    /// Starts `spec` as the target of a live migration from `from`: an
-    /// incoming instance whose memory is copied over the `migration` network.
-    /// Once the copy is complete it runs (it is listed in
-    /// [`HostOs::instances`]) and `from`'s instance ends. An instance the host
-    /// already has, incoming or running, changes nothing; `stop_instance`
-    /// gives an incoming one up. The incoming instance is given up, never
-    /// completed, once the clock reaches `deadline` or once `from` no longer
-    /// runs it.
-    fn migrate_in(&mut self, spec: InstanceSpec, from: HostId, deadline: SimTime);
-    /// Gives up instance `id` if it is migrating in; one that runs is left alone.
-    fn abort_migration(&mut self, id: &str);
-    /// The ids of the instances migrating in now.
-    fn migrations(&self) -> Vec<String>;
-    /// Starts holding a replica of `volume` on the disk with most room for
-    /// it, copied over the storage network from `source`'s replica, or empty
-    /// (complete at once) when `None`. A volume the host already holds keeps
-    /// its replica; an incomplete one whose copy was interrupted resumes
-    /// copying from `source`. The disk the replica is on, or `None` if no
-    /// disk can hold it.
-    fn create_replica(&mut self, volume: &str, size_gb: u32, source: Option<HostId>) -> Option<String>;
-    /// Every replica the host holds, with how much of it is copied.
-    fn replicas(&self) -> Vec<ReplicaReport>;
-    fn delete_replica(&mut self, volume: &str);
     /// Starts a CP replica on this host with empty Raft state that knows
     /// `voters`, unless the host already holds CP state (its replica runs, or
     /// resumes from disk on boot).
@@ -180,8 +150,8 @@ pub trait Ctx {
     }
 }
 
-/// `Send` so a whole simulation can be moved onto a server thread; `Any` so
-/// the simulator can reach a concrete actor (e.g. the UI client) by type.
+/// `Send` so a replica can be moved onto a server thread; `Any` so the
+/// runtime can reach a concrete actor (e.g. the UI client) by type.
 pub trait Actor: Any + Send {
     fn on_start(&mut self, ctx: &mut dyn Ctx);
     fn on_message(&mut self, ctx: &mut dyn Ctx, from: Endpoint, msg: Msg);

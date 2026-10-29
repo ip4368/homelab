@@ -3,8 +3,8 @@
 use super::objects::{Change, CpMode, Lifecycle, NetworkResult, ObjectRef};
 use model::network::{LldpNeighbor, ObservedSwitchPort};
 use model::{
-    Deployment, HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate,
-    PodPhase, ProfileId, ReplicaRef, Role, SwitchId, Vm, VmPhase, Volume, VolumeHealth,
+    HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId,
+    Role, SwitchId,
 };
 use crate::runtime::SimTime;
 use serde::{Deserialize, Serialize};
@@ -110,24 +110,6 @@ pub enum Command {
         mlag_peer: Option<SwitchId>,
         last_seen: SimTime,
     },
-    /// Creates a deployment and one `Pending` pod status per replica.
-    CreateDeployment { deployment: Deployment },
-    DeleteDeployment { id: String },
-    /// Creates a VM, with a `Pending` status. Fails with `MissingDependency`
-    /// if its volume does not exist.
-    CreateVm { vm: Vm },
-    DeleteVm { id: String },
-    /// Creates a volume, with a status that has no replicas (`Faulted`) until
-    /// the storage controller places some.
-    CreateVolume { volume: Volume },
-    /// Fails with `InUse`, listing the VMs, while a VM uses the volume.
-    DeleteVolume { id: String },
-    /// Where pod `idx` of `deployment` runs.
-    SetPodStatus { deployment: String, idx: u32, host: Option<HostId>, phase: PodPhase },
-    /// Where a VM runs; the status's `since` becomes the log time when `host` or `phase` changes.
-    SetVmStatus { id: String, host: Option<HostId>, phase: VmPhase },
-    /// Replaces a volume's replica list and health as the storage controller judged them.
-    SetVolumeStatus { id: String, replicas: Vec<ReplicaRef>, health: VolumeHealth },
     /// Sets the cluster's Kubernetes secret and the host whose K3s server
     /// starts the Kubernetes cluster. Fails with `AlreadyExists` once set.
     SetKube { token: String, init_host: HostId },
@@ -152,16 +134,10 @@ pub enum ApplyError {
     InvalidRolloutState,
     /// A rollout batch must be 1 to 100 percent of the hosts.
     InvalidBatchPct(u8),
-    /// The object refers to this one, which does not exist.
-    MissingDependency(ObjectRef),
     /// A control-plane voter's host cannot be removed; replace the member first.
     CpVoter,
     /// Not one of the [`AlertKind`](crate::controllers::alerts::AlertKind)s.
     UnknownAlertKind(String),
-    /// The VM is not in a phase (or on a host) that allows this status: a
-    /// migration starts only from `Running` on its source, and ends only
-    /// `Running` on its source or its target.
-    InvalidVmPhase,
 }
 
 impl fmt::Display for ApplyError {
@@ -179,12 +155,8 @@ impl fmt::Display for ApplyError {
             Self::RolloutInProgress(id) => write!(f, "rollout {id} in progress"),
             Self::InvalidRolloutState => f.write_str("rollout state does not allow this change"),
             Self::InvalidBatchPct(pct) => write!(f, "batch_pct must be 1 to 100, not {pct}"),
-            Self::MissingDependency(r) => {
-                write!(f, "needs {} {}, which does not exist", format!("{:?}", r.kind).to_lowercase(), r.id)
-            }
             Self::CpVoter => f.write_str("host is a control-plane voter; replace it first"),
             Self::UnknownAlertKind(kind) => write!(f, "unknown alert kind {kind}"),
-            Self::InvalidVmPhase => f.write_str("VM phase does not allow this change"),
         }
     }
 }

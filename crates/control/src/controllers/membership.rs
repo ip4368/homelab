@@ -206,11 +206,11 @@ fn end_handoff(state: &ClusterState, raft: &RaftMembers) -> Option<Action> {
 }
 
 /// Whether the state knows `h`'s host and it is not up (up: `Ready`, or
-/// cordoned, draining or drained, which still run the replica). A member
-/// the state has no host for is not judged.
+/// cordoned, which still runs the replica). A member the state has no host
+/// for is not judged.
 fn down(state: &ClusterState, h: &HostId) -> bool {
     state.hosts.get(h).is_some_and(|h| {
-        !matches!(h.lifecycle, Lifecycle::Ready | Lifecycle::Cordoned | Lifecycle::Draining | Lifecycle::Drained)
+        !matches!(h.lifecycle, Lifecycle::Ready | Lifecycle::Cordoned)
     })
 }
 

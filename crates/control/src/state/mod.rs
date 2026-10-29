@@ -5,11 +5,9 @@
 mod command;
 mod objects;
 mod rollout;
-mod workload;
 
 pub use command::{ApplyError, Command};
 pub use objects::*;
-pub use workload::UNSCHEDULED;
 
 use crate::controllers::alerts::AlertKind;
 use crate::controllers::join::UNKNOWN_LOCATION;
@@ -37,15 +35,6 @@ pub struct ClusterState {
     pub switches: BTreeMap<SwitchId, SwitchObj>,
     /// Every rollout, done ones included; at most one is not done.
     pub rollouts: BTreeMap<String, Rollout>,
-    pub deployments: BTreeMap<String, DeploymentObj>,
-    /// Keyed by `(deployment, idx)`.
-    pub pods: BTreeMap<(String, u32), PodObj>,
-    pub vms: BTreeMap<String, VmObj>,
-    /// Keyed by VM id.
-    pub vm_status: BTreeMap<String, VmStatusObj>,
-    pub volumes: BTreeMap<String, VolumeObj>,
-    /// Keyed by volume id.
-    pub volume_status: BTreeMap<String, VolumeStatusObj>,
     pub alerts: BTreeMap<String, Alert>,
     /// Keyed by `seq`, oldest first.
     pub events: BTreeMap<u64, Event>,
@@ -75,12 +64,6 @@ impl ClusterState {
             templates: BTreeMap::new(),
             switches: BTreeMap::new(),
             rollouts: BTreeMap::new(),
-            deployments: BTreeMap::new(),
-            pods: BTreeMap::new(),
-            vms: BTreeMap::new(),
-            vm_status: BTreeMap::new(),
-            volumes: BTreeMap::new(),
-            volume_status: BTreeMap::new(),
             alerts: BTreeMap::new(),
             events: BTreeMap::new(),
             cp: CpInfo { voters: Default::default(), mode: CpMode::Suggest, handoff: None, version: 0 },
@@ -409,15 +392,6 @@ impl ClusterState {
             Command::PauseRollout { id, reason, failed } => self.pause_rollout(v, &id, reason, failed)?,
             Command::ResumeRollout { id } => self.resume_rollout(v, &id)?,
             Command::AbortRollout { id } => self.abort_rollout(v, &id)?,
-            Command::CreateDeployment { deployment } => self.create_deployment(v, deployment)?,
-            Command::DeleteDeployment { id } => self.delete_deployment(v, &id)?,
-            Command::CreateVm { vm } => self.create_vm(at, v, vm)?,
-            Command::DeleteVm { id } => self.delete_vm(v, &id)?,
-            Command::CreateVolume { volume } => self.create_volume(v, volume)?,
-            Command::DeleteVolume { id } => self.delete_volume(v, &id)?,
-            Command::SetPodStatus { deployment, idx, host, phase } => self.set_pod_status(v, deployment, idx, host, phase)?,
-            Command::SetVmStatus { id, host, phase } => self.set_vm_status(at, v, &id, host, phase)?,
-            Command::SetVolumeStatus { id, replicas, health } => self.set_volume_status(v, &id, replicas, health)?,
             Command::SetKube { token, init_host } => {
                 if self.kube.is_some() {
                     return Err(ApplyError::AlreadyExists);
@@ -471,12 +445,6 @@ impl ClusterState {
         upserts.extend(self.templates.values().filter(|o| o.version > v).cloned().map(Object::Template));
         upserts.extend(self.switches.values().filter(|o| o.version > v).cloned().map(Object::Switch));
         upserts.extend(self.rollouts.values().filter(|o| o.version > v).cloned().map(Object::Rollout));
-        upserts.extend(self.deployments.values().filter(|o| o.version > v).cloned().map(Object::Deployment));
-        upserts.extend(self.pods.values().filter(|o| o.version > v).cloned().map(Object::Pod));
-        upserts.extend(self.vms.values().filter(|o| o.version > v).cloned().map(Object::Vm));
-        upserts.extend(self.vm_status.values().filter(|o| o.version > v).cloned().map(Object::VmStatus));
-        upserts.extend(self.volumes.values().filter(|o| o.version > v).cloned().map(Object::Volume));
-        upserts.extend(self.volume_status.values().filter(|o| o.version > v).cloned().map(Object::VolumeStatus));
         upserts.extend(self.alerts.values().filter(|o| o.version > v).cloned().map(Object::Alert));
         upserts.extend(self.events.values().filter(|o| o.version > v).cloned().map(Object::Event));
         if self.cp.version > v {
@@ -665,14 +633,10 @@ mod tests {
         let mut s = ClusterState::new();
         ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
         let set = |s: &mut ClusterState, l| s.apply(10, Command::SetLifecycle { id: hid("h1"), lifecycle: l });
-        assert_eq!(set(&mut s, Lifecycle::Drained), Err(ApplyError::InvalidLifecycle));
         assert_eq!(set(&mut s, Lifecycle::Ready), Err(ApplyError::InvalidLifecycle));
         assert_eq!(set(&mut s, Lifecycle::Removed), Err(ApplyError::InvalidLifecycle));
-        set(&mut s, Lifecycle::Draining).unwrap();
-        set(&mut s, Lifecycle::Ready).unwrap(); // uncordoned: the drain is cancelled
-        set(&mut s, Lifecycle::Draining).unwrap();
-        set(&mut s, Lifecycle::Drained).unwrap();
-        set(&mut s, Lifecycle::Ready).unwrap();
+        set(&mut s, Lifecycle::Cordoned).unwrap();
+        set(&mut s, Lifecycle::Ready).unwrap(); // uncordoned
         set(&mut s, Lifecycle::NotReady).unwrap();
         set(&mut s, Lifecycle::Ready).unwrap();
         assert_eq!(s.hosts[&hid("h1")].last_transition, 10);
@@ -693,29 +657,20 @@ mod tests {
         set(&mut s, Lifecycle::Ready).unwrap();
         assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Ready);
         assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
-        // Cordoned, Draining and Drained hosts come back as they were
-        for prior in [Lifecycle::Cordoned, Lifecycle::Draining, Lifecycle::Drained] {
-            let mut s = ClusterState::new();
-            ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
-            if prior == Lifecycle::Cordoned {
-                set(&mut s, Lifecycle::Cordoned).unwrap();
-            } else {
-                set(&mut s, Lifecycle::Draining).unwrap();
-                if prior == Lifecycle::Drained {
-                    set(&mut s, Lifecycle::Drained).unwrap();
-                }
-            }
-            set(&mut s, Lifecycle::NotReady).unwrap();
-            set(&mut s, Lifecycle::Ready).unwrap();
-            assert_eq!(s.hosts[&hid("h1")].lifecycle, prior);
-            assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
-        }
+        // A cordoned host comes back as it was
+        let mut s = ClusterState::new();
+        ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
+        set(&mut s, Lifecycle::Cordoned).unwrap();
+        set(&mut s, Lifecycle::NotReady).unwrap();
+        set(&mut s, Lifecycle::Ready).unwrap();
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Cordoned);
+        assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
         // leaving NotReady any other way clears the memory
         let mut s = ClusterState::new();
         ready_host(&mut s, "h1", ProfileId::MiniPc, 0);
         set(&mut s, Lifecycle::Cordoned).unwrap();
         set(&mut s, Lifecycle::NotReady).unwrap();
-        set(&mut s, Lifecycle::Draining).unwrap();
+        set(&mut s, Lifecycle::Cordoned).unwrap();
         assert_eq!(s.hosts[&hid("h1")].before_not_ready, None);
         // a Provisioning host cannot go NotReady
         let mut s = ClusterState::new();
@@ -908,7 +863,7 @@ mod tests {
         let mut s = ClusterState::new();
         assert_eq!(s.apply(1, raise("x", "Gremlins", host_ref("h1"), None)), Err(ApplyError::UnknownAlertKind("Gremlins".into())));
         s.apply(1, raise("p", "PortDown", host_ref("h1"), Some("sfp0"))).unwrap();
-        s.apply(1, raise("v", "VolumeFaulted", ObjectRef::volume("data"), None)).unwrap();
+        s.apply(1, raise("v", "HostDown", host_ref("h1"), None)).unwrap();
         assert_eq!((s.alerts["p"].severity, s.alerts["v"].severity), (Severity::Warning, Severity::Critical));
         assert_eq!(s.alerts["p"].subject.as_deref(), Some("sfp0"));
     }

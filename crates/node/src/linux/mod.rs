@@ -2,9 +2,8 @@
 //! inventory from `/sys`, network configs through systemd-networkd with
 //! `netplan try` semantics, LLDP heard on every NIC, Raft state on disk,
 //! data disks mounted under `/mnt/<name>`, and Kubernetes (K3s and
-//! Longhorn) run by a worker thread ([`kube`]). The control plane's own
-//! workload stand-ins (instances, replicas) do not run on real hosts:
-//! Kubernetes runs the workloads.
+//! Longhorn) run by a worker thread ([`kube`]). Workloads run on
+//! Kubernetes, not through the control plane.
 
 pub mod kube;
 pub mod lldp;
@@ -14,9 +13,9 @@ pub mod store;
 pub mod sysfs;
 
 use crate::runtime::{NodeOs, VipControl};
-use control::proto::{InstanceSpec, KubeAdmin, KubeSpec, KubeStatus, LogCmd, ReplicaReport};
+use control::proto::{KubeAdmin, KubeSpec, KubeStatus, LogCmd};
 use control::raft::{Durable, DurableOp};
-use control::runtime::{HostOs, HostUsage, SimTime};
+use control::runtime::{HostOs, HostUsage};
 use model::network::{bootstrap_config, HostNetworkConfig, LldpNeighbor, LogicalNetwork};
 use model::{profile, HostId, Inventory, NetworkId};
 use serde::de::DeserializeOwned;
@@ -30,61 +29,6 @@ use std::process::Command;
 use std::thread::JoinHandle;
 use store::{write_synced, RaftStore};
 use sysfs::{Sys, UsageSampler};
-
-/// The systemd unit a workload instance runs as: `homelab-inst-<id>.service`,
-/// with the id escaped so it is a valid unit name (`_` → `__`, `/` → `_s`).
-pub fn instance_unit(id: &str) -> String {
-    let mut out = String::from("homelab-inst-");
-    for c in id.chars() {
-        match c {
-            '_' => out.push_str("__"),
-            '/' => out.push_str("_s"),
-            c if c.is_ascii_alphanumeric() || c == '-' || c == '.' => out.push(c),
-            c => out.push_str(&format!("_x{:02x}", c as u32 & 0xff)),
-        }
-    }
-    out.push_str(".service");
-    out
-}
-
-/// The instance id a unit name from [`instance_unit`] stands for.
-pub fn instance_of_unit(unit: &str) -> Option<String> {
-    let body = unit.strip_prefix("homelab-inst-")?.strip_suffix(".service")?;
-    let mut out = String::new();
-    let mut chars = body.chars();
-    while let Some(c) = chars.next() {
-        if c != '_' {
-            out.push(c);
-            continue;
-        }
-        match chars.next()? {
-            '_' => out.push('_'),
-            's' => out.push('/'),
-            'x' => {
-                let hex: String = chars.by_ref().take(2).collect();
-                out.push(u8::from_str_radix(&hex, 16).ok()? as char);
-            }
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn instance_units_round_trip() {
-        for id in ["vm/web-1", "pod/media_server/0", "vm/a b"] {
-            let unit = instance_unit(id);
-            assert!(unit.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)), "{unit}");
-            assert_eq!(instance_of_unit(&unit).as_deref(), Some(id));
-        }
-        assert_eq!(instance_unit("vm/web-1"), "homelab-inst-vm_sweb-1.service");
-        assert_eq!(instance_of_unit("sshd.service"), None);
-    }
-}
 
 /// Where a host keeps things.
 #[derive(Debug, Clone)]
@@ -429,24 +373,6 @@ impl HostOs for LinuxOs {
             eprintln!("homelabd: mark joined: {e}");
         }
     }
-
-    fn start_instance(&mut self, _spec: InstanceSpec) {}
-    fn stop_instance(&mut self, _id: &str) {}
-    fn instances(&self) -> Vec<String> {
-        vec![]
-    }
-    fn migrate_in(&mut self, _spec: InstanceSpec, _from: HostId, _deadline: SimTime) {}
-    fn abort_migration(&mut self, _id: &str) {}
-    fn migrations(&self) -> Vec<String> {
-        vec![]
-    }
-    fn create_replica(&mut self, _volume: &str, _size_gb: u32, _source: Option<HostId>) -> Option<String> {
-        None
-    }
-    fn replicas(&self) -> Vec<ReplicaReport> {
-        vec![]
-    }
-    fn delete_replica(&mut self, _volume: &str) {}
 
     fn apply_kube(&mut self, spec: KubeSpec) {
         if let Some(k) = &self.kube {

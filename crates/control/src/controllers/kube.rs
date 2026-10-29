@@ -118,7 +118,7 @@ pub fn node_labels(h: &HostObj) -> BTreeMap<String, String> {
 }
 
 fn member(h: &HostObj) -> bool {
-    matches!(h.lifecycle, Lifecycle::Ready | Lifecycle::Cordoned | Lifecycle::Draining | Lifecycle::Drained)
+    matches!(h.lifecycle, Lifecycle::Ready | Lifecycle::Cordoned)
 }
 
 /// Whether `id`'s host is up: a member host the control plane hears from.

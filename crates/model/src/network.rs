@@ -186,8 +186,7 @@ pub enum PortMode {
     Trunk { native: Option<u16>, allowed: BTreeSet<u16> },
 }
 
-/// Configuration of one switch port. This is the switch's ground truth in
-/// the simulator and, from Task 12, what the switch reports when polled.
+/// Configuration of one switch port: what the switch reports when polled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
 pub struct SwitchPortCfg {

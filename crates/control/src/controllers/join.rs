@@ -16,7 +16,7 @@ use std::net::Ipv4Addr;
 
 /// At most one "join rejected" event per host this often, however often its agent retries.
 pub const REJECT_EVENT_EVERY_MS: u64 = 60_000;
-/// A joining host's location until something knows better (presets, LLDP).
+/// A joining host's location until something knows better (LLDP).
 pub const UNKNOWN_LOCATION: &str = "unknown";
 pub const INVALID_TOKEN: &str = "invalid token";
 

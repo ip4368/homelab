@@ -17,7 +17,7 @@ pub fn run(state: &ClusterState, v: &Volatile, now: SimTime) -> Vec<Action> {
         // Hosts still joining or provisioning are not expected to heartbeat yet.
         if !matches!(
             host.lifecycle,
-            Lifecycle::Ready | Lifecycle::Cordoned | Lifecycle::Draining | Lifecycle::Drained | Lifecycle::NotReady
+            Lifecycle::Ready | Lifecycle::Cordoned | Lifecycle::NotReady
         ) {
             continue;
         }
@@ -128,7 +128,7 @@ mod tests {
 
     #[test]
     fn silent_host_goes_not_ready_with_one_alert_then_recovers() {
-        let mut s = state_with(&[("h1", Lifecycle::Draining), ("h2", Lifecycle::Ready)]);
+        let mut s = state_with(&[("h1", Lifecycle::Cordoned), ("h2", Lifecycle::Ready)]);
         let mut v = Volatile::new(0, 1);
         v.last_heartbeat.insert(hid("h1"), 5_000);
         v.last_heartbeat.insert(hid("h2"), 44_000);
@@ -162,7 +162,7 @@ mod tests {
             ]
         );
         apply_all(&mut s, now + 3000, cmds);
-        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Draining, "recovery restores the prior state");
+        assert_eq!(s.hosts[&hid("h1")].lifecycle, Lifecycle::Cordoned, "recovery restores the prior state");
         assert!(run(&s, &v, now + 4000).is_empty());
     }
 

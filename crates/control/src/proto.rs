@@ -8,19 +8,11 @@ use crate::controllers::rollout::{DEFAULT_BATCH_PCT, DEFAULT_SOAK_S};
 use crate::state::{Change, Changes, Command, CpMode, NetworkResult};
 use ipnet::Ipv4Net;
 use model::network::{IpRange, LldpNeighbor, ObservedSwitchPort};
-use model::{Deployment, HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId, Vm, Volume};
+use model::{HostId, HostNetworkConfig, Inventory, NetworkId, ProfileId, Role, SwitchId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use ts_rs::TS;
-
-/// A live migration not complete this long after it began fails: the
-/// control plane puts the VM back on its source.
-pub const MIGRATION_TIMEOUT_MS: u64 = 120_000;
-/// A migration's target gives up this long before the control plane does
-/// ([`MigrateIn`](Msg::MigrateIn)'s `deadline`), so that a migration that
-/// completes is always heard of before the control plane would revert it.
-pub const MIGRATION_MARGIN_MS: u64 = 10_000;
 
 /// The network control traffic rides on.
 pub fn mgmt() -> NetworkId {
@@ -58,86 +50,6 @@ pub struct MetricSample {
     /// Per port name.
     pub port_rx_bps: BTreeMap<String, f64>,
     pub port_tx_bps: BTreeMap<String, f64>,
-    pub instances: u32,
-}
-
-/// Where a flow starts or ends.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub enum FlowEnd {
-    Host(HostId),
-    /// The upstream router: VM client traffic and transcode streams end here.
-    Router,
-}
-
-/// What generates a traffic flow.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum FlowKind {
-    Iperf,
-    ReplicaWrite,
-    Rebuild,
-    Migration,
-    VmClient,
-    Transcode,
-    Pod,
-}
-
-/// How an instance's CPU and RAM usage moves, as a percentage of what it
-/// requested: `base_pct`, plus up to `noise_pct` of smooth seeded noise, plus
-/// a short burst once every `burst_every_s` (0 for none).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct UsageProfile {
-    pub base_pct: f32,
-    pub noise_pct: f32,
-    pub burst_every_s: u32,
-}
-
-/// A flow an instance keeps up from its host for as long as it runs. Its
-/// demand moves along a seeded curve between `min_mbps` and `max_mbps`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct FlowSpec {
-    pub kind: FlowKind,
-    pub to: FlowEnd,
-    pub network: NetworkId,
-    pub min_mbps: f64,
-    pub max_mbps: f64,
-}
-
-/// What a host runs for a pod or VM.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InstanceSpec {
-    /// `vm/<id>` or `pod/<deployment>/<idx>`.
-    pub id: String,
-    pub cpu_m: u32,
-    pub ram_mb: u32,
-    pub usage: UsageProfile,
-    pub flows: Vec<FlowSpec>,
-}
-
-/// The instance id a host runs VM `id` under.
-pub fn vm_instance(id: &str) -> String {
-    format!("vm/{id}")
-}
-
-/// The instance id a host runs pod `idx` of `deployment` under.
-pub fn pod_instance(deployment: &str, idx: u32) -> String {
-    format!("pod/{deployment}/{idx}")
-}
-
-/// A volume replica a host holds, as its agent reports it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ReplicaReport {
-    pub volume: String,
-    pub disk: String,
-    /// How much of it is copied, 0 to 100.
-    pub pct: u8,
-    /// How much of it is copied, in bytes: progress too fine to move `pct`
-    /// (a large volume, a slow link) still shows here.
-    pub copied_bytes: u64,
-    /// Whether a copy into it is running. An incomplete replica that is not
-    /// copying was interrupted (its host or source lost power) and waits for
-    /// a `CreateReplica` naming a source to resume.
-    pub copying: bool,
 }
 
 /// What a host runs of Kubernetes (K3s).
@@ -278,15 +190,8 @@ pub enum ApiOp {
     SetRoles { id: HostId, roles: BTreeSet<Role> },
     SetLabels { id: HostId, labels: BTreeMap<String, String> },
     Cordon { id: HostId },
-    /// Readies the host again; cancels a drain.
+    /// Readies the host again.
     Uncordon { id: HostId },
-    /// Empties the host so it can be serviced: its VMs live-migrate away one
-    /// at a time, its pods are rescheduled and its volume replicas move off,
-    /// then it is `Drained`.
-    Drain { host: HostId },
-    /// Live-migrates a running VM to `to`, or with `None` to the host the
-    /// scheduler picks. The result is the target host.
-    MigrateVm { vm: String, to: Option<HostId> },
     RemoveHost { id: HostId },
     /// Sets, or with `None` clears, the host's hand-written network config.
     SetHostOverride { id: HostId, config: Option<HostNetworkConfig> },
@@ -313,16 +218,6 @@ pub enum ApiOp {
     ResumeRollout { id: String },
     /// Gives a rollout up and takes its change back.
     AbortRollout { id: String },
-    /// Refused unless `replicas` is 1 to 1000.
-    CreateDeployment { deployment: Deployment },
-    DeleteDeployment { id: String },
-    /// Refused unless its volume exists.
-    CreateVm { vm: Vm },
-    DeleteVm { id: String },
-    /// Refused unless `size_gb` is at least 1 and `replicas` 1 to 5.
-    CreateVolume { volume: Volume },
-    /// Refused while a VM uses the volume.
-    DeleteVolume { id: String },
     /// How dead control-plane members are replaced: suggested or automatic.
     SetCpMode { mode: CpMode },
     /// Replaces down CP voter `dead` with eligible host `with`: `with` joins
@@ -381,16 +276,13 @@ pub enum Msg {
     /// it has none); `observed` carries it only on the first heartbeat, after a
     /// change, or when the leader asked ([`Msg::ReportRequest`]).
     /// `net_generation` is the network config generation the host runs (0
-    /// when the agent does not know, e.g. after a restart). `instances` and
-    /// `replicas` are what the host runs and holds now.
+    /// when the agent does not know, e.g. after a restart).
     Heartbeat {
         host: HostId,
         lifecycle_seen: u64,
         observed_at: Option<SimTime>,
         observed: Option<Observed>,
         net_generation: u64,
-        instances: Vec<String>,
-        replicas: Vec<ReplicaReport>,
     },
     /// Leader to agent: send your observation, I don't have the one stamped
     /// in your last heartbeat.
@@ -414,26 +306,6 @@ pub enum Msg {
     NetworkStatus { generation: u64, result: NetworkResult },
     /// Leader to agent: keep `generation`.
     ConfirmNetwork { generation: u64 },
-    /// Leader to agent: run this instance (a repeat of a running one changes nothing).
-    StartInstance(InstanceSpec),
-    /// Leader to agent: stop the instance with this id.
-    StopInstance(String),
-    /// Leader to the agent of a live migration's target: start an incoming
-    /// instance of `spec`, copying its memory from `from` over the
-    /// `migration` network (a repeat changes nothing). The incoming instance
-    /// is given up, never completed, once the clock reaches `deadline`, or
-    /// once `from` no longer runs the VM.
-    MigrateIn { spec: InstanceSpec, from: HostId, deadline: SimTime },
-    /// Leader to agent: give up the incoming instance with this id, if it is
-    /// still migrating in (one that runs already is left alone).
-    AbortMigration(String),
-    /// Agent to the VIP: the incoming instance `instance` took over from its source.
-    MigrationDone { instance: String },
-    /// Leader to agent: hold a replica of `volume`, copied from the replica on
-    /// `source`, or empty (complete at once) when `None`. A repeat for a
-    /// replica the host holds changes nothing.
-    CreateReplica { volume: String, size_gb: u32, source: Option<HostId> },
-    DeleteReplica { volume: String },
     /// Leader to agent: start a CP replica on this host, empty and knowing
     /// the current `voters`, to catch up as a learner. A host that already
     /// runs one keeps it.

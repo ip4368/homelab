@@ -1,6 +1,6 @@
 //! A freshly installed cluster: the Raft state its first replicas start
-//! from, like `k3s server --cluster-init`. The simulator seeds whole fleets
-//! with it; a real first host (`homelabd bootstrap`) seeds a fleet of one.
+//! from, like `k3s server --cluster-init`. The lab's bring-up seeds whole
+//! fleets with it; a real first host (`homelabd bootstrap`) seeds a fleet of one.
 
 use crate::controllers::join::allocate_ips;
 use crate::proto::LogCmd;
@@ -136,6 +136,39 @@ mod tests {
             }
         }
         s
+    }
+
+    /// Bootstrapping only bootstraps: every seeded command is cluster
+    /// setup (CP, Kubernetes secret, networks, templates, rules, hosts).
+    /// In particular, no workload of any kind is created.
+    #[test]
+    fn seeded_log_holds_bootstrap_commands_only() {
+        let hosts = [
+            SeedHost { id: HostId::from("ms01-1"), inventory: Inventory::from_profile(ProfileId::Ms01, 0), location: "lab".into(), running: None },
+            SeedHost { id: HostId::from("ms01-2"), inventory: Inventory::from_profile(ProfileId::Ms01, 0), location: "lab".into(), running: None },
+        ];
+        let d = seeded_durable(&hosts, &[HostId::from("ms01-1")].into(), "t", 1);
+        assert!(!d.log.is_empty());
+        for e in &d.log {
+            let EntryPayload::Normal(LogCmd { cmd, .. }) = &e.payload else { panic!("seed holds commands only") };
+            assert!(
+                matches!(
+                    cmd,
+                    Command::SetCp { .. }
+                        | Command::SetKube { .. }
+                        | Command::UpsertNetwork { .. }
+                        | Command::UpsertTemplate { .. }
+                        | Command::UpsertRule { .. }
+                        | Command::AddPendingHost { .. }
+                        | Command::ApproveHost { .. }
+                        | Command::ProvisionHost { .. }
+                        | Command::SetDesiredNetwork { .. }
+                        | Command::RecordNetworkResult { .. }
+                        | Command::SetLifecycle { .. }
+                ),
+                "bootstrap must not seed {cmd:?}"
+            );
+        }
     }
 
     #[test]

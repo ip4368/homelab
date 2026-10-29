@@ -1,5 +1,5 @@
-//! A host's lifecycle phase. It lives in `model` because the scheduler
-//! filters hosts by it.
+//! A host's lifecycle phase. It lives in `model` because control,
+//! the node agent and the UI all speak it.
 
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -13,8 +13,6 @@ pub enum Lifecycle {
     Ready,
     NotReady,
     Cordoned,
-    Draining,
-    Drained,
     Removed,
 }
 
@@ -30,18 +28,10 @@ impl Lifecycle {
                 | (Provisioning, Ready)
                 | (Ready, NotReady)
                 | (Cordoned, NotReady)
-                | (Draining, NotReady)
-                | (Drained, NotReady)
                 | (Ready, Cordoned)
-                | (Ready, Draining)
                 | (NotReady, Ready)
                 | (NotReady, Cordoned)
-                | (NotReady, Draining)
                 | (Cordoned, Ready)
-                | (Cordoned, Draining)
-                | (Draining, Ready)
-                | (Draining, Drained)
-                | (Drained, Ready)
         )
     }
 }

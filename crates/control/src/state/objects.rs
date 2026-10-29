@@ -8,8 +8,8 @@ use model::network::{LldpNeighbor, ObservedSwitchPort};
 // Defined in `model` (the scheduler filters on it); kept importable from here.
 pub use model::Lifecycle;
 use model::{
-    Deployment, HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate,
-    PodStatus, ProfileId, Role, SwitchId, Vm, VmStatus, Volume, VolumeStatus,
+    HardwareProfile, HostId, HostNetworkConfig, Inventory, Issue, LogicalNetwork, NetworkId, NetworkTemplate, ProfileId,
+    Role, SwitchId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -180,74 +180,6 @@ pub struct SwitchObj {
     /// written when the report changes or this value is a minute old.
     #[ts(type = "number")]
     pub last_seen: SimTime,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// A deployment with the state version at which it last changed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct DeploymentObj {
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub deployment: Deployment,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// A VM with the state version at which it last changed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct VmObj {
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub vm: Vm,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// A volume with the state version at which it last changed.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct VolumeObj {
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub volume: Volume,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// One pod of a deployment: `deployment` and `idx` identify it (as `<deployment>/<idx>`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct PodObj {
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub status: PodStatus,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// Where a VM runs; `id` is the VM's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct VmStatusObj {
-    pub id: String,
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub status: VmStatus,
-    #[ts(type = "number")]
-    pub version: u64,
-}
-
-/// Where a volume's replicas are; `id` is the volume's.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[ts(export)]
-pub struct VolumeStatusObj {
-    pub id: String,
-    #[serde(flatten)]
-    #[ts(flatten)]
-    pub status: VolumeStatus,
     #[ts(type = "number")]
     pub version: u64,
 }
@@ -425,12 +357,6 @@ pub enum ObjectKind {
     Template,
     Switch,
     Rollout,
-    Deployment,
-    Vm,
-    Volume,
-    Pod,
-    VmStatus,
-    VolumeStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]
@@ -453,18 +379,6 @@ impl ObjectRef {
     pub fn switch(id: &SwitchId) -> Self {
         Self { kind: ObjectKind::Switch, id: id.to_string() }
     }
-    pub fn deployment(id: &str) -> Self {
-        Self { kind: ObjectKind::Deployment, id: id.into() }
-    }
-    pub fn vm(id: &str) -> Self {
-        Self { kind: ObjectKind::Vm, id: id.into() }
-    }
-    pub fn volume(id: &str) -> Self {
-        Self { kind: ObjectKind::Volume, id: id.into() }
-    }
-    pub fn pod(deployment: &str, idx: u32) -> Self {
-        Self { kind: ObjectKind::Pod, id: PodStatus::key(deployment, idx) }
-    }
     pub fn cp() -> Self {
         Self { kind: ObjectKind::Cp, id: "cp".into() }
     }
@@ -484,12 +398,6 @@ pub enum Object {
     Template(TemplateObj),
     Switch(SwitchObj),
     Rollout(Rollout),
-    Deployment(DeploymentObj),
-    Vm(VmObj),
-    Volume(VolumeObj),
-    Pod(PodObj),
-    VmStatus(VmStatusObj),
-    VolumeStatus(VolumeStatusObj),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]

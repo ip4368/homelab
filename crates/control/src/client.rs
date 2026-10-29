@@ -5,10 +5,10 @@
 use crate::proto::{mgmt, ApiOp, ApiResult, MetricSample, Msg};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{Changes, ClusterState, Object, ObjectKind, ObjectRef, EVENT_RING};
-use model::{HostId, NetworkId, PodStatus, SwitchId};
+use model::{HostId, NetworkId, SwitchId};
 use std::collections::BTreeMap;
 
-/// Where the simulator runs the client.
+/// Where the server runs the client.
 pub const CLIENT: Endpoint = Endpoint { addr: Addr::Client, svc: Svc::Client };
 const VIP: Endpoint = Endpoint { addr: Addr::Vip, svc: Svc::Cp };
 
@@ -79,30 +79,6 @@ impl ClusterView {
                     s.revive(ObjectKind::Rollout, &o.id);
                     s.rollouts.insert(o.id.clone(), o);
                 }
-                Object::Deployment(o) => {
-                    s.revive(ObjectKind::Deployment, &o.deployment.id);
-                    s.deployments.insert(o.deployment.id.clone(), o);
-                }
-                Object::Pod(o) => {
-                    s.revive(ObjectKind::Pod, &PodStatus::key(&o.status.deployment, o.status.idx));
-                    s.pods.insert((o.status.deployment.clone(), o.status.idx), o);
-                }
-                Object::Vm(o) => {
-                    s.revive(ObjectKind::Vm, &o.vm.id);
-                    s.vms.insert(o.vm.id.clone(), o);
-                }
-                Object::VmStatus(o) => {
-                    s.revive(ObjectKind::VmStatus, &o.id);
-                    s.vm_status.insert(o.id.clone(), o);
-                }
-                Object::Volume(o) => {
-                    s.revive(ObjectKind::Volume, &o.volume.id);
-                    s.volumes.insert(o.volume.id.clone(), o);
-                }
-                Object::VolumeStatus(o) => {
-                    s.revive(ObjectKind::VolumeStatus, &o.id);
-                    s.volume_status.insert(o.id.clone(), o);
-                }
             }
         }
         for ObjectRef { kind, id } in changes.removed {
@@ -138,28 +114,6 @@ impl ClusterView {
                 }
                 ObjectKind::Rollout => {
                     s.rollouts.remove(&id);
-                }
-                ObjectKind::Deployment => {
-                    s.deployments.remove(&id);
-                }
-                ObjectKind::Pod => {
-                    if let Some((deployment, idx)) = id.rsplit_once('/')
-                        && let Ok(idx) = idx.parse::<u32>()
-                    {
-                        s.pods.remove(&(deployment.to_string(), idx));
-                    }
-                }
-                ObjectKind::Vm => {
-                    s.vms.remove(&id);
-                }
-                ObjectKind::VmStatus => {
-                    s.vm_status.remove(&id);
-                }
-                ObjectKind::Volume => {
-                    s.volumes.remove(&id);
-                }
-                ObjectKind::VolumeStatus => {
-                    s.volume_status.remove(&id);
                 }
             }
         }
