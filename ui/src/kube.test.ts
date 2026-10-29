@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import type { HostObj } from './gen/HostObj'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, filterKube, gib, podTone, replicaLabel, volumeHosts, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, filterKube, gib, podTone, removalStatus, replicaLabel, volumeHosts, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return { namespace, name, owner, node, status, ready: 1, containers: 1, restarts: 0, created: 0 }
@@ -66,5 +67,20 @@ describe('kube', () => {
   it('formats ages and sizes like kubectl', () => {
     expect([age(0, 45_000), age(0, 12 * 60_000), age(0, 3 * 3_600_000), age(0, 3 * 86_400_000), age(null, 1)]).toEqual(['45s', '12m', '3h', '3d', ''])
     expect([gib(2 ** 31), gib(1.5 * 2 ** 30)]).toEqual(['2 GiB', '1.5 GiB'])
+  })
+
+  it('walks a removal through drain, evict, node deletion and wipe', () => {
+    const kube = (over: object) => ({ role: 'Agent', phase: 'Running', node_ready: true, labels: {}, storage_disks: [], version: 'v', detail: null, etcd_members: [], etcd_unread: null, etcd_unstarted: [], storage_off: [], node_cordoned: false, evicted: [], nodes_deleted: [], ...over })
+    const host = (id: string, lifecycle: HostObj['lifecycle'], k: object | null) => ({ id, lifecycle, kube: k && kube(k) }) as HostObj
+    const exec = (evicted: string[], nodes_deleted: string[]) => host('ms01-01', 'Ready', { role: 'Server', evicted, nodes_deleted })
+    expect(removalStatus({ a: host('a', 'Ready', {}) }, 'a')).toBeNull()
+    expect(removalStatus({ a: host('a', 'Removing', {}) }, 'a')).toBe('Draining Kubernetes workloads…')
+    expect(removalStatus({ a: host('a', 'Removing', { node_cordoned: true }) }, 'a')).toBe('Drained. Evicting Longhorn replicas…')
+    const mid = { a: host('a', 'Removing', { node_cordoned: true }), 'ms01-01': exec(['a'], []) }
+    expect(removalStatus(mid, 'a')).toBe('Replicas evicted. Deleting the node…')
+    const deleted = { a: host('a', 'Removing', {}), 'ms01-01': exec(['a'], ['a']) }
+    expect(removalStatus(deleted, 'a')).toBe('Node deleted. Wiping the machine…')
+    expect(removalStatus({ a: host('a', 'Removing', null) }, 'a')).toBe('Wiping the machine…')
+    expect(removalStatus({ a: host('a', 'Removing', { phase: 'Wiped' }) }, 'a')).toBe('Wiped. Forgetting…')
   })
 })

@@ -265,6 +265,10 @@ button:disabled:hover {
   border-left-color: #7c5cc4;
 }
 
+.lc-Removing {
+  border-left-color: #d92d20;
+}
+
 .lc-Removed {
   border-left-color: var(--muted);
   opacity: 0.6;
@@ -529,6 +533,10 @@ button:disabled:hover {
 
 .topo-node.host.lc-Cordoned rect {
   stroke: #7c5cc4;
+}
+
+.topo-node.host.lc-Removing rect {
+  stroke: #d92d20;
 }
 
 .topo-node text {

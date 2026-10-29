@@ -131,15 +131,18 @@ curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' -d
 
 Longhorn switches only while no volume is attached, so scale down the workloads that use volumes until its instance managers have restarted with `lhnet1`.
 
-## Starting over on a machine
+## Removing a host, and starting over on a machine
+
+Remove the host in the UI (**Remove** in its **Lifecycle** section). The cluster drains its Kubernetes workloads, moves its Longhorn replicas elsewhere, deletes its node, then tells the machine to wipe itself: K3s is uninstalled, its data disks are blanked, and its cluster state is deleted. The host is forgotten once the wipe is reported, and the drawer shows each step. A host whose data disks stop storing (its storage role held or removed) has its replicas moved off the same way, but its bytes stay until it is removed.
+
+A host that never answers (powered off, unreachable) waits for **Force remove**, which deletes it without cleaning anything up: wipe such a machine by hand before it rejoins, with the daemon stopped:
 
 ```sh
-sudo systemctl disable --now homelabd
-sudo /usr/local/bin/k3s-uninstall.sh || sudo /usr/local/bin/k3s-agent-uninstall.sh
-sudo rm -rf /var/lib/homelab /etc/homelab /run/homelab /etc/cni/multus
+sudo systemctl stop homelabd
+sudo homelabd wipe
 ```
 
-Remove the host in the UI first, so the cluster forgets it.
+Wiping keeps the network up and `/etc/homelab/node.json`. `homelabd join` (or `init`) then starts it fresh. Cordoning a host drains its Kubernetes workloads without removing it; uncordoning schedules them again. homelabd owns the cordon state: a `kubectl cordon` by hand is reverted.
 
 ## Not covered yet
 

@@ -3,4 +3,4 @@
 /**
  * How a host's Kubernetes install stands.
  */
-export type KubePhase = "Absent" | "Installing" | "Running" | { "Failed": string };
+export type KubePhase = "Absent" | "Installing" | "Running" | { "Failed": string } | "Wiped";

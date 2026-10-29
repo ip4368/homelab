@@ -1,3 +1,4 @@
+import type { HostObj } from './gen/HostObj'
 import type { KubePod } from './gen/KubePod'
 import type { KubeView } from './gen/KubeView'
 import type { KubeWorkload } from './gen/KubeWorkload'
@@ -102,4 +103,22 @@ export function gib(bytes: number): string {
 /** The pods on `host`, by namespace and name. */
 export function podsOn(k: Pick<KubeView, 'pods'>, host: string): KubePod[] {
   return k.pods.filter((p) => p.node === host)
+}
+
+/**
+ * Where a `Removing` host stands: drain, evict, node deletion and wipe run
+ * in that order, and the executor servers report the middle two in their
+ * own statuses. Null for hosts that are not being removed.
+ */
+export function removalStatus(hosts: Record<string, HostObj>, id: string): string | null {
+  const h = hosts[id]
+  if (!h || h.lifecycle !== 'Removing') return null
+  const reported = (f: (k: NonNullable<HostObj['kube']>) => string[]) =>
+    Object.values(hosts).some((x) => x.kube && f(x.kube).includes(id))
+  if (h.kube?.phase === 'Wiped') return 'Wiped. Forgetting…'
+  if (reported((k) => k.nodes_deleted)) return 'Node deleted. Wiping the machine…'
+  if (reported((k) => k.evicted)) return 'Replicas evicted. Deleting the node…'
+  if (!h.kube) return 'Wiping the machine…'
+  if (h.kube.node_cordoned) return 'Drained. Evicting Longhorn replicas…'
+  return 'Draining Kubernetes workloads…'
 }

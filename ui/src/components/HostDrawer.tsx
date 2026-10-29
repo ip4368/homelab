@@ -6,7 +6,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { KubeRole } from '../gen/KubeRole'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
-import { podTone, podsOn, SYSTEM_NAMESPACES } from '../kube'
+import { podTone, podsOn, removalStatus, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
 import { Charts } from './Charts'
 import { HandoffDialog, handoffChoices } from './HandoffDialog'
@@ -92,6 +92,7 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   const role = name(k.role)
   const phase = k.phase
   if (phase === 'Absent') return { text: 'nothing installed', tone: 'muted' }
+  if (phase === 'Wiped') return { text: 'wiped: K3s uninstalled, data disks blanked, cluster state deleted', tone: 'muted' }
   if (typeof phase === 'object' && 'Failed' in phase) return { text: `${role}: failed (${phase.Failed}); retrying`, tone: 'bad' }
   if (phase === 'Installing') {
     // While K3s reinstalls, `role` is still the one installed, and the detail names the one coming:
@@ -103,7 +104,8 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   }
   const disks = k.storage_disks.length ? `, Longhorn on ${k.storage_disks.join(', ')}` : ''
   const etcd = k.etcd_unread ? `; cannot read etcd's members (${k.etcd_unread})` : ''
-  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
+  const cordoned = k.node_cordoned ? ', cordoned (drained)' : ''
+  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${cordoned}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
 }
 
 function Kubernetes({ host }: { host: HostObj }) {
@@ -167,6 +169,37 @@ function ControlPlane({ host }: { host: HostObj }) {
   )
 }
 
+/** Removal progress, and the force path for a host that never answers its wipe. */
+function Removal({ host }: { host: HostObj }) {
+  const hosts = useStore((s) => s.view.hosts)
+  const { error, busy, run } = useAction()
+  const status = removalStatus(hosts, host.id)
+  if (!status) return null
+  const force = () => {
+    if (
+      window.confirm(
+        `Forget ${host.id} at once? Anything left on it (workloads, replicas, K3s) is NOT cleaned up; wipe it by hand (\`homelabd wipe\`) before it rejoins.`,
+      )
+    ) {
+      run(() => op({ ForgetHost: { id: host.id } }))
+    }
+  }
+  return (
+    <div className="section">
+      <h4>Removal</h4>
+      <p className="warn" role="status">
+        {status}
+      </p>
+      <div className="actions">
+        <button onClick={force} disabled={busy} title="Delete the host without waiting for its wipe">
+          Force remove
+        </button>
+        {error && <span className="bad">{error}</span>}
+      </div>
+    </div>
+  )
+}
+
 /** Roles editor: Approve while the host is Pending, otherwise Apply (SetRoles). */
 function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boolean }) {
   const pending = host.lifecycle === 'Pending'
@@ -194,14 +227,18 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
   if (!host) return null
 
   const remove = () => {
-    if (window.confirm(`Remove ${host.id}?`)) {
+    if (
+      window.confirm(
+        `Remove ${host.id}? Its workloads drain away, its Longhorn replicas move elsewhere, then the machine is wiped and forgotten. It can rejoin fresh afterwards.`,
+      )
+    ) {
       run(() => op({ RemoveHost: { id: host.id } }))
     }
   }
 
-  const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0]) =>
+  const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0], title?: string) =>
     show && (
-      <button onClick={() => run(() => op(o))} disabled={busy}>
+      <button onClick={() => run(() => op(o))} disabled={busy} title={title}>
         {label}
       </button>
     )
@@ -222,9 +259,9 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
       <div className="section">
         <h4>Lifecycle</h4>
         <div className="actions">
-          {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
-          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned', { Uncordon: { id: host.id } })}
-          {host.lifecycle !== 'Removed' && (
+          {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } }, 'Drain its Kubernetes workloads (kubectl drain)')}
+          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned', { Uncordon: { id: host.id } }, 'Schedule Kubernetes workloads on it again')}
+          {host.lifecycle !== 'Removing' && host.lifecycle !== 'Removed' && (
             <button onClick={remove} disabled={busy}>
               Remove
             </button>
@@ -232,13 +269,19 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
         </div>
         {error && <div className="bad">{error}</div>}
       </div>
+      {host.lifecycle === 'Removing' && <Removal host={host} />}
       <div className="section">
         <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>
-      {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
-      <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
-      {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
-      <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
+      {/* Nothing to edit on the way out. */}
+      {host.lifecycle !== 'Removing' && (
+        <>
+          {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
+          <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
+          {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
+          <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
+        </>
+      )}
     </aside>
   )
 }

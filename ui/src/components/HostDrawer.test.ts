@@ -40,6 +40,9 @@ describe('host drawer kubernetes', () => {
     etcd_unread: null,
     etcd_unstarted: [],
     storage_off: [],
+    node_cordoned: false,
+    evicted: [],
+    nodes_deleted: [],
     ...over,
   })
   it('says what the host runs and how far it got', () => {
@@ -51,6 +54,8 @@ describe('host drawer kubernetes', () => {
     expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('switching from K3s agent to K3s server (API + etcd)')
     expect(kubeSummary(k({ role: null, phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('installing K3s server (API + etcd)')
     expect(kubeSummary(k({ phase: { Failed: 'no route' } })).tone).toBe('bad')
+    expect(kubeSummary(k({ phase: 'Wiped' }))).toEqual({ text: 'wiped: K3s uninstalled, data disks blanked, cluster state deleted', tone: 'muted' })
+    expect(kubeSummary(k({ node_cordoned: true })).text).toBe('K3s server (API + etcd) v1.36.5+k3s1, node Ready, cordoned (drained), Longhorn on nvme0')
     expect(kubeSummary(k({ etcd_unread: 'curl: (7) Failed to connect' }))).toEqual({
       text: "K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",
       tone: 'warn',

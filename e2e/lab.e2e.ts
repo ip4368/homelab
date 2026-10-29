@@ -808,6 +808,38 @@ await step('K8', 'Replace a K3s server: power one off, replace it; etcd lists ex
   note(`${victim} powered on: Ready ${secs(back.ms)} later, a K3s ${h?.kube?.role === 'Agent' ? 'agent' : h?.kube?.role} and every node Ready ${secs(kb.ms)} after that; etcd still lists [${after}]`)
 })
 
+await step('K9', 'Cordon drains: cordoning a host drains its node, uncordoning schedules it again', async (note) => {
+  await healthy(5 * 60_000)
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const s0 = watch.seen!
+  const target = [...s0.hosts.values()].find((h) => h.lifecycle === 'Ready' && !s0.cp.voters.includes(h.id) && h.id.startsWith('ms01'))
+    ?? [...s0.hosts.values()].find((h) => h.lifecycle === 'Ready' && !s0.cp.voters.includes(h.id))
+  if (!target) throw new Failed('no Ready non-voter to cordon')
+  const host = target.id
+  const send = async (o: unknown) => {
+    const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(o) })
+    if (!res.ok) throw new Failed(`op ${JSON.stringify(o)}: ${res.status} ${await res.text()}`)
+  }
+  await send({ Cordon: { id: host } })
+  await waitFor(`${host} Cordoned`, 60_000, (s) => s.hosts.get(host)?.lifecycle === 'Cordoned')
+  const drained = await waitAsync(`${host} unschedulable`, 5 * 60_000, async () => {
+    const n = await k.get(`/api/v1/nodes/${host}`)
+    return (n.status === 200 && n.body.spec.unschedulable === true) || `unschedulable=${n.status === 200 ? n.body.spec.unschedulable : n.status}`
+  })
+  note(`${host} cordoned: its node unschedulable ${secs(drained.ms)} later`)
+  await waitFor(`homelabd reports ${host} cordoned`, 60_000, (s) => s.hosts.get(host)?.kube?.node_cordoned === true)
+  await send({ Uncordon: { id: host } })
+  await waitAsync(`${host} schedulable again`, 5 * 60_000, async () => {
+    const n = await k.get(`/api/v1/nodes/${host}`)
+    return (n.status === 200 && !n.body.spec.unschedulable) || `unschedulable=${n.status === 200 ? n.body.spec.unschedulable : n.status}`
+  })
+  await waitFor(`homelabd reports ${host} uncordoned`, 60_000, (s) => s.hosts.get(host)?.kube?.node_cordoned === false)
+  await healthy(5 * 60_000)
+  await kubeHealthy(10 * 60_000)
+  note(`${host} uncordoned: schedulable, and the cluster healthy again`)
+})
+
 watch.close()
 console.log('\n==== results')
 for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'}  [${r.id}] ${r.name}`)

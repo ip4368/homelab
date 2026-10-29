@@ -40,7 +40,9 @@ Control-plane replicas run hand-rolled Raft (pre-vote, check-quorum, single-serv
 membership changes). The leader runs the controllers over the replicated state: join and
 approval, network templates, staged rollouts and validation, health, control-plane
 membership, K3s install and join, alerts. Host agents and switch pollers talk to the
-leader only by messages.
+leader only by messages. Cordoning a host drains its Kubernetes workloads through
+kubectl; removing one evicts its Longhorn replicas, deletes its node and wipes the
+machine before forgetting it.
 
 - **Data model and network validation** live in the `model` crate; `control` depends only on it.
 - **Metrics** are collected from the agents and the history lives in the leader's memory.
@@ -62,7 +64,7 @@ If the control plane has no leader or no quorum, operations return 503 and the U
   the host drawer, which has:
   - inventory: NICs (ports no link uses show as grey "unused") and disks;
   - Kubernetes: what K3s runs on the node, and its pods;
-  - lifecycle: Cordon, Uncordon, Remove;
+  - lifecycle: Cordon (drains its Kubernetes workloads), Uncordon, Remove (drains, evicts its Longhorn replicas, wipes the machine and forgets it, with progress and a force path);
   - live charts;
   - the roles editor;
   - the per-host network editor (ports → links → networks, with drift and validation errors).
@@ -117,5 +119,6 @@ node e2e/lab.e2e.ts                          # the VM lab end to end (needs ./la
 
 ## Known limitations
 
+- **A force-removed host keeps running orphaned until wiped by hand** (`homelabd wipe`); it cannot rejoin before that.
 - **Metrics history resets on leader failover.** The UI shows "metrics since …".
 - **No real-system concerns.** There is no authentication or multi-user support.

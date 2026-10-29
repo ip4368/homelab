@@ -47,4 +47,18 @@ etcd_unstarted: Array<string>,
  * On a server: the hosts whose Longhorn disks it last took out of
  * scheduling ([`KubeAdmin::storage_off`]).
  */
-storage_off: Array<HostId>, };
+storage_off: Array<HostId>, 
+/**
+ * Whether this host's node is cordoned in Kubernetes.
+ */
+node_cordoned: boolean, 
+/**
+ * On a server: the hosts of [`KubeAdmin::evict`] it verified hold no
+ * Longhorn replicas (or have no Longhorn node left).
+ */
+evicted: Array<HostId>, 
+/**
+ * On a server: the hosts of [`KubeAdmin::delete_nodes`] whose nodes
+ * are gone from Kubernetes.
+ */
+nodes_deleted: Array<HostId>, };
