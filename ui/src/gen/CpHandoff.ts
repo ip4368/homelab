@@ -5,4 +5,9 @@ import type { HostId } from "./HostId";
  * Voter `from` hands its place to `to`: `to` joins (a learner, then a
  * voter), and once it runs a K3s server, `from` leaves.
  */
-export type CpHandoff = { from: HostId, to: HostId, since: number, };
+export type CpHandoff = { from: HostId, to: HostId, since: number, 
+/**
+ * The user cancelled it: `to` leaves the control plane again, if it
+ * joined, and `from` stays.
+ */
+cancelled: boolean, };

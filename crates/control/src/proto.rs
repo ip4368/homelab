@@ -335,6 +335,10 @@ pub enum ApiOp {
     /// voter is down or a membership change is in progress. Answered once
     /// the hand-off is recorded; `CpInfo::handoff` shows it until it ends.
     HandOffCp { from: HostId, to: HostId },
+    /// Cancels the hand-off in progress: its new host leaves the control
+    /// plane again, if it joined, and the old voter stays. Refused once the
+    /// old voter has left. Answered once the cancel is recorded.
+    CancelCpHandoff,
     /// Reads the leader's metrics history (nothing is written). The result
     /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
     /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.

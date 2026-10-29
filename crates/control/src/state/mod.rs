@@ -283,7 +283,14 @@ impl ClusterState {
                     return Err(ApplyError::AlreadyExists);
                 }
                 let message = format!("handing {from}'s control-plane place to {to}");
-                self.cp.handoff = Some(CpHandoff { from, to, since: at });
+                self.cp.handoff = Some(CpHandoff { from, to, since: at, cancelled: false });
+                self.cp.version = v;
+                self.event(at, v, ObjectRef::cp(), message);
+            }
+            Command::CancelCpHandoff => {
+                let Some(h) = self.cp.handoff.as_mut() else { return Err(ApplyError::NotFound) };
+                let message = format!("cancelling the hand-off of {}'s control-plane place to {}", h.from, h.to);
+                h.cancelled = true;
                 self.cp.version = v;
                 self.event(at, v, ObjectRef::cp(), message);
             }

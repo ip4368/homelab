@@ -146,7 +146,7 @@ function ControlPlane({ host }: { host: HostObj }) {
       </p>
       {handoff && (
         <p className="warn" role="status">
-          Handing {handoff.from}'s place to {handoff.to}.
+          {handoff.cancelled ? 'Cancelling the hand-off of' : 'Handing'} {handoff.from}'s place to {handoff.to}.
         </p>
       )}
       {(handoff || offered) && (

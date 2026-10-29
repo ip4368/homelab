@@ -56,6 +56,9 @@ pub enum Command {
     /// Starts handing voter `from`'s place to `to` (the membership
     /// controller does it). Fails with `AlreadyExists` while one is in progress.
     StartCpHandoff { from: HostId, to: HostId },
+    /// Cancels the hand-off in progress (the membership controller undoes
+    /// it, then ends it). Fails with `NotFound` while none is in progress.
+    CancelCpHandoff,
     /// Ends the hand-off in progress, done or given up, as `message` says.
     EndCpHandoff { message: String },
     /// Creates or replaces a network. Changing the VLAN or MTU of one in use

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
+import type { Event as ClusterEvent } from '../gen/Event'
 import type { HostObj } from '../gen/HostObj'
-import { handoffChoices, handoffSteps } from './HandoffDialog'
+import { handoffChoices, handoffEndReason, handoffSteps } from './HandoffDialog'
 
 describe('control-plane hand-off', () => {
   const ms01 = { id: 'Ms01', arch: 'X86_64', ram_gb: 96 }
@@ -37,5 +38,20 @@ describe('control-plane hand-off', () => {
     // Once v1 has left, the server step counts as done even if spare is restarting.
     expect(states(['v2', 'spare'], reinstalling, installing)).toEqual([['done', null], ['done', null], ['done', null], ['active', 'installed; starting']])
     expect(states(['v2', 'spare'], k3s(hosts.v1, 'Agent', 'Running'), k3s(hosts.spare, 'Server', 'Running')).every(([s]) => s === 'done')).toBe(true)
+  })
+
+  it('says why a hand-off ended without its old voter leaving, from the newest event about it', () => {
+    const event = (seq: number, kind: string, message: string) => ({ seq, at: seq, entity: { kind, id: '' }, message, version: seq }) as unknown as ClusterEvent
+    const events = [
+      event(1, 'Cp', "gave up handing v1's control-plane place to spare: spare cannot join (it must be Ready, eligible and not a member)"),
+      event(2, 'Cp', "handing v1's control-plane place to spare"),
+      event(3, 'Cp', "cancelling the hand-off of v1's control-plane place to spare"),
+      event(4, 'Cp', "stopped handing v1's control-plane place to spare: cancelled by the user"),
+      event(5, 'Host', "stopped handing v1's control-plane place to spare: not the control plane's"),
+      event(6, 'Cp', "stopped handing v2's control-plane place to spare: cancelled by the user"),
+    ]
+    expect(handoffEndReason({ from: 'v1', to: 'spare' }, events)).toBe("stopped handing v1's control-plane place to spare: cancelled by the user")
+    expect(handoffEndReason({ from: 'v1', to: 'spare' }, events.slice(0, 3))).toMatch(/^gave up handing v1's/)
+    expect(handoffEndReason({ from: 'v1', to: 'other' }, events)).toBeUndefined()
   })
 })

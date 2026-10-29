@@ -17,6 +17,9 @@
 //!   once it runs a K3s server (so etcd never runs short of a member while
 //!   it installs), the old voter is removed. It ends, recorded as an event,
 //!   once the old voter is gone, or when the new host can no longer join.
+//!   Until the old voter is gone, the user may cancel it
+//!   (`ApiOp::CancelCpHandoff`): the new host is removed again, if it
+//!   joined (say its K3s server never starts), and the hand-off ends.
 //!
 //! Nothing changes while a config change is uncommitted. Candidates are
 //! `Ready`, control-plane-eligible hosts, MS-01s first, then hosts on an
@@ -149,6 +152,20 @@ pub fn check_handoff(state: &ClusterState, raft: &RaftMembers, from: &HostId, to
     Ok(())
 }
 
+/// Why the leader refuses to cancel the hand-off, if it does: none is in
+/// progress, it is already cancelled, or its old voter has left (it is
+/// done but for its event).
+pub fn check_cancel_handoff(state: &ClusterState) -> Result<(), String> {
+    let Some(h) = &state.cp.handoff else { return Err("no control-plane hand-off is in progress".into()) };
+    if h.cancelled {
+        return Err(format!("the hand-off of {}'s control-plane place to {} is already cancelled", h.from, h.to));
+    }
+    if !state.cp.voters.contains(&h.from) {
+        return Err(format!("{} has already handed its control-plane place to {}", h.from, h.to));
+    }
+    Ok(())
+}
+
 /// Why setting (`wanted`) or clearing host `id`'s control-plane role by
 /// hand is refused: the role follows the voters.
 pub fn control_plane_role_refused(id: &HostId, wanted: bool) -> String {
@@ -166,8 +183,9 @@ fn serves_kube(state: &ClusterState, id: &HostId) -> bool {
     state.kube.is_none() || state.hosts.get(id).is_some_and(running)
 }
 
-/// Ends the hand-off in progress once its old voter is gone, or once its
-/// new host is no member and can no longer join.
+/// Ends the hand-off in progress once its old voter is gone, once it is
+/// cancelled and its new host is no member, or once its new host is no
+/// member and can no longer join.
 fn end_handoff(state: &ClusterState, raft: &RaftMembers) -> Option<Action> {
     let h = state.cp.handoff.as_ref()?;
     if raft.pending {
@@ -177,6 +195,8 @@ fn end_handoff(state: &ClusterState, raft: &RaftMembers) -> Option<Action> {
         format!("{} handed its control-plane place to {}", h.from, h.to)
     } else if !raft.voters.contains(&h.from) {
         format!("gave up handing {}'s control-plane place to {}: {} left the control plane first", h.from, h.to, h.from)
+    } else if h.cancelled && !raft.is_member(&h.to) {
+        format!("stopped handing {}'s control-plane place to {}: cancelled by the user", h.from, h.to)
     } else if !raft.is_member(&h.to) && !candidates(state, raft).contains(&h.to) {
         format!("gave up handing {}'s control-plane place to {}: {} cannot join (it must be Ready, eligible and not a member)", h.from, h.to, h.to)
     } else {
@@ -206,6 +226,11 @@ fn next_change(state: &ClusterState, v: &Volatile, raft: &RaftMembers, now: SimT
     if raft.pending {
         return None;
     }
+    // A cancelled hand-off's new host goes again, learner or voter (it is
+    // an extra voter while the old one stays), before a learner is promoted.
+    if let Some(h) = state.cp.handoff.as_ref().filter(|h| h.cancelled && raft.voters.contains(&h.from) && raft.is_member(&h.to)) {
+        return Some(MemberChange::Remove(h.to.clone()));
+    }
     if let Some(l) = raft.learners.first() {
         return if down(state, l) {
             Some(MemberChange::Remove(l.clone()))
@@ -223,7 +248,7 @@ fn next_change(state: &ClusterState, v: &Volatile, raft: &RaftMembers, now: SimT
             return Some(MemberChange::Remove(h.clone()));
         }
     }
-    if let Some(h) = state.cp.handoff.as_ref().filter(|h| raft.voters.contains(&h.from)) {
+    if let Some(h) = state.cp.handoff.as_ref().filter(|h| !h.cancelled && raft.voters.contains(&h.from)) {
         if raft.voters.contains(&h.to) && serves_kube(state, &h.to) {
             return Some(MemberChange::Remove(h.from.clone()));
         }
@@ -610,6 +635,55 @@ mod tests {
         assert_eq!(step(&mut s, &v, &raft, 4000).change, None, "v1 stays");
         assert_eq!(s.cp.handoff, None);
         assert!(last_event(&s).starts_with("gave up handing v1's control-plane place to mini-1: mini-1 cannot join"), "{}", last_event(&s));
+    }
+
+    #[test]
+    fn a_cancelled_handoff_removes_its_new_host_again_and_keeps_the_old_voter() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        let v = Volatile::new(0, 1);
+        s.apply(0, Command::SetKube { token: "t".into(), init_host: hid("v1") }).unwrap();
+        for id in ["v1", "v2", "v3"] {
+            k3s(&mut s, id, KubeRole::Server, KubePhase::Running);
+        }
+        assert_eq!(check_cancel_handoff(&s), Err("no control-plane hand-off is in progress".into()));
+        s.apply(0, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        raft.voters.insert(hid("mini-1"));
+        s.apply_membership(raft.voters.clone());
+        // mini-1's K3s server never starts: the hand-off waits on it for good.
+        k3s(&mut s, "mini-1", KubeRole::Server, KubePhase::Installing);
+        assert_eq!(step(&mut s, &v, &raft, 1000).change, None);
+
+        assert_eq!(check_cancel_handoff(&s), Ok(()));
+        s.apply(2000, Command::CancelCpHandoff).unwrap();
+        assert_eq!(last_event(&s), "cancelling the hand-off of v1's control-plane place to mini-1");
+        assert!(check_cancel_handoff(&s).unwrap_err().contains("already cancelled"));
+        assert_eq!(step(&mut s, &v, &raft, 3000).change, Some(MemberChange::Remove(hid("mini-1"))), "mini-1 goes, not v1");
+        raft.voters.remove(&hid("mini-1"));
+        s.apply_membership(raft.voters.clone());
+
+        assert_eq!(step(&mut s, &v, &raft, 4000).change, None, "nothing joins in its place");
+        assert_eq!(s.cp.handoff, None);
+        assert_eq!(last_event(&s), "stopped handing v1's control-plane place to mini-1: cancelled by the user");
+        assert_eq!(s.cp.voters, ids(&["v1", "v2", "v3"]));
+        assert!(!s.hosts[&hid("mini-1")].roles.contains(&Role::ControlPlane));
+    }
+
+    #[test]
+    fn a_cancelled_handoff_removes_a_learner_rather_than_promote_it_and_is_refused_once_the_old_voter_left() {
+        let (mut s, mut raft) = state(CpMode::Suggest);
+        let v = Volatile::new(0, 1);
+        s.apply(0, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        raft.learners.insert(hid("mini-1"));
+        raft.caught_up.insert(hid("mini-1"));
+        s.apply(1000, Command::CancelCpHandoff).unwrap();
+        assert_eq!(step(&mut s, &v, &raft, 2000).change, Some(MemberChange::Remove(hid("mini-1"))));
+        raft.learners.clear();
+        assert_eq!(step(&mut s, &v, &raft, 3000).change, None);
+        assert_eq!(s.cp.handoff, None);
+
+        s.apply(4000, Command::StartCpHandoff { from: hid("v1"), to: hid("mini-1") }).unwrap();
+        s.apply_membership(ids(&["v2", "v3", "mini-1"]));
+        assert_eq!(check_cancel_handoff(&s), Err("v1 has already handed its control-plane place to mini-1".into()));
     }
 
     #[test]

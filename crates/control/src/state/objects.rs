@@ -406,6 +406,10 @@ pub struct CpHandoff {
     pub to: HostId,
     #[ts(type = "number")]
     pub since: SimTime,
+    /// The user cancelled it: `to` leaves the control plane again, if it
+    /// joined, and `from` stays.
+    #[serde(default)]
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, TS)]

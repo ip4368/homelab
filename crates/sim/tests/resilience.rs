@@ -674,6 +674,50 @@ fn the_leader_hands_its_control_plane_place_to_a_host_the_user_picks() {
 }
 
 #[test]
+fn a_handoff_whose_new_k3s_server_never_starts_is_cancelled_and_the_old_voter_stays() {
+    use control::proto::{KubePhase, KubeRole};
+    let mut e = default_fleet(28);
+    settle(&mut e);
+    let etcd_is_voters = |e: &Engine| {
+        let voters = &e.client_view().state.cp.voters;
+        let kube = &e.fabric().world().kube;
+        voters.len() == 5 && kube.etcd == *voters && kube.unstarted.is_empty() && voters.iter().all(|v| kube_of(e, v) == Some((Some(KubeRole::Server), KubePhase::Running)))
+    };
+    assert!(e.run_until(e.now() + 5 * 60_000, etcd_is_voters), "etcd {:?}", e.fabric().world().kube.etcd);
+    let s = &e.client_view().state;
+    let (voters, leader) = (s.cp.voters.clone(), e.true_leader().expect("a leader"));
+    let from = voters.iter().find(|v| **v != leader).unwrap().clone();
+    let ready_ms01 = |h: &&control::state::HostObj| h.lifecycle == Lifecycle::Ready && h.profile.id == ProfileId::Ms01;
+    let to = s.hosts.values().filter(ready_ms01).find(|h| !s.cp.voters.contains(&h.id)).expect("a spare MS-01").id.clone();
+
+    // `to` joins the control plane, but its K3s server never starts: the hand-off waits on it for good.
+    e.fabric_mut().world_mut().kube.stall_joins.insert(to.clone());
+    let req = e.api(ApiOp::HandOffCp { from: from.clone(), to: to.clone() });
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let stuck = |e: &Engine| e.client_view().state.cp.voters.contains(&to) && kube_of(e, &to) == Some((Some(KubeRole::Server), KubePhase::Installing));
+    assert!(e.run_until(e.now() + 3 * 60_000, stuck), "{to}: {:?}", kube_of(&e, &to));
+    e.run_for(60_000);
+    assert!(e.client_view().state.cp.voters.contains(&from), "{from} stays while {to}'s server is not running");
+
+    let req = e.api(ApiOp::CancelCpHandoff);
+    e.run_for(2000);
+    assert_eq!(e.take_api_result(req), Some(ApiResult::Ok(serde_json::Value::Null)));
+    let undone = |e: &Engine| {
+        let s = &e.client_view().state;
+        s.cp.voters == voters && s.cp.handoff.is_none() && etcd_is_voters(e) && kube_of(e, &to) == Some((Some(KubeRole::Agent), KubePhase::Running))
+    };
+    assert!(e.run_until(e.now() + 3 * 60_000, undone), "voters {:?}, etcd {:?}, unstarted {:?}, {to}: {:?}", e.client_view().state.cp.voters, e.fabric().world().kube.etcd, e.fabric().world().kube.unstarted, kube_of(&e, &to));
+    let s = &e.client_view().state;
+    assert!(s.events.values().any(|ev| ev.message == format!("stopped handing {from}'s control-plane place to {to}: cancelled by the user")));
+    assert!(!s.hosts[&to].roles.contains(&Role::ControlPlane) && s.hosts[&from].roles.contains(&Role::ControlPlane));
+    let req = e.api(ApiOp::CancelCpHandoff);
+    e.run_for(2000);
+    assert!(matches!(e.take_api_result(req), Some(ApiResult::Err(m)) if m.contains("no control-plane hand-off")));
+    assert!(e.fabric().world().kube.violations.is_empty(), "{:?}", e.fabric().world().kube.violations);
+}
+
+#[test]
 fn a_server_that_leaves_its_etcd_member_behind_as_it_becomes_an_agent_has_it_removed() {
     use control::proto::{KubePhase, KubeRole};
     use sim::world::EtcdChange;

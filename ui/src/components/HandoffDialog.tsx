@@ -3,6 +3,7 @@ import { op } from '../api'
 import { formatClock } from '../clock'
 import { ineligibleReason } from '../eligibility'
 import type { CpInfo } from '../gen/CpInfo'
+import type { Event as ClusterEvent } from '../gen/Event'
 import type { HostObj } from '../gen/HostObj'
 import { useStore } from '../store'
 import { useAction } from './useAction'
@@ -71,6 +72,17 @@ export function handoffSteps({ from, to }: Handoff, cp: CpInfo, hosts: Record<st
     active = true
     return { label, state, detail: state === 'active' ? raw[i][2] : null }
   })
+}
+
+/**
+ * Why the hand-off ended without its old voter leaving, from the newest
+ * control-plane event that says so: given up by the control plane, or
+ * cancelled by the user.
+ */
+export function handoffEndReason({ from, to }: Handoff, events: ClusterEvent[]): string | undefined {
+  const place = `handing ${from}'s control-plane place to ${to}`
+  const ends = [`gave up ${place}`, `stopped ${place}`]
+  return [...events].reverse().find((e) => e.entity.kind === 'Cp' && ends.some((m) => e.message.startsWith(m)))?.message
 }
 
 const STEP_MARK: Record<StepState, string> = { done: '✓', active: '●', pending: '○' }
@@ -166,26 +178,33 @@ export function HandoffDialog({ host, onClose }: Props) {
       await op({ HandOffCp: choice })
       setSent(choice)
     })
+  const cancel = () => run(() => op('CancelCpHandoff'))
 
   let body: React.ReactNode
   if (following) {
     const steps = handoffSteps(following, cp, hosts)
     const finished = steps.every((s) => s.state === 'done')
-    // Ended without `from` leaving: the control plane gave it up, and its event says why.
+    // Ended without `from` leaving: given up or cancelled, and its event says why.
     const ended = seen && !cp.handoff && cp.voters.includes(following.from)
-    const gaveUp = `gave up handing ${following.from}'s control-plane place to ${following.to}`
-    const why = ended ? [...events].reverse().find((e) => e.entity.kind === 'Cp' && e.message.startsWith(gaveUp)) : undefined
+    const why = ended ? handoffEndReason(following, events) : undefined
+    const cancelling = cp.handoff?.cancelled ?? false
+    // Cancellable until `from` has left; after that only the end's event is left to record.
+    const cancellable = cp.handoff !== null && !cancelling && cp.voters.includes(following.from)
     body = (
       <>
         <p>
           {!seen ? (
             <span className="muted">Starting the hand-off…</span>
+          ) : cancelling ? (
+            <span className="warn">
+              Cancelling: {following.to} leaves the control plane again, if it joined, and {following.from} stays.
+            </span>
           ) : cp.handoff ? (
             <>
               Handing <strong>{following.from}</strong>'s place to <strong>{following.to}</strong>, since {formatClock(cp.handoff.since)}.
             </>
           ) : ended ? (
-            <span className="bad">{why ? `The control plane ${why.message}.` : 'The hand-off was given up.'}</span>
+            <span className="bad">{why ? `The control plane ${why}.` : 'The hand-off was given up.'}</span>
           ) : finished ? (
             <span className="ok">
               {following.to} took {following.from}'s place in the control plane.
@@ -196,10 +215,21 @@ export function HandoffDialog({ host, onClose }: Props) {
             </>
           )}
         </p>
-        <Steps steps={steps} />
+        {!cancelling && !ended && <Steps steps={steps} />}
+        {cancellable && (
+          <p className="muted">
+            Stuck? Cancelling takes {following.to} out of the control plane again (it reinstalls as a K3s agent); {following.from} keeps its place.
+          </p>
+        )}
         <div className="actions">
           <button onClick={onClose}>Close</button>
-          <span className="muted">The hand-off goes on with this closed.</span>
+          {cancellable && (
+            <button disabled={busy} onClick={cancel}>
+              Cancel hand-off
+            </button>
+          )}
+          {cp.handoff && <span className="muted">The hand-off goes on with this closed.</span>}
+          {error && <span className="bad">{error}</span>}
         </div>
       </>
     )

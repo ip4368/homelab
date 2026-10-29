@@ -425,6 +425,10 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
         ApiOp::HandOffCp { from, to } => return Handling::HandOffCp { from, to },
+        ApiOp::CancelCpHandoff => match membership::check_cancel_handoff(state) {
+            Ok(()) => Command::CancelCpHandoff,
+            Err(e) => return Handling::Answer(ApiResult::Err(e)),
+        },
         ApiOp::GetSeries { entity, metrics } => {
             let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
             return Handling::Answer(result);
