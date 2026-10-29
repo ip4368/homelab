@@ -261,9 +261,7 @@ button:disabled:hover {
   border-left-color: var(--warn);
 }
 
-.lc-Cordoned,
-.lc-Draining,
-.lc-Drained {
+.lc-Cordoned {
   border-left-color: #7c5cc4;
 }
 
@@ -529,9 +527,7 @@ button:disabled:hover {
   stroke: var(--warn);
 }
 
-.topo-node.host.lc-Cordoned rect,
-.topo-node.host.lc-Draining rect,
-.topo-node.host.lc-Drained rect {
+.topo-node.host.lc-Cordoned rect {
   stroke: #7c5cc4;
 }
 
@@ -806,7 +802,7 @@ ul.problems {
   overflow: auto;
 }
 
-/* Ground-truth overlay: hatching where the control plane's view and the simulator disagree. */
+/* Ground-truth overlay: hatching where the control plane's view and the lab's truth disagree. */
 .tile.truth-diff {
   background-image: repeating-linear-gradient(45deg, rgba(192, 38, 28, 0.35) 0 4px, transparent 4px 9px);
   outline: 2px dashed var(--bad);
@@ -900,14 +896,6 @@ table.workload-table th {
 .replica-map td,
 .replica-map th {
   padding: 3px 8px;
-}
-
-.drain-progress {
-  margin: 4px 0;
-  padding: 4px 8px;
-  border-left: 4px solid #7c5cc4;
-  background: #f3effb;
-  font-size: 13px;
 }
 
 button.danger {

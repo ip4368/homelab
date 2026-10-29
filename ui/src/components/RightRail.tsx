@@ -47,32 +47,22 @@ function Alerts({ onSelect }: { onSelect(id: string): void }) {
 
 /**
  * What the lab sees from outside the machines that the control plane cannot:
- * a VM instance running on several machines at once, and the VIP held by more
- * than one. Shown only with the ground-truth overlay.
+ * who holds the VIP. Shown only with the ground-truth overlay.
  */
-function SplitBrain() {
+function VipHolders() {
   const truth = useStore((s) => s.truth)
-  const vms = useMemo(() => truth.vms.filter((v) => v.instances.some((i) => truth.split_brain_vms.includes(i))), [truth])
   return (
     <div className="truth-section">
       <h4>
-        Split-brain <span className="truth-label">ground truth</span>
+        VIP <span className="truth-label">ground truth</span>
       </h4>
-      {truth.split_brain_vms.length === 0 && truth.vip_holders.length <= 1 ? (
-        <p className="muted">No VM is running in two places; the VIP has {truth.vip_holders.length === 1 ? `one holder (${truth.vip_holders[0]})` : 'no holder'}.</p>
+      {truth.vip_holders.length <= 1 ? (
+        <p className="muted">The VIP has {truth.vip_holders.length === 1 ? `one holder (${truth.vip_holders[0]})` : 'no holder'}.</p>
       ) : (
         <ul className="rail-list">
-          {truth.split_brain_vms.map((i) => (
-            <li key={i}>
-              <span className="sev sev-Critical">Critical</span> <strong>{i}</strong> runs on{' '}
-              {vms.filter((v) => v.instances.includes(i)).map((v) => v.id).join(' and ')}
-            </li>
-          ))}
-          {truth.vip_holders.length > 1 && (
-            <li>
-              <span className="sev sev-Critical">Critical</span> <strong>VIP</strong> held by {truth.vip_holders.join(' and ')}
-            </li>
-          )}
+          <li>
+            <span className="sev sev-Critical">Critical</span> <strong>VIP</strong> held by {truth.vip_holders.join(' and ')}
+          </li>
         </ul>
       )}
     </div>
@@ -199,7 +189,7 @@ export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void;
         ))}
       </div>
       <div className="rail-body">
-        {tab === 'Alerts' && showTruth && <SplitBrain />}
+        {tab === 'Alerts' && showTruth && <VipHolders />}
         {tab === 'Alerts' && <Alerts onSelect={onSelect} />}
         {tab === 'Events' && <Events />}
         {tab === 'Pending joins' && <PendingJoins onSelect={onSelect} />}

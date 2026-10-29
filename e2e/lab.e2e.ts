@@ -139,7 +139,6 @@ function unhealthy(s: Seen): string | null {
   if (s.cp.voters.length !== 3) return `${s.cp.voters.length} voters`
   if (!s.leader) return 'no leader'
   if (s.truth.vip_holders.length !== 1 || s.truth.vip_holders[0] !== s.leader) return `VIP held by [${s.truth.vip_holders}], leader ${s.leader}`
-  if (s.truth.split_brain_vms.length) return `split brain: ${s.truth.split_brain_vms}`
   return null
 }
 

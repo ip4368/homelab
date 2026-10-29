@@ -8,7 +8,6 @@ import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
 import { podTone, podsOn, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
-import { hostWorkloads, removeHostPrompt, replicaStateLabel, type WorkloadRef } from '../workloads'
 import { Charts } from './Charts'
 import { HandoffDialog, handoffChoices } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
@@ -189,85 +188,13 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
   )
 }
 
-/** What the view places on the host. While it drains, this is what is left to move off. */
-function HostWorkloads({ host, onSelectWorkload }: { host: HostObj; onSelectWorkload(ref: WorkloadRef): void }) {
-  const pods = useStore((s) => s.view.pods)
-  const vmStatus = useStore((s) => s.view.vmStatus)
-  const volumeStatus = useStore((s) => s.view.volumeStatus)
-  const { vms, pods: podIds, replicas } = useMemo(
-    () => hostWorkloads({ pods, vmStatus, volumeStatus }, host.id),
-    [pods, vmStatus, volumeStatus, host.id],
-  )
-  const draining = host.lifecycle === 'Draining'
-  const none = vms.length + podIds.length + replicas.length === 0
-  const link = (ref: WorkloadRef, label = ref.id) => (
-    <button key={`${ref.kind}:${label}`} className="link" onClick={() => onSelectWorkload(ref)}>
-      {label}
-    </button>
-  )
-  const list = <T,>(items: T[], render: (t: T) => React.ReactNode) => (
-    <>
-      {items.slice(0, MAX_LISTED).map((t, n) => (
-        <span key={n}>
-          {n > 0 && ', '}
-          {render(t)}
-        </span>
-      ))}
-      {items.length > MAX_LISTED && <span className="muted"> and {items.length - MAX_LISTED} more</span>}
-    </>
-  )
-  return (
-    <div className="section">
-      <h4>Workloads</h4>
-      {draining && (
-        <p className="drain-progress" role="status">
-          Draining: {vms.length} VM{vms.length === 1 ? '' : 's'}, {podIds.length} pod{podIds.length === 1 ? '' : 's'}, {replicas.length} volume replica
-          {replicas.length === 1 ? '' : 's'} left to move off.
-        </p>
-      )}
-      {host.lifecycle === 'Drained' && none && <p className="ok">Drained: nothing runs here.</p>}
-      {none && !draining && host.lifecycle !== 'Drained' && <p className="muted">Nothing placed on this host.</p>}
-      <dl className="inventory">
-        {vms.length > 0 && (
-          <>
-            <dt>VMs</dt>
-            <dd>{list(vms, (v) => link({ kind: 'vm', id: v }))}</dd>
-          </>
-        )}
-        {podIds.length > 0 && (
-          <>
-            <dt>Pods</dt>
-            <dd>{list(podIds, (p) => link({ kind: 'deployment', id: p.slice(0, p.lastIndexOf('/')) }, p))}</dd>
-          </>
-        )}
-        {replicas.length > 0 && (
-          <>
-            <dt>Replicas</dt>
-            <dd>
-              {list(replicas, (r) => (
-                <>
-                  {link({ kind: 'volume', id: r.volume })} <span className="muted">{r.disk} {replicaStateLabel(r.state)}</span>
-                </>
-              ))}
-            </dd>
-          </>
-        )}
-      </dl>
-    </div>
-  )
-}
-
-export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onClose(): void; onSelectWorkload(ref: WorkloadRef): void }) {
+export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
   const host = useStore((s) => s.view.hosts[id])
-  const pods = useStore((s) => s.view.pods)
-  const vmStatus = useStore((s) => s.view.vmStatus)
-  const volumeStatus = useStore((s) => s.view.volumeStatus)
   const { error, busy, run } = useAction()
   if (!host) return null
 
   const remove = () => {
-    // Removal is permanent for the session: say what it does to what runs here.
-    if (window.confirm(removeHostPrompt(host.id, hostWorkloads({ pods, vmStatus, volumeStatus }, host.id)))) {
+    if (window.confirm(`Remove ${host.id}?`)) {
       run(() => op({ RemoveHost: { id: host.id } }))
     }
   }
@@ -296,15 +223,7 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
         <h4>Lifecycle</h4>
         <div className="actions">
           {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
-          <button
-            onClick={() => run(() => op({ Drain: { host: host.id } }))}
-            disabled={busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
-            title="Live-migrate VMs, reschedule pods and move volume replicas off this host"
-          >
-            Drain
-          </button>
-          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
-          {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
+          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned', { Uncordon: { id: host.id } })}
           {host.lifecycle !== 'Removed' && (
             <button onClick={remove} disabled={busy}>
               Remove
@@ -316,7 +235,6 @@ export function HostDrawer({ id, onClose, onSelectWorkload }: { id: string; onCl
       <div className="section">
         <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>
-      <HostWorkloads host={host} onSelectWorkload={onSelectWorkload} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
       <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
       {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}

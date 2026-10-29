@@ -11,4 +11,4 @@ disk_pct: { [key in string]: number },
 /**
  * Per port name.
  */
-port_rx_bps: { [key in string]: number }, port_tx_bps: { [key in string]: number }, instances: number, };
+port_rx_bps: { [key in string]: number }, port_tx_bps: { [key in string]: number }, };

@@ -3,7 +3,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { MetricSample } from '../gen/MetricSample'
 import { GROUP_BYS, groupHosts, type GroupBy } from '../grouping'
 import { useStore } from '../store'
-import { truthDiff } from '../workloads'
+import { truthDiff } from '../truth'
 import { FleetCanvas } from './FleetCanvas'
 
 /** Above this many hosts the grid is drawn on a canvas instead of a DOM tile each. */

@@ -14,8 +14,6 @@ const LIFECYCLE: Record<Lifecycle, string> = {
   Approved: '#b45309',
   Provisioning: '#b45309',
   Cordoned: '#7c5cc4',
-  Draining: '#7c5cc4',
-  Drained: '#7c5cc4',
   Removed: '#667085',
 }
 /**
