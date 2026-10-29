@@ -76,6 +76,8 @@ curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
 
 The new machine joins the control plane, is promoted to a voter, and reinstalls K3s as a server. Only once that server runs does the old voter leave the control plane, so etcd never runs a member short. The old voter then reinstalls K3s as an agent, deleting its own node first so its etcd member leaves, and stays in the fleet. If the old voter leads the control plane, it steps down and the VIP moves to the new leader. The control plane refuses a hand-off while a voter is down (replace it first) or while another membership change is in progress. It gives up a hand-off, saying so in the events, if the new machine goes down before it joins.
 
+If the new machine's K3s server never starts, the hand-off waits with an extra voter. Cancel it with **Cancel hand-off** in the hand-off's progress (**Show progress** in either host's **Control plane** section), or submit `"CancelCpHandoff"` to `/api/ops`. The new machine leaves the control plane again and reinstalls K3s as an agent, and the old voter keeps its place. Once the old voter has left, the hand-off can no longer be cancelled.
+
 ## When a control-plane machine dies
 
 The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To take it, or to replace the host sooner, submit the operation the alert carries:
