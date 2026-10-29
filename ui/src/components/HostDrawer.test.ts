@@ -46,6 +46,10 @@ describe('host drawer kubernetes', () => {
     expect(kubeSummary(null).tone).toBe('muted')
     expect(kubeSummary(k({}))).toEqual({ text: 'K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0', tone: 'ok' })
     expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'starting k3s-agent' })).text).toBe('K3s agent: starting k3s-agent')
+    // A reinstall reports the role still installed, and the detail names the one coming.
+    expect(kubeSummary(k({ phase: 'Installing', detail: 'installing K3s as Agent' })).text).toBe('switching from K3s server (API + etcd) to K3s agent')
+    expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('switching from K3s agent to K3s server (API + etcd)')
+    expect(kubeSummary(k({ role: null, phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('installing K3s server (API + etcd)')
     expect(kubeSummary(k({ phase: { Failed: 'no route' } })).tone).toBe('bad')
     expect(kubeSummary(k({ etcd_unread: 'curl: (7) Failed to connect' }))).toEqual({
       text: "K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",

@@ -584,6 +584,7 @@ impl Worker {
         }
         if o.role != Some(spec.role) {
             self.applied = None;
+            // The UI's kubeSummary reads this detail to say what the host switches to.
             kube.set_status(self.installing(&o, format!("installing K3s as {:?}", spec.role)));
             if let Err(e) = self.install(spec, o.role) {
                 eprintln!("homelabd: kubernetes: {e}");
