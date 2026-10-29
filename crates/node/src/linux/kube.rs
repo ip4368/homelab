@@ -34,6 +34,7 @@
 
 use super::{sh, LinuxVip, Paths};
 use control::proto::{KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus, StorageNetwork};
+use control::runtime::SimTime;
 use model::HostId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
@@ -66,7 +67,7 @@ const LONGHORN_DISK_ANNOTATION: &str = "node.longhorn.io/default-disks-config";
 /// because the host does not store, to give back once it does.
 const STORAGE_OFF_ANNOTATION: &str = "homelab.io/storage-off";
 /// On a node: the control plane cordoned it, so uncordons it once its host
-/// is `Ready` again. A node cordoned by hand has none, and is left alone.
+/// is no longer held. A node cordoned by hand has none, and is left alone.
 const CORDONED_ANNOTATION: &str = "homelab.io/cordoned";
 /// How long one `kubectl drain` waits for its pods to go; the next request
 /// from the leader drains again.
@@ -375,12 +376,13 @@ pub fn storage_off_patches(nodes: &serde_json::Value, off: &BTreeSet<HostId>) ->
 }
 
 /// The merge patches, by node, that cordon the nodes of the hosts in
-/// `cordon` and uncordon those the control plane cordoned before, from the
-/// list of nodes (`kubectl get nodes -o json`): a listed node that is
-/// schedulable is cordoned and noted in [`CORDONED_ANNOTATION`]; a noted
-/// node no longer listed is uncordoned, and the note dropped. A node
-/// cordoned by hand is not noted, so stays cordoned.
-pub fn cordon_patches(nodes: &serde_json::Value, cordon: &BTreeSet<HostId>) -> Vec<(String, serde_json::Value)> {
+/// `cordon` and uncordon those of the hosts in `uncordon` the control plane
+/// cordoned before, from the list of nodes (`kubectl get nodes -o json`): a
+/// node in `cordon` that is schedulable is cordoned and noted in
+/// [`CORDONED_ANNOTATION`]; a noted node in `uncordon` is uncordoned, and
+/// the note dropped. A node cordoned by hand is not noted, so stays
+/// cordoned; so does the node of a host in neither set (a removed host).
+pub fn cordon_patches(nodes: &serde_json::Value, cordon: &BTreeSet<HostId>, uncordon: &BTreeSet<HostId>) -> Vec<(String, serde_json::Value)> {
     let mut out = vec![];
     for n in nodes["items"].as_array().into_iter().flatten() {
         let Some(name) = n["metadata"]["name"].as_str() else { continue };
@@ -390,7 +392,7 @@ pub fn cordon_patches(nodes: &serde_json::Value, cordon: &BTreeSet<HostId>) -> V
             if !unschedulable {
                 out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: "true" } }, "spec": { "unschedulable": true } })));
             }
-        } else if noted {
+        } else if noted && uncordon.contains(&HostId::from(name)) {
             out.push((name.to_string(), serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: null } }, "spec": { "unschedulable": null } })));
         }
     }
@@ -567,8 +569,11 @@ struct Worker {
 struct Drains {
     /// The hosts whose nodes it cordoned.
     cordoned: BTreeSet<HostId>,
-    /// The hosts asked to be drained whose nodes are empty.
-    drained: BTreeSet<HostId>,
+    /// The hosts whose nodes carry [`CORDONED_ANNOTATION`].
+    noted: BTreeSet<HostId>,
+    /// The hosts asked to be drained whose nodes are empty, each with the
+    /// drain it answers.
+    drained_since: BTreeMap<HostId, SimTime>,
     /// Why the others' pods could not all be evicted yet.
     blocked: BTreeMap<HostId, String>,
 }
@@ -594,7 +599,8 @@ impl Worker {
                 status.etcd_unread = unread;
                 status.storage_off.clone_from(&self.storage_off);
                 status.cordoned.clone_from(&self.drains.cordoned);
-                status.drained.clone_from(&self.drains.drained);
+                status.cordon_noted.clone_from(&self.drains.noted);
+                status.drained_since.clone_from(&self.drains.drained_since);
                 status.drain_blocked.clone_from(&self.drains.blocked);
             }
             wait = if ok { EVERY } else { BACKOFF };
@@ -636,7 +642,8 @@ impl Worker {
             etcd_unstarted,
             storage_off: if server { self.storage_off.clone() } else { BTreeSet::new() },
             cordoned: drains.cordoned,
-            drained: drains.drained,
+            cordon_noted: drains.noted,
+            drained_since: drains.drained_since,
             drain_blocked: drains.blocked,
         }
     }
@@ -824,32 +831,45 @@ impl Worker {
         Ok(())
     }
 
-    /// Cordons the nodes of the hosts `admin` lists and uncordons those it
-    /// cordoned before ([`cordon_patches`]), then drains the nodes it asks
-    /// to (`kubectl drain`, for up to [`DRAIN_TIMEOUT`]), noting which are
-    /// empty and why the others are not.
+    /// Cordons and uncordons the nodes of the hosts `admin` lists
+    /// ([`cordon_patches`]), then drains the nodes it asks to (`kubectl
+    /// drain`, for up to [`DRAIN_TIMEOUT`]), noting which are empty and why
+    /// the others are not. A node whose pods cannot be listed is neither:
+    /// the leader asks again.
     fn cordon_and_drain(&mut self, admin: &KubeAdmin) -> Result<(), String> {
         let json = self.kubectl(KubeRole::Server, &["get", "nodes", "-o", "json"])?;
         let nodes: serde_json::Value = serde_json::from_str(&json).map_err(|e| format!("read the nodes: {e}"))?;
-        for (node, patch) in cordon_patches(&nodes, &admin.cordon) {
+        let items = || nodes["items"].as_array().into_iter().flatten();
+        let mut noted: BTreeSet<HostId> =
+            items().filter(|n| !n["metadata"]["annotations"][CORDONED_ANNOTATION].is_null()).filter_map(|n| Some(HostId::from(n["metadata"]["name"].as_str()?))).collect();
+        for (node, patch) in cordon_patches(&nodes, &admin.cordon, &admin.uncordon) {
             eprintln!("homelabd: kubernetes: node {node}: {patch}");
             self.kubectl(KubeRole::Server, &["patch", "node", &node, "--type", "merge", "-p", &patch.to_string()])?;
+            if patch["spec"]["unschedulable"] == true {
+                noted.insert(HostId::from(node.as_str()));
+            } else {
+                noted.remove(&HostId::from(node.as_str()));
+            }
         }
-        let has_node = |h: &HostId| nodes["items"].as_array().into_iter().flatten().any(|n| n["metadata"]["name"] == h.as_str());
-        let mut drains = Drains { cordoned: admin.cordon.clone(), ..Drains::default() };
-        for host in &admin.drain {
+        let has_node = |h: &HostId| items().any(|n| n["metadata"]["name"] == h.as_str());
+        let mut drains = Drains { cordoned: admin.cordon.clone(), noted, ..Drains::default() };
+        for (host, since) in &admin.drain_since {
             if !has_node(host) {
-                drains.drained.insert(host.clone());
+                drains.drained_since.insert(host.clone(), *since);
                 continue;
             }
             let timeout = format!("--timeout={DRAIN_TIMEOUT}");
             let drained = self.kubectl(KubeRole::Server, &["drain", host.as_str(), "--ignore-daemonsets", "--delete-emptydir-data", &timeout]);
-            let selector = format!("spec.nodeName={host}");
-            let pods = self.kubectl(KubeRole::Server, &["get", "pods", "--all-namespaces", "--field-selector", &selector, "-o", "json"])?;
-            let pods: serde_json::Value = serde_json::from_str(&pods).map_err(|e| format!("read {host}'s pods: {e}"))?;
+            let pods = match self.pods_on(host) {
+                Ok(pods) => pods,
+                Err(e) => {
+                    eprintln!("homelabd: kubernetes: draining {host}: {e}");
+                    continue;
+                }
+            };
             let left = pods_left_to_drain(&pods);
             if left.is_empty() {
-                drains.drained.insert(host.clone());
+                drains.drained_since.insert(host.clone(), *since);
             } else if let Err(e) = drained {
                 eprintln!("homelabd: kubernetes: draining {host}: {} left: {e}", left.join(", "));
                 drains.blocked.insert(host.clone(), drain_refusal(&e));
@@ -857,6 +877,13 @@ impl Worker {
         }
         self.drains = drains;
         Ok(())
+    }
+
+    /// The pods on `host`'s node (`kubectl get pods -o json`).
+    fn pods_on(&self, host: &HostId) -> Result<serde_json::Value, String> {
+        let selector = format!("spec.nodeName={host}");
+        let pods = self.kubectl(KubeRole::Server, &["get", "pods", "--all-namespaces", "--field-selector", &selector, "-o", "json"])?;
+        serde_json::from_str(&pods).map_err(|e| format!("read {host}'s pods: {e}"))
     }
 
     fn kubectl(&self, role: KubeRole, args: &[&str]) -> Result<String, String> {
@@ -1182,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn nodes_are_cordoned_for_their_hosts_and_only_those_cordoned_so_are_uncordoned() {
+    fn nodes_are_cordoned_for_their_hosts_and_only_those_cordoned_so_are_uncordoned_unless_removed() {
         let node = |name: &str, unschedulable: bool, noted: bool| {
             let annotations = if noted { serde_json::json!({ CORDONED_ANNOTATION: "true" }) } else { serde_json::json!({}) };
             serde_json::json!({ "metadata": { "name": name, "annotations": annotations }, "spec": { "unschedulable": unschedulable } })
@@ -1192,12 +1219,17 @@ mod tests {
             node("ms01-02", true, true),
             node("ms01-03", true, false),
             node("ms01-04", true, true),
+            node("ms01-05", true, true),
         ] });
-        let cordon: BTreeSet<HostId> = [HostId::from("ms01-01"), HostId::from("ms01-04")].into();
-        let patches = cordon_patches(&nodes, &cordon);
+        let hosts = |ids: &[&str]| -> BTreeSet<HostId> { ids.iter().map(|id| HostId::from(*id)).collect() };
+        let patches = cordon_patches(&nodes, &hosts(&["ms01-01", "ms01-04"]), &hosts(&["ms01-02", "ms01-03"]));
         let cordoned = serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: "true" } }, "spec": { "unschedulable": true } });
         let uncordoned = serde_json::json!({ "metadata": { "annotations": { CORDONED_ANNOTATION: null } }, "spec": { "unschedulable": null } });
-        assert_eq!(patches, [("ms01-01".to_string(), cordoned), ("ms01-02".to_string(), uncordoned)], "ms01-03 was cordoned by hand; ms01-04 is already");
+        assert_eq!(
+            patches,
+            [("ms01-01".to_string(), cordoned), ("ms01-02".to_string(), uncordoned)],
+            "ms01-03 was cordoned by hand; ms01-04 is already; ms01-05's host was removed, so it stays cordoned"
+        );
     }
 
     #[test]

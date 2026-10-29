@@ -62,7 +62,7 @@ The UI never shortens either to just "down". What each combination means and who
 | NotReady | Ready | homelabd's agent or the mgmt path to the leader broke, K3s didn't | `HostDown`; nothing in Kubernetes | keeps running the pods |
 | NotReady | not Ready | the host is off, or cut off | `HostDown`; after 10 min suggests replacing a dead voter | evicts its pods |
 
-homelabd removes a dead host's etcd member only when both are down (it already refuses to delete a `Ready` node). It never evicts pods because a host is NotReady: eviction timing is Kubernetes'.
+homelabd removes a dead host's etcd member only when both are down (it already refuses to delete a `Ready` node). It never evicts pods because a host is NotReady: eviction timing is Kubernetes'. Nor does it change a cordon then: the node of a Cordoned, Draining or Drained host stays cordoned while the host is NotReady, since its kubelet may run on, and a removed host's node stays cordoned until it is deleted.
 
 ## 4. Supervising K3s
 

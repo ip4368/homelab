@@ -53,10 +53,17 @@ storage_off: Array<HostId>,
  */
 cordoned: Array<HostId>, 
 /**
- * On a server: the hosts it was asked to drain whose nodes hold
- * nothing but DaemonSet and static pods any more ([`KubeAdmin::drain`]).
+ * On a server: the hosts whose nodes carry the note that homelabd
+ * cordoned them, as it last left them; one whose host is in
+ * [`KubeAdmin::uncordon`] is still to be uncordoned.
  */
-drained: Array<HostId>, 
+cordon_noted: Array<HostId>, 
+/**
+ * On a server: the hosts it was asked to drain whose nodes hold
+ * nothing but DaemonSet and static pods any more, each with the drain
+ * it answers ([`KubeAdmin::drain_since`]).
+ */
+drained_since: { [key in HostId]: number }, 
 /**
  * On a server: why the pods of a host it was asked to drain could not
  * all be evicted yet, by host.

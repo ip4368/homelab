@@ -41,7 +41,8 @@ describe('host drawer kubernetes', () => {
     etcd_unstarted: [],
     storage_off: [],
     cordoned: [],
-    drained: [],
+    cordon_noted: [],
+    drained_since: {},
     drain_blocked: {},
     ...over,
   })

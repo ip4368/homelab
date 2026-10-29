@@ -122,14 +122,20 @@ pub struct KubeAdmin {
     /// Hosts whose Longhorn disks take no new replicas: they have no active
     /// storage role. Disks this took from a host not listed are given back.
     pub storage_off: BTreeSet<HostId>,
-    /// Hosts whose nodes are kept cordoned. A node this cordoned whose host
-    /// is not listed is uncordoned; one cordoned by hand is left alone.
+    /// Hosts whose nodes are kept cordoned.
     #[serde(default)]
     pub cordon: BTreeSet<HostId>,
-    /// Hosts whose nodes are drained: their pods are evicted, but for
-    /// DaemonSet and static pods.
+    /// Hosts whose nodes are uncordoned if this cordoned them; one cordoned
+    /// by hand is left alone. A node whose host is in neither set (it was
+    /// removed) is left as it is.
     #[serde(default)]
-    pub drain: BTreeSet<HostId>,
+    pub uncordon: BTreeSet<HostId>,
+    /// Hosts whose nodes are drained: their pods are evicted, but for
+    /// DaemonSet and static pods. Each with when its host became `Draining`,
+    /// which the server reports back ([`KubeStatus::drained_since`]), so a
+    /// report of an earlier drain is never taken for this one.
+    #[serde(default)]
+    pub drain_since: BTreeMap<HostId, SimTime>,
 }
 
 /// How a host's Kubernetes install stands.
@@ -184,10 +190,17 @@ pub struct KubeStatus {
     /// On a server: the hosts whose nodes it last cordoned ([`KubeAdmin::cordon`]).
     #[serde(default)]
     pub cordoned: BTreeSet<HostId>,
-    /// On a server: the hosts it was asked to drain whose nodes hold
-    /// nothing but DaemonSet and static pods any more ([`KubeAdmin::drain`]).
+    /// On a server: the hosts whose nodes carry the note that homelabd
+    /// cordoned them, as it last left them; one whose host is in
+    /// [`KubeAdmin::uncordon`] is still to be uncordoned.
     #[serde(default)]
-    pub drained: BTreeSet<HostId>,
+    pub cordon_noted: BTreeSet<HostId>,
+    /// On a server: the hosts it was asked to drain whose nodes hold
+    /// nothing but DaemonSet and static pods any more, each with the drain
+    /// it answers ([`KubeAdmin::drain_since`]).
+    #[serde(default)]
+    #[ts(type = "{ [key in HostId]: number }")]
+    pub drained_since: BTreeMap<HostId, SimTime>,
     /// On a server: why the pods of a host it was asked to drain could not
     /// all be evicted yet, by host.
     #[serde(default)]

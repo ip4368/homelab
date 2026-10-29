@@ -2,16 +2,21 @@
 //!
 //! * **Cordon.** The Kubernetes node of a `Cordoned`, `Draining` or
 //!   `Drained` host is cordoned (`kubectl cordon`): new pods go elsewhere.
-//!   The kube controller asks a running K3s server to do it
+//!   It stays cordoned while such a host is `NotReady`: its kubelet may
+//!   well run on. The kube controller asks a running K3s server to do it
 //!   ([`KubeAdmin::cordon`](crate::proto::KubeAdmin::cordon)), and to
-//!   uncordon the node once the host is `Ready` again.
+//!   uncordon the node of any other host
+//!   ([`KubeAdmin::uncordon`](crate::proto::KubeAdmin::uncordon)). The node
+//!   of a removed host is left cordoned.
 //! * **Drain.** A `Draining` host's node is drained as well
-//!   (`kubectl drain`, [`KubeAdmin::drain`](crate::proto::KubeAdmin::drain)):
+//!   (`kubectl drain`, [`KubeAdmin::drain_since`](crate::proto::KubeAdmin::drain_since)):
 //!   its pods are evicted, so their controllers start them elsewhere and
 //!   Longhorn moves its volumes' engines with them. Once the server reports
-//!   the node holds nothing but DaemonSet and static pods
-//!   ([`KubeStatus::drained`]), the host is `Drained`. A host that runs no
-//!   Kubernetes has nothing to drain and is `Drained` at once.
+//!   the node holds nothing but DaemonSet and static pods for this drain
+//!   ([`KubeStatus::drained_since`], the time the host became `Draining`),
+//!   the host is `Drained`; a report of an earlier drain does not count.
+//!   A host that runs no Kubernetes has nothing to drain and is `Drained`
+//!   at once.
 //!
 //!   Everything a drain goes by is in the replicated state or reported
 //!   again by the servers, so a new leader picks it up where it was.
@@ -25,21 +30,32 @@
 use super::alerts::AlertKind;
 use super::{Action, Volatile};
 use crate::proto::{KubePhase, KubeRole, KubeStatus};
-use crate::state::{ClusterState, Command, Lifecycle, ObjectKind, ObjectRef};
+use crate::runtime::SimTime;
+use crate::state::{ClusterState, Command, HostObj, Lifecycle, ObjectKind, ObjectRef};
 use model::HostId;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const DRAIN_BLOCKED: &str = AlertKind::DrainBlocked.as_str();
 
-/// The hosts whose Kubernetes nodes are kept cordoned.
+/// The hosts whose Kubernetes nodes are kept cordoned, `NotReady` ones
+/// included if they were held before they dropped out.
 pub fn cordoned(state: &ClusterState) -> BTreeSet<HostId> {
-    let held = |l: &Lifecycle| matches!(l, Lifecycle::Cordoned | Lifecycle::Draining | Lifecycle::Drained);
-    state.hosts.values().filter(|h| held(&h.lifecycle)).map(|h| h.id.clone()).collect()
+    let held = |l: Lifecycle| matches!(l, Lifecycle::Cordoned | Lifecycle::Draining | Lifecycle::Drained);
+    let lifecycle = |h: &HostObj| if h.lifecycle == Lifecycle::NotReady { h.before_not_ready.unwrap_or(h.lifecycle) } else { h.lifecycle };
+    state.hosts.values().filter(|h| held(lifecycle(h))).map(|h| h.id.clone()).collect()
 }
 
-/// The hosts whose Kubernetes nodes are being drained.
-pub fn draining(state: &ClusterState) -> BTreeSet<HostId> {
-    state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Draining).map(|h| h.id.clone()).collect()
+/// The hosts whose Kubernetes nodes are uncordoned if homelabd cordoned
+/// them: every other host. A removed host is in neither set.
+pub fn uncordoned(state: &ClusterState) -> BTreeSet<HostId> {
+    let cordoned = cordoned(state);
+    state.hosts.keys().filter(|id| !cordoned.contains(*id)).cloned().collect()
+}
+
+/// The hosts whose Kubernetes nodes are being drained, each with when it
+/// became `Draining`: the drain a server's report must answer.
+pub fn draining(state: &ClusterState) -> BTreeMap<HostId, SimTime> {
+    state.hosts.values().filter(|h| h.lifecycle == Lifecycle::Draining).map(|h| (h.id.clone(), h.last_transition)).collect()
 }
 
 /// The statuses of the K3s servers that run: each says which nodes it drained.
@@ -60,8 +76,8 @@ fn runs_no_kube(state: &ClusterState, v: &Volatile, host: &HostId) -> bool {
 pub fn run(state: &ClusterState, v: &Volatile) -> Vec<Action> {
     let mut out = vec![];
     let mut blocked = BTreeMap::new();
-    for host in draining(state) {
-        if runs_no_kube(state, v, &host) || servers(state, v).any(|s| s.drained.contains(&host)) {
+    for (host, since) in draining(state) {
+        if runs_no_kube(state, v, &host) || servers(state, v).any(|s| s.drained_since.get(&host) == Some(&since)) {
             out.push(Action::Propose(Command::SetLifecycle { id: host, lifecycle: Lifecycle::Drained }));
         } else if let Some(why) = servers(state, v).find_map(|s| s.drain_blocked.get(&host)) {
             blocked.insert(host, why.clone());
@@ -164,15 +180,41 @@ mod tests {
     fn cordoned_draining_and_drained_hosts_keep_their_nodes_cordoned() {
         let (mut s, _) = cluster();
         assert!(cordoned(&s).is_empty());
+        assert_eq!(uncordoned(&s), [hid("m1"), hid("m2")].into());
         set_lifecycle(&mut s, "m2", Lifecycle::Cordoned);
-        assert_eq!(cordoned(&s), [hid("m2")].into());
+        assert_eq!((cordoned(&s), uncordoned(&s)), ([hid("m2")].into(), [hid("m1")].into()));
         assert!(draining(&s).is_empty(), "a cordon evicts nothing");
         set_lifecycle(&mut s, "m2", Lifecycle::Draining);
-        assert_eq!((cordoned(&s), draining(&s)), ([hid("m2")].into(), [hid("m2")].into()));
+        assert_eq!((cordoned(&s), draining(&s)), ([hid("m2")].into(), [(hid("m2"), 0)].into()));
         set_lifecycle(&mut s, "m2", Lifecycle::Drained);
-        assert_eq!((cordoned(&s), draining(&s)), ([hid("m2")].into(), BTreeSet::new()));
+        assert_eq!((cordoned(&s), draining(&s)), ([hid("m2")].into(), BTreeMap::new()));
         set_lifecycle(&mut s, "m2", Lifecycle::Ready);
         assert!(cordoned(&s).is_empty(), "uncordoned");
+    }
+
+    #[test]
+    fn a_held_host_that_goes_not_ready_keeps_its_node_cordoned() {
+        let (mut s, _) = cluster();
+        set_lifecycle(&mut s, "m1", Lifecycle::NotReady);
+        assert_eq!((cordoned(&s), uncordoned(&s)), (BTreeSet::new(), [hid("m1"), hid("m2")].into()), "m1 was Ready");
+        for held in [Lifecycle::Cordoned, Lifecycle::Draining, Lifecycle::Drained] {
+            let (mut s, _) = cluster();
+            set_lifecycle(&mut s, "m2", if held == Lifecycle::Cordoned { held } else { Lifecycle::Draining });
+            if held == Lifecycle::Drained {
+                set_lifecycle(&mut s, "m2", held);
+            }
+            set_lifecycle(&mut s, "m2", Lifecycle::NotReady);
+            assert_eq!((cordoned(&s), uncordoned(&s)), ([hid("m2")].into(), [hid("m1")].into()), "its kubelet may run on ({held:?})");
+            assert!(draining(&s).is_empty(), "nothing to drain while it is away");
+        }
+    }
+
+    #[test]
+    fn a_removed_host_is_neither_cordoned_nor_uncordoned() {
+        let (mut s, _) = cluster();
+        set_lifecycle(&mut s, "m2", Lifecycle::Cordoned);
+        s.apply(0, Command::RemoveHost { id: hid("m2") }).unwrap();
+        assert_eq!((cordoned(&s), uncordoned(&s)), (BTreeSet::new(), [hid("m1")].into()), "its node stays as it is");
     }
 
     #[test]
@@ -180,7 +222,21 @@ mod tests {
         let (mut s, mut v) = cluster();
         set_lifecycle(&mut s, "m2", Lifecycle::Draining);
         assert!(run(&s, &v).is_empty(), "its pods are still being evicted");
-        v.kube_status.get_mut(&hid("m1")).unwrap().drained = [hid("m2")].into();
+        v.kube_status.get_mut(&hid("m1")).unwrap().drained_since = [(hid("m2"), 0)].into();
+        assert_eq!(run(&s, &v), [drained("m2")]);
+    }
+
+    #[test]
+    fn a_report_of_an_earlier_drain_does_not_drain_the_host_again() {
+        let (mut s, mut v) = cluster();
+        let set = |s: &mut ClusterState, at, lifecycle| s.apply(at, Command::SetLifecycle { id: hid("m2"), lifecycle }).unwrap();
+        set(&mut s, 10, Lifecycle::Draining);
+        v.kube_status.get_mut(&hid("m1")).unwrap().drained_since = [(hid("m2"), 10)].into();
+        set(&mut s, 20, Lifecycle::Drained);
+        set(&mut s, 30, Lifecycle::Ready);
+        set(&mut s, 40, Lifecycle::Draining);
+        assert!(run(&s, &v).is_empty(), "the server has not answered the drain begun at 40");
+        v.kube_status.get_mut(&hid("m1")).unwrap().drained_since = [(hid("m2"), 40)].into();
         assert_eq!(run(&s, &v), [drained("m2")]);
     }
 

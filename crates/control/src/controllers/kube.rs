@@ -248,13 +248,17 @@ fn admin(state: &ClusterState, v: &Volatile, status: &impl Fn(&HostId) -> Option
     let etcd_agents = remove_etcd_members.iter().filter(|m| up(state, m) && runs_agent(status(m).as_ref())).cloned().collect();
     let storage_off: BTreeSet<HostId> = state.hosts.values().filter(|h| member(h) && !stores(h)).map(|h| h.id.clone()).collect();
     let cordon = drain::cordoned(state);
-    let drain = drain::draining(state);
-    let applied = status(via).is_some_and(|s| s.storage_off == storage_off && s.cordoned == cordon && drain.is_subset(&s.drained));
+    let uncordon = drain::uncordoned(state);
+    let drain_since = drain::draining(state);
+    let applied = status(via).is_some_and(|s| {
+        let drained = drain_since.iter().all(|(h, since)| s.drained_since.get(h) == Some(since));
+        s.storage_off == storage_off && s.cordoned == cordon && s.cordon_noted.is_disjoint(&uncordon) && drained
+    });
     if (remove_etcd_members.is_empty() && applied) || v.kube_admin_sent.is_some_and(|at| now < at + KUBE_RESEND_MS) {
         return None;
     }
     let to = Endpoint::new(Addr::Host(via.clone()), Svc::Agent);
-    let admin = KubeAdmin { remove_etcd_members, etcd_peers, etcd_agents, storage_off, cordon, drain };
+    let admin = KubeAdmin { remove_etcd_members, etcd_peers, etcd_agents, storage_off, cordon, uncordon, drain_since };
     Some(Action::Send(to, mgmt(), Msg::KubeAdmin(admin)))
 }
 
@@ -505,6 +509,17 @@ mod tests {
         assert!(status.etcd_members.is_empty() && status.etcd_unread.is_none() && status.storage_off.is_empty());
     }
 
+    /// The release that first drained through Kubernetes logged `drained` as
+    /// a list of hosts; it is ignored now, since it does not say which drain.
+    #[test]
+    fn a_status_logged_with_a_list_of_drained_hosts_still_replays() {
+        let logged = r#"{"at":1,"cmd":{"RecordKube":{"id":"ms01-01","status":{"role":"Server","phase":"Running","node_ready":true,"labels":{},"storage_disks":[],"version":"v1","cordoned":["ms01-02"],"drained":["ms01-02"],"drain_blocked":{}}}}}"#;
+        let cmd: LogCmd = serde_json::from_str(logged).expect("its RecordKube replays");
+        let Command::RecordKube { status, .. } = cmd.cmd else { panic!("{cmd:?}") };
+        assert_eq!(status.cordoned, set(&["ms01-02"]));
+        assert!(status.drained_since.is_empty() && status.cordon_noted.is_empty());
+    }
+
     #[test]
     fn a_member_left_behind_by_a_server_that_became_an_agent_goes_through_etcd_before_a_server_joins() {
         let (mut s, mut v) = three_servers();
@@ -521,7 +536,7 @@ mod tests {
 
         v.kube_status.insert(hid("ms01-04"), running(KubeRole::Agent));
         let peer = s.hosts[&hid("ms01-04")].ips[&mgmt()];
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-04"]), etcd_peers: [(hid("ms01-04"), peer)].into(), etcd_agents: set(&["ms01-04"]), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), drain: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-04"]), etcd_peers: [(hid("ms01-04"), peer)].into(), etcd_agents: set(&["ms01-04"]), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), uncordon: s.hosts.keys().cloned().collect(), drain_since: BTreeMap::new() };
         assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want)]);
 
         // ms01-04 takes ms01-03's place: it becomes a voter, so its member is
@@ -557,7 +572,7 @@ mod tests {
         // Membership replaced it with ms01-04: the unstarted member goes, by its peer address, before ms01-04 joins.
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer(&s, "ms01-03"))].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), drain: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer(&s, "ms01-03"))].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), uncordon: s.hosts.keys().cloned().collect(), drain_since: BTreeMap::new() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)]);
         assert!(!sent(&actions).contains_key(&hid("ms01-04")));
 
@@ -603,7 +618,7 @@ mod tests {
         s.apply_membership(set(&["ms01-01", "ms01-02", "ms01-04"]));
         let actions = run(&s, &v, 0);
         let peer = s.hosts[&hid("ms01-03")].ips[&mgmt()];
-        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer)].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), drain: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: set(&["ms01-03"]), etcd_peers: [(hid("ms01-03"), peer)].into(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), uncordon: s.hosts.keys().cloned().collect(), drain_since: BTreeMap::new() };
         assert_eq!(asked(&actions), [(hid("ms01-01"), want)], "through the first running server");
         assert!(!sent(&actions).contains_key(&hid("ms01-04")), "the replacement waits for the dead member to go");
         v.kube_admin_sent = Some(0);
@@ -669,20 +684,59 @@ mod tests {
         let (mut s, mut v) = three_servers();
         assert!(asked(&run(&s, &v, 0)).is_empty(), "every host stores");
         hold_storage(&mut s, "ms01-04", true);
-        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: set(&["ms01-04"]), cordon: BTreeSet::new(), drain: BTreeSet::new() };
+        let want = KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: set(&["ms01-04"]), cordon: BTreeSet::new(), uncordon: s.hosts.keys().cloned().collect(), drain_since: BTreeMap::new() };
         assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), want.clone())]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off = want.storage_off;
         assert!(asked(&run(&s, &v, 0)).is_empty(), "the server applied it");
 
         // The network is fixed: the disks are given back.
         hold_storage(&mut s, "ms01-04", false);
-        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), drain: BTreeSet::new() })]);
+        assert_eq!(asked(&run(&s, &v, 0)), [(hid("ms01-01"), KubeAdmin { remove_etcd_members: BTreeSet::new(), etcd_peers: BTreeMap::new(), etcd_agents: BTreeSet::new(), storage_off: BTreeSet::new(), cordon: BTreeSet::new(), uncordon: s.hosts.keys().cloned().collect(), drain_since: BTreeMap::new() })]);
         v.kube_status.get_mut(&hid("ms01-01")).unwrap().storage_off.clear();
         // A host without the storage role never stores.
         let mut roles = s.hosts[&hid("ms01-04")].roles.clone();
         roles.remove(&Role::Storage);
         s.apply(0, Command::SetRoles { id: hid("ms01-04"), roles }).unwrap();
         assert_eq!(asked(&run(&s, &v, 0))[0].1.storage_off, set(&["ms01-04"]));
+    }
+
+    #[test]
+    fn a_node_homelabd_cordoned_is_uncordoned_once_its_host_is_known_and_not_held() {
+        let (mut s, mut v) = three_servers();
+        // ms01-04 was cordoned, then removed: its node keeps the note, and nothing is asked of it.
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().cordon_noted = set(&["ms01-04"]);
+        s.apply(0, Command::RemoveHost { id: hid("ms01-04") }).unwrap();
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "a removed host's node stays cordoned");
+        // It rejoins under the same id, Ready: its node is uncordoned.
+        let inv = Inventory::from_profile(ProfileId::Ms01, 0);
+        let profile = model::HardwareProfile::with_discovered(&inv);
+        s.apply(0, Command::AddPendingHost { id: hid("ms01-04"), profile, inventory: inv, location: "lab".into() }).unwrap();
+        let asks = asked(&run(&s, &v, 0));
+        assert_eq!(asks.len(), 1);
+        assert!(asks[0].1.uncordon.contains(&hid("ms01-04")) && asks[0].1.cordon.is_empty());
+        v.kube_status.get_mut(&hid("ms01-01")).unwrap().cordon_noted.clear();
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "the server uncordoned it");
+    }
+
+    #[test]
+    fn a_drain_is_asked_for_until_the_server_answers_that_drain() {
+        let (mut s, mut v) = three_servers();
+        let set_lifecycle = |s: &mut ClusterState, at, lifecycle| s.apply(at, Command::SetLifecycle { id: hid("ms01-04"), lifecycle }).unwrap();
+        set_lifecycle(&mut s, 10, Lifecycle::Draining);
+        let applied = |v: &mut Volatile, since| {
+            let st = v.kube_status.get_mut(&hid("ms01-01")).unwrap();
+            (st.cordoned, st.drained_since) = (set(&["ms01-04"]), [(hid("ms01-04"), since)].into());
+        };
+        assert_eq!(asked(&run(&s, &v, 0))[0].1.drain_since, [(hid("ms01-04"), 10)].into());
+        applied(&mut v, 10);
+        assert!(asked(&run(&s, &v, 0)).is_empty(), "drained");
+        // Drained, readied and drained again before the server heard: its report is of the first drain.
+        set_lifecycle(&mut s, 20, Lifecycle::Drained);
+        set_lifecycle(&mut s, 30, Lifecycle::Ready);
+        set_lifecycle(&mut s, 40, Lifecycle::Draining);
+        assert_eq!(asked(&run(&s, &v, 0))[0].1.drain_since, [(hid("ms01-04"), 40)].into(), "the drain begun at 40 is asked for");
+        applied(&mut v, 40);
+        assert!(asked(&run(&s, &v, 0)).is_empty());
     }
 
     #[test]
