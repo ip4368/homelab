@@ -33,7 +33,7 @@
 //! It writes what it found to `/run/homelab/kube.json` for `homelabd status`.
 
 use super::{sh, LinuxVip, Paths};
-use control::proto::{KubeAdmin, KubePhase, KubeRole, KubeSpec, KubeStatus, StorageNetwork};
+use control::proto::{KubeAdmin, KubeHealth, KubePhase, KubeRole, KubeSpec, KubeStatus, StorageNetwork};
 use control::runtime::SimTime;
 use model::HostId;
 use std::collections::{BTreeMap, BTreeSet};
@@ -474,9 +474,13 @@ struct Shared {
     want: Option<KubeSpec>,
     /// Work for the cluster the leader asked for, not done yet.
     admin: Option<KubeAdmin>,
+    /// A restart of the K3s service was asked for, not done yet.
+    restart: bool,
     /// A new spec or work arrived since the worker last looked.
     changed: bool,
     status: Option<KubeStatus>,
+    /// The server's own API health, on a host running a server.
+    health: Option<KubeHealth>,
 }
 
 /// The host's Kubernetes supervisor: hand it specs, read its status.
@@ -518,6 +522,15 @@ impl Kube {
         cv.notify_one();
     }
 
+    /// Asks for the K3s service to be restarted once.
+    pub fn restart(&self) {
+        let (lock, cv) = &*self.shared;
+        let mut s = lock.lock().expect("kube lock");
+        s.restart = true;
+        s.changed = true;
+        cv.notify_one();
+    }
+
     pub fn status(&self) -> Option<KubeStatus> {
         self.shared.0.lock().expect("kube lock").status.clone()
     }
@@ -526,14 +539,22 @@ impl Kube {
         self.shared.0.lock().expect("kube lock").status = Some(status);
     }
 
-    /// The spec in hand and the work asked for, after waiting up to `wait`
-    /// for something new.
-    fn next(&self, wait: Duration) -> (Option<KubeSpec>, Option<KubeAdmin>) {
+    pub fn health(&self) -> Option<KubeHealth> {
+        self.shared.0.lock().expect("kube lock").health.clone()
+    }
+
+    fn set_health(&self, health: Option<KubeHealth>) {
+        self.shared.0.lock().expect("kube lock").health = health;
+    }
+
+    /// The spec in hand, the work asked for, and whether a restart was
+    /// asked for, after waiting up to `wait` for something new.
+    fn next(&self, wait: Duration) -> (Option<KubeSpec>, Option<KubeAdmin>, bool) {
         let (lock, cv) = &*self.shared;
         let s = lock.lock().expect("kube lock");
         let (mut s, _) = cv.wait_timeout_while(s, wait, |s| !s.changed).expect("kube lock");
         s.changed = false;
-        (s.want.clone(), s.admin.take())
+        (s.want.clone(), s.admin.take(), std::mem::take(&mut s.restart))
     }
 }
 
@@ -582,7 +603,10 @@ impl Worker {
     fn run(mut self, kube: &Kube) {
         let mut wait = Duration::ZERO;
         loop {
-            let (want, admin) = kube.next(wait);
+            let (want, admin, restart) = kube.next(wait);
+            if restart {
+                self.restart();
+            }
             let (mut status, ok) = self.step(want.as_ref(), kube);
             if let Some(admin) = admin
                 && status.role == Some(KubeRole::Server)
@@ -608,6 +632,7 @@ impl Worker {
                 let _ = std::fs::create_dir_all(&self.paths.run);
                 let _ = std::fs::write(status_path(&self.paths), b);
             }
+            kube.set_health(self.api_health(&status));
             kube.set_status(status);
         }
     }
@@ -723,6 +748,26 @@ impl Worker {
         let node_ready = ready.as_deref().map(str::trim) == Ok("True");
         let (etcd_members, etcd_unread) = if r == KubeRole::Server && active { split(self.etcd_members()) } else { (vec![], None) };
         Observed { role, active, unregistered: ready.err(), node_ready, version, etcd_members, etcd_unread }
+    }
+
+    /// This server's own API health, for the leader's supervision: whether
+    /// its `/readyz` answers `ok`. `None` on a host with no server.
+    fn api_health(&self, status: &KubeStatus) -> Option<KubeHealth> {
+        if status.role != Some(KubeRole::Server) {
+            return None;
+        }
+        let ready = self.kubectl(KubeRole::Server, &["get", "--raw", "/readyz"]).is_ok_and(|o| o.trim() == "ok");
+        Some(KubeHealth { api_ready: ready })
+    }
+
+    /// Restarts the installed K3s service once, if one is installed.
+    fn restart(&self) {
+        if let Some(r) = self.observe().role {
+            eprintln!("homelabd: kubernetes: restarting {}", unit(r));
+            if let Err(e) = sh("systemctl", &["restart", unit(r)]) {
+                eprintln!("homelabd: kubernetes: restart: {e}");
+            }
+        }
     }
 
     /// etcd's members, from this host's K3s server (`/db/info` answers the

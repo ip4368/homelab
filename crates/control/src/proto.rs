@@ -214,6 +214,15 @@ impl KubeStatus {
     }
 }
 
+/// What a running K3s server reports about the cluster's health, every few
+/// seconds. Unlike [`KubeStatus`], this never enters the Raft log: the
+/// leader keeps the latest per server in memory, like metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KubeHealth {
+    /// Its own API's `/readyz`, on loopback.
+    pub api_ready: bool,
+}
+
 /// A user operation, as submitted through the API.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -366,6 +375,14 @@ pub enum Msg {
     /// Agent to the VIP: how its Kubernetes stands, when that changes and
     /// every [`crate::agent::KUBE_REPORT_MS`] regardless.
     KubeStatus { host: HostId, status: KubeStatus },
+    /// Agent of a running K3s server to the VIP: what its API says, when
+    /// that changes and every [`crate::agent::KUBE_HEALTH_REPORT_MS`]
+    /// regardless. Kept in the leader's memory, never in the log.
+    KubeHealth { host: HostId, health: KubeHealth },
+    /// Leader to the agent of a host whose K3s misbehaves: restart its K3s
+    /// service for recorded attempt `attempt` (its log time). The agent runs
+    /// each attempt once, so a new leader may safely send an old one again.
+    KubeRepair { attempt: SimTime },
     /// Leader to a switch's management interface, every poll interval.
     SwitchPoll,
     /// Switch to the leader: its own configuration.

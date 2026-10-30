@@ -5,7 +5,8 @@
 use crate::controllers::join::{self, JoinOutcome};
 use crate::controllers::rollout;
 use crate::controllers::membership::{self, RaftMembers};
-use crate::controllers::{self, Action, HostReport, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
+use crate::controllers::supervise;
+use crate::controllers::{self, Action, HostReport, KubeHealthReading, PendingApi, PendingJoin, SwitchReading, Volatile, FAILED_BACKOFF_MS};
 use crate::proto::{mgmt, ApiOp, ApiResult, LogCmd, Msg, Observed};
 use crate::raft::{Durable, EntryPayload, RaftConfig, RaftNode, RaftOut, RaftRole};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
@@ -177,6 +178,12 @@ impl CpReplica {
         if let Some(change) = plan.change {
             // Refused only if the leader cannot change membership now; the next run asks again.
             let _ = change.apply(raft);
+        }
+        let sv = supervise::run(&self.state, v, &self.me, now);
+        actions.extend(sv.actions);
+        if let Some(to) = sv.transfer {
+            // Refused only if the target is no voter or another transfer runs; the next run asks again.
+            let _ = raft.transfer_leader(mono, to);
         }
         for action in actions {
             match action {
@@ -481,6 +488,18 @@ impl Actor for CpReplica {
                     v.kube_status.insert(host, status);
                 }
             }
+            Msg::KubeHealth { host, health } => {
+                if let Some(v) = &mut self.volatile
+                    && self.state.hosts.contains_key(&host)
+                {
+                    v.kube_health.insert(host.clone(), KubeHealthReading { at: now, health: health.clone() });
+                    if health.api_ready {
+                        v.api_down_since.remove(&host);
+                    } else {
+                        v.api_down_since.entry(host).or_insert(now);
+                    }
+                }
+            }
             Msg::Api { req, op } => self.on_api(ctx, from, req, op),
             Msg::Sync { since } => self.on_sync(ctx, from, since),
             Msg::Ping(_)
@@ -495,6 +514,7 @@ impl Actor for CpReplica {
             | Msg::StartCpReplica { .. }
             | Msg::Kube(_)
             | Msg::KubeAdmin(_)
+            | Msg::KubeRepair { .. }
             | Msg::Directory { .. } => {}
         }
     }
@@ -846,6 +866,44 @@ mod tests {
         rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 4, op: ApiOp::TransferLeadership { to: hid("h9") } });
         let resp = rig.ctx.sent.pop();
         assert!(matches!(resp, Some((_, Msg::ApiResp { req: 4, result: ApiResult::Err(_) }))), "h9 is no voter: {resp:?}");
+    }
+
+    #[test]
+    fn health_reports_feed_the_supervising_controller() {
+        use crate::controllers::supervise::{KUBE_API_DOWN, KUBE_API_DOWN_GRACE_MS};
+        use crate::proto::KubeHealth;
+        let mut rig = Rig::new(vec![Command::AddPendingHost {
+            id: hid("h1"),
+            profile: profile(ProfileId::MiniPc, 0),
+            inventory: Inventory::from_profile(ProfileId::MiniPc, 0),
+            location: "rack-1".into(),
+        }]);
+        rig.elect();
+        rig.ack();
+        let agent = host_ep("h1", Svc::Agent);
+        let health = |host: &str, api_ready: bool| Msg::KubeHealth { host: hid(host), health: KubeHealth { api_ready } };
+
+        rig.r.on_message(&mut rig.ctx, host_ep("zz", Svc::Agent), health("zz", false));
+        assert!(rig.r.volatile.as_ref().unwrap().kube_health.is_empty(), "unknown hosts are ignored");
+
+        rig.r.on_message(&mut rig.ctx, agent.clone(), health("h1", false));
+        let since = rig.ctx.now;
+        assert_eq!(rig.r.volatile.as_ref().unwrap().api_down_since.get(&hid("h1")), Some(&since));
+        rig.advance(1000);
+        rig.r.on_message(&mut rig.ctx, agent.clone(), health("h1", false));
+        assert_eq!(rig.r.volatile.as_ref().unwrap().api_down_since.get(&hid("h1")), Some(&since), "the first stamp sticks");
+        rig.r.on_message(&mut rig.ctx, agent.clone(), health("h1", true));
+        assert!(!rig.r.volatile.as_ref().unwrap().api_down_since.contains_key(&hid("h1")), "ready clears it");
+
+        rig.r.on_message(&mut rig.ctx, agent.clone(), health("h1", false));
+        rig.advance(KUBE_API_DOWN_GRACE_MS);
+        rig.r.on_message(&mut rig.ctx, agent.clone(), health("h1", false));
+        rig.controllers();
+        assert!(
+            rig.proposed().iter().any(|c| matches!(c, Command::RaiseAlert { kind, .. } if kind == KUBE_API_DOWN)),
+            "down past its grace, the alert goes up: {:?}",
+            rig.proposed()
+        );
     }
 
     #[test]

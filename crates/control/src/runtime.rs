@@ -1,7 +1,7 @@
 //! The runtime interface: what an [`Actor`] can see and do. The host
 //! runtime (`node`) implements [`Ctx`]; control code only ever talks to this trait.
 
-use crate::proto::{KubeAdmin, KubeSpec, KubeStatus, LogCmd, Msg};
+use crate::proto::{KubeAdmin, KubeHealth, KubeSpec, KubeStatus, LogCmd, Msg};
 use crate::raft::{Durable, DurableOp};
 use model::network::{HostNetworkConfig, LldpNeighbor, ObservedSwitchPort};
 use model::{HostId, Inventory, NetworkId, SwitchId};
@@ -108,6 +108,14 @@ pub trait HostOs {
     fn kube_status(&self) -> Option<KubeStatus> {
         None
     }
+    /// What this host's K3s server says of its own API; `None` unless this
+    /// host runs a server.
+    fn kube_health(&self) -> Option<KubeHealth> {
+        None
+    }
+    /// Restarts the host's K3s service once, in the background; nothing on a
+    /// host with no K3s installed.
+    fn restart_kube(&mut self) {}
     /// An admin kubeconfig for the cluster's Kubernetes, pointed at the VIP;
     /// `None` unless this host runs a K3s server that wrote one.
     fn kubeconfig(&self) -> Option<String> {

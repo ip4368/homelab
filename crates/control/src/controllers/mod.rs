@@ -16,11 +16,12 @@ pub mod join;
 pub mod kube;
 pub mod membership;
 pub mod network;
+pub mod supervise;
 pub mod observe;
 pub mod rollout;
 
 use crate::metrics::MetricsStore;
-use crate::proto::{KubeStatus, MetricSample, Msg, Observed};
+use crate::proto::{KubeHealth, KubeStatus, MetricSample, Msg, Observed};
 use crate::runtime::{Addr, Endpoint, SimTime};
 use crate::state::{ClusterState, Command, NetworkResult};
 use model::network::ObservedSwitchPort;
@@ -76,6 +77,14 @@ pub struct SwitchReading {
     pub mlag_peer: Option<SwitchId>,
 }
 
+/// A K3s server's latest health report, as its agent sent it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KubeHealthReading {
+    /// When the report arrived.
+    pub at: SimTime,
+    pub health: KubeHealth,
+}
+
 /// The leader's memory outside the log. Rebuilt from nothing by every new
 /// leader, by design.
 #[derive(Debug, Clone, PartialEq)]
@@ -116,8 +125,15 @@ pub struct Volatile {
     pub directory_sent: Option<(directory::Directory, SimTime)>,
     /// Each host's latest Kubernetes status report.
     pub kube_status: BTreeMap<HostId, KubeStatus>,
+    /// Each K3s server's latest health report.
+    pub kube_health: BTreeMap<HostId, KubeHealthReading>,
+    /// When each host's K3s API was first seen not ready without a ready
+    /// report since; absent while ready or unreported.
+    pub api_down_since: BTreeMap<HostId, SimTime>,
     /// When each host was last sent its Kubernetes spec.
     pub kube_sent: BTreeMap<HostId, SimTime>,
+    /// When each host was last sent a K3s restart.
+    pub kube_repair_sent: BTreeMap<HostId, SimTime>,
     /// When a K3s server was last sent work for the cluster ([`crate::proto::KubeAdmin`]).
     pub kube_admin_sent: Option<SimTime>,
     /// Controller proposals by log index, until they apply.
@@ -148,7 +164,10 @@ impl Volatile {
             join_rejected_at: BTreeMap::new(),
             directory_sent: None,
             kube_status: BTreeMap::new(),
+            kube_health: BTreeMap::new(),
+            api_down_since: BTreeMap::new(),
             kube_sent: BTreeMap::new(),
+            kube_repair_sent: BTreeMap::new(),
             kube_admin_sent: None,
             in_flight: BTreeMap::new(),
             failed: Vec::new(),
@@ -210,7 +229,10 @@ impl Volatile {
         self.net_results.remove(host);
         self.net_pushed.remove(host);
         self.kube_status.remove(host);
+        self.kube_health.remove(host);
+        self.api_down_since.remove(host);
         self.kube_sent.remove(host);
+        self.kube_repair_sent.remove(host);
     }
 
     /// Records that the replica sent `msg` to `to`, for controllers that pace
@@ -231,6 +253,9 @@ impl Volatile {
             }
             (Addr::Host(id), Msg::Kube(_)) => {
                 self.kube_sent.insert(id.clone(), now);
+            }
+            (Addr::Host(id), Msg::KubeRepair { .. }) => {
+                self.kube_repair_sent.insert(id.clone(), now);
             }
             (Addr::Host(_), Msg::KubeAdmin(_)) => {
                 self.kube_admin_sent = Some(now);

@@ -4,6 +4,7 @@ import type { HostId } from "./HostId";
 import type { HostNet } from "./HostNet";
 import type { HostNetworkConfig } from "./HostNetworkConfig";
 import type { Inventory } from "./Inventory";
+import type { KubeRepairAttempt } from "./KubeRepairAttempt";
 import type { KubeStatus } from "./KubeStatus";
 import type { Lifecycle } from "./Lifecycle";
 import type { LldpNeighbor } from "./LldpNeighbor";
@@ -36,4 +37,10 @@ ips: { [key in NetworkId]: string }, net: HostNet,
 /**
  * What its agent last reported of its Kubernetes node; `None` before any report.
  */
-kube: KubeStatus | null, last_transition: number, version: number, };
+kube: KubeStatus | null, 
+/**
+ * The K3s repairs homelabd attempted on this host for the open incident,
+ * oldest first; cleared when the incident ends, so a new leader never
+ * restarts what an earlier one gave up on.
+ */
+kube_repairs: Array<KubeRepairAttempt>, last_transition: number, version: number, };

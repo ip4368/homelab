@@ -50,10 +50,34 @@ pub struct HostObj {
     pub net: HostNet,
     /// What its agent last reported of its Kubernetes node; `None` before any report.
     pub kube: Option<crate::proto::KubeStatus>,
+    /// The K3s repairs homelabd attempted on this host for the open incident,
+    /// oldest first; cleared when the incident ends, so a new leader never
+    /// restarts what an earlier one gave up on.
+    #[serde(default)]
+    pub kube_repairs: Vec<KubeRepairAttempt>,
     #[ts(type = "number")]
     pub last_transition: SimTime,
     #[ts(type = "number")]
     pub version: u64,
+}
+
+/// One repair homelabd decided for a host's K3s, recorded before it is
+/// carried out.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub struct KubeRepairAttempt {
+    /// When the attempt was recorded (log time).
+    #[ts(type = "number")]
+    pub at: SimTime,
+    pub action: KubeRepairAction,
+}
+
+/// What homelabd repairs on a host's K3s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum KubeRepairAction {
+    /// Restart the host's K3s service once.
+    RestartK3s,
 }
 
 /// Where pushing a host's network config stands, for its desired generation.

@@ -389,6 +389,16 @@ impl HostOs for LinuxOs {
         self.kube.as_ref()?.status()
     }
 
+    fn kube_health(&self) -> Option<control::proto::KubeHealth> {
+        self.kube.as_ref()?.health()
+    }
+
+    fn restart_kube(&mut self) {
+        if let Some(k) = &self.kube {
+            k.restart();
+        }
+    }
+
     fn kubeconfig(&self) -> Option<String> {
         kube::admin_kubeconfig(self.vip?).ok()
     }

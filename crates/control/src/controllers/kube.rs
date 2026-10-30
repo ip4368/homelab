@@ -182,6 +182,19 @@ pub fn etcd_removal<'m>(state: &ClusterState, members: &'m BTreeSet<HostId>, sta
     (live_members(state, members, status) > members.len() / 2).then_some(m)
 }
 
+/// Whether `without`'s K3s server may restart: the members on the other
+/// live servers are still a quorum of all members, so etcd never notices.
+/// False while the members are unknown.
+pub fn etcd_keeps_quorum_without(
+    state: &ClusterState,
+    members: &BTreeSet<HostId>,
+    status: &impl Fn(&HostId) -> Option<KubeStatus>,
+    without: &HostId,
+) -> bool {
+    let live_others = members.iter().filter(|m| *m != without && up(state, m) && runs_server(status(m).as_ref())).count();
+    live_others > members.len() / 2
+}
+
 /// Whether a server that is no etcd member yet must wait to join `members`:
 /// while a dead member is still to go, or a dead voter still to leave the
 /// control plane (in both cases its replacement joins after it went), or

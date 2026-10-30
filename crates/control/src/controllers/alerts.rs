@@ -43,10 +43,11 @@ pub enum AlertKind {
     SwitchUnreachable,
     CpReplacementSuggested,
     DrainBlocked,
+    KubeApiDown,
 }
 
 impl AlertKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::HostDown,
         Self::CpQuorumAtRisk,
         Self::BondDegraded,
@@ -58,6 +59,7 @@ impl AlertKind {
         Self::SwitchUnreachable,
         Self::CpReplacementSuggested,
         Self::DrainBlocked,
+        Self::KubeApiDown,
     ];
 
     /// The name an alert of this kind carries in `Alert::kind`.
@@ -74,6 +76,7 @@ impl AlertKind {
             Self::SwitchUnreachable => "SwitchUnreachable",
             Self::CpReplacementSuggested => "CpReplacementSuggested",
             Self::DrainBlocked => "DrainBlocked",
+            Self::KubeApiDown => "KubeApiDown",
         }
     }
 
@@ -83,7 +86,7 @@ impl AlertKind {
 
     pub const fn severity(self) -> Severity {
         match self {
-            Self::HostDown | Self::CpQuorumAtRisk => Severity::Critical,
+            Self::HostDown | Self::CpQuorumAtRisk | Self::KubeApiDown => Severity::Critical,
             Self::BondDegraded
             | Self::PortDown
             | Self::NetworkMismatch

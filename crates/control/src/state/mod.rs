@@ -116,6 +116,7 @@ impl ClusterState {
                     ips: BTreeMap::new(),
                     net: HostNet::default(),
                     kube: None,
+                    kube_repairs: Vec::new(),
                     last_transition: at,
                     version: v,
                 };
@@ -399,6 +400,16 @@ impl ClusterState {
             Command::RecordKube { id, status } => {
                 let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
                 host.kube = Some(status);
+                host.version = v;
+            }
+            Command::RecordRepair { id, action } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                host.kube_repairs.push(KubeRepairAttempt { at, action });
+                host.version = v;
+            }
+            Command::ClearKubeRepairs { id } => {
+                let host = self.hosts.get_mut(&id).ok_or(ApplyError::NotFound)?;
+                host.kube_repairs.clear();
                 host.version = v;
             }
         }

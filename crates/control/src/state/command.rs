@@ -114,6 +114,12 @@ pub enum Command {
     SetKube { token: String, init_host: HostId },
     /// What a host's agent last reported of its Kubernetes node.
     RecordKube { id: HostId, status: crate::proto::KubeStatus },
+    /// Records a K3s repair for `id`'s host, decided by the leader and
+    /// carried out after this commits. Fails with `NotFound` for no host.
+    RecordRepair { id: HostId, action: super::objects::KubeRepairAction },
+    /// Drops `id`'s host's recorded repairs: its incident ended. Fails with
+    /// `NotFound` for no host.
+    ClearKubeRepairs { id: HostId },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

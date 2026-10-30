@@ -7,7 +7,7 @@
 //! confirmed one is written for the next boot. A member also runs what the
 //! leader asks of Kubernetes (K3s), which runs the workloads.
 
-use crate::proto::{mgmt, KubeStatus, MetricSample, Msg, Observed};
+use crate::proto::{mgmt, KubeHealth, KubeStatus, MetricSample, Msg, Observed};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::NetworkResult;
 use model::network::{bootstrap_config, HostNetworkConfig, LogicalNetwork};
@@ -20,6 +20,8 @@ pub const METRICS_MS: u64 = 10_000;
 pub const REVERT_MS: u64 = 30_000;
 /// How often a member reports its Kubernetes status even when unchanged.
 pub const KUBE_REPORT_MS: u64 = 30_000;
+/// How often a K3s server reports its API's health even when unchanged.
+pub const KUBE_HEALTH_REPORT_MS: u64 = 10_000;
 
 const VIP: Endpoint = Endpoint { addr: Addr::Vip, svc: Svc::Cp };
 
@@ -51,13 +53,17 @@ pub struct HostAgent {
     trial: Option<Trial>,
     /// The Kubernetes status last reported, and when.
     kube_reported: Option<(KubeStatus, SimTime)>,
+    /// The K3s API health last reported, and when.
+    health_reported: Option<(KubeHealth, SimTime)>,
+    /// The repair attempt last carried out, if any.
+    last_repair: Option<SimTime>,
 }
 
 impl HostAgent {
     /// `token` is the join token for an unjoined host; `None` means the host
     /// already joined (e.g. it rebooted) and the agent just heartbeats.
     pub fn new(token: Option<String>) -> Self {
-        Self { token, observed: None, net_generation: 0, trial: None, kube_reported: None }
+        Self { token, observed: None, net_generation: 0, trial: None, kube_reported: None, health_reported: None, last_repair: None }
     }
 
     /// Whether the agent runs as a cluster member (not trying to join).
@@ -99,7 +105,8 @@ impl HostAgent {
         let net_generation = self.net_generation;
         let hb = Msg::Heartbeat { host: host.clone(), lifecycle_seen: 0, observed_at, observed, net_generation };
         ctx.send(VIP, mgmt(), hb);
-        self.report_kube(ctx, host, now);
+        self.report_kube(ctx, host.clone(), now);
+        self.report_health(ctx, host, now);
     }
 
     /// Reports the host's Kubernetes status if it changed since the last
@@ -111,6 +118,17 @@ impl HostAgent {
         if due {
             self.kube_reported = Some((status.clone(), now));
             ctx.send(VIP, mgmt(), Msg::KubeStatus { host, status });
+        }
+    }
+
+    /// Reports the host's K3s API health, if it runs a server, when it
+    /// changes or every [`KUBE_HEALTH_REPORT_MS`] regardless.
+    fn report_health(&mut self, ctx: &mut dyn Ctx, host: HostId, now: SimTime) {
+        let Some(health) = ctx.host().and_then(|os| os.kube_health()) else { return };
+        let due = self.health_reported.as_ref().is_none_or(|(last, at)| *last != health || now >= at + KUBE_HEALTH_REPORT_MS);
+        if due {
+            self.health_reported = Some((health.clone(), now));
+            ctx.send(VIP, mgmt(), Msg::KubeHealth { host, health });
         }
     }
 
@@ -246,6 +264,13 @@ impl Actor for HostAgent {
                     os.kube_admin(admin);
                 }
             }
+            // Each recorded attempt runs once, however often leaders send it.
+            Msg::KubeRepair { attempt } if self.token.is_none() && self.last_repair != Some(attempt) => {
+                self.last_repair = Some(attempt);
+                if let Some(os) = ctx.host() {
+                    os.restart_kube();
+                }
+            }
             _ => {}
         }
     }
@@ -292,6 +317,8 @@ mod tests {
         inventory: Inventory,
         /// The voters of every CP replica started.
         cp_spawned: Vec<BTreeSet<HostId>>,
+        health: Option<KubeHealth>,
+        restarts: u32,
     }
 
     impl HostOs for FakeOs {
@@ -337,6 +364,12 @@ mod tests {
         fn spawn_cp_replica(&mut self, voters: BTreeSet<HostId>) {
             self.cp_spawned.push(voters);
         }
+        fn kube_health(&self) -> Option<KubeHealth> {
+            self.health.clone()
+        }
+        fn restart_kube(&mut self) {
+            self.restarts += 1;
+        }
     }
 
     /// Records what the agent sends; timers fire when the test advances time.
@@ -357,6 +390,8 @@ mod tests {
                 lldp: vec![neighbor("sw-1", "p1")],
                 inventory: Inventory::from_profile(ProfileId::Pi5, 1),
                 cp_spawned: vec![],
+                health: None,
+                restarts: 0,
             };
             Self { now: 0, os, sent: vec![], timers: vec![] }
         }
@@ -707,5 +742,29 @@ mod tests {
         ctx.take();
         a.on_message(&mut ctx, VIP, Msg::ReportRequest);
         assert!(ctx.take().is_empty());
+    }
+
+    #[test]
+    fn server_health_is_reported_on_change_and_repair_runs_once_per_attempt() {
+        let (mut a, mut ctx) = member();
+        let health = |ready: bool| Msg::KubeHealth { host: HostId::from("m1"), health: KubeHealth { api_ready: ready } };
+        let takes = |ctx: &mut FakeCtx| ctx.take().into_iter().filter(|m| matches!(m, Msg::KubeHealth { .. })).collect::<Vec<_>>();
+
+        ctx.os.health = Some(KubeHealth { api_ready: true });
+        ctx.advance(&mut a, HEARTBEAT_MS);
+        assert_eq!(takes(&mut ctx), [health(true)], "first report goes at once");
+        ctx.advance(&mut a, HEARTBEAT_MS + KUBE_HEALTH_REPORT_MS - 1);
+        assert!(takes(&mut ctx).is_empty(), "unchanged and not due");
+        ctx.advance(&mut a, HEARTBEAT_MS + KUBE_HEALTH_REPORT_MS);
+        assert_eq!(takes(&mut ctx), [health(true)], "re-sent on the interval");
+        ctx.os.health = Some(KubeHealth { api_ready: false });
+        ctx.advance(&mut a, 2 * HEARTBEAT_MS + KUBE_HEALTH_REPORT_MS);
+        assert_eq!(takes(&mut ctx), [health(false)], "a change goes at the next heartbeat");
+
+        a.on_message(&mut ctx, VIP, Msg::KubeRepair { attempt: 7 });
+        a.on_message(&mut ctx, VIP, Msg::KubeRepair { attempt: 7 });
+        assert_eq!(ctx.os.restarts, 1, "a repeated attempt restarts once");
+        a.on_message(&mut ctx, VIP, Msg::KubeRepair { attempt: 8 });
+        assert_eq!(ctx.os.restarts, 2);
     }
 }
