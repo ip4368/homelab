@@ -1,14 +1,14 @@
-//! Hand-rolled Raft (Ongaro §5) with pre-vote, leader stickiness and
-//! check-quorum. [`RaftNode`] is a pure state machine: time arrives only via
-//! the `now` arguments, randomness only from its seeded RNG, and every effect
-//! (sending, persisting, leadership changes) is returned as a [`RaftOut`] for
-//! the caller to carry out.
+//! Hand-rolled Raft (Ongaro §5) with pre-vote, leader stickiness,
+//! check-quorum and leadership transfer. [`RaftNode`] is a pure state
+//! machine: time arrives only via the `now` arguments, randomness only from
+//! its seeded RNG, and every effect (sending, persisting, leadership
+//! changes) is returned as a [`RaftOut`] for the caller to carry out.
 
 mod membership;
 mod node;
 
 pub use membership::{MemberChange, MembershipError, CATCH_UP_ENTRIES};
-pub use node::RaftNode;
+pub use node::{RaftNode, TransferError};
 
 use model::HostId;
 use serde::{Deserialize, Serialize};
@@ -105,14 +105,21 @@ pub enum DurableOp<T> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RaftMsg<T> {
     /// With `pre_vote`, `term` is the term the sender would campaign in; the
-    /// receiver changes no state.
-    RequestVote { term: u64, last_log_index: u64, last_log_term: u64, pre_vote: bool },
+    /// receiver changes no state. With `transfer`, the sender campaigns
+    /// because its leader asked it to ([`RaftMsg::TimeoutNow`]): the vote
+    /// bypasses leader stickiness, so a healthy leader's followers still
+    /// grant it.
+    RequestVote { term: u64, last_log_index: u64, last_log_term: u64, pre_vote: bool, #[serde(default)] transfer: bool },
     VoteResp { term: u64, granted: bool, pre_vote: bool },
     Append { term: u64, prev_log_index: u64, prev_log_term: u64, entries: Vec<Entry<T>>, leader_commit: u64 },
     /// On success `match_index` is the last index known to match the
     /// leader. On rejection `conflict_index` is where the leader should
     /// resume sending.
     AppendResp { term: u64, success: bool, match_index: u64, conflict_index: u64 },
+    /// The leader asks one voter to campaign at once: it starts a
+    /// (pre-)election with `transfer` votes instead of waiting for its
+    /// election timer. Ignored unless it comes from the term's leader.
+    TimeoutNow { term: u64 },
 }
 
 /// Effects for the caller to carry out in order. A `Persist` must be durable

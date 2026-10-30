@@ -14,6 +14,10 @@
 //! are in `membership.rs`). Quorums and commitment count the current voters
 //! only; the leader tracks progress for every voter and learner, kept in
 //! step with each config it appends.
+//!
+//! Leadership transfer (Ongaro §3.10) moves the VIP without an outage: the
+//! leader replicates to the chosen voter until caught up, then asks it to
+//! campaign at once (`RaftMsg::TimeoutNow`), whose votes bypass stickiness.
 
 use super::{Durable, DurableOp, Entry, EntryPayload, NotLeader, RaftConfig, RaftMsg, RaftOut, RaftRole};
 use crate::runtime::SimTime;
@@ -25,10 +29,21 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug)]
 enum Role {
     Follower,
-    /// Collecting pre-votes for `term + 1`.
-    PreCandidate { votes: BTreeSet<HostId> },
+    /// Collecting pre-votes for `term + 1`. With `transfer`, the election
+    /// was asked for by [`super::RaftMsg::TimeoutNow`] and its votes bypass
+    /// leader stickiness.
+    PreCandidate { votes: BTreeSet<HostId>, transfer: bool },
     Candidate { votes: BTreeSet<HostId> },
     Leader(Progress),
+}
+
+/// A leadership transfer the leader started: it replicates to `to` until
+/// caught up, then asks it to campaign ([`super::RaftMsg::TimeoutNow`]).
+#[derive(Debug)]
+struct Transfer {
+    to: HostId,
+    /// When the transfer started, on the clock `tick`/`step` supply.
+    start: SimTime,
 }
 
 /// Leader-side view of each peer (every voter and learner but itself).
@@ -40,6 +55,28 @@ struct Progress {
     last_ack: BTreeMap<HostId, SimTime>,
     next_heartbeat: SimTime,
 }
+
+/// Why [`RaftNode::transfer_leader`] refused to start a hand-over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransferError {
+    NotLeader(NotLeader),
+    /// Only a voter can take over; learners never campaign.
+    NotVoter,
+    /// A transfer to another voter is already in progress.
+    InProgress,
+}
+
+impl std::fmt::Display for TransferError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransferError::NotLeader(_) => f.write_str("not the leader"),
+            TransferError::NotVoter => f.write_str("not a voter"),
+            TransferError::InProgress => f.write_str("a leadership transfer is already in progress"),
+        }
+    }
+}
+
+impl std::error::Error for TransferError {}
 
 #[derive(Debug)]
 pub struct RaftNode<T> {
@@ -67,6 +104,8 @@ pub struct RaftNode<T> {
     out: Vec<RaftOut<T>>,
     /// The latest time supplied by `tick`/`step`/`propose`.
     clock: SimTime,
+    /// A leadership transfer this leader started; `None` otherwise.
+    transfer: Option<Transfer>,
 }
 
 impl<T: Clone> RaftNode<T> {
@@ -89,6 +128,7 @@ impl<T: Clone> RaftNode<T> {
             taken_index: 0,
             out: Vec::new(),
             clock: 0,
+            transfer: None,
         };
         node.recompute_voters();
         node
@@ -112,18 +152,24 @@ impl<T: Clone> RaftNode<T> {
         let term = msg_term(&m);
         if term > self.term() {
             match &m {
+                // Transfer votes bypass stickiness: the leader asked for this
+                // election, so its followers grant it rather than ignore it.
+                RaftMsg::RequestVote { pre_vote: true, transfer: true, .. } => {}
+                RaftMsg::RequestVote { transfer: true, .. } => self.become_follower(now, term, None),
                 // Stickiness: while a leader is fresh, ignore vote requests outright.
                 RaftMsg::RequestVote { .. } if self.in_lease(now) => return std::mem::take(&mut self.out),
                 // Pre-votes change no state, and a granted pre-vote echoes the
                 // term we would campaign in.
                 RaftMsg::RequestVote { pre_vote: true, .. } => {}
                 RaftMsg::VoteResp { pre_vote: true, granted: true, .. } => {}
-                RaftMsg::Append { .. } => self.become_follower(now, term, Some(from.clone())),
+                RaftMsg::Append { .. } | RaftMsg::TimeoutNow { .. } => {
+                    self.become_follower(now, term, Some(from.clone()))
+                }
                 _ => self.become_follower(now, term, None),
             }
         }
         match m {
-            RaftMsg::RequestVote { term, last_log_index, last_log_term, pre_vote } => {
+            RaftMsg::RequestVote { term, last_log_index, last_log_term, pre_vote, .. } => {
                 self.on_request_vote(now, from, term, last_log_index, last_log_term, pre_vote)
             }
             RaftMsg::VoteResp { term, granted, pre_vote } => self.on_vote_resp(now, from, term, granted, pre_vote),
@@ -133,6 +179,7 @@ impl<T: Clone> RaftNode<T> {
             RaftMsg::AppendResp { term, success, match_index, conflict_index } => {
                 self.on_append_resp(now, from, term, success, match_index, conflict_index)
             }
+            RaftMsg::TimeoutNow { term } => self.on_timeout_now(now, from, term),
         }
         std::mem::take(&mut self.out)
     }
@@ -147,6 +194,47 @@ impl<T: Clone> RaftNode<T> {
         let index = self.append_local(EntryPayload::Normal(t));
         self.broadcast_append();
         Ok(index)
+    }
+
+    /// Hands leadership to voter `to` (Ongaro §3.10): the leader replicates
+    /// to it until caught up, then asks it to campaign at once
+    /// ([`RaftMsg::TimeoutNow`]). The transferee's votes bypass leader
+    /// stickiness, so the hand-over completes in a few round trips while the
+    /// leader stays up. If `to` cannot take over within one election timeout
+    /// the transfer is silently dropped and this node keeps leading.
+    ///
+    /// Transferring to self is a no-op success. The resulting `Send`s come
+    /// out of the next `tick`/`step`, as with `propose`.
+    pub fn transfer_leader(&mut self, now: SimTime, to: HostId) -> Result<(), TransferError> {
+        self.clock = self.clock.max(now);
+        if !self.is_leader() {
+            return Err(TransferError::NotLeader(NotLeader { leader_hint: self.leader.clone() }));
+        }
+        if to == self.me {
+            return Ok(());
+        }
+        if !self.voters.contains(&to) {
+            return Err(TransferError::NotVoter);
+        }
+        if let Some(t) = &self.transfer {
+            if t.to == to {
+                return Ok(());
+            }
+            return Err(TransferError::InProgress);
+        }
+        self.transfer = Some(Transfer { to: to.clone(), start: now });
+        if self.match_index_of(&to).is_some_and(|m| m >= self.last_index()) {
+            self.send_timeout_now(&to);
+        } else {
+            self.send_append(&to);
+        }
+        Ok(())
+    }
+
+    /// The voter a transfer started by [`RaftNode::transfer_leader`] is
+    /// handing over to, if one is in progress.
+    pub fn transfer_target(&self) -> Option<&HostId> {
+        self.transfer.as_ref().map(|t| &t.to)
     }
 
     /// Entries committed since the last call, in log order, including `Noop`
@@ -261,46 +349,52 @@ impl<T: Clone> RaftNode<T> {
         }
         self.role = Role::Follower;
         self.leader = leader;
+        self.transfer = None;
         self.reset_election_timer(now);
     }
 
     fn start_pre_vote(&mut self, now: SimTime) {
-        self.role = Role::PreCandidate { votes: BTreeSet::from([self.me.clone()]) };
+        self.start_pre_vote_with(now, false);
+    }
+
+    fn start_pre_vote_with(&mut self, now: SimTime, transfer: bool) {
+        self.role = Role::PreCandidate { votes: BTreeSet::from([self.me.clone()]), transfer };
         self.leader = None;
         self.reset_election_timer(now);
-        self.request_votes(true);
+        self.request_votes(true, transfer);
         self.check_votes(now);
     }
 
-    fn campaign(&mut self, now: SimTime) {
+    fn campaign(&mut self, now: SimTime, transfer: bool) {
         let term = self.durable.term + 1;
         self.persist(DurableOp::SetHardState { term, voted_for: Some(self.me.clone()) });
         self.role = Role::Candidate { votes: BTreeSet::from([self.me.clone()]) };
         self.leader = None;
         self.reset_election_timer(now);
-        self.request_votes(false);
+        self.request_votes(false, transfer);
         self.check_votes(now);
     }
 
-    fn request_votes(&mut self, pre_vote: bool) {
+    fn request_votes(&mut self, pre_vote: bool, transfer: bool) {
         let term = if pre_vote { self.durable.term + 1 } else { self.durable.term };
         let (last_log_index, last_log_term) = (self.last_index(), self.last_term());
         for peer in self.voting_peers() {
-            let m = RaftMsg::RequestVote { term, last_log_index, last_log_term, pre_vote };
+            let m = RaftMsg::RequestVote { term, last_log_index, last_log_term, pre_vote, transfer };
             self.out.push(RaftOut::Send(peer, m));
         }
     }
 
     /// Advances a (pre-)candidate that has a quorum of votes.
     fn check_votes(&mut self, now: SimTime) {
-        let won = match &self.role {
-            Role::PreCandidate { votes } | Role::Candidate { votes } => {
-                votes.intersection(&self.voters).count() >= self.quorum()
+        let (won, transfer) = match &self.role {
+            Role::PreCandidate { votes, transfer } => {
+                (votes.intersection(&self.voters).count() >= self.quorum(), *transfer)
             }
-            _ => false,
+            Role::Candidate { votes } => (votes.intersection(&self.voters).count() >= self.quorum(), false),
+            _ => (false, false),
         };
         match self.role {
-            Role::PreCandidate { .. } if won => self.campaign(now),
+            Role::PreCandidate { .. } if won => self.campaign(now, transfer),
             Role::Candidate { .. } if won => self.become_leader(now),
             _ => {}
         }
@@ -317,6 +411,7 @@ impl<T: Clone> RaftNode<T> {
             next_heartbeat: now + self.cfg.heartbeat_ms,
         });
         self.leader = Some(self.me.clone());
+        self.transfer = None;
         self.out.push(RaftOut::BecameLeader(self.durable.term));
         self.append_local(EntryPayload::Noop);
         self.broadcast_append();
@@ -324,6 +419,13 @@ impl<T: Clone> RaftNode<T> {
     }
 
     fn leader_tick(&mut self, now: SimTime) {
+        // A transfer that ran out of time, or whose target is no voter,
+        // is silently dropped: this node keeps leading.
+        if let Some(t) = &self.transfer
+            && (now.saturating_sub(t.start) > self.cfg.election_min_ms || !self.voters.contains(&t.to))
+        {
+            self.transfer = None;
+        }
         // A leader that removed itself steps down once the removal commits,
         // telling its peers the commit index on the way out.
         let removed = !self.voters.contains(&self.me) && self.commit_index >= self.config_index;
@@ -339,7 +441,20 @@ impl<T: Clone> RaftNode<T> {
             p.next_heartbeat = now + self.cfg.heartbeat_ms;
             self.broadcast_append();
         }
+        // A caught-up transferee is asked again on every heartbeat until it
+        // takes over: a lost TimeoutNow must not stall the hand-over.
+        if let Some(t) = &self.transfer
+            && self.match_index_of(&t.to).is_some_and(|m| m >= self.last_index())
+        {
+            let to = t.to.clone();
+            self.send_timeout_now(&to);
+        }
         self.advance_commit();
+    }
+
+    fn send_timeout_now(&mut self, to: &HostId) {
+        let m = RaftMsg::TimeoutNow { term: self.durable.term };
+        self.out.push(RaftOut::Send(to.clone(), m));
     }
 
     // ---- message handlers ----
@@ -370,7 +485,7 @@ impl<T: Clone> RaftNode<T> {
         }
         let my_term = self.durable.term;
         match &mut self.role {
-            Role::PreCandidate { votes } if pre_vote && term == my_term + 1 => {
+            Role::PreCandidate { votes, .. } if pre_vote && term == my_term + 1 => {
                 votes.insert(from);
             }
             Role::Candidate { votes } if !pre_vote && term == my_term => {
@@ -379,6 +494,20 @@ impl<T: Clone> RaftNode<T> {
             _ => return,
         }
         self.check_votes(now);
+    }
+
+    fn on_timeout_now(&mut self, now: SimTime, from: HostId, term: u64) {
+        if term != self.durable.term || self.is_leader() || !self.voters.contains(&self.me) {
+            return;
+        }
+        // Only a voter — in practice the term's leader — can ask for a
+        // hand-over. Anything else is ignored.
+        if from == self.me || !self.voters.contains(&from) {
+            return;
+        }
+        // A pre-vote first, so a transferee that cannot win (say it is
+        // partitioned) never inflates its term and never stops following.
+        self.start_pre_vote_with(now, true);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -456,6 +585,14 @@ impl<T: Clone> RaftNode<T> {
         let Role::Leader(p) = &self.role else { unreachable!() };
         if p.next_index[&from] <= self.last_index() {
             self.send_append(&from);
+        }
+        // The transferee caught up: ask it to campaign at once rather than
+        // at the next heartbeat.
+        if success
+            && self.transfer.as_ref().is_some_and(|t| t.to == from)
+            && self.match_index_of(&from).is_some_and(|m| m >= self.last_index())
+        {
+            self.send_timeout_now(&from);
         }
     }
 
@@ -538,6 +675,9 @@ impl<T: Clone> RaftNode<T> {
         });
         (self.config_index, self.voters, self.learners) =
             latest.unwrap_or_else(|| (0, self.durable.voters.clone(), BTreeSet::new()));
+        if self.transfer.as_ref().is_some_and(|t| !self.voters.contains(&t.to)) {
+            self.transfer = None;
+        }
         let (peers, next) = (self.peers(), self.last_index() + 1);
         let Role::Leader(p) = &mut self.role else { return };
         p.next_index.retain(|h, _| peers.contains(h));
@@ -597,7 +737,8 @@ fn msg_term<T>(m: &RaftMsg<T>) -> u64 {
         RaftMsg::RequestVote { term, .. }
         | RaftMsg::VoteResp { term, .. }
         | RaftMsg::Append { term, .. }
-        | RaftMsg::AppendResp { term, .. } => *term,
+        | RaftMsg::AppendResp { term, .. }
+        | RaftMsg::TimeoutNow { term } => *term,
     }
 }
 
@@ -968,7 +1109,7 @@ pub(super) mod tests {
         c.run_for(500);
         let f = (l + 1) % 3;
         let term = c.nodes[f].term();
-        let vote = RaftMsg::RequestVote { term: term + 5, last_log_index: 100, last_log_term: term + 4, pre_vote: false };
+        let vote = RaftMsg::RequestVote { term: term + 5, last_log_index: 100, last_log_term: term + 4, pre_vote: false, transfer: false };
         let outs = c.nodes[f].step(c.now, hid((l + 2) % 3), vote);
         assert!(outs.is_empty(), "{outs:?}");
         assert_eq!(c.nodes[f].term(), term);
@@ -981,5 +1122,127 @@ pub(super) mod tests {
         let l = c.elect();
         c.propose(l, 5);
         assert!(c.run_until(500, |c| c.committed[0] == [5]));
+    }
+
+    #[test]
+    fn leadership_transfer_hands_over_to_the_chosen_voter() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(500);
+        for v in [1, 2] {
+            c.propose(l, v);
+        }
+        assert!(c.run_until(2000, |c| c.committed.iter().all(|x| x == &[1, 2])), "{:?}", c.committed);
+        let term = c.nodes[l].term();
+        let t = (l + 1) % 3;
+
+        c.nodes[l].transfer_leader(c.now, hid(t)).expect("the leader hands over");
+        assert_eq!(c.nodes[l].transfer_target(), Some(&hid(t)));
+        assert!(c.run_until(2000, |c| c.leaders() == [t]), "no hand-over to {t}");
+        assert_eq!(c.nodes[t].term(), term + 1);
+        assert!(!c.nodes[l].is_leader());
+        assert_eq!(c.nodes[l].transfer_target(), None, "stepping down clears the transfer");
+        assert_eq!(c.nodes[t].transfer_target(), None, "a new leader starts with none");
+
+        // The new leader serves: its proposal commits everywhere, including on the old leader.
+        c.propose(t, 3);
+        assert!(c.run_until(2000, |c| c.committed.iter().all(|x| x == &[1, 2, 3])), "{:?}", c.committed);
+    }
+
+    #[test]
+    fn transfer_waits_for_a_lagging_transferee_to_catch_up() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(500);
+        let t = (l + 1) % 3;
+        c.isolate(&[t]);
+        for v in [1, 2, 3] {
+            c.propose(l, v);
+        }
+        c.run_for(500);
+        assert!(c.committed[t].is_empty(), "the isolated transferee heard nothing: {:?}", c.committed);
+
+        c.nodes[l].transfer_leader(c.now, hid(t)).expect("transfer starts while the transferee lags");
+        c.run_for(500);
+        assert_eq!(c.leaders(), vec![l], "nothing hands over while the transferee is cut off");
+
+        c.heal();
+        assert!(c.run_until(3000, |c| c.leaders() == [t]), "no hand-over once the transferee caught up");
+        assert!(c.run_until(2000, |c| c.committed.iter().all(|x| x == &[1, 2, 3])), "{:?}", c.committed);
+    }
+
+    #[test]
+    fn transfer_times_out_and_the_leader_keeps_leading() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(500);
+        let t = (l + 1) % 3;
+        let term = c.nodes[l].term();
+        c.isolate(&[t]);
+
+        c.nodes[l].transfer_leader(c.now, hid(t)).expect("transfer starts");
+        c.run_for(RaftConfig::default().election_min_ms + 500);
+        assert_eq!(c.leaders(), vec![l], "the leader keeps leading when the transferee cannot take over");
+        assert_eq!(c.nodes[l].transfer_target(), None, "the transfer times out");
+        assert_eq!(c.nodes[t].term(), term, "a transferee that heard nothing never campaigns");
+
+        // The cluster is unharmed: healing and asking again hands over.
+        c.heal();
+        c.run_for(500);
+        assert_eq!(c.leaders(), vec![l]);
+        c.nodes[l].transfer_leader(c.now, hid(t)).expect("a transfer can start again");
+        assert!(c.run_until(2000, |c| c.leaders() == [t]));
+    }
+
+    #[test]
+    fn transfer_refusals() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(500);
+        let f = (l + 1) % 3;
+        let o = (l + 2) % 3;
+
+        assert_eq!(
+            c.nodes[f].transfer_leader(c.now, hid(o)),
+            Err(TransferError::NotLeader(NotLeader { leader_hint: Some(hid(l)) })),
+            "only the leader hands over"
+        );
+        assert_eq!(c.nodes[l].transfer_leader(c.now, hid(99)), Err(TransferError::NotVoter));
+        assert_eq!(c.nodes[l].transfer_leader(c.now, hid(l)), Ok(()), "handing over to self is a no-op");
+        assert_eq!(c.nodes[l].transfer_target(), None);
+
+        let n = c.add_node();
+        c.nodes[l].add_learner(hid(n)).expect("leader adds a learner");
+        assert_eq!(c.nodes[l].transfer_leader(c.now, hid(n)), Err(TransferError::NotVoter), "learners never campaign");
+
+        c.nodes[l].transfer_leader(c.now, hid(f)).expect("first transfer starts");
+        assert_eq!(c.nodes[l].transfer_leader(c.now, hid(o)), Err(TransferError::InProgress));
+        assert_eq!(c.nodes[l].transfer_leader(c.now, hid(f)), Ok(()), "repeating the same target is idempotent");
+    }
+
+    #[test]
+    fn transfer_votes_bypass_stickiness() {
+        let mut c = Cluster::new(3);
+        let l = c.elect();
+        c.run_for(500);
+        let f = (l + 1) % 3;
+        let term = c.nodes[f].term();
+        let last = c.nodes[f].durable().log.len() as u64;
+        let last_term = c.nodes[f].durable().log.last().map_or(0, |e| e.term);
+        let from = hid((l + 2) % 3);
+
+        let vote = |transfer: bool| RaftMsg::RequestVote {
+            term: term + 1,
+            last_log_index: last,
+            last_log_term: last_term,
+            pre_vote: false,
+            transfer,
+        };
+        assert!(c.nodes[f].step(c.now, from.clone(), vote(false)).is_empty(), "a normal vote is ignored while the leader is fresh");
+        assert_eq!(c.nodes[f].term(), term);
+
+        let outs = c.nodes[f].step(c.now, from.clone(), vote(true));
+        let granted = outs.iter().any(|o| matches!(o, RaftOut::Send(to, RaftMsg::VoteResp { granted: true, pre_vote: false, .. }) if *to == from));
+        assert!(granted, "a transfer vote is granted despite the fresh leader: {outs:?}");
     }
 }
