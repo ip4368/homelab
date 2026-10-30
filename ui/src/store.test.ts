@@ -44,6 +44,7 @@ function snapshot(over: Partial<ViewSnapshot> = {}, clock: Partial<ClockInfo> = 
     events: [],
     cp: { voters: ['cp-1'], mode: 'Suggest', handoff: null, version: 1 },
     metrics: {},
+    kube_health: {},
     ...over,
   }
   return { type: 'snapshot', view, truth, kube: emptyKube, clock: { now: 2000, ...clock } }
@@ -59,6 +60,7 @@ function delta(over: Partial<Extract<ServerMsg, { type: 'delta' }>> = {}): Serve
     upserts: [],
     removed: [],
     metrics: {},
+    kube_health: {},
     truth,
     kube: null,
     clock: { now: 2500 },
@@ -213,6 +215,16 @@ describe('store', () => {
     expect(s.getState().view.metrics.b.at).toBe(1)
     s.applyMessage(delta({ removed: [{ kind: 'Host', id: 'b' }] }))
     expect(Object.keys(s.getState().view.metrics)).toEqual(['a'])
+  })
+
+  it('delta health merges over the latest reports and a removed host drops its report', () => {
+    const s = createStore()
+    s.applyMessage(snapshot({ kube_health: { a: { api_ready: true }, b: { api_ready: true } } }))
+    s.applyMessage(delta({ kube_health: { a: { api_ready: false } } }))
+    expect(s.getState().view.kube_health.a.api_ready).toBe(false)
+    expect(s.getState().view.kube_health.b.api_ready).toBe(true)
+    s.applyMessage(delta({ removed: [{ kind: 'Host', id: 'b' }] }))
+    expect(Object.keys(s.getState().view.kube_health)).toEqual(['a'])
   })
 
   it('takes leader, term, truth and clock from every delta', () => {

@@ -2,7 +2,7 @@
 //! through the VIP, keeps a [`ClusterView`] fresh by polling `Sync`, and
 //! submits API operations on the user's behalf.
 
-use crate::proto::{mgmt, ApiOp, ApiResult, MetricSample, Msg};
+use crate::proto::{mgmt, ApiOp, ApiResult, KubeHealth, MetricSample, Msg};
 use crate::runtime::{Actor, Addr, Ctx, Endpoint, SimTime, Svc};
 use crate::state::{Changes, ClusterState, Object, ObjectKind, ObjectRef, EVENT_RING};
 use model::{HostId, NetworkId, SwitchId};
@@ -33,6 +33,8 @@ pub struct ClusterView {
     pub last_sync_at: Option<SimTime>,
     /// Latest sample per host.
     pub metrics: BTreeMap<HostId, MetricSample>,
+    /// Latest K3s API health per server.
+    pub kube_health: BTreeMap<HostId, KubeHealth>,
 }
 
 impl ClusterView {
@@ -200,7 +202,7 @@ impl Actor for ClientActor {
 
     fn on_message(&mut self, ctx: &mut dyn Ctx, _from: Endpoint, msg: Msg) {
         match msg {
-            Msg::SyncResp { changes, leader, term, metrics } => {
+            Msg::SyncResp { changes, leader, term, metrics, kube_health } => {
                 self.sync_stats.syncs += 1;
                 self.sync_stats.upserts += changes.upserts.len() as u64;
                 self.view.merge(changes);
@@ -208,6 +210,7 @@ impl Actor for ClientActor {
                 self.view.term = term;
                 self.view.last_sync_at = Some(ctx.now());
                 self.view.metrics.extend(metrics);
+                self.view.kube_health.extend(kube_health);
             }
             // Never proposed, so trying again is safe.
             Msg::ApiResp { req, result: ApiResult::NotLeader } if self.outstanding.contains_key(&req) => {

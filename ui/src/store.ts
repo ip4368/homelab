@@ -6,6 +6,7 @@ import type { CpInfo } from './gen/CpInfo'
 import type { Event as ClusterEvent } from './gen/Event'
 import type { HostObj } from './gen/HostObj'
 import type { JoinToken } from './gen/JoinToken'
+import type { KubeHealth } from './gen/KubeHealth'
 import type { KubeView } from './gen/KubeView'
 import type { LabTruth } from './gen/LabTruth'
 import type { MetricSample } from './gen/MetricSample'
@@ -47,6 +48,8 @@ export interface View {
   cp: CpInfo
   /** Latest sample per host. */
   metrics: Record<string, MetricSample>
+  /** Latest K3s API health per server. */
+  kube_health: Record<string, KubeHealth>
 }
 
 export interface UiState {
@@ -88,6 +91,7 @@ function initialState(): UiState {
       events: [],
       cp: { voters: [], mode: 'Suggest', handoff: null, version: 0 },
       metrics: {},
+      kube_health: {},
     },
     truth: emptyTruth,
     kube: emptyKube,
@@ -131,12 +135,13 @@ function viewFromSnapshot(s: Extract<ServerMsg, { type: 'snapshot' }>['view']): 
     events: capEvents([...s.events].sort((a, b) => a.seq - b.seq)),
     cp: s.cp,
     metrics: s.metrics,
+    kube_health: s.kube_health,
   }
 }
 
 /** Applies a delta's upserts and removals, copying only the slices that change. */
 function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View {
-  let { hosts, tokens, rules, switches, networks, templates, rollouts, alerts, events, cp, metrics } = view
+  let { hosts, tokens, rules, switches, networks, templates, rollouts, alerts, events, cp, metrics, kube_health } = view
   const upsertedEvents = new Map<number, ClusterEvent>()
   const removedEvents = new Set<number>()
   const edit = <T,>(rec: Record<string, T>, copied: Set<unknown>): Record<string, T> => {
@@ -197,6 +202,8 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
         delete hosts[r.id]
         metrics = edit(metrics, copied)
         delete metrics[r.id]
+        kube_health = edit(kube_health, copied)
+        delete kube_health[r.id]
         break
       case 'Token':
         tokens = edit(tokens, copied)
@@ -235,6 +242,7 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
   }
 
   if (Object.keys(d.metrics).length > 0) metrics = { ...metrics, ...d.metrics }
+  if (Object.keys(d.kube_health).length > 0) kube_health = { ...kube_health, ...d.kube_health }
 
   if (upsertedEvents.size > 0 || removedEvents.size > 0) {
     const merged = new Map(events.map((e) => [e.seq, e]))
@@ -259,6 +267,7 @@ function mergeDelta(view: View, d: Extract<ServerMsg, { type: 'delta' }>): View 
     events,
     cp,
     metrics,
+    kube_health,
   }
 }
 

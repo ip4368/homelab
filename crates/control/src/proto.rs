@@ -217,7 +217,8 @@ impl KubeStatus {
 /// What a running K3s server reports about the cluster's health, every few
 /// seconds. Unlike [`KubeStatus`], this never enters the Raft log: the
 /// leader keeps the latest per server in memory, like metrics.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct KubeHealth {
     /// Its own API's `/readyz`, on loopback.
     pub api_ready: bool,
@@ -392,5 +393,12 @@ pub enum Msg {
     ApiResp { req: u64, result: ApiResult },
     /// Client to the VIP: everything after state version `since`.
     Sync { since: u64 },
-    SyncResp { changes: Changes, leader: HostId, term: u64, metrics: Vec<(HostId, MetricSample)> },
+    SyncResp {
+        changes: Changes,
+        leader: HostId,
+        term: u64,
+        metrics: Vec<(HostId, MetricSample)>,
+        /// The latest K3s API health per server, like metrics.
+        kube_health: Vec<(HostId, KubeHealth)>,
+    },
 }

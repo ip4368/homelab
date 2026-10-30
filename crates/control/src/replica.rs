@@ -341,8 +341,9 @@ impl CpReplica {
         // A leader cut off from its quorum, or not caught up yet, may hold a stale view; stay silent.
         let Some(v) = self.volatile.as_ref().filter(|v| v.caught_up && raft.has_quorum(mono)) else { return };
         let metrics = v.metrics.iter().map(|(h, m)| (h.clone(), m.clone())).collect();
+        let kube_health = v.kube_health.iter().map(|(h, r)| (h.clone(), r.health.clone())).collect();
         let changes = self.state.changes_since(since);
-        ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics });
+        ctx.send(from, mgmt(), Msg::SyncResp { changes, leader: self.me.clone(), term: raft.term(), metrics, kube_health });
     }
 }
 

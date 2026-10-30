@@ -6,6 +6,7 @@ import type { Event } from "./Event";
 import type { HostId } from "./HostId";
 import type { HostObj } from "./HostObj";
 import type { JoinToken } from "./JoinToken";
+import type { KubeHealth } from "./KubeHealth";
 import type { MetricSample } from "./MetricSample";
 import type { NetworkObj } from "./NetworkObj";
 import type { Rollout } from "./Rollout";
@@ -19,4 +20,8 @@ export type ViewSnapshot = { version: number, leader: HostId | null, term: numbe
 /**
  * Latest sample per host.
  */
-metrics: { [key in HostId]: MetricSample }, };
+metrics: { [key in HostId]: MetricSample }, 
+/**
+ * Latest K3s API health per server.
+ */
+kube_health: { [key in HostId]: KubeHealth }, };

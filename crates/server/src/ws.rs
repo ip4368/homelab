@@ -8,7 +8,7 @@ use crate::kube::KubeView;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
-use control::proto::MetricSample;
+use control::proto::{KubeHealth, MetricSample};
 use control::state::{
     Alert, AutoApproveRule, CpInfo, Event, HostObj, JoinToken, NetworkObj, Object, ObjectRef, Rollout, SwitchObj, TemplateObj,
 };
@@ -42,6 +42,8 @@ pub struct ViewSnapshot {
     pub cp: CpInfo,
     /// Latest sample per host.
     pub metrics: BTreeMap<HostId, MetricSample>,
+    /// Latest K3s API health per server.
+    pub kube_health: BTreeMap<HostId, KubeHealth>,
 }
 
 impl ViewSnapshot {
@@ -63,6 +65,7 @@ impl ViewSnapshot {
             events: s.events.values().cloned().collect(),
             cp: s.cp.clone(),
             metrics: v.metrics.clone(),
+            kube_health: v.kube_health.clone(),
         }
     }
 }
@@ -86,6 +89,8 @@ pub enum ServerMsg {
         removed: Vec<ObjectRef>,
         /// Samples newer than the last ones sent.
         metrics: BTreeMap<HostId, MetricSample>,
+        /// Health that changed since it was last sent.
+        kube_health: BTreeMap<HostId, KubeHealth>,
         truth: LabTruth,
         /// What Kubernetes runs, if it was read again since the previous message.
         kube: Option<KubeView>,
@@ -99,6 +104,8 @@ pub struct Connection {
     version: u64,
     /// When each host's latest sample was taken, as last sent.
     metrics_sent: BTreeMap<HostId, u64>,
+    /// Each server's K3s API health, as last sent.
+    health_sent: BTreeMap<HostId, KubeHealth>,
     /// The Kubernetes view last sent.
     kube_sent: Arc<KubeView>,
 }
@@ -106,7 +113,7 @@ pub struct Connection {
 impl Connection {
     /// Starts a connection with its snapshot of `p`.
     pub fn open(p: &Published) -> (Self, ServerMsg) {
-        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new(), kube_sent: p.kube.clone() };
+        let mut c = Self { epoch: p.epoch, version: 0, metrics_sent: BTreeMap::new(), health_sent: BTreeMap::new(), kube_sent: p.kube.clone() };
         let msg = c.snapshot(p);
         (c, msg)
     }
@@ -115,6 +122,7 @@ impl Connection {
         self.epoch = p.epoch;
         self.version = p.view.version;
         self.metrics_sent = p.view.metrics.iter().map(|(h, m)| (h.clone(), m.at)).collect();
+        self.health_sent = p.view.kube_health.clone();
         self.kube_sent = p.kube.clone();
         ServerMsg::Snapshot { view: ViewSnapshot::of(p), truth: p.truth.clone(), kube: (*p.kube).clone(), clock: p.clock }
     }
@@ -137,6 +145,16 @@ impl Connection {
         for (h, m) in &metrics {
             self.metrics_sent.insert(h.clone(), m.at);
         }
+        let kube_health: BTreeMap<_, _> = p
+            .view
+            .kube_health
+            .iter()
+            .filter(|(h, hh)| self.health_sent.get(*h) != Some(*hh))
+            .map(|(h, hh)| (h.clone(), hh.clone()))
+            .collect();
+        for (h, hh) in &kube_health {
+            self.health_sent.insert(h.clone(), hh.clone());
+        }
         self.version = p.view.version;
         let kube = (!Arc::ptr_eq(&self.kube_sent, &p.kube)).then(|| (*p.kube).clone());
         self.kube_sent = p.kube.clone();
@@ -148,6 +166,7 @@ impl Connection {
             upserts: changes.upserts,
             removed: changes.removed,
             metrics,
+            kube_health,
             truth: p.truth.clone(),
             kube,
             clock: p.clock,
@@ -252,6 +271,22 @@ mod tests {
         // The removal is not repeated.
         let ServerMsg::Delta { removed, upserts, .. } = conn.next(&published(&view, 40)) else { panic!() };
         assert!(removed.is_empty() && upserts.is_empty());
+    }
+
+    #[test]
+    fn health_travels_in_snapshots_and_only_changes_in_deltas() {
+        let mut view = ClusterView::default();
+        view.kube_health.insert(HostId::from("h1"), KubeHealth { api_ready: true });
+        let (mut conn, first) = Connection::open(&published(&view, 10));
+        let ServerMsg::Snapshot { view: snap, .. } = first else { panic!("{first:?}") };
+        assert_eq!(snap.kube_health.get(&HostId::from("h1")), Some(&KubeHealth { api_ready: true }));
+
+        let ServerMsg::Delta { kube_health, .. } = conn.next(&published(&view, 20)) else { panic!() };
+        assert!(kube_health.is_empty(), "unchanged health is not repeated");
+
+        view.kube_health.insert(HostId::from("h1"), KubeHealth { api_ready: false });
+        let ServerMsg::Delta { kube_health, .. } = conn.next(&published(&view, 30)) else { panic!() };
+        assert_eq!(kube_health.get(&HostId::from("h1")), Some(&KubeHealth { api_ready: false }));
     }
 
     #[test]
