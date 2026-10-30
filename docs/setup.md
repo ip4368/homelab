@@ -80,7 +80,7 @@ If the new machine's K3s server never starts, the hand-off waits with an extra v
 
 ## When a control-plane machine dies
 
-The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To take it, or to replace the host sooner, submit the operation the alert carries:
+The control-plane hosts are both the homelabd control plane (Raft) and the K3s servers (etcd). When one has been down for 10 minutes, the control plane raises a `CpReplacementSuggested` alert naming the best spare machine (MS-01s first). To replace the host sooner, open its drawer and use **Replace…** in its **Control plane** section (it offers the same spares, best first, and needs the host down but not the 10 minutes). Or submit the operation the alert carries:
 
 ```sh
 curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \

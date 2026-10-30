@@ -14,6 +14,7 @@ import { useStore } from '../store'
 import { Charts } from './Charts'
 import { HandoffDialog, handoffChoices } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
+import { ReplaceDialog, replaceChoices } from './ReplaceDialog'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
 
@@ -183,12 +184,15 @@ function ControlPlane({ host }: { host: HostObj }) {
   const hosts = useStore((s) => s.view.hosts)
   const leader = useStore((s) => s.view.leader)
   const [open, setOpen] = useState(false)
+  const [replacing, setReplacing] = useState(false)
   const { error, busy, run } = useAction()
   const voter = cp.voters.includes(host.id)
   const leads = leader === host.id
   const handoff = cp.handoff
   const reason = ineligibleReason(host.profile, 'ControlPlane')
   const offered = useMemo(() => handoffChoices(host, cp, hosts).length > 0, [host, cp, hosts])
+  const down = voter && host.lifecycle === 'NotReady'
+  const spares = useMemo(() => (down ? replaceChoices(cp, hosts).length : 0), [down, cp, hosts])
   return (
     <div className="section">
       <h4>Control plane</h4>
@@ -196,6 +200,7 @@ function ControlPlane({ host }: { host: HostObj }) {
         {voter ? 'Voter: runs a control-plane replica and a K3s server (API + etcd).' : reason ? `Cannot join: ${reason}.` : 'Not a voter.'}
       </p>
       {voter && <p className={leads ? 'ok' : 'muted'}>{leads ? 'Leads: holds the VIP.' : `Follows${leader ? ` ${leader}` : ''}.`}</p>}
+      {down && spares === 0 && <p className="warn">Down: no Ready spare could take its place.</p>}
       {handoff && (
         <p className="warn" role="status">
           {handoff.cancelled ? 'Cancelling the hand-off of' : 'Handing'} {handoff.from}'s place to {handoff.to}.
@@ -218,7 +223,15 @@ function ControlPlane({ host }: { host: HostObj }) {
           {error && <span className="bad">{error}</span>}
         </div>
       )}
+      {down && spares > 0 && (
+        <div className="actions">
+          <button onClick={() => setReplacing(true)} title="Replace this dead voter with a spare now, without waiting for the automatic replacement">
+            Replace…
+          </button>
+        </div>
+      )}
       {open && <HandoffDialog host={host} onClose={() => setOpen(false)} />}
+      {replacing && <ReplaceDialog host={host} onClose={() => setReplacing(false)} />}
     </div>
   )
 }
