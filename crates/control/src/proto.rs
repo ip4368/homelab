@@ -398,7 +398,9 @@ pub enum Msg {
         leader: HostId,
         term: u64,
         metrics: Vec<(HostId, MetricSample)>,
-        /// The latest K3s API health per server, like metrics.
+        /// The latest K3s API health per server, like metrics. Defaulted so
+        /// replies from before it existed still decode.
+        #[serde(default)]
         kube_health: Vec<(HostId, KubeHealth)>,
     },
 }
