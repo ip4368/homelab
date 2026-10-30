@@ -235,6 +235,16 @@ impl CpReplica {
                 let cmd = Command::StartCpHandoff { from: leaving, to };
                 (raft.propose(mono, LogCmd { at: now, cmd }).expect("checked leadership above"), serde_json::Value::Null)
             }
+            Handling::TransferLeadership { to } => {
+                let result = match raft.transfer_leader(mono, to) {
+                    Ok(()) => ApiResult::Ok(serde_json::Value::Null),
+                    Err(e) => ApiResult::Err(e.to_string()),
+                };
+                // `transfer_leader` queues its Sends like `propose`; flush them now.
+                let outs = self.raft().tick(mono);
+                self.handle(ctx, outs);
+                return ctx.send(from, mgmt(), Msg::ApiResp { req, result });
+            }
         };
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
@@ -339,6 +349,8 @@ enum Handling {
     ReplaceCpMember { dead: HostId, with: HostId },
     /// Record a hand-off of `from`'s CP place to `to`, if the membership allows it.
     HandOffCp { from: HostId, to: HostId },
+    /// Hand Raft leadership (and the VIP) to `to`; answer at once.
+    TransferLeadership { to: HostId },
 }
 
 /// How the leader of `term` handles `op`, given its state.
@@ -386,6 +398,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
         ApiOp::SetCpMode { mode } => Command::SetCpMode { mode },
         ApiOp::ReplaceCpMember { dead, with } => return Handling::ReplaceCpMember { dead, with },
         ApiOp::HandOffCp { from, to } => return Handling::HandOffCp { from, to },
+        ApiOp::TransferLeadership { to } => return Handling::TransferLeadership { to },
         ApiOp::CancelCpHandoff => match membership::check_cancel_handoff(state) {
             Ok(()) => Command::CancelCpHandoff,
             Err(e) => return Handling::Answer(ApiResult::Err(e)),
@@ -802,6 +815,37 @@ mod tests {
 
     fn host_ep(h: &str, svc: Svc) -> Endpoint {
         Endpoint::new(Addr::Host(hid(h)), svc)
+    }
+
+    #[test]
+    fn leadership_transfer_is_answered_at_once_without_a_write() {
+        let mut rig = Rig::new(vec![]);
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        let transfer = |to: &str| Msg::Api { req: 1, op: ApiOp::TransferLeadership { to: hid(to) } };
+        rig.r.on_message(&mut rig.ctx, client.clone(), transfer("h2"));
+        assert_eq!(rig.ctx.sent.pop(), Some((client.clone(), Msg::ApiResp { req: 1, result: ApiResult::NotLeader })));
+
+        rig.elect();
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 2, op: ApiOp::TransferLeadership { to: hid("h2") } });
+        assert_eq!(
+            rig.ctx.sent.pop(),
+            Some((client.clone(), Msg::ApiResp { req: 2, result: ApiResult::Unavailable })),
+            "not caught up yet"
+        );
+
+        rig.ack();
+        let log = rig.r.log_len();
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 3, op: ApiOp::TransferLeadership { to: hid("h2") } });
+        assert_eq!(
+            rig.ctx.sent.pop(),
+            Some((client.clone(), Msg::ApiResp { req: 3, result: ApiResult::Ok(serde_json::Value::Null) }))
+        );
+        assert_eq!(rig.r.raft().transfer_target(), Some(&hid("h2")));
+        assert_eq!(rig.r.log_len(), log, "a transfer writes no log entry");
+
+        rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req: 4, op: ApiOp::TransferLeadership { to: hid("h9") } });
+        let resp = rig.ctx.sent.pop();
+        assert!(matches!(resp, Some((_, Msg::ApiResp { req: 4, result: ApiResult::Err(_) }))), "h9 is no voter: {resp:?}");
     }
 
     #[test]
