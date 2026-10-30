@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { HostNetworkConfig } from '../gen/HostNetworkConfig'
-import { kubeSummary, linkPorts, nicState } from './HostDrawer'
+import { apiHealthLine, kubeSummary, linkPorts, nicState, repairLabel } from './HostDrawer'
 
 const cfg: HostNetworkConfig = {
   links: [
@@ -48,7 +48,8 @@ describe('host drawer kubernetes', () => {
   })
   it('says what the host runs and how far it got', () => {
     expect(kubeSummary(null).tone).toBe('muted')
-    expect(kubeSummary(k({}))).toEqual({ text: 'K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0', tone: 'ok' })
+    expect(kubeSummary(k({}))).toEqual({ text: 'K3s server (API + etcd) v1.36.5+k3s1, Node Ready, Longhorn on nvme0', tone: 'ok' })
+    expect(kubeSummary(k({ node_ready: false })).text).toContain('Node not Ready')
     expect(kubeSummary(k({ role: 'Agent', phase: 'Installing', detail: 'starting k3s-agent' })).text).toBe('K3s agent: starting k3s-agent')
     // A reinstall reports the role still installed, and the detail names the one coming.
     expect(kubeSummary(k({ phase: 'Installing', detail: 'installing K3s as Agent' })).text).toBe('switching from K3s server (API + etcd) to K3s agent')
@@ -56,8 +57,21 @@ describe('host drawer kubernetes', () => {
     expect(kubeSummary(k({ role: null, phase: 'Installing', detail: 'installing K3s as Server' })).text).toBe('installing K3s server (API + etcd)')
     expect(kubeSummary(k({ phase: { Failed: 'no route' } })).tone).toBe('bad')
     expect(kubeSummary(k({ etcd_unread: 'curl: (7) Failed to connect' }))).toEqual({
-      text: "K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",
+      text: "K3s server (API + etcd) v1.36.5+k3s1, Node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",
       tone: 'warn',
     })
+  })
+
+  it('says how the server API stands, and nothing for a host with no server', () => {
+    expect(apiHealthLine('Server', { api_ready: true })).toEqual({ text: 'ready', tone: 'ok' })
+    expect(apiHealthLine('Server', { api_ready: false })).toEqual({ text: 'not ready', tone: 'bad' })
+    expect(apiHealthLine('Server', undefined)).toEqual({ text: 'health unknown (no report yet)', tone: 'muted' })
+    expect(apiHealthLine('Agent', { api_ready: true })).toBeNull()
+    expect(apiHealthLine(null, undefined)).toBeNull()
+  })
+
+  it('names repair attempts with their age', () => {
+    expect(repairLabel({ at: 1000, action: 'RestartK3s' }, 13_000)).toBe('restarted K3s 12s ago')
+    expect(repairLabel({ at: 0, action: 'RestartK3s' }, 12 * 60_000)).toBe('restarted K3s 12m ago')
   })
 })

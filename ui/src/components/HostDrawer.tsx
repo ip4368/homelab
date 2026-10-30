@@ -3,10 +3,13 @@ import { op } from '../api'
 import { ineligibleReason } from '../eligibility'
 import type { HostNet } from '../gen/HostNet'
 import type { HostObj } from '../gen/HostObj'
+import type { KubeHealth } from '../gen/KubeHealth'
+import type { KubeRepairAction } from '../gen/KubeRepairAction'
+import type { KubeRepairAttempt } from '../gen/KubeRepairAttempt'
 import type { KubeRole } from '../gen/KubeRole'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
-import { podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
+import { age, podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
 import { Charts } from './Charts'
 import { HandoffDialog, handoffChoices } from './HandoffDialog'
@@ -103,21 +106,50 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   }
   const disks = k.storage_disks.length ? `, Longhorn on ${k.storage_disks.join(', ')}` : ''
   const etcd = k.etcd_unread ? `; cannot read etcd's members (${k.etcd_unread})` : ''
-  return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
+  return { text: `${role} ${k.version}, Node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
+}
+
+/** A K3s server's own API, from its health reports; `null` for a host with no server. */
+export function apiHealthLine(role: KubeRole | null, health: KubeHealth | undefined): { text: string; tone: 'ok' | 'bad' | 'muted' } | null {
+  if (role !== 'Server') return null
+  if (!health) return { text: 'health unknown (no report yet)', tone: 'muted' }
+  return health.api_ready ? { text: 'ready', tone: 'ok' } : { text: 'not ready', tone: 'bad' }
+}
+
+/** A repair attempt in words: `restarted K3s 12m ago`. */
+export function repairLabel(a: KubeRepairAttempt, now: number): string {
+  const what = (action: KubeRepairAction): string => (action === 'RestartK3s' ? 'restarted K3s' : action)
+  return `${what(a.action)} ${age(a.at, now)} ago`
 }
 
 function Kubernetes({ host }: { host: HostObj }) {
   const { text, tone } = kubeSummary(host.kube)
   const kube = useStore((s) => s.kube)
+  const health = useStore((s) => s.view.kube_health[host.id])
+  const now = useStore((s) => s.clock.now)
   const pods = useMemo(() => podsOn(kube, host.id), [kube, host.id])
   // Your workloads first; K3s's and Longhorn's own pods are summed up.
   const apps = pods.filter((p) => !SYSTEM_NAMESPACES.includes(p.namespace))
   const system = pods.length - apps.length
   const left = podsToDrain(pods).length
+  const api = apiHealthLine(host.kube?.role ?? null, health)
   return (
     <div className="section">
       <h4>Kubernetes</h4>
       <p className={tone}>{text}</p>
+      {api && (
+        <p>
+          K3s API: <span className={api.tone}>{api.text}</span>
+        </p>
+      )}
+      {host.kube_repairs.length > 0 && (
+        <p>
+          Repairs:{' '}
+          {host.kube_repairs
+            .map((a) => repairLabel(a, now))
+            .join(', ')}
+        </p>
+      )}
       {host.lifecycle === 'Draining' && (
         <p className="drain-progress" role="status">
           Draining: node cordoned, {left} pod{left === 1 ? '' : 's'} left to evict.
@@ -149,8 +181,11 @@ function Kubernetes({ host }: { host: HostObj }) {
 function ControlPlane({ host }: { host: HostObj }) {
   const cp = useStore((s) => s.view.cp)
   const hosts = useStore((s) => s.view.hosts)
+  const leader = useStore((s) => s.view.leader)
   const [open, setOpen] = useState(false)
+  const { error, busy, run } = useAction()
   const voter = cp.voters.includes(host.id)
+  const leads = leader === host.id
   const handoff = cp.handoff
   const reason = ineligibleReason(host.profile, 'ControlPlane')
   const offered = useMemo(() => handoffChoices(host, cp, hosts).length > 0, [host, cp, hosts])
@@ -160,6 +195,7 @@ function ControlPlane({ host }: { host: HostObj }) {
       <p className={voter ? 'ok' : 'muted'}>
         {voter ? 'Voter: runs a control-plane replica and a K3s server (API + etcd).' : reason ? `Cannot join: ${reason}.` : 'Not a voter.'}
       </p>
+      {voter && <p className={leads ? 'ok' : 'muted'}>{leads ? 'Leads: holds the VIP.' : `Follows${leader ? ` ${leader}` : ''}.`}</p>}
       {handoff && (
         <p className="warn" role="status">
           {handoff.cancelled ? 'Cancelling the hand-off of' : 'Handing'} {handoff.from}'s place to {handoff.to}.
@@ -168,6 +204,18 @@ function ControlPlane({ host }: { host: HostObj }) {
       {(handoff || offered) && (
         <div className="actions">
           <button onClick={() => setOpen(true)}>{handoff ? 'Show progress' : voter ? 'Hand off…' : 'Take over…'}</button>
+        </div>
+      )}
+      {voter && !leads && (
+        <div className="actions">
+          <button
+            onClick={() => run(() => op({ TransferLeadership: { to: host.id } }))}
+            disabled={busy}
+            title="Hand Raft leadership — and with it the VIP — to this voter"
+          >
+            Move VIP here
+          </button>
+          {error && <span className="bad">{error}</span>}
         </div>
       )}
       {open && <HandoffDialog host={host} onClose={() => setOpen(false)} />}
@@ -220,7 +268,7 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
     <aside className="drawer host-drawer" aria-label={`host ${host.id}`}>
       <div className="drawer-head">
         <h3>{host.id}</h3>
-        <span className={`lifecycle lc-${host.lifecycle}`}>{host.lifecycle}</span>
+        <span className={`lifecycle lc-${host.lifecycle}`}>{host.lifecycle === 'NotReady' ? 'Host NotReady' : host.lifecycle}</span>
         <div className="spacer" />
         <button onClick={onClose} aria-label="close">
           ×
