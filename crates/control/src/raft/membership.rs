@@ -39,6 +39,8 @@ pub enum MembershipError {
     /// The voters known to be up plus the learner would not make a quorum
     /// of the larger voter set.
     WouldLoseQuorum,
+    /// The leader is handing leadership over.
+    Transferring,
 }
 
 impl fmt::Display for MembershipError {
@@ -53,6 +55,7 @@ impl fmt::Display for MembershipError {
             MembershipError::LastVoter => "the last voter cannot be removed",
             MembershipError::Unresponsive => "the learner has not answered recently",
             MembershipError::WouldLoseQuorum => "too few voters are up to grow the voter set safely",
+            MembershipError::Transferring => "the leader is handing leadership over",
         };
         f.write_str(s)
     }
@@ -152,6 +155,9 @@ impl<T: Clone> RaftNode<T> {
         }
         if self.config_pending() || !self.committed_in_term() {
             return Err(MembershipError::ChangePending);
+        }
+        if self.transferee().is_some() {
+            return Err(MembershipError::Transferring);
         }
         Ok(())
     }

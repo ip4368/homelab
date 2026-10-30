@@ -147,5 +147,5 @@ The safety rules, which every repair follows:
 
 ## 9. Follow-ups (not in this design)
 
-- **Move the VIP off a leader whose K3s API stays down.** That needs Raft leadership transfer, which homelabd's Raft does not have yet: the leader would hand over to a voter whose API is ready.
+- **Move the VIP off a leader whose K3s API stays down.** homelabd's Raft now has leadership transfer (`RaftNode::transfer_leadership`, `ApiOp::TransferCpLeadership`), so the VIP can be moved by hand. What is left: once the restarts of §4.3 give up on `KubeApiDown`, the supervisor transfers leadership to a voter whose `/readyz` answers.
 - **Reinstall a K3s agent** whose install keeps failing, once it is proven on the lab that Longhorn's data on `/mnt` survives it.

@@ -166,7 +166,8 @@ impl CpReplica {
 
     fn run_controllers(&mut self, ctx: &mut dyn Ctx) {
         let (now, mono) = (ctx.now(), ctx.monotonic_ms());
-        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
+        // A leader handing over could propose nothing; the next leader runs them.
+        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono) && r.transferee().is_none()) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         v.failed.retain(|(_, at)| now < at + FAILED_BACKOFF_MS);
         v.forget_removed(&self.state);
@@ -202,7 +203,9 @@ impl CpReplica {
     fn on_api(&mut self, ctx: &mut dyn Ctx, from: Endpoint, req: u64, op: ApiOp) {
         let (now, mono) = (ctx.now(), ctx.monotonic_ms());
         let raft = self.raft.as_mut().expect("on_start runs before anything else");
-        if !raft.is_leader() {
+        // A leader handing over takes no writes; the client retries through
+        // the VIP, which soon reaches the new leader.
+        if !raft.is_leader() || raft.transferee().is_some() {
             return ctx.send(from, mgmt(), Msg::ApiResp { req, result: ApiResult::NotLeader });
         }
         let v = self.volatile.as_ref().expect("leader has volatile state");
@@ -235,6 +238,15 @@ impl CpReplica {
                 let cmd = Command::StartCpHandoff { from: leaving, to };
                 (raft.propose(mono, LogCmd { at: now, cmd }).expect("checked leadership above"), serde_json::Value::Null)
             }
+            Handling::TransferLeadership { to } => {
+                let result = match raft.transfer_leadership(mono, to) {
+                    Ok(()) => ApiResult::Ok(serde_json::Value::Null),
+                    Err(e) => ApiResult::Err(e.to_string()),
+                };
+                ctx.send(from, mgmt(), Msg::ApiResp { req, result });
+                let outs = self.raft().tick(mono);
+                return self.handle(ctx, outs);
+            }
         };
         let pending = PendingApi { from, req, term, ok, proposed_at: now };
         self.volatile.as_mut().expect("leader has volatile state").pending.insert(index, pending);
@@ -243,11 +255,12 @@ impl CpReplica {
     }
 
     /// Only a leader with quorum and a caught-up state can judge a token or
-    /// know whether the host exists; anyone else stays silent and the agent retries.
+    /// know whether the host exists, and only one not handing over can
+    /// propose; anyone else stays silent and the agent retries.
     fn on_join(&mut self, ctx: &mut dyn Ctx, from: Endpoint, token: String, inventory: Inventory) {
         let (now, mono) = (ctx.now(), ctx.monotonic_ms());
         let Addr::Host(host) = from.addr.clone() else { return };
-        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono)) else { return };
+        let Some(raft) = self.raft.as_mut().filter(|r| r.has_quorum(mono) && r.transferee().is_none()) else { return };
         let Some(v) = self.volatile.as_mut().filter(|v| v.caught_up) else { return };
         match join::on_request(&self.state, v, now, &host, &token, inventory) {
             JoinOutcome::Accepted => ctx.send(from, mgmt(), Msg::JoinResp(Ok(()))),
@@ -339,6 +352,8 @@ enum Handling {
     ReplaceCpMember { dead: HostId, with: HostId },
     /// Record a hand-off of `from`'s CP place to `to`, if the membership allows it.
     HandOffCp { from: HostId, to: HostId },
+    /// Hand Raft leadership to voter `to`; answer once that starts.
+    TransferLeadership { to: HostId },
 }
 
 /// How the leader of `term` handles `op`, given its state.
@@ -390,6 +405,7 @@ fn handle_op(ctx: &mut dyn Ctx, state: &ClusterState, v: &Volatile, term: u64, o
             Ok(()) => Command::CancelCpHandoff,
             Err(e) => return Handling::Answer(ApiResult::Err(e)),
         },
+        ApiOp::TransferCpLeadership { to } => return Handling::TransferLeadership { to },
         ApiOp::GetSeries { entity, metrics } => {
             let result = v.history.query(state, &entity, &metrics).map_or_else(ApiResult::Err, ApiResult::Ok);
             return Handling::Answer(result);
@@ -721,6 +737,31 @@ mod tests {
         assert!(matches!(rig.ctx.sent.pop(), Some((_, Msg::SyncResp { .. }))));
         rig.r.on_message(&mut rig.ctx, client.clone(), cordon(2));
         assert!(matches!(rig.proposed().as_slice(), [Command::SetLifecycle { .. }]), "{:?}", rig.proposed());
+    }
+
+    #[test]
+    fn a_leader_handing_over_takes_nothing_and_steps_down_for_the_new_leader() {
+        let mut rig = Rig::new(orphaned_alert());
+        rig.elect();
+        rig.ack();
+        let client = Endpoint::new(Addr::Client, Svc::Client);
+        let api = |rig: &mut Rig, req: u64, op: ApiOp| {
+            rig.r.on_message(&mut rig.ctx, client.clone(), Msg::Api { req, op });
+            rig.ctx.sent.pop().map(|(_, m)| m)
+        };
+        let resp = api(&mut rig, 1, ApiOp::TransferCpLeadership { to: hid("h9") });
+        assert!(matches!(resp, Some(Msg::ApiResp { result: ApiResult::Err(_), .. })), "h9 is no voter: {resp:?}");
+        let resp = api(&mut rig, 2, ApiOp::TransferCpLeadership { to: hid("h2") });
+        assert_eq!(resp, Some(Msg::ApiResp { req: 2, result: ApiResult::Ok(serde_json::Value::Null) }));
+        let resp = api(&mut rig, 3, ApiOp::Cordon { id: hid("h9") });
+        assert_eq!(resp, Some(Msg::ApiResp { req: 3, result: ApiResult::NotLeader }), "retried until the new leader answers");
+        rig.controllers();
+        assert!(rig.proposed().is_empty(), "the controllers wait for the new leader: {:?}", rig.proposed());
+
+        let (term, last) = (rig.r.raft().term(), rig.r.log_len() as u64);
+        rig.h2_says(RaftMsg::RequestVote { term: term + 1, last_log_index: last, last_log_term: term, pre_vote: false, transfer: true });
+        assert_eq!(rig.r.raft_role(), Some(RaftRole::Follower), "it steps down for h2's campaign");
+        assert!(rig.r.volatile.is_none());
     }
 
     #[test]

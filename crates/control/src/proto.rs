@@ -271,6 +271,13 @@ pub enum ApiOp {
     /// plane again, if it joined, and the old voter stays. Refused once the
     /// old voter has left. Answered once the cancel is recorded.
     CancelCpHandoff,
+    /// Moves the control-plane leadership, and with it the VIP, to voter
+    /// `to`: the leader brings `to`'s log up to its own and has it campaign
+    /// at once. Refused unless `to` is a voter that answered recently.
+    /// Answered as soon as the hand-over starts. Until `to` leads (within a
+    /// second or so), the leader answers every other op `NotLeader`; if `to`
+    /// has not won within an election timeout, the leader carries on.
+    TransferCpLeadership { to: HostId },
     /// Reads the leader's metrics history (nothing is written). The result
     /// is `{since, series: {metric: [[t, v], ...]}}`, one series per metric
     /// name in [`crate::metrics::METRICS`]; an unknown metric or entity is an `Err`.
