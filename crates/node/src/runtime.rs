@@ -112,6 +112,9 @@ impl Ctx for NodeCtx<'_> {
     fn rand_u64(&mut self) -> u64 {
         self.core.rng.next_u64()
     }
+    fn redial(&mut self, to: &Addr) {
+        self.core.transport.disconnect(to);
+    }
     /// The node holds the VIP whenever its replica leads ([`Node::after`]).
     fn claim_vip(&mut self) {}
     fn host(&mut self) -> Option<&mut dyn HostOs> {

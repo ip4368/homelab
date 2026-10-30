@@ -143,6 +143,9 @@ pub trait Ctx {
     /// Fire `on_timer(token)` on this actor `after_ms` from now.
     fn set_timer(&mut self, after_ms: u64, token: u64);
     fn rand_u64(&mut self) -> u64;
+    /// Drops any connection to `to`, so the next message to it dials afresh:
+    /// one to the VIP may still lead to a host that no longer holds it.
+    fn redial(&mut self, _to: &Addr) {}
     /// Claim the VIP for this endpoint (control-plane leader only).
     fn claim_vip(&mut self);
     fn host(&mut self) -> Option<&mut dyn HostOs>;

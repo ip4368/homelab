@@ -149,6 +149,11 @@ impl Transport {
         self.inner.conns.lock().expect("conns lock").clear();
     }
 
+    /// Drops the connections to `addr`: the next message to it dials afresh.
+    pub fn disconnect(&self, addr: &Addr) {
+        self.inner.conns.lock().expect("conns lock").remove(addr);
+    }
+
     /// Whether a connection to `addr` is open or being dialled.
     pub fn connected(&self, addr: &Addr) -> bool {
         self.inner.conns.lock().expect("conns lock").get(addr).is_some_and(|cs| !cs.is_empty())
@@ -307,6 +312,17 @@ mod tests {
         assert!(!a.connected(&host("b")), "the silent connection is gone");
         a.send(ep(&host("a"), Svc::Agent), ep(&host("b"), Svc::Cp), &mgmt(), Msg::Ping(2));
         assert_eq!(recv(&mut b_rx).await.msg, Msg::Ping(2), "a fresh dial carries the next message");
+    }
+
+    #[tokio::test]
+    async fn a_disconnected_peer_is_dialled_afresh() {
+        let (a, _a_rx, _b, mut b_rx) = pair().await;
+        a.send(ep(&host("a"), Svc::Agent), ep(&host("b"), Svc::Cp), &mgmt(), Msg::Ping(1));
+        recv(&mut b_rx).await;
+        a.disconnect(&host("b"));
+        assert!(!a.connected(&host("b")));
+        a.send(ep(&host("a"), Svc::Agent), ep(&host("b"), Svc::Cp), &mgmt(), Msg::Ping(2));
+        assert_eq!(recv(&mut b_rx).await.msg, Msg::Ping(2), "over a new connection");
     }
 
     #[tokio::test]

@@ -209,8 +209,11 @@ impl Actor for ClientActor {
                 self.view.last_sync_at = Some(ctx.now());
                 self.view.metrics.extend(metrics);
             }
-            // Never proposed, so trying again is safe.
+            // Never proposed, so trying again is safe. The VIP is moving: a
+            // retry over the old connection would reach the host that let it
+            // go (or none), and be lost.
             Msg::ApiResp { req, result: ApiResult::NotLeader } if self.outstanding.contains_key(&req) => {
+                ctx.redial(&Addr::Vip);
                 ctx.set_timer(NOT_LEADER_RETRY_MS, req * 2 + RETRY);
             }
             Msg::ApiResp { req, result } => self.finish(req, result),
@@ -256,6 +259,7 @@ mod tests {
     struct FakeCtx {
         sent: Vec<Msg>,
         timers: Vec<(u64, u64)>,
+        redials: Vec<Addr>,
     }
 
     impl Ctx for FakeCtx {
@@ -274,6 +278,9 @@ mod tests {
         }
         fn rand_u64(&mut self) -> u64 {
             4
+        }
+        fn redial(&mut self, to: &Addr) {
+            self.redials.push(to.clone());
         }
         fn claim_vip(&mut self) {}
         fn host(&mut self) -> Option<&mut dyn crate::runtime::HostOs> {
@@ -295,6 +302,7 @@ mod tests {
         let retry = ctx.timers.pop().unwrap();
         assert_eq!(retry.0, NOT_LEADER_RETRY_MS);
         assert!(c.take_results().is_empty(), "NotLeader is not a final answer");
+        assert_eq!(ctx.redials, [Addr::Vip], "the retry dials the VIP afresh");
         c.on_timer(&mut ctx, retry.1);
         assert_eq!(ctx.sent, [api.clone(), api]);
 
