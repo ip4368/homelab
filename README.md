@@ -44,8 +44,8 @@ K3s: [docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md](docs/plans/
 ## What runs where
 
 - **homelabd's control plane.** Control-plane replicas on the voters run hand-rolled Raft
-  (pre-vote, check-quorum, single-server membership changes) over the management network, with
-  their state on disk. The leader holds the VIP, answers the API and runs the controllers: join
+  (pre-vote, check-quorum, single-server membership changes, leadership transfer) over the
+  management network, with their state on disk. The leader holds the VIP, answers the API and runs the controllers: join
   and approval, network templates, rollouts and validation, switch observation, health, alerts,
   control-plane membership, and what each host runs of Kubernetes.
 - **Host agents.** Apply network configs like `netplan try` (reverted unless confirmed), report
@@ -80,8 +80,9 @@ the **Ground truth** checkbox; the lab host's clock.
 
 - **Fleet:** every host as a tile, coloured by health, with CPU/RAM and role badges, grouped by
   rack, switch, role or profile. Click a tile to open the host drawer: inventory, what it runs of
-  Kubernetes (and its pods), control-plane membership and hand-off, lifecycle (Cordon, Drain,
-  Uncordon, Cancel drain, Remove), live charts, the roles editor and the per-host network editor.
+  Kubernetes (and its pods), control-plane membership (hand-off, replacing a down voter, moving the
+  VIP), lifecycle (Cordon, Drain, Uncordon, Cancel drain, Remove), live charts, the roles editor and
+  the per-host network editor.
 - **Topology:** switches, uplinks and host connections, with ports coloured by state and
   utilisation, and VLAN/MTU mismatches highlighted. Click a switch for its port table, port config
   editor and suggested fixes.
@@ -90,7 +91,7 @@ the **Ground truth** checkbox; the lab host's clock.
 - **Workloads:** what Kubernetes runs, read from the K3s API: workloads, their pods and where they
   run, and Longhorn's volumes with their replicas.
 
-**Right rail:** alerts, the event log, and the *Pending joins* queue (approve with roles).
+**Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
 
 **Ground-truth overlay:** what the lab sees from outside the machines but the control plane does
 not, for example a host the control plane still believes Ready while it is powered off, partitions,

@@ -9,8 +9,9 @@ import type { Role } from '../gen/Role'
 import { podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
 import { useStore } from '../store'
 import { Charts } from './Charts'
-import { HandoffDialog, handoffChoices } from './HandoffDialog'
+import { downVoters, HandoffDialog, handoffChoices, isDown } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
+import { ReplaceDialog, replaceChoices } from './ReplaceDialog'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
 
@@ -146,31 +147,75 @@ function Kubernetes({ host }: { host: HostObj }) {
   )
 }
 
+/**
+ * Where `host` stands for leading the control plane (and holding the VIP):
+ * `leads`, `offer` (a voter the leader can hand over to), `down` (a voter
+ * that cannot take over now), or `null` for a non-voter or with no leader to ask.
+ */
+export function leadership(host: HostObj, voters: string[], leader: string | null): 'leads' | 'offer' | 'down' | null {
+  if (!voters.includes(host.id) || leader === null) return null
+  if (leader === host.id) return 'leads'
+  return isDown(host) ? 'down' : 'offer'
+}
+
 function ControlPlane({ host }: { host: HostObj }) {
   const cp = useStore((s) => s.view.cp)
   const hosts = useStore((s) => s.view.hosts)
-  const [open, setOpen] = useState(false)
+  const leader = useStore((s) => s.view.leader)
+  const [open, setOpen] = useState<'handoff' | 'replace' | null>(null)
+  const { error, busy, run } = useAction()
+  const lead = leadership(host, cp.voters, leader)
   const voter = cp.voters.includes(host.id)
   const handoff = cp.handoff
   const reason = ineligibleReason(host.profile, 'ControlPlane')
   const offered = useMemo(() => handoffChoices(host, cp, hosts).length > 0, [host, cp, hosts])
+  const replaceable = useMemo(() => replaceChoices(host, cp, hosts), [host, cp, hosts])
+  const down = downVoters(cp, hosts)
   return (
     <div className="section">
       <h4>Control plane</h4>
       <p className={voter ? 'ok' : 'muted'}>
         {voter ? 'Voter: runs a control-plane replica and a K3s server (API + etcd).' : reason ? `Cannot join: ${reason}.` : 'Not a voter.'}
       </p>
+      {lead === 'leads' && <p className="ok">Leader: holds the VIP, answers the API and runs the controllers.</p>}
+      {lead === 'offer' && (
+        <div className="actions">
+          <button
+            onClick={() => run(() => op({ TransferCpLeadership: { to: host.id } }))}
+            disabled={busy}
+            title={`${leader} hands leadership, and the VIP, to ${host.id}`}
+          >
+            Move the VIP here
+          </button>
+          {error && <span className="bad">{error}</span>}
+        </div>
+      )}
       {handoff && (
         <p className="warn" role="status">
           {handoff.cancelled ? 'Cancelling the hand-off of' : 'Handing'} {handoff.from}'s place to {handoff.to}.
         </p>
       )}
-      {(handoff || offered) && (
+      {voter && isDown(host) && (
+        <p className="bad">
+          Down: the control plane runs a voter short until {host.id} is replaced
+          {replaceable.length === 0 ? '. No Ready, control-plane-eligible host is free to take its place.' : '.'}
+        </p>
+      )}
+      {down.length > 0 && !down.includes(host.id) && (voter || replaceable.length > 0) && (
+        <p className="warn">Voter {down.join(', ')} is down: replace it before handing off a control-plane place.</p>
+      )}
+      {replaceable.length > 0 && !handoff && (
         <div className="actions">
-          <button onClick={() => setOpen(true)}>{handoff ? 'Show progress' : voter ? 'Hand off…' : 'Take over…'}</button>
+          <button onClick={() => setOpen('replace')}>{voter ? 'Replace…' : `Replace ${replaceable.length === 1 ? replaceable[0].dead : 'a down voter'}…`}</button>
         </div>
       )}
-      {open && <HandoffDialog host={host} onClose={() => setOpen(false)} />}
+      {(handoff || offered) && (
+        <div className="actions">
+          <button onClick={() => setOpen('handoff')}>{handoff ? 'Show progress' : voter ? 'Hand off…' : 'Take over…'}</button>
+        </div>
+      )}
+      {open === 'handoff' && <HandoffDialog host={host} onClose={() => setOpen(null)} />}
+      {open === 'replace' && <ReplaceDialog host={host} onClose={() => setOpen(null)} />}
     </div>
   )
 }

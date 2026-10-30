@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { HostNetworkConfig } from '../gen/HostNetworkConfig'
-import { kubeSummary, linkPorts, nicState } from './HostDrawer'
+import type { HostObj } from '../gen/HostObj'
+import { kubeSummary, leadership, linkPorts, nicState } from './HostDrawer'
 
 const cfg: HostNetworkConfig = {
   links: [
@@ -59,5 +60,20 @@ describe('host drawer kubernetes', () => {
       text: "K3s server (API + etcd) v1.36.5+k3s1, node Ready, Longhorn on nvme0; cannot read etcd's members (curl: (7) Failed to connect)",
       tone: 'warn',
     })
+  })
+})
+
+describe('host drawer leadership', () => {
+  const host = (id: string, lifecycle: HostObj['lifecycle'] = 'Ready') => ({ id, lifecycle }) as HostObj
+  const voters = ['v1', 'v2', 'v3']
+  it('offers to move the VIP to a voter that is up, and says which voter leads', () => {
+    expect(leadership(host('v1'), voters, 'v1')).toBe('leads')
+    expect(leadership(host('v2'), voters, 'v1')).toBe('offer')
+    expect(leadership(host('v2', 'Cordoned'), voters, 'v1')).toBe('offer')
+    expect(leadership(host('v3', 'NotReady'), voters, 'v1')).toBe('down')
+  })
+  it('offers nothing on a non-voter, or with no leader to ask', () => {
+    expect(leadership(host('m1'), voters, 'v1')).toBeNull()
+    expect(leadership(host('v2'), voters, null)).toBeNull()
   })
 })

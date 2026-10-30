@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { Event as ClusterEvent } from '../gen/Event'
 import type { HostObj } from '../gen/HostObj'
-import { handoffChoices, handoffEndReason, handoffSteps } from './HandoffDialog'
+import { downVoters, handoffChoices, handoffEndReason, handoffSteps, isDown } from './HandoffDialog'
 
 describe('control-plane hand-off', () => {
   const ms01 = { id: 'Ms01', arch: 'X86_64', ram_gb: 96 }
@@ -23,6 +23,14 @@ describe('control-plane hand-off', () => {
     ])
     expect(handoffChoices(hosts.cordoned, cp, hosts)).toEqual([])
     expect(handoffChoices(hosts.pi, cp, hosts)).toEqual([])
+  })
+
+  it('offers no hand-off while a voter is down, which the control plane would refuse', () => {
+    const withDown: Record<string, HostObj> = { ...hosts, v2: host('v2', ms01, 'NotReady') }
+    expect(downVoters(cp, withDown)).toEqual(['v2'])
+    expect(handoffChoices(withDown.v1, cp, withDown)).toEqual([])
+    expect(handoffChoices(withDown.spare, cp, withDown)).toEqual([])
+    expect(['Ready', 'Cordoned', 'Draining', 'Drained', 'NotReady'].map((l) => isDown(host('h', ms01, l)))).toEqual([false, false, false, false, true])
   })
 
   it('follows the hand-off step by step from what the cluster state shows', () => {

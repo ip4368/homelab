@@ -13,13 +13,30 @@ export interface Handoff {
   to: string
 }
 
+/** Whether `h` may join the control plane: Ready, eligible and no voter. */
+export function canJoin(h: HostObj, cp: CpInfo): boolean {
+  return h.lifecycle === 'Ready' && !cp.voters.includes(h.id) && ineligibleReason(h.profile, 'ControlPlane') === null
+}
+
+/** Whether `h` is down, as the control plane counts a voter down: not Ready, cordoned, draining or drained. */
+export function isDown(h: HostObj | undefined): boolean {
+  return h !== undefined && !['Ready', 'Cordoned', 'Draining', 'Drained'].includes(h.lifecycle)
+}
+
+/** The voters whose hosts are down. */
+export function downVoters(cp: CpInfo, hosts: Record<string, HostObj>): string[] {
+  return cp.voters.filter((v) => isDown(hosts[v])).sort()
+}
+
 /**
  * The hand-offs offered for `host`'s control-plane place: a voter hands its
  * place to any Ready, eligible host that is no voter; such a host takes any
- * voter's. The leader may still refuse one (a change is in progress) and says why.
+ * voter's. None while a voter is down: the control plane refuses them until
+ * it is replaced. The leader may still refuse one (a change is in progress) and says why.
  */
 export function handoffChoices(host: HostObj, cp: CpInfo, hosts: Record<string, HostObj>): Handoff[] {
-  const mayJoin = (h: HostObj) => h.lifecycle === 'Ready' && !cp.voters.includes(h.id) && ineligibleReason(h.profile, 'ControlPlane') === null
+  if (downVoters(cp, hosts).length > 0) return []
+  const mayJoin = (h: HostObj) => canJoin(h, cp)
   if (cp.voters.includes(host.id)) {
     return Object.values(hosts)
       .filter(mayJoin)
@@ -38,12 +55,12 @@ export interface Step {
   detail: string | null
 }
 
-function runs(h: HostObj | undefined, role: 'Server' | 'Agent'): boolean {
+export function runs(h: HostObj | undefined, role: 'Server' | 'Agent'): boolean {
   return h?.kube?.role === role && h.kube.phase === 'Running'
 }
 
 /** What `h`'s K3s is doing, if it is not simply running. */
-function kubeDoing(h: HostObj | undefined): string | null {
+export function kubeDoing(h: HostObj | undefined): string | null {
   const k = h?.kube
   if (!k) return null
   if (typeof k.phase === 'object' && 'Failed' in k.phase) return `failed: ${k.phase.Failed}; retrying`
@@ -62,8 +79,16 @@ export function handoffSteps({ from, to }: Handoff, cp: CpInfo, hosts: Record<st
     [`${from} leaves the control plane`, !cp.voters.includes(from), null],
     [`${from} runs a K3s agent`, runs(hosts[from], 'Agent'), kubeDoing(hosts[from])],
   ]
-  // A later step that holds makes the earlier ones done too: once `from` has
-  // left, `to` running a server is no longer what the hand-off waits on.
+  return toSteps(raw)
+}
+
+/**
+ * Steps from `[label, done, detail]` in order: each is done once it holds,
+ * and the first that does not is active. A later step that holds makes the
+ * earlier ones done too (once `from` has left, `to` running a server is no
+ * longer what a hand-off waits on).
+ */
+export function toSteps(raw: [string, boolean, string | null][]): Step[] {
   const last = raw.map(([, done]) => done).lastIndexOf(true)
   let active = false
   return raw.map(([label, done], i) => {
@@ -87,7 +112,7 @@ export function handoffEndReason({ from, to }: Handoff, events: ClusterEvent[]):
 
 const STEP_MARK: Record<StepState, string> = { done: '✓', active: '●', pending: '○' }
 
-function Steps({ steps }: { steps: Step[] }) {
+export function Steps({ steps }: { steps: Step[] }) {
   return (
     <ol className="handoff-steps">
       {steps.map((s) => (
@@ -170,7 +195,7 @@ export function HandoffDialog({ host, onClose }: Props) {
 
   const following: Handoff | null = cp.handoff ?? sent ?? null
   const choice = choices.find((c) => (voter ? c.to : c.from) === other) ?? choices[0]
-  const down = cp.voters.filter((v) => hosts[v]?.lifecycle === 'NotReady')
+  const down = downVoters(cp, hosts)
 
   const submit = () =>
     choice &&

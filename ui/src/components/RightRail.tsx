@@ -1,5 +1,6 @@
 import { useMemo, useState } from 'react'
 import { op } from '../api'
+import type { ApiOp } from '../gen/ApiOp'
 import type { HostObj } from '../gen/HostObj'
 import type { Role } from '../gen/Role'
 import { useStore } from '../store'
@@ -11,6 +12,32 @@ type Tab = 'Alerts' | 'Events' | 'Pending joins'
 const TABS: Tab[] = ['Alerts', 'Events', 'Pending joins']
 const RESOLVED_SHOWN = 20
 const EVENTS_SHOWN = 200
+
+/** What an alert's suggested op does, as its button's label and the question confirming it. */
+export function alertAction(action: ApiOp): { label: string; confirm: string } {
+  if (typeof action === 'object' && 'ReplaceCpMember' in action) {
+    const { dead, with: spare } = action.ReplaceCpMember
+    return {
+      label: `Replace with ${spare}`,
+      confirm: `Replace control-plane voter ${dead} with ${spare}? ${spare} joins the control plane and installs a K3s server; ${dead} is removed from the control plane and etcd.`,
+    }
+  }
+  return { label: 'Apply suggested fix', confirm: 'Apply the fix this alert suggests?' }
+}
+
+/** The button for an open alert's suggested op, with its error beside it. */
+function AlertAction({ action }: { action: ApiOp }) {
+  const { error, busy, run } = useAction()
+  const { label, confirm } = alertAction(action)
+  return (
+    <div className="actions">
+      <button disabled={busy} onClick={() => window.confirm(confirm) && run(() => op(action))}>
+        {label}
+      </button>
+      {error && <span className="bad">{error}</span>}
+    </div>
+  )
+}
 
 function Alerts({ onSelect }: { onSelect(id: string): void }) {
   const alerts = useStore((s) => s.view.alerts)
@@ -35,6 +62,7 @@ function Alerts({ onSelect }: { onSelect(id: string): void }) {
             <span className="muted">{a.entity.id}</span>
           )}
           <div>{a.message}</div>
+          {a.resolved_at === null && a.action && <AlertAction action={a.action} />}
           <div className="muted">
             {formatClock(a.raised_at)}
             {a.resolved_at !== null && ` — resolved ${formatClock(a.resolved_at)}`}

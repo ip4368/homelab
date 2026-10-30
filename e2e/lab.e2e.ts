@@ -442,6 +442,45 @@ await step('3b', 'Stale leader: freeze the leader, then thaw it', async (note) =
   note(`the leader stayed ${elected.value}; the ex-leader stepped down and released the VIP`)
 })
 
+await step('3c', 'Move the VIP: hand the leadership to a chosen voter', async (note) => {
+  await healthy(5 * 60_000)
+  const k = await kube()
+  const s0 = watch.seen!
+  const [old, term] = [s0.leader!, s0.term]
+  const to = s0.cp.voters.find((v) => v !== old)!
+  const nonVoter = [...s0.hosts.keys()].find((h) => !s0.cp.voters.includes(h))
+  const op = (body: unknown) => fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  if (nonVoter) {
+    const refused = await op({ TransferCpLeadership: { to: nonVoter } })
+    if (refused.status !== 400) throw new Failed(`moving the VIP to non-voter ${nonVoter}: ${refused.status} ${await refused.text()}`)
+    note(`moving it to ${nonVoter}, no voter, is refused: ${(await refused.json()).error}`)
+  }
+  const asked = now()
+  const res = await op({ TransferCpLeadership: { to } })
+  if (!res.ok) throw new Failed(`TransferCpLeadership to ${to}: ${res.status} ${await res.text()}`)
+  const led = await waitFor(`${to} leading`, 10_000, (s) => s.leader === to)
+  note(`${old} handed the leadership to ${to}: the client saw it lead ${secs(now() - asked)} after asking, in term ${watch.seen!.term}`)
+  if (watch.seen!.term !== term + 1) throw new Failed(`${to} leads in term ${watch.seen!.term}, not ${term + 1}: the hand-over took more than one election`)
+  // An op sent in the tens of milliseconds while the VIP moves can be lost
+  // (its outcome unknown, as with any change of leader); once the new leader
+  // is seen, ops go straight to it.
+  const t = now()
+  const after = await op({ SetCpMode: { mode: s0.cp.mode } })
+  if (!after.ok) throw new Failed(`an op to the new leader: ${after.status} ${await after.text()}`)
+  if (now() - t > 2000) throw new Failed(`an op to the new leader took ${secs(now() - t)}`)
+  note(`an op to the new leader was answered in ${secs(now() - t)}`)
+  const vip = await waitFor(`the VIP on ${to} only`, 15_000, (s) => s.truth.vip_holders.length === 1 && s.truth.vip_holders[0] === to)
+  note(`the VIP is on ${to} alone ${secs(led.ms + vip.ms)} after asking`)
+  await waitAsync('the Kubernetes API through the VIP', 60_000, async () => {
+    const r = await k.get('/readyz')
+    return r.status === 200 || `readyz ${r.status} ${r.text.slice(0, 80)}`
+  })
+  note(`the Kubernetes API answers through the VIP (${to}'s K3s server) ${secs(now() - asked)} after asking`)
+  await sleep(10_000)
+  if (watch.seen!.leader !== to || unhealthy(watch.seen!) !== null) throw new Failed(`10 s on: leader ${watch.seen!.leader}, ${unhealthy(watch.seen!) ?? 'healthy'}`)
+  note(`10 s on, ${to} still leads and every machine is healthy`)
+})
+
 await step('4', 'Reboot persistence: reset a CP voter', async (note) => {
   await healthy(5 * 60_000)
   const s0 = watch.seen!
@@ -773,7 +812,12 @@ await step('K8', 'Replace a K3s server: power one off, replace it; etcd lists ex
   await fault({ PowerOff: { vm: victim } })
   const off = now()
   await waitFor(`${victim} NotReady`, 90_000, (s) => s.hosts.get(victim)?.lifecycle === 'NotReady')
-  // As the CpReplacementSuggested alert offers it 10 min on; asked for at once here.
+  // A dead voter is replaced, not handed off (the UI offers only Replace then).
+  const handoff = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ HandOffCp: { from: s0.leader, to: spare } }) })
+  const refusal = await handoff.text()
+  if (handoff.status !== 400 || !refusal.includes('replace it first')) throw new Failed(`a hand-off while ${victim} is down: ${handoff.status} ${refusal}`)
+  note(`a hand-off while ${victim} is down is refused: ${JSON.parse(refusal).error}`)
+  // As the CpReplacementSuggested alert and the UI's Replace button offer it; asked for at once here.
   const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ReplaceCpMember: { dead: victim, with: spare } }) })
   if (!res.ok) throw new Failed(`ReplaceCpMember: ${res.status} ${await res.text()}`)
   const asked = now()
