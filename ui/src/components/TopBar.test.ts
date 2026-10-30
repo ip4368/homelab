@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import type { HostObj } from '../gen/HostObj'
 import { formatClock } from '../clock'
-import { quorumOf } from './TopBar'
+import { quorumOf, replacementModeBlurb } from './TopBar'
 
 const host = (lifecycle: HostObj['lifecycle']) => ({ lifecycle }) as HostObj
 
@@ -18,5 +18,12 @@ describe('TopBar helpers', () => {
     expect(quorumOf(cp, hosts)).toEqual({ live: 2, voters: 3, ok: true })
     expect(quorumOf(cp, { a: host('Ready') })).toEqual({ live: 1, voters: 3, ok: false })
     expect(quorumOf({ ...cp, voters: [] }, {})).toEqual({ live: 0, voters: 0, ok: false })
+  })
+
+  it('says what each replacement mode does', () => {
+    expect(replacementModeBlurb('Auto')).toBe('Auto: replaces a voter down 10 minutes without asking')
+    expect(replacementModeBlurb('Suggest')).toBe(
+      'Suggest: raises an alert naming a spare once a voter has been down 10 minutes; you replace it',
+    )
   })
 })

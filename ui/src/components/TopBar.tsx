@@ -1,15 +1,25 @@
 import { useMemo, useState } from 'react'
+import { op } from '../api'
 import type { CpInfo } from '../gen/CpInfo'
+import type { CpMode } from '../gen/CpMode'
 import type { HostObj } from '../gen/HostObj'
 import { formatClock } from '../clock'
 import { useStore } from '../store'
 import { Charts } from './Charts'
+import { useAction } from './useAction'
 
 /** A voter is live when its host is in the view and not NotReady. */
 export function quorumOf(cp: CpInfo, hosts: Record<string, HostObj>): { live: number; voters: number; ok: boolean } {
   const voters = cp.voters.length
   const live = cp.voters.filter((id) => hosts[id] && hosts[id].lifecycle !== 'NotReady').length
   return { live, voters, ok: voters > 0 && live >= Math.floor(voters / 2) + 1 }
+}
+
+/** What a voter-replacement mode does, for the toggle's tooltip. */
+export function replacementModeBlurb(mode: CpMode): string {
+  return mode === 'Auto'
+    ? 'Auto: replaces a voter down 10 minutes without asking'
+    : 'Suggest: raises an alert naming a spare once a voter has been down 10 minutes; you replace it'
 }
 
 function Stat({ label, value, tone }: { label: string; value: string | number; tone?: 'ok' | 'warn' | 'bad' }) {
@@ -30,6 +40,7 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
   const clock = useStore((s) => s.clock)
   const connection = useStore((s) => s.connection)
   const [monitoring, setMonitoring] = useState(false)
+  const { error: modeError, busy: modeBusy, run: runMode } = useAction()
 
   const counts = useMemo(() => {
     const c = { Ready: 0, NotReady: 0, Pending: 0 }
@@ -59,6 +70,19 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
           tone={quorum.voters === 0 ? undefined : quorum.ok ? 'ok' : 'bad'}
         />
         <Stat label="Alerts" value={activeAlerts} tone={activeAlerts > 0 ? 'warn' : undefined} />
+        <label className="inline" title={replacementModeBlurb(cp.mode)}>
+          Replacement{' '}
+          <select
+            value={cp.mode}
+            disabled={modeBusy}
+            aria-label="voter replacement mode"
+            onChange={(e) => runMode(() => op({ SetCpMode: { mode: e.target.value as CpMode } }))}
+          >
+            <option value="Suggest">Suggest</option>
+            <option value="Auto">Auto</option>
+          </select>
+        </label>
+        {modeError && <span className="bad">{modeError}</span>}
         <div className="spacer" />
         <button className={monitoring ? 'active' : ''} aria-pressed={monitoring} onClick={() => setMonitoring(!monitoring)}>
           Monitoring
