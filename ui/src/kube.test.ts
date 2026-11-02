@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, filterKube, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, volumeHosts, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, deletePrompt, filterKube, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return { namespace, name, owner, node, status, ready: 1, containers: 1, restarts: 0, created: 0 }
@@ -85,5 +85,28 @@ describe('draining', () => {
   it('says what removing a host leaves behind', () => {
     expect(removeHostPrompt('a', pods)).toContain('2 pods still run on it: drain it first')
     expect(removeHostPrompt('a', pods.slice(1, 4))).toContain('No pods need moving off it.')
+  })
+
+  it('offers no changes in the system namespaces, and no scaling of a DaemonSet', () => {
+    expect(workloadActions(web)).toEqual({ scale: true, restart: true, remove: true })
+    expect(workloadActions({ namespace: 'demo', kind: 'DaemonSet' })).toEqual({ scale: false, restart: true, remove: true })
+    for (const namespace of ['kube-system', 'longhorn-system', 'kube-public', 'kube-node-lease']) {
+      expect(workloadActions({ namespace, kind: 'Deployment' })).toEqual({ scale: false, restart: false, remove: false })
+    }
+  })
+
+  it("deleting a StatefulSet says its claims stay, naming them", () => {
+    const postgres: KubeWorkload = { namespace: 'demo', name: 'postgres', kind: 'StatefulSet', desired: 1, ready: 1 }
+    const pgPods = [pod('demo', 'postgres-0', 'ms01-04', 'StatefulSet/postgres'), pod('other', 'postgres-0', 'ms01-04', 'StatefulSet/postgres')]
+    const elsewhere = { ...volume, name: 'pvc-2', pvc: 'other/data-postgres-0' }
+    const unused = { ...volume, name: 'pvc-3', pvc: 'demo/scratch', pods: [] }
+    const claims = workloadClaims(postgres, pgPods, [volume, elsewhere, unused])
+    expect(claims).toEqual(['demo/data-postgres-0'])
+    expect(deletePrompt(postgres, claims)).toBe(
+      'Delete StatefulSet demo/postgres and its pods? Its volume claims stay, with their data: demo/data-postgres-0. Delete them with kubectl once you no longer need them.',
+    )
+    expect(deletePrompt(postgres, [])).toContain('Its volume claims stay.')
+    expect(deletePrompt(web, [])).toBe('Delete Deployment demo/web and its pods?')
+    expect(restartPrompt(web)).toContain('Restart Deployment demo/web?')
   })
 })

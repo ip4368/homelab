@@ -137,6 +137,15 @@ The stateful pods tolerate an unreachable node for only 20 s, so powering off th
 
 The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with its host, and the Longhorn volumes with where their replicas are and whether they are in sync or rebuilding. The server asks the control plane for the admin kubeconfig, then reads the Kubernetes API through the VIP every 3 s, so it needs no access to the hosts themselves.
 
+Each workload's row can also change it, as kubectl would: type a new replica count and click **Scale** (Deployments and StatefulSets), **Restart** its pods a few at a time (`kubectl rollout restart`), or **Delete** it. Deleting a StatefulSet keeps its volume claims and their data; delete those with kubectl once you no longer need them. Nothing in `kube-system`, `kube-public`, `kube-node-lease` or `longhorn-system` can be changed from the UI: K3s and Longhorn run there, installed and supervised by homelabd, so use kubectl. The same changes can be scripted:
+
+```sh
+curl -X POST http://<server>:8080/api/kube -H 'content-type: application/json' \
+  -d '{"Scale": {"workload": {"namespace": "demo", "kind": "Deployment", "name": "web"}, "replicas": 5}}'
+```
+
+(`Restart` and `Delete` take just `{"workload": …}`.) A later `kubectl apply` of a manifest that sets `replicas:` sets it back, as after `kubectl scale`.
+
 ## Upgrading homelabd
 
 ```sh

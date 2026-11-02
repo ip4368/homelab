@@ -7,6 +7,9 @@ import type { LonghornVolume } from './gen/LonghornVolume'
 /** Namespaces K3s and Longhorn run their own pods in. */
 export const SYSTEM_NAMESPACES = ['kube-system', 'longhorn-system']
 
+/** Namespaces the server changes nothing in (as `PROTECTED_NAMESPACES` in crates/server/src/kube_action.rs): kubectl only. */
+export const PROTECTED_NAMESPACES = [...SYSTEM_NAMESPACES, 'kube-public', 'kube-node-lease']
+
 export interface KubeFilter {
   /** Empty for any namespace. */
   namespace: string
@@ -118,4 +121,28 @@ export function removeHostPrompt(host: string, pods: KubePod[]): string {
   const left = podsToDrain(pods).length
   const what = left === 0 ? 'No pods need moving off it.' : `${left} pod${left === 1 ? '' : 's'} still run${left === 1 ? 's' : ''} on it: drain it first so they move off cleanly.`
   return `Remove ${host}? ${what} It leaves the cluster for good; to bring it back, reinstall it with a new join token.`
+}
+
+/** What the Workloads tab offers to do to `w`: nothing in a protected namespace, and no scaling of a DaemonSet (one pod per node). */
+export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind'>): { scale: boolean; restart: boolean; remove: boolean } {
+  if (PROTECTED_NAMESPACES.includes(w.namespace)) return { scale: false, restart: false, remove: false }
+  return { scale: w.kind !== 'DaemonSet', restart: true, remove: true }
+}
+
+/** The claims of a StatefulSet's pods: the Longhorn volumes its pods use. */
+export function workloadClaims(w: KubeWorkload, pods: KubePod[], volumes: LonghornVolume[]): string[] {
+  const owner = `${w.kind}/${w.name}`
+  const mine = new Set(pods.filter((p) => p.namespace === w.namespace && p.owner === owner).map((p) => p.name))
+  return volumes.filter((v) => v.pvc && volumeNamespace(v) === w.namespace && v.pods.some((p) => mine.has(p))).map((v) => v.pvc as string).sort()
+}
+
+export function restartPrompt(w: KubeWorkload): string {
+  return `Restart ${w.kind} ${w.namespace}/${w.name}? Kubernetes replaces its pods a few at a time, as kubectl rollout restart does.`
+}
+
+export function deletePrompt(w: KubeWorkload, claims: string[]): string {
+  const ask = `Delete ${w.kind} ${w.namespace}/${w.name} and its pods?`
+  if (w.kind !== 'StatefulSet') return ask
+  const kept = claims.length === 0 ? 'Its volume claims stay' : `Its volume claims stay, with their data: ${claims.join(', ')}`
+  return `${ask} ${kept}. Delete them with kubectl once you no longer need them.`
 }

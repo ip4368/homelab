@@ -1,6 +1,9 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { kubeAction } from '../api'
+import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, filterKube, gib, podTone, replicaLabel, volumeTone, workloadTone, type KubeFilter } from '../kube'
+import { age, deletePrompt, filterKube, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { useAction } from './useAction'
 
 /** Pod tables can be long; the filters narrow them. */
 const ROWS_SHOWN = 300
@@ -17,6 +20,112 @@ function Hosts({ hosts, onSelectHost }: { hosts: string[]; onSelectHost(id: stri
           </button>
         </span>
       ))}
+    </>
+  )
+}
+
+/** A workload's row: its replicas (editable, to scale it), Restart and Delete, and Kubernetes' answer when it says no. */
+function WorkloadRow({ w, hosts, onSelectHost }: { w: KubeWorkload; hosts: string[]; onSelectHost(id: string): void }) {
+  const pods = useStore((s) => s.kube.pods)
+  const volumes = useStore((s) => s.kube.volumes)
+  const { error, busy, run } = useAction()
+  const [replicas, setReplicas] = useState(String(w.desired))
+  // Follow changes made elsewhere (kubectl, another browser) unless a new count is being typed,
+  // or was just asked for and Kubernetes has not reported it yet.
+  const [editing, setEditing] = useState(false)
+  useEffect(() => {
+    if (!editing) setReplicas(String(w.desired))
+    else if (String(w.desired) === replicas) setEditing(false)
+  }, [w.desired, editing, replicas])
+  const can = workloadActions(w)
+  const workload = { namespace: w.namespace, kind: w.kind, name: w.name }
+  const wanted = Number(replicas)
+  const scalable = can.scale && replicas.trim() !== '' && Number.isInteger(wanted) && wanted >= 0 && wanted !== w.desired
+  const scale = () => {
+    if (!scalable) return
+    void run(() =>
+      kubeAction({ Scale: { workload, replicas: wanted } }).catch((e: unknown) => {
+        setEditing(false)
+        throw e
+      }),
+    )
+  }
+
+  return (
+    <>
+      <tr>
+        <td className="muted">{w.namespace}</td>
+        <td>
+          <strong>{w.name}</strong>
+        </td>
+        <td>{w.kind}</td>
+        <td className={workloadTone(w)}>
+          {w.ready}/
+          {can.scale ? (
+            <input
+              type="number"
+              min={0}
+              value={replicas}
+              disabled={busy}
+              onChange={(e) => {
+                setEditing(true)
+                setReplicas(e.target.value)
+              }}
+              onKeyDown={(e) => e.key === 'Enter' && scale()}
+              style={{ width: 52 }}
+              aria-label={`replicas of ${w.name}`}
+            />
+          ) : (
+            w.desired
+          )}
+          {scalable && (
+            <>
+              {' '}
+              <button disabled={busy} onClick={scale}>
+                Scale
+              </button>{' '}
+              <button
+                className="link"
+                disabled={busy}
+                onClick={() => {
+                  setEditing(false)
+                  setReplicas(String(w.desired))
+                }}
+              >
+                cancel
+              </button>
+            </>
+          )}
+        </td>
+        <td>
+          <Hosts hosts={hosts} onSelectHost={onSelectHost} />
+        </td>
+        <td className="row-actions">
+          {can.restart && (
+            <button disabled={busy} onClick={() => window.confirm(restartPrompt(w)) && run(() => kubeAction({ Restart: { workload } }))}>
+              Restart
+            </button>
+          )}{' '}
+          {can.remove && (
+            <button
+              disabled={busy}
+              onClick={() => window.confirm(deletePrompt(w, workloadClaims(w, pods, volumes))) && run(() => kubeAction({ Delete: { workload } }))}
+            >
+              Delete
+            </button>
+          )}
+          {!can.remove && <span className="muted" title="K3s and Longhorn run here, installed and supervised by homelabd: change it with kubectl">system</span>}
+        </td>
+      </tr>
+      {error && (
+        <tr>
+          <td colSpan={6}>
+            <div className="bad refusal" role="alert">
+              {error}
+            </div>
+          </td>
+        </tr>
+      )}
     </>
   )
 }
@@ -73,27 +182,16 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
             <th>Kind</th>
             <th>Ready</th>
             <th>Hosts</th>
+            <th />
           </tr>
         </thead>
         <tbody>
           {rows.workloads.map(({ workload: w, hosts }) => (
-            <tr key={`${w.namespace}/${w.kind}/${w.name}`}>
-              <td className="muted">{w.namespace}</td>
-              <td>
-                <strong>{w.name}</strong>
-              </td>
-              <td>{w.kind}</td>
-              <td className={workloadTone(w)}>
-                {w.ready}/{w.desired}
-              </td>
-              <td>
-                <Hosts hosts={hosts} onSelectHost={onSelectHost} />
-              </td>
-            </tr>
+            <WorkloadRow key={`${w.namespace}/${w.kind}/${w.name}`} w={w} hosts={hosts} onSelectHost={onSelectHost} />
           ))}
           {rows.workloads.length === 0 && (
             <tr>
-              <td colSpan={5} className="muted">
+              <td colSpan={6} className="muted">
                 {kube.workloads.length === 0 ? 'None yet. "Seed workloads" in the lab panel adds a few.' : 'Nothing matches the filters.'}
               </td>
             </tr>

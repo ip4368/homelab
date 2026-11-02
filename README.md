@@ -38,6 +38,10 @@ everything K3s stands on, and supervises K3s; K3s owns everything that runs on i
 | Starting cordon and drain | Evicting the pods |
 | Host metrics; K3s's health: alerts and safe repairs | |
 
+The Workloads tab's changes (scale, restart, delete) come from the UI's server on the user's
+behalf, as kubectl would make them with the admin kubeconfig. homelabd itself still never writes a
+workload.
+
 The full split, the two kinds of "down" (host NotReady, node not Ready) and how homelabd supervises
 K3s: [docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md](docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md).
 
@@ -89,7 +93,8 @@ the **Ground truth** checkbox; the lab host's clock.
 - **Networks:** logical networks (VLAN, subnet, MTU), network templates (with staged rollouts) and
   auto-approve rules.
 - **Workloads:** what Kubernetes runs, read from the K3s API: workloads, their pods and where they
-  run, and Longhorn's volumes with their replicas.
+  run, and Longhorn's volumes with their replicas. Scale, restart or delete a workload from its row
+  (not in the K3s and Longhorn namespaces).
 
 **Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
 

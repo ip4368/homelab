@@ -1,4 +1,5 @@
 import type { ApiOp } from './gen/ApiOp'
+import type { KubeAction } from './gen/KubeAction'
 import type { LabFault } from './gen/LabFault'
 
 /**
@@ -29,6 +30,11 @@ export async function op(o: ApiOp): Promise<unknown> {
 export async function seedWorkloads(): Promise<string> {
   const result = (await post('/api/lab/seed', {})) as { output: string }
   return result.output
+}
+
+/** Scales, restarts or deletes a workload in the cluster's Kubernetes, as kubectl would. */
+export async function kubeAction(a: KubeAction): Promise<void> {
+  await post('/api/kube', a)
 }
 
 /** Does something to the lab's hardware; resolves with the new machine's id for `AddVm`. */
