@@ -94,7 +94,8 @@ the **Ground truth** checkbox; the lab host's clock.
   auto-approve rules.
 - **Workloads:** what Kubernetes runs, read from the K3s API: workloads, their pods and where they
   run, and Longhorn's volumes with their replicas. Scale, restart, edit or delete a workload from
-  its row, and apply YAML after a dry-run preview (not in the K3s and Longhorn namespaces).
+  its row, and apply YAML after a dry-run preview, pasted or written by a small form for an app
+  from an image (not in the K3s and Longhorn namespaces).
 
 **Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
 

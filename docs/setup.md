@@ -148,6 +148,8 @@ curl -X POST http://<server>:8080/api/kube -H 'content-type: application/json' \
 
 **Apply YAML…** above the table takes one or more manifests (`---` between them), as `kubectl apply --server-side` does. **Preview** checks them with the API's dry run and says what each object would become: created, changed or unchanged, or Kubernetes' reason for refusing it. **Apply** is offered once a preview of exactly that YAML found no problem. Namespaces are applied first; objects that name no namespace go in the one the dialog names (`default` if none). The same namespaces as above are refused, and so is anything cluster-wide but a Namespace (Nodes, CRDs, ClusterRoles…): use kubectl for those.
 
+Its **New from image** tab writes the YAML for a typical app: a name, an image and replicas; optionally the port it serves on (a Service), a web path (an Ingress on K3s's Traefik at `http://<VIP><path>`; the app sees the path as it is), a Longhorn volume per pod (then a StatefulSet, on hosts on the storage network) and roles its hosts must all have (the form names the hosts that do). Its pods leave a dead host after 20 s. **Write YAML** puts the manifests in the YAML tab, to preview and apply like any other, or to edit first (environment variables, resources and probes are not on the form).
+
 If another tool set a field the YAML sets to another value (plain `kubectl apply`, `kubectl edit`, a Scale from this page), the preview names the field and who set it. Tick **take over** and preview again to apply anyway (`--force-conflicts`). **Edit YAML** on a workload's row opens its live manifest in the same dialog, without status and bookkeeping, with **take over** already ticked: like `kubectl edit`, what you change is set, whoever set it before.
 
 ```sh

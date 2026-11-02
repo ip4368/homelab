@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { kubeApply } from '../api'
 import type { ApplyReport } from '../gen/ApplyReport'
 import { outcomeLabel, previewVerdict } from '../kube'
+import { NewAppForm } from './NewAppForm'
 import { useAction } from './useAction'
 
 export interface ApplyDraft {
@@ -13,6 +14,8 @@ export interface ApplyDraft {
   force?: boolean
   /** Shown under the title. */
   note?: string
+  /** Offer the New from image form beside the YAML. */
+  offerNew?: boolean
 }
 
 const PLACEHOLDER = `apiVersion: apps/v1
@@ -62,6 +65,7 @@ export function ApplyDialog({ draft, namespaces, onClose }: { draft: ApplyDraft;
   const [yaml, setYaml] = useState(draft.yaml)
   const [namespace, setNamespace] = useState(draft.namespace)
   const [force, setForce] = useState(draft.force ?? false)
+  const [tab, setTab] = useState<'yaml' | 'new'>('yaml')
   const [preview, setPreview] = useState<{ report: ApplyReport; yaml: string; namespace: string; force: boolean } | null>(null)
   const [applied, setApplied] = useState<ApplyReport | null>(null)
   const previewing = useAction()
@@ -94,74 +98,97 @@ export function ApplyDialog({ draft, namespaces, onClose }: { draft: ApplyDraft;
           </button>
         </div>
         {draft.note && <p className="muted">{draft.note}</p>}
-        <textarea
-          className="yaml-box"
-          value={yaml}
-          onChange={(e) => setYaml(e.target.value)}
-          placeholder={PLACEHOLDER}
-          spellCheck={false}
-          aria-label="manifests"
-          disabled={busy}
-        />
-        <div className="actions">
-          <label className="inline">
-            Namespace{' '}
-            <input value={namespace} onChange={(e) => setNamespace(e.target.value.trim())} placeholder="default" list="apply-namespaces" size={16} aria-label="default namespace" disabled={busy} />
-          </label>
-          <datalist id="apply-namespaces">
-            {namespaces.map((n) => (
-              <option key={n} value={n} />
-            ))}
-          </datalist>
-          <span className="muted">for objects that name none</span>
-          <div className="spacer" />
-          {(force || (verdict?.conflicts.length ?? 0) > 0) && (
-            <label className="inline warn" title="Apply with --force-conflicts: fields other managers own become homelab-ui's">
-              <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} disabled={busy} /> take over
+        {draft.offerNew && (
+          <div className="tabs inline-tabs" role="tablist">
+            <button role="tab" aria-selected={tab === 'yaml'} className={tab === 'yaml' ? 'active' : ''} onClick={() => setTab('yaml')}>
+              YAML
+            </button>
+            <button role="tab" aria-selected={tab === 'new'} className={tab === 'new' ? 'active' : ''} onClick={() => setTab('new')} disabled={busy}>
+              New from image
+            </button>
+          </div>
+        )}
+        {tab === 'new' && (
+          <NewAppForm
+            namespace={namespace}
+            namespaces={namespaces}
+            onWrite={(y, ns) => {
+              setYaml(y)
+              setNamespace(ns)
+              setTab('yaml')
+            }}
+          />
+        )}
+        <div hidden={tab !== 'yaml'}>
+          <textarea
+            className="yaml-box"
+            value={yaml}
+            onChange={(e) => setYaml(e.target.value)}
+            placeholder={PLACEHOLDER}
+            spellCheck={false}
+            aria-label="manifests"
+            disabled={busy}
+          />
+          <div className="actions">
+            <label className="inline">
+              Namespace{' '}
+              <input value={namespace} onChange={(e) => setNamespace(e.target.value.trim())} placeholder="default" list="apply-namespaces" size={16} aria-label="default namespace" disabled={busy} />
             </label>
-          )}
-          <button onClick={check} disabled={busy || yaml.trim() === ''}>
-            Preview
-          </button>
-          <button className="active" onClick={apply} disabled={busy || !current || !verdict?.canApply} title={current ? undefined : 'Preview this YAML first'}>
-            Apply
-          </button>
-        </div>
-        {previewing.error && (
-          <div className="bad refusal" role="alert">
-            {previewing.error}
-          </div>
-        )}
-        {preview && !applied && (
-          <>
-            <h4 className="modal-sub">{current ? 'Preview' : 'Preview (of an earlier version: preview again)'}</h4>
-            <Report report={preview.report} />
-            {verdict && verdict.conflicts.length > 0 && (
-              <div className="warn refusal">
-                Other field managers own fields this YAML sets to other values:
-                <ul className="fixes">
-                  {verdict.conflicts.map((c) => (
-                    <li key={`${c.object}${c.field}`}>
-                      {c.object}: <code>{c.field}</code> (owned by {c.manager})
-                    </li>
-                  ))}
-                </ul>
-                Tick <em>take over</em> and preview again to apply anyway.
-              </div>
+            <datalist id="apply-namespaces">
+              {namespaces.map((n) => (
+                <option key={n} value={n} />
+              ))}
+            </datalist>
+            <span className="muted">for objects that name none</span>
+            <div className="spacer" />
+            {(force || (verdict?.conflicts.length ?? 0) > 0) && (
+              <label className="inline warn" title="Apply with --force-conflicts: fields other managers own become homelab-ui's">
+                <input type="checkbox" checked={force} onChange={(e) => setForce(e.target.checked)} disabled={busy} /> take over
+              </label>
             )}
-          </>
-        )}
-        {applying.error && (
-          <div className="bad refusal" role="alert">
-            {applying.error}
+            <button onClick={check} disabled={busy || yaml.trim() === ''}>
+              Preview
+            </button>
+            <button className="active" onClick={apply} disabled={busy || !current || !verdict?.canApply} title={current ? undefined : 'Preview this YAML first'}>
+              Apply
+            </button>
           </div>
-        )}
-        {applied && (
-          <>
-            <h4 className="modal-sub">Applied</h4>
-            <Report report={applied} />
-          </>
-        )}
+          {previewing.error && (
+            <div className="bad refusal" role="alert">
+              {previewing.error}
+            </div>
+          )}
+          {preview && !applied && (
+            <>
+              <h4 className="modal-sub">{current ? 'Preview' : 'Preview (of an earlier version: preview again)'}</h4>
+              <Report report={preview.report} />
+              {verdict && verdict.conflicts.length > 0 && (
+                <div className="warn refusal">
+                  Other field managers own fields this YAML sets to other values:
+                  <ul className="fixes">
+                    {verdict.conflicts.map((c) => (
+                      <li key={`${c.object}${c.field}`}>
+                        {c.object}: <code>{c.field}</code> (owned by {c.manager})
+                      </li>
+                    ))}
+                  </ul>
+                  Tick <em>take over</em> and preview again to apply anyway.
+                </div>
+              )}
+            </>
+          )}
+          {applying.error && (
+            <div className="bad refusal" role="alert">
+              {applying.error}
+            </div>
+          )}
+          {applied && (
+            <>
+              <h4 className="modal-sub">Applied</h4>
+              <Report report={applied} />
+            </>
+          )}
+        </div>
       </div>
     </div>
   )

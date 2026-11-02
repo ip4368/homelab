@@ -1,7 +1,7 @@
 # Homelab Cluster Manager — Creating and Managing Workloads from the UI
 
 Date: 2026-11-02
-Status: Steps 1 (workload actions) and 2 (Apply YAML, Edit YAML) built; step 3 not yet.
+Status: Built (steps 1–4).
 Builds on: `2026-10-29-homelabd-k3s-responsibilities-design.md` (who owns what) and the Workloads tab, which reads Kubernetes through the VIP with the admin kubeconfig (`crates/server/src/kube.rs`).
 
 ## 1. Intent
@@ -72,11 +72,11 @@ A second tab in the same dialog. It generates YAML only; nothing is applied unti
 | Name, namespace, image, replicas | A Deployment (1–n replicas), with a Namespace object if the namespace is new |
 | Container port, "expose" | A ClusterIP Service on that port |
 | Ingress path (optional) | An Ingress on K3s's Traefik at `http://<vip><path>`, like the demo web app |
-| Volume size and mount path (optional) | A **StatefulSet** instead, 1 replica, with a `volumeClaimTemplate` on `longhorn`, and `nodeSelector: homelab.io/storage-network=true` (Longhorn runs only there) |
-| Run on (role, optional) | `nodeSelector: homelab.io/<role>=true` |
+| Volume size and mount path (optional) | A **StatefulSet** instead, with a `volumeClaimTemplate` on `longhorn` (a volume per pod), and `nodeSelector: homelab.io/storage-network=true` (Longhorn runs only there; the demo's `homelab.io/storage` is narrower than needed) |
+| Run on (roles, optional) | `nodeSelector` with `homelab.io/<role>=true` for each: hosts with all of them. The form names those hosts, and warns when none has them all. "Any of these roles" needs `nodeAffinity`: write it in the YAML |
 | (always) | 20 s tolerations for `node.kubernetes.io/unreachable` and `not-ready`, so pods move quickly off a dead host (as `docs/setup.md` advises) |
 
-A pure function in `ui/src/kube.ts` turns the form into YAML text, with template strings and `JSON.stringify` for scalars (valid YAML double-quoted strings). It is tested with vitest.
+A pure function in `ui/src/newapp.ts` turns the form into YAML text, with template strings and `JSON.stringify` for scalars (valid YAML double-quoted strings). It is tested with vitest.
 
 ## 7. Server changes
 

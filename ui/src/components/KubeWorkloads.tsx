@@ -173,7 +173,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
           </select>
         </label>
         <input placeholder="search name" value={filter.text} onChange={(e) => set({ text: e.target.value })} aria-label="search kube name" size={16} />
-        <button onClick={() => setDraft({ title: 'Apply YAML', yaml: '', namespace: filter.namespace })}>Apply YAML…</button>
+        <button onClick={() => setDraft({ title: 'Apply YAML', yaml: '', namespace: filter.namespace, offerNew: true })}>Apply YAML…</button>
         <span className="muted">
           {kube.pods.length} pods in {kube.workloads.length} workloads, {kube.volumes.length} Longhorn volumes
           {kube.at > 0 && ` · read ${age(kube.at, now)} ago`}
