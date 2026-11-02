@@ -3,6 +3,7 @@
 //! Read from the K3s API through the VIP with an admin kubeconfig, every
 //! few seconds, the way `kubectl get` would.
 
+use crate::kube_detail;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -21,6 +22,10 @@ pub const KUBECONFIG_RETRY: Duration = Duration::from_secs(10);
 /// cluster may have been reinstalled, with a new CA).
 pub const FAILURES_BEFORE_REFRESH: u32 = 5;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How far back Warning events are shown.
+const EVENTS_FOR_MS: u64 = 60 * 60 * 1000;
+/// The most Warning events kept.
+const MAX_EVENTS: usize = 200;
 
 /// What Kubernetes runs, as of `at`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, TS)]
@@ -34,6 +39,10 @@ pub struct KubeView {
     pub workloads: Vec<KubeWorkload>,
     pub pods: Vec<KubePod>,
     pub volumes: Vec<LonghornVolume>,
+    /// Warning events of the last hour on workloads and their pods, newest first.
+    pub events: Vec<KubeEvent>,
+    /// Why there is no CPU and memory usage: metrics-server did not answer.
+    pub metrics_error: Option<String>,
 }
 
 /// The kinds of workload the Workloads tab shows.
@@ -75,6 +84,104 @@ pub struct KubeWorkload {
     pub kind: WorkloadKind,
     pub desired: u32,
     pub ready: u32,
+    /// Pods (or for a DaemonSet, nodes) already on the latest spec.
+    pub updated: u32,
+    pub health: Health,
+    /// Usage summed over its pods, from metrics-server; none without it.
+    #[ts(type = "number | null")]
+    pub cpu_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_bytes: Option<u64>,
+    /// Limits summed over its pods; none if a pod has none.
+    #[ts(type = "number | null")]
+    pub cpu_limit_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_limit_bytes: Option<u64>,
+    /// Its pod template's container images.
+    pub images: Vec<String>,
+    /// How to reach it, Ingresses first.
+    pub endpoints: Vec<Endpoint>,
+    /// Its controller's conditions that are not as they should be.
+    pub conditions: Vec<KubeCondition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct Health {
+    pub state: HealthState,
+    /// Why, in a few words: `CrashLoopBackOff (2 pods)`, `1/3 updated`…
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+pub enum HealthState {
+    Healthy,
+    RollingOut,
+    Degraded,
+    Down,
+    /// Scaled to 0.
+    Idle,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct Endpoint {
+    /// `http://10.0.3.253/app`, `10.0.3.253:8096`, `web.demo:80`.
+    pub address: String,
+    /// The URL to open, when it is likely a web page.
+    pub link: Option<String>,
+    pub kind: EndpointKind,
+    /// What makes it: `Ingress web`, `Service web`.
+    pub via: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
+pub enum EndpointKind {
+    Ingress,
+    LoadBalancer,
+    NodePort,
+    /// Only from inside the cluster.
+    Cluster,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct KubeCondition {
+    /// Its type: `Available`, `Progressing`, `ReplicaFailure`.
+    pub kind: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+}
+
+/// How a container last ended.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct Termination {
+    /// `OOMKilled`, `Error`, `Completed`…
+    pub reason: String,
+    pub exit_code: i32,
+    #[ts(type = "number | null")]
+    pub at: Option<u64>,
+}
+
+/// A Warning event.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct KubeEvent {
+    pub namespace: String,
+    /// The workload it concerns, as `<kind>/<name>`, if any.
+    pub workload: Option<String>,
+    /// What it is about, as `<kind>/<name>`.
+    pub object: String,
+    pub reason: String,
+    pub message: String,
+    pub count: u32,
+    /// When it last happened (Unix ms).
+    #[ts(type = "number | null")]
+    pub last: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -95,6 +202,20 @@ pub struct KubePod {
     /// When it was created (Unix ms).
     #[ts(type = "number | null")]
     pub created: Option<u64>,
+    #[ts(type = "number | null")]
+    pub cpu_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub cpu_limit_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_limit_bytes: Option<u64>,
+    /// Why it is as it is, in Kubernetes' words: the scheduler's message, or a waiting container's.
+    pub detail: Option<String>,
+    /// The scheduler cannot place it.
+    pub unschedulable: bool,
+    /// How a container that restarted last ended.
+    pub last_termination: Option<Termination>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -133,7 +254,7 @@ pub struct LonghornReplica {
 }
 
 /// The raw lists one read fetches.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Lists {
     pub pods: Value,
     pub replicasets: Value,
@@ -143,6 +264,18 @@ pub struct Lists {
     pub volumes: Value,
     pub replicas: Value,
     pub engines: Value,
+    pub services: Value,
+    pub ingresses: Value,
+    pub events: Value,
+    /// Pod usage from metrics-server, or why there is none.
+    pub metrics: Result<Value, String>,
+}
+
+impl Default for Lists {
+    fn default() -> Self {
+        let v = Value::Null;
+        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v, metrics: Ok(Value::Null) }
+    }
 }
 
 /// How to reach the API: its URL and a client holding the kubeconfig's CA and client certificate.
@@ -209,8 +342,23 @@ impl Access {
         Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
     }
 
+    /// The cluster's own address, as the kubeconfig reaches it (the VIP): `10.0.3.253`.
+    pub fn host(&self) -> &str {
+        let rest = self.server.split_once("://").map_or(self.server.as_str(), |(_, r)| r);
+        let authority = rest.split('/').next().unwrap_or(rest);
+        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+    }
+
     pub async fn read(&self) -> Result<Lists, ReadError> {
-        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines) = tokio::try_join!(
+        // metrics-server is an add-on: without it, everything else still shows.
+        let metrics = async {
+            match self.client.get(format!("{}/apis/metrics.k8s.io/v1beta1/pods", self.server)).send().await {
+                Ok(r) if r.status().is_success() => r.json::<Value>().await.map_err(|e| e.to_string()),
+                Ok(r) => Err(format!("metrics-server: {}", r.status())),
+                Err(e) => Err(format!("metrics-server: {e}")),
+            }
+        };
+        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, metrics) = tokio::join!(
             self.list("/api/v1/pods"),
             self.list("/apis/apps/v1/replicasets"),
             self.list("/apis/apps/v1/deployments"),
@@ -219,8 +367,25 @@ impl Access {
             self.list("/apis/longhorn.io/v1beta2/namespaces/longhorn-system/volumes"),
             self.list("/apis/longhorn.io/v1beta2/namespaces/longhorn-system/replicas"),
             self.list("/apis/longhorn.io/v1beta2/namespaces/longhorn-system/engines"),
-        )?;
-        Ok(Lists { pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines })
+            self.list("/api/v1/services"),
+            self.list("/apis/networking.k8s.io/v1/ingresses"),
+            self.list("/api/v1/events?fieldSelector=type%3DWarning"),
+            metrics,
+        );
+        Ok(Lists {
+            pods: pods?,
+            replicasets: replicasets?,
+            deployments: deployments?,
+            statefulsets: statefulsets?,
+            daemonsets: daemonsets?,
+            volumes: volumes?,
+            replicas: replicas?,
+            engines: engines?,
+            services: services?,
+            ingresses: ingresses?,
+            events: events?,
+            metrics,
+        })
     }
 }
 
@@ -336,30 +501,13 @@ fn key(meta: &Value) -> (String, String) {
     (text(&meta["namespace"]).unwrap_or_default(), text(&meta["name"]).unwrap_or_default())
 }
 
-/// The view `lists` describe, read at `at`.
-pub fn view_of(lists: &Lists, at: u64) -> KubeView {
+/// The view `lists` describe, read at `at`; `vip` is the cluster's own address, for endpoints.
+pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
     // A Deployment's pods belong to a ReplicaSet it owns.
     let rs_owner: BTreeMap<(String, String), (String, String)> =
         items(&lists.replicasets).iter().filter_map(|rs| Some((key(&rs["metadata"]), controller(&rs["metadata"])?))).collect();
 
-    let mut workloads: Vec<KubeWorkload> = Vec::new();
-    for d in items(&lists.deployments) {
-        let (namespace, name) = key(&d["metadata"]);
-        let desired = d["spec"]["replicas"].as_u64().map_or(1, |n| n as u32);
-        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::Deployment, desired, ready: count(&d["status"]["readyReplicas"]) });
-    }
-    for s in items(&lists.statefulsets) {
-        let (namespace, name) = key(&s["metadata"]);
-        let desired = s["spec"]["replicas"].as_u64().map_or(1, |n| n as u32);
-        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::StatefulSet, desired, ready: count(&s["status"]["readyReplicas"]) });
-    }
-    for d in items(&lists.daemonsets) {
-        let (namespace, name) = key(&d["metadata"]);
-        let (desired, ready) = (count(&d["status"]["desiredNumberScheduled"]), count(&d["status"]["numberReady"]));
-        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::DaemonSet, desired, ready });
-    }
-    workloads.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
-
+    let usage = lists.metrics.as_ref().map(kube_detail::pod_usage).unwrap_or_default();
     let mut pods: Vec<KubePod> = items(&lists.pods)
         .iter()
         .map(|p| {
@@ -374,6 +522,16 @@ pub fn view_of(lists: &Lists, at: u64) -> KubeView {
             });
             let statuses = p["status"]["containerStatuses"].as_array().map_or(&[][..], Vec::as_slice);
             let containers = p["spec"]["containers"].as_array().map_or(statuses.len(), Vec::len) as u32;
+            let scheduled = p["status"]["conditions"].as_array().into_iter().flatten().find(|c| c["type"] == "PodScheduled");
+            let unschedulable = scheduled.is_some_and(|c| c["status"] == "False" && c["reason"] == "Unschedulable");
+            let waiting = statuses.iter().find_map(|c| text(&c["state"]["waiting"]["message"]));
+            let detail = if unschedulable { scheduled.and_then(|c| text(&c["message"])) } else { waiting };
+            let last_termination = statuses.iter().find_map(|c| {
+                let t = &c["lastState"]["terminated"];
+                Some(Termination { reason: text(&t["reason"])?, exit_code: t["exitCode"].as_i64().unwrap_or(0) as i32, at: t["finishedAt"].as_str().and_then(timestamp_ms) })
+            });
+            let used = usage.get(&(namespace.clone(), name.clone()));
+            let (cpu_limit_milli, memory_limit_bytes) = kube_detail::pod_limits(p);
             KubePod {
                 owner,
                 node: text(&p["spec"]["nodeName"]),
@@ -382,12 +540,102 @@ pub fn view_of(lists: &Lists, at: u64) -> KubeView {
                 containers,
                 restarts: statuses.iter().map(|c| count(&c["restartCount"])).sum(),
                 created: meta["creationTimestamp"].as_str().and_then(timestamp_ms),
+                cpu_milli: used.map(|u| u.0),
+                memory_bytes: used.map(|u| u.1),
+                cpu_limit_milli,
+                memory_limit_bytes,
+                detail,
+                unschedulable,
+                last_termination,
                 namespace,
                 name,
             }
         })
         .collect();
     pods.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    let metrics_ok = lists.metrics.is_ok();
+    let mut workloads: Vec<KubeWorkload> = Vec::new();
+    for (list, kind) in [(&lists.deployments, WorkloadKind::Deployment), (&lists.statefulsets, WorkloadKind::StatefulSet), (&lists.daemonsets, WorkloadKind::DaemonSet)] {
+        for w in items(list) {
+            let (namespace, name) = key(&w["metadata"]);
+            let st = &w["status"];
+            let (desired, ready, updated) = match kind {
+                WorkloadKind::DaemonSet => (count(&st["desiredNumberScheduled"]), count(&st["numberReady"]), count(&st["updatedNumberScheduled"])),
+                _ => (w["spec"]["replicas"].as_u64().map_or(1, |n| n as u32), count(&st["readyReplicas"]), count(&st["updatedReplicas"])),
+            };
+            let conditions: Vec<KubeCondition> = st["conditions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|c| KubeCondition { kind: text(&c["type"]).unwrap_or_default(), status: text(&c["status"]).unwrap_or_default(), reason: text(&c["reason"]), message: text(&c["message"]) })
+                .filter(|c| if c.kind == "ReplicaFailure" { c.status == "True" } else { c.status != "True" })
+                .collect();
+            let controller_problem = conditions.iter().find_map(|c| match (c.kind.as_str(), c.reason.as_deref()) {
+                ("ReplicaFailure", _) => Some(format!("ReplicaFailure: {}", c.message.as_deref().unwrap_or("pods cannot be created"))),
+                ("Progressing", Some("ProgressDeadlineExceeded")) => Some("rollout stuck (ProgressDeadlineExceeded)".into()),
+                _ => None,
+            });
+            let owner = format!("{kind}/{name}");
+            let mine: Vec<&KubePod> = pods.iter().filter(|p| p.namespace == namespace && p.owner.as_deref() == Some(owner.as_str())).collect();
+            let health = kube_detail::health(&kube_detail::HealthInput {
+                desired,
+                ready,
+                updated,
+                spec_seen: st["observedGeneration"].as_u64().unwrap_or(0) >= w["metadata"]["generation"].as_u64().unwrap_or(0),
+                controller_problem,
+                pods: mine.clone(),
+            });
+            let sum = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { if mine.is_empty() { None } else { mine.iter().map(|p| f(p)).sum() } };
+            let template = &w["spec"]["template"];
+            workloads.push(KubeWorkload {
+                kind,
+                desired,
+                ready,
+                updated,
+                health,
+                cpu_milli: if metrics_ok { sum(|p| p.cpu_milli) } else { None },
+                memory_bytes: if metrics_ok { sum(|p| p.memory_bytes) } else { None },
+                cpu_limit_milli: sum(|p| p.cpu_limit_milli),
+                memory_limit_bytes: sum(|p| p.memory_limit_bytes),
+                images: template["spec"]["containers"].as_array().into_iter().flatten().filter_map(|c| text(&c["image"])).collect(),
+                endpoints: kube_detail::endpoints(&namespace, &template["metadata"]["labels"], &lists.services, &lists.ingresses, vip),
+                conditions,
+                namespace,
+                name,
+            });
+        }
+    }
+    workloads.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    // Warning events, matched to the workload they concern.
+    let pod_owner: BTreeMap<(&str, &str), &str> = pods.iter().filter_map(|p| Some(((p.namespace.as_str(), p.name.as_str()), p.owner.as_deref()?))).collect();
+    let mut events: Vec<KubeEvent> = items(&lists.events)
+        .iter()
+        .filter_map(|e| {
+            let obj = &e["involvedObject"];
+            let (namespace, kind, name) = (text(&obj["namespace"])?, text(&obj["kind"])?, text(&obj["name"])?);
+            let workload = match kind.as_str() {
+                "Pod" => pod_owner.get(&(namespace.as_str(), name.as_str())).map(|o| o.to_string()),
+                "ReplicaSet" => rs_owner.get(&(namespace.clone(), name.clone())).map(|(k, n)| format!("{k}/{n}")),
+                "Deployment" | "StatefulSet" | "DaemonSet" => Some(format!("{kind}/{name}")),
+                _ => None,
+            };
+            let last = [&e["lastTimestamp"], &e["series"]["lastObservedTime"], &e["eventTime"], &e["metadata"]["creationTimestamp"]].into_iter().find_map(|t| t.as_str().and_then(timestamp_ms));
+            Some(KubeEvent {
+                object: format!("{kind}/{name}"),
+                namespace,
+                workload,
+                reason: text(&e["reason"]).unwrap_or_default(),
+                message: text(&e["message"]).unwrap_or_default(),
+                count: e["count"].as_u64().or_else(|| e["series"]["count"].as_u64()).map_or(1, |n| n as u32),
+                last,
+            })
+        })
+        .filter(|e| e.last.is_none_or(|t| t + EVENTS_FOR_MS >= at))
+        .collect();
+    events.sort_by_key(|e| std::cmp::Reverse(e.last));
+    events.truncate(MAX_EVENTS);
 
     // The engine of each volume knows which replicas it is using, and how.
     let modes: BTreeMap<String, String> = items(&lists.engines)
@@ -431,7 +679,7 @@ pub fn view_of(lists: &Lists, at: u64) -> KubeView {
         .collect();
     volumes.sort_by(|a, b| a.pvc.cmp(&b.pvc).then_with(|| a.name.cmp(&b.name)));
 
-    KubeView { at, error: None, workloads, pods, volumes }
+    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned() }
 }
 
 /// Keeps `tx` up to date with what Kubernetes runs, reading it with the
@@ -460,7 +708,7 @@ where
         match a.read().await {
             Ok(lists) => {
                 failures = 0;
-                tx.send_replace(Arc::new(view_of(&lists, node::runtime::wall_ms())));
+                tx.send_replace(Arc::new(view_of(&lists, node::runtime::wall_ms(), a.host())));
             }
             Err(e) => {
                 failures += 1;
@@ -537,6 +785,8 @@ mod tests {
         assert_eq!(pod_status(&pod(json!({ "phase": "Pending" }), false)), "Pending");
     }
 
+    const VIP: &str = "10.0.3.253";
+
     fn sample() -> Lists {
         Lists {
             pods: list(vec![
@@ -567,12 +817,25 @@ mod tests {
                 json!({ "metadata": { "name": "pvc-1-r-a" }, "spec": { "volumeName": "pvc-1", "nodeID": "ms01-01", "diskPath": "/mnt/nvme0", "failedAt": "2026-10-27T14:00:45Z" }, "status": { "currentState": "stopped" } }),
             ]),
             engines: list(vec![json!({ "status": { "replicaModeMap": { "pvc-1-r-b": "WO" } } })]),
+            services: list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "type": "ClusterIP", "selector": { "app": "web" }, "ports": [{ "port": 80 }] } })]),
+            ingresses: list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "rules": [{ "http": { "paths": [{ "path": "/", "backend": { "service": { "name": "web" } } }] } }] } })]),
+            events: list(vec![
+                json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "postgres-0" }, "reason": "FailedScheduling", "message": "0/4 nodes are available", "count": 3, "lastTimestamp": "1970-01-01T01:00:00Z" }),
+                json!({ "involvedObject": { "namespace": "demo", "kind": "ReplicaSet", "name": "web-6d4" }, "reason": "FailedCreate", "message": "quota", "lastTimestamp": "1970-01-01T01:30:00Z" }),
+                json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "gone-123" }, "reason": "BackOff", "message": "x", "lastTimestamp": "1970-01-01T01:10:00Z" }),
+                json!({ "involvedObject": { "kind": "Node", "name": "ms01-01" }, "reason": "InvalidDiskCapacity", "message": "x" }),
+                json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "web-6d4-x2" }, "reason": "Unhealthy", "message": "old", "lastTimestamp": "1970-01-01T00:00:01Z" }),
+            ]),
+            metrics: Ok(json!({ "items": [{ "metadata": { "namespace": "demo", "name": "web-6d4-x2" }, "containers": [{ "usage": { "cpu": "12m", "memory": "30Mi" } }, { "usage": { "cpu": "3m", "memory": "2Mi" } }] }] })),
         }
     }
 
+    /// 1:40, so events from 0:40 on are within the hour.
+    const NOW: u64 = 6_000_000;
+
     #[test]
     fn pods_belong_to_their_workload_and_node() {
-        let v = view_of(&sample(), 7);
+        let v = view_of(&sample(), 7, VIP);
         assert_eq!(v.at, 7);
         let names: Vec<_> = v.pods.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["postgres-0", "web-6d4-x2"]);
@@ -586,14 +849,14 @@ mod tests {
 
     #[test]
     fn workloads_count_their_ready_replicas() {
-        let v = view_of(&sample(), 0);
+        let v = view_of(&sample(), NOW, VIP);
         let rows: Vec<_> = v.workloads.iter().map(|w| (w.kind, w.name.as_str(), w.ready, w.desired)).collect();
         assert_eq!(rows, [(WorkloadKind::StatefulSet, "postgres", 0, 1), (WorkloadKind::Deployment, "web", 2, 3), (WorkloadKind::DaemonSet, "longhorn-manager", 5, 6)]);
     }
 
     #[test]
     fn volumes_list_their_claim_pods_and_replicas() {
-        let v = view_of(&sample(), 0);
+        let v = view_of(&sample(), NOW, VIP);
         let [vol] = v.volumes.as_slice() else { panic!("{:?}", v.volumes) };
         assert_eq!(vol.pvc.as_deref(), Some("demo/data-postgres-0"));
         assert_eq!(vol.pods, ["postgres-0"]);
@@ -604,8 +867,60 @@ mod tests {
     }
 
     #[test]
+    fn workloads_carry_health_usage_images_and_endpoints() {
+        let v = view_of(&sample(), NOW, VIP);
+        let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
+        assert_eq!(web.health.state, HealthState::RollingOut, "0 of 3 updated: {:?}", web.health);
+        assert_eq!((web.cpu_milli, web.memory_bytes, web.cpu_limit_milli), (Some(15), Some(32 << 20), None));
+        let eps: Vec<_> = web.endpoints.iter().map(|e| e.address.as_str()).collect();
+        // The template has no labels in this sample, so no Service selects it.
+        assert!(eps.is_empty(), "{eps:?}");
+        let pg = v.workloads.iter().find(|w| w.name == "postgres").unwrap();
+        assert_eq!((pg.cpu_milli, pg.memory_bytes), (None, None), "its pod has no usage yet");
+        assert_eq!(v.metrics_error, None);
+    }
+
+    #[test]
+    fn a_template_labelled_for_a_service_gets_its_endpoints() {
+        let mut lists = sample();
+        lists.deployments = list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "replicas": 1, "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "containers": [{ "image": "nginx:1.29" }] } } }, "status": {} })]);
+        let v = view_of(&lists, NOW, VIP);
+        let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
+        let eps: Vec<_> = web.endpoints.iter().map(|e| (e.address.as_str(), e.link.is_some())).collect();
+        assert_eq!(eps, [("http://10.0.3.253/", true), ("web.demo:80", false)]);
+        assert_eq!(web.images, ["nginx:1.29"]);
+    }
+
+    #[test]
+    fn warning_events_of_the_last_hour_are_matched_to_their_workload() {
+        let v = view_of(&sample(), NOW, VIP);
+        let rows: Vec<_> = v.events.iter().map(|e| (e.reason.as_str(), e.workload.as_deref(), e.count)).collect();
+        assert_eq!(
+            rows,
+            [("FailedCreate", Some("Deployment/web"), 1), ("BackOff", None, 1), ("FailedScheduling", Some("StatefulSet/postgres"), 3)],
+            "newest first; a ReplicaSet's are its Deployment's; nodes' and old ones left out"
+        );
+    }
+
+    #[test]
+    fn without_metrics_server_the_rest_still_shows() {
+        let lists = Lists { metrics: Err("metrics-server: 503 Service Unavailable".into()), ..sample() };
+        let v = view_of(&lists, NOW, VIP);
+        assert_eq!(v.metrics_error.as_deref(), Some("metrics-server: 503 Service Unavailable"));
+        assert!(v.workloads.iter().all(|w| w.cpu_milli.is_none() && w.memory_bytes.is_none()));
+        assert_eq!(v.workloads.len(), 3);
+    }
+
+    #[test]
+    fn the_vip_is_the_kubeconfigs_server_host() {
+        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new() }.host().to_string();
+        assert_eq!(host("https://10.0.3.253:6443"), "10.0.3.253");
+        assert_eq!(host("https://k3s.home"), "k3s.home");
+    }
+
+    #[test]
     fn missing_lists_are_empty() {
-        let v = view_of(&Lists::default(), 1);
+        let v = view_of(&Lists::default(), 1, VIP);
         assert!(v.pods.is_empty() && v.workloads.is_empty() && v.volumes.is_empty());
     }
 }

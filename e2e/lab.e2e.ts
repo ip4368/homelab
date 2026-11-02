@@ -6,7 +6,8 @@
 // design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
-// workload through `/api/kube`, as the Workloads tab does), checked against the cluster's Kubernetes API through the VIP with the
+// workload through `/api/kube`, as the Workloads tab does; K11 checks the
+// health, usage, endpoints and events the tab shows), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -27,6 +28,7 @@ import type { PortTruth } from '../ui/src/gen/PortTruth.ts'
 import type { SwitchPortCfg } from '../ui/src/gen/SwitchPortCfg.ts'
 import type { ApplyReport } from '../ui/src/gen/ApplyReport.ts'
 import type { KubeAction } from '../ui/src/gen/KubeAction.ts'
+import type { KubeView } from '../ui/src/gen/KubeView.ts'
 import { Kube } from './kube.ts'
 
 const BASE = process.env.LAB_URL ?? 'http://127.0.0.1:8080'
@@ -40,6 +42,8 @@ interface Seen {
   switches: Map<string, SwitchObj>
   cp: CpInfo
   truth: LabTruth
+  /** The server's read of Kubernetes, as the Workloads tab shows it. */
+  kube: KubeView
 }
 
 class Watcher {
@@ -76,6 +80,7 @@ class Watcher {
         switches: new Map(m.view.switches.map((w) => [w.id, w])),
         cp: m.view.cp,
         truth: m.truth,
+        kube: m.kube,
       }
       return
     }
@@ -83,6 +88,7 @@ class Watcher {
     s.leader = m.leader
     s.term = m.term
     s.truth = m.truth
+    if (m.kube) s.kube = m.kube
     for (const o of m.upserts) {
       if (o.type === 'Host') s.hosts.set(o.id, o)
       else if (o.type === 'Alert') s.alerts.set(o.id, o)
@@ -1023,6 +1029,93 @@ metadata: { name: ${ns} }
       return (d.status === 404 && left.items.length === 0) || `deployment ${d.status}, ${left.items.length} pods left`
     })
     note(`deleted: the Deployment and its pods gone ${secs(now() - asked)} after asking`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+await step('K11', 'Workload details: a healthy workload shows its usage, limits and an Ingress endpoint that answers; a broken one shows down, why, and its Warning events', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-details'
+  const tag = Math.random().toString(36).slice(2, 8)
+  const path = `/k11-${tag}`
+  const manifests = `apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: site }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: site } }
+  template:
+    metadata: { labels: { app: site } }
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: site
+          image: "busybox:1.37"
+          command: [sh, -c, "mkdir -p /www${path} && echo k11-${tag}-ok > /www${path}/index.html && exec httpd -f -p 8080 -h /www"]
+          ports: [{ containerPort: 8080 }]
+          resources: { limits: { cpu: 200m, memory: 64Mi } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: site }
+spec:
+  selector: { app: site }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: site }
+spec:
+  rules:
+    - http:
+        paths: [{ path: "${path}", pathType: Prefix, backend: { service: { name: site, port: { number: 80 } } } }]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: broken }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: broken } }
+  template:
+    metadata: { labels: { app: broken } }
+    spec:
+      containers: [{ name: broken, image: "registry.invalid/none:1" }]
+`
+  const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: manifests, namespace: ns, dry_run: false, force: false }) })
+  if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
+  try {
+    const workload = (name: string) => watch.seen!.kube.workloads.find((w) => w.namespace === ns && w.name === name)
+    const site = await waitFor('site healthy with its usage', 5 * 60_000, () => {
+      const w = workload('site')
+      return w?.health.state === 'Healthy' && w.memory_bytes !== null && w.cpu_milli !== null ? w : null
+    })
+    const w = site.value
+    if (w.cpu_limit_milli !== 400 || w.memory_limit_bytes !== 128 * 2 ** 20) throw new Failed(`site's limits: ${w.cpu_limit_milli}m and ${w.memory_limit_bytes} bytes, not 400m and 128Mi (2 pods)`)
+    const ingress = w.endpoints.find((e) => e.kind === 'Ingress')
+    if (!ingress?.link?.endsWith(path)) throw new Failed(`site's endpoints: ${JSON.stringify(w.endpoints)}`)
+    if (!w.endpoints.some((e) => e.address === `site.${ns}:80`)) throw new Failed(`no in-cluster endpoint: ${JSON.stringify(w.endpoints)}`)
+    const page = await waitAsync(`${ingress.link} answering`, 2 * 60_000, async () => {
+      const r = await fetch(`${ingress.link}/`)
+      const body = await r.text()
+      return (r.ok && body.includes(`k11-${tag}-ok`) && { body: body.trim() }) || `${r.status} ${body.slice(0, 80)}`
+    })
+    note(`site: healthy ${secs(site.ms)} after applying, using ${w.cpu_milli}m and ${Math.round(w.memory_bytes! / 2 ** 20)}Mi of 400m and 128Mi; ${ingress.address} answers "${page.value.body}"`)
+
+    const broken = await waitFor('broken down, for its image', 3 * 60_000, () => {
+      const b = workload('broken')
+      return b?.health.state === 'Down' && /ImagePullBackOff|ErrImagePull/.test(b.health.reason ?? '') ? b : null
+    })
+    const events = await waitFor("broken's Warning events", 2 * 60_000, () => {
+      const es = watch.seen!.kube.events.filter((e) => e.namespace === ns && e.workload === 'Deployment/broken')
+      return es.length > 0 ? es : null
+    })
+    note(`broken: down (${broken.value.health.reason}); events: ${[...new Set(events.value.map((e) => e.reason))].join(', ')}`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }
