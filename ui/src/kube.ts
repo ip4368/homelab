@@ -1,6 +1,8 @@
 import type { ApplyOutcome } from './gen/ApplyOutcome'
 import type { ApplyReport } from './gen/ApplyReport'
 import type { FieldConflict } from './gen/FieldConflict'
+import type { HealthState } from './gen/HealthState'
+import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeView } from './gen/KubeView'
 import type { KubeWorkload } from './gen/KubeWorkload'
@@ -134,9 +136,7 @@ export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind'>): { 
 
 /** The claims of a StatefulSet's pods: the Longhorn volumes its pods use. */
 export function workloadClaims(w: KubeWorkload, pods: KubePod[], volumes: LonghornVolume[]): string[] {
-  const owner = `${w.kind}/${w.name}`
-  const mine = new Set(pods.filter((p) => p.namespace === w.namespace && p.owner === owner).map((p) => p.name))
-  return volumes.filter((v) => v.pvc && volumeNamespace(v) === w.namespace && v.pods.some((p) => mine.has(p))).map((v) => v.pvc as string).sort()
+  return workloadVolumes(w, pods, volumes).flatMap((v) => (v.pvc ? [v.pvc] : [])).sort()
 }
 
 export function restartPrompt(w: KubeWorkload): string {
@@ -183,4 +183,59 @@ export function editDraft(w: KubeWorkload, yaml: string): { title: string; yaml:
     force: true,
     note: 'As kubectl edit: what you change is set, whoever set it before (a scale from this page, kubectl). Untick "take over" to see who that was instead.',
   }
+}
+
+/** Millicores as people read them: `850m`, `1.25 cores`; a dash for none. */
+export function cpu(milli: number | null | undefined): string {
+  if (milli === null || milli === undefined) return '–'
+  if (milli < 1000) return `${milli}m`
+  return `${(milli / 1000).toFixed(milli < 10_000 ? 2 : 1)} cores`
+}
+
+/** Bytes as Kubernetes writes memory: `84Mi`, `1.2Gi`; a dash for none. */
+export function mem(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined) return '–'
+  if (bytes < 2 ** 30) return `${Math.round(bytes / 2 ** 20)}Mi`
+  return `${(bytes / 2 ** 30).toFixed(1)}Gi`
+}
+
+/** Usage against a limit, when there is one: `84Mi / 2Gi`. */
+export function usage(used: number | null, limit: number | null, format: (n: number | null) => string): string {
+  return limit === null ? format(used) : `${format(used)} / ${format(limit)}`
+}
+
+/** Usage near or over its limit is worth a look. */
+export function usageTone(used: number | null, limit: number | null): Tone {
+  if (used === null || limit === null || limit === 0) return 'muted'
+  return used >= limit * 0.9 ? 'bad' : used >= limit * 0.75 ? 'warn' : 'ok'
+}
+
+export const HEALTH_LABELS: Record<HealthState, string> = { Healthy: 'healthy', RollingOut: 'rolling out', Degraded: 'degraded', Down: 'down', Idle: 'idle' }
+
+export function healthTone(s: HealthState): Tone {
+  return s === 'Healthy' ? 'ok' : s === 'Down' ? 'bad' : s === 'Idle' ? 'muted' : 'warn'
+}
+
+/** The Warning events about `w`: on it, its ReplicaSets or its pods (the server matched them). */
+export function workloadEvents(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'name'>, events: KubeEvent[]): KubeEvent[] {
+  const owner = `${w.kind}/${w.name}`
+  return events.filter((e) => e.namespace === w.namespace && e.workload === owner)
+}
+
+/** The Longhorn volumes `w`'s pods use. */
+export function workloadVolumes(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'name'>, pods: KubePod[], volumes: LonghornVolume[]): LonghornVolume[] {
+  const owner = `${w.kind}/${w.name}`
+  const mine = new Set(pods.filter((p) => p.namespace === w.namespace && p.owner === owner).map((p) => p.name))
+  return volumes.filter((v) => volumeNamespace(v) === w.namespace && v.pods.some((p) => mine.has(p)))
+}
+
+/** Why a pod is as it is, for its status's tooltip: Kubernetes' words, and how a container last ended. */
+export function podWhy(p: Pick<KubePod, 'detail' | 'last_termination' | 'restarts'>): string | undefined {
+  const parts = [p.detail, p.last_termination && p.restarts > 0 ? `last ended: ${p.last_termination.reason} (exit ${p.last_termination.exit_code})` : null]
+  return parts.filter(Boolean).join('\n') || undefined
+}
+
+/** A workload's key, as the drawer is opened with: `<namespace>/<kind>/<name>`. */
+export function workloadKey(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'name'>): string {
+  return `${w.namespace}/${w.kind}/${w.name}`
 }

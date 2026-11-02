@@ -6,6 +6,8 @@ import { KubeWorkloads } from './components/KubeWorkloads'
 import { NetworksPage } from './components/NetworksPage'
 import { RightRail } from './components/RightRail'
 import { SwitchDrawer } from './components/SwitchDrawer'
+import { WorkloadDrawer } from './components/WorkloadDrawer'
+import { workloadKey } from './kube'
 import { TopBar } from './components/TopBar'
 import { Topology } from './components/Topology'
 import { useStore } from './store'
@@ -23,20 +25,26 @@ export default function App() {
   const [view, setView] = useState<ViewName>(() => viewFromHash(location.hash))
   const [host, setHost] = useState<string | null>(null)
   const [sw, setSwitch] = useState<string | null>(null)
+  const [workload, setWorkload] = useState<string | null>(null)
   // `?truth` in the URL opens with the overlay on, so a link can show it.
   const [showTruth, setShowTruth] = useState(() => new URLSearchParams(location.search).has('truth'))
   const hostExists = useStore((s) => host !== null && host in s.view.hosts)
   const switchExists = useStore((s) => sw !== null && sw in s.view.switches)
-  // A removed host or switch must not stay selected.
+  const workloadExists = useStore((s) => workload !== null && s.kube.workloads.some((w) => workloadKey(w) === workload))
+  // A removed host, switch or workload must not stay selected.
   useEffect(() => {
     if (host !== null && !hostExists) setHost(null)
   }, [host, hostExists])
   useEffect(() => {
     if (sw !== null && !switchExists) setSwitch(null)
   }, [sw, switchExists])
-  // The switch drawer belongs to the topology view.
+  useEffect(() => {
+    if (workload !== null && !workloadExists) setWorkload(null)
+  }, [workload, workloadExists])
+  // The switch drawer belongs to the topology view, the workload drawer to the workloads view.
   useEffect(() => {
     if (view !== 'topology') setSwitch(null)
+    if (view !== 'workloads') setWorkload(null)
   }, [view])
   useEffect(() => {
     const onHash = () => setView(viewFromHash(location.hash))
@@ -48,9 +56,14 @@ export default function App() {
   const selectHost = (id: string) => {
     setHost(id)
     setSwitch(null)
+    setWorkload(null)
   }
   const selectSwitch = (id: string) => {
     setSwitch(id)
+    setHost(null)
+  }
+  const selectWorkload = (key: string) => {
+    setWorkload(key)
     setHost(null)
   }
 
@@ -73,12 +86,13 @@ export default function App() {
               ) : view === 'networks' ? (
                 <NetworksPage />
               ) : view === 'workloads' ? (
-                <KubeWorkloads onSelectHost={selectHost} />
+                <KubeWorkloads onSelectHost={selectHost} onSelectWorkload={selectWorkload} />
               ) : (
                 <Topology selectedSwitch={sw} selectedHost={host} onSelectSwitch={selectSwitch} onSelectHost={selectHost} />
               )}
             </main>
             {host && <HostDrawer key={host} id={host} onClose={() => setHost(null)} />}
+            {view === 'workloads' && workload && <WorkloadDrawer key={workload} id={workload} onClose={() => setWorkload(null)} onSelectHost={selectHost} />}
             {view === 'topology' && sw && <SwitchDrawer key={sw} id={sw} onClose={() => setSwitch(null)} onSelectHost={selectHost} onSelectSwitch={selectSwitch} />}
           </div>
           <LabPanel selected={host} />

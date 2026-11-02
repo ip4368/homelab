@@ -2,31 +2,16 @@ import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, deletePrompt, editDraft, filterKube, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
+import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
 
 /** Pod tables can be long; the filters narrow them. */
 const ROWS_SHOWN = 300
 
-function Hosts({ hosts, onSelectHost }: { hosts: string[]; onSelectHost(id: string): void }) {
-  if (hosts.length === 0) return <span className="muted">none</span>
-  return (
-    <>
-      {hosts.map((h, n) => (
-        <span key={h}>
-          {n > 0 && ', '}
-          <button className="link" onClick={() => onSelectHost(h)}>
-            {h}
-          </button>
-        </span>
-      ))}
-    </>
-  )
-}
-
 /** A workload's row: its replicas (editable, to scale it), Restart, Edit YAML and Delete, and Kubernetes' answer when it says no. */
-function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; hosts: string[]; onSelectHost(id: string): void; onEdit(d: ApplyDraft): void }) {
+function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWorkload; hosts: string[]; onSelectHost(id: string): void; onSelect(): void; onEdit(d: ApplyDraft): void }) {
   const pods = useStore((s) => s.kube.pods)
   const volumes = useStore((s) => s.kube.volumes)
   const { error, busy, run } = useAction()
@@ -57,10 +42,12 @@ function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; host
       <tr>
         <td className="muted">{w.namespace}</td>
         <td>
-          <strong>{w.name}</strong>
+          <button className="link" onClick={onSelect} title="details">
+            <strong>{w.name}</strong>
+          </button>{' '}
+          <span className="muted">{w.kind}</span>
         </td>
-        <td>{w.kind}</td>
-        <td className={workloadTone(w)}>
+        <td className={`${workloadTone(w)} num`}>
           {w.ready}/
           {can.scale ? (
             <input
@@ -99,6 +86,24 @@ function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; host
           )}
         </td>
         <td>
+          <HealthBadge health={w.health} />
+        </td>
+        <td className="num">
+          <Usage used={w.cpu_milli} limit={w.cpu_limit_milli} format={cpu} />
+        </td>
+        <td className="num">
+          <Usage used={w.memory_bytes} limit={w.memory_limit_bytes} format={mem} />
+        </td>
+        <td>
+          {w.endpoints.length > 0 ? <EndpointLink e={w.endpoints[0]} /> : <span className="muted">none</span>}
+          {w.endpoints.length > 1 && (
+            <button className="link muted" onClick={onSelect}>
+              {' '}
+              +{w.endpoints.length - 1}
+            </button>
+          )}
+        </td>
+        <td>
           <Hosts hosts={hosts} onSelectHost={onSelectHost} />
         </td>
         <td className="row-actions">
@@ -125,7 +130,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; host
       </tr>
       {error && (
         <tr>
-          <td colSpan={6}>
+          <td colSpan={9}>
             <div className="bad refusal" role="alert">
               {error}
             </div>
@@ -137,7 +142,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; host
 }
 
 /** What Kubernetes runs, as the server reads it from the K3s API: workloads, their pods and Longhorn's volumes. */
-export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void }) {
+export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost(id: string): void; onSelectWorkload(key: string): void }) {
   const kube = useStore((s) => s.kube)
   const now = useStore((s) => s.clock.now)
   const [filter, setFilter] = useState<KubeFilter>({ namespace: '', hideSystem: true, host: '', text: '' })
@@ -179,6 +184,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
           {kube.at > 0 && ` · read ${age(kube.at, now)} ago`}
         </span>
       </div>
+      {kube.metrics_error && kube.at > 0 && <p className="muted">No CPU and memory usage: {kube.metrics_error}</p>}
       {kube.error && <p className={kube.at > 0 ? 'warn' : 'muted'}>{kube.at > 0 ? `Last read failed: ${kube.error}` : `Waiting for Kubernetes: ${kube.error}`}</p>}
 
       <h4>Workloads</h4>
@@ -187,19 +193,22 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
           <tr>
             <th>Namespace</th>
             <th>Name</th>
-            <th>Kind</th>
             <th>Ready</th>
+            <th>Health</th>
+            <th>CPU</th>
+            <th>Memory</th>
+            <th>Endpoints</th>
             <th>Hosts</th>
             <th />
           </tr>
         </thead>
         <tbody>
           {rows.workloads.map(({ workload: w, hosts }) => (
-            <WorkloadRow key={`${w.namespace}/${w.kind}/${w.name}`} w={w} hosts={hosts} onSelectHost={onSelectHost} onEdit={setDraft} />
+            <WorkloadRow key={workloadKey(w)} w={w} hosts={hosts} onSelectHost={onSelectHost} onSelect={() => onSelectWorkload(workloadKey(w))} onEdit={setDraft} />
           ))}
           {rows.workloads.length === 0 && (
             <tr>
-              <td colSpan={6} className="muted">
+              <td colSpan={9} className="muted">
                 {kube.workloads.length === 0 ? 'None yet. Apply YAML adds some, or "Seed workloads" in the lab panel.' : 'Nothing matches the filters.'}
               </td>
             </tr>
@@ -216,6 +225,8 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
             <th>Status</th>
             <th>Ready</th>
             <th>Restarts</th>
+            <th>CPU</th>
+            <th>Memory</th>
             <th>Host</th>
             <th>Age</th>
           </tr>
@@ -227,18 +238,28 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
               <td title={p.owner ?? undefined}>
                 <strong>{p.name}</strong>
               </td>
-              <td className={podTone(p)}>{p.status}</td>
+              <td className={podTone(p)} title={podWhy(p)}>
+                {p.status}
+              </td>
               <td>
                 {p.ready}/{p.containers}
               </td>
-              <td className={p.restarts > 0 ? 'warn' : 'muted'}>{p.restarts}</td>
+              <td className={p.restarts > 0 ? 'warn' : 'muted'} title={podWhy(p)}>
+                {p.restarts}
+              </td>
+              <td className="num">
+                <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
+              </td>
+              <td className="num">
+                <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
+              </td>
               <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">unscheduled</span>}</td>
               <td className="muted">{age(p.created, now)}</td>
             </tr>
           ))}
           {rows.pods.length === 0 && (
             <tr>
-              <td colSpan={7} className="muted">
+              <td colSpan={9} className="muted">
                 {kube.pods.length === 0 ? 'No pods yet.' : 'Nothing matches the filters.'}
               </td>
             </tr>

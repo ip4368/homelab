@@ -68,7 +68,7 @@ export interface Store {
 }
 
 const emptyTruth: LabTruth = { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], at: 0 }
-export const emptyKube: KubeView = { at: 0, error: null, workloads: [], pods: [], volumes: [] }
+export const emptyKube: KubeView = { at: 0, error: null, workloads: [], pods: [], volumes: [], events: [], metrics_error: null }
 
 function initialState(): UiState {
   return {

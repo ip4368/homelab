@@ -631,6 +631,27 @@ label.inline {
   width: min(560px, 94vw);
 }
 
+.workload-drawer {
+  width: 560px;
+  /* Everything in it wraps; the vertical scrollbar alone would add a horizontal one. */
+  overflow-x: hidden;
+}
+
+.pod-why {
+  font-size: 11px;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  max-width: 220px;
+}
+
+.kube-events div {
+  overflow-wrap: anywhere;
+}
+
+.kube-events li {
+  margin-bottom: 6px;
+}
+
 .apply-dialog {
   width: min(880px, 94vw);
 }

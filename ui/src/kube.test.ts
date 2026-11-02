@@ -1,16 +1,53 @@
 import { describe, expect, it } from 'vitest'
 import type { ApplyReport } from './gen/ApplyReport'
+import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, deletePrompt, editDraft, filterKube, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
-  return { namespace, name, owner, node, status, ready: 1, containers: 1, restarts: 0, created: 0 }
+  return {
+    namespace,
+    name,
+    owner,
+    node,
+    status,
+    ready: 1,
+    containers: 1,
+    restarts: 0,
+    created: 0,
+    cpu_milli: null,
+    memory_bytes: null,
+    cpu_limit_milli: null,
+    memory_limit_bytes: null,
+    detail: null,
+    unschedulable: false,
+    last_termination: null,
+  }
 }
 
-const web: KubeWorkload = { namespace: 'demo', name: 'web', kind: 'Deployment', desired: 3, ready: 3 }
-const manager: KubeWorkload = { namespace: 'longhorn-system', name: 'longhorn-manager', kind: 'DaemonSet', desired: 2, ready: 2 }
+function workload(namespace: string, name: string, kind: KubeWorkload['kind'], desired: number, ready: number): KubeWorkload {
+  return {
+    namespace,
+    name,
+    kind,
+    desired,
+    ready,
+    updated: desired,
+    health: { state: 'Healthy', reason: null },
+    cpu_milli: null,
+    memory_bytes: null,
+    cpu_limit_milli: null,
+    memory_limit_bytes: null,
+    images: [],
+    endpoints: [],
+    conditions: [],
+  }
+}
+
+const web = workload('demo', 'web', 'Deployment', 3, 3)
+const manager = workload('longhorn-system', 'longhorn-manager', 'DaemonSet', 2, 2)
 const pods = [
   pod('demo', 'web-a', 'ms01-02', 'Deployment/web'),
   pod('demo', 'web-b', 'ms01-01', 'Deployment/web'),
@@ -97,7 +134,7 @@ describe('draining', () => {
   })
 
   it("deleting a StatefulSet says its claims stay, naming them", () => {
-    const postgres: KubeWorkload = { namespace: 'demo', name: 'postgres', kind: 'StatefulSet', desired: 1, ready: 1 }
+    const postgres = workload('demo', 'postgres', 'StatefulSet', 1, 1)
     const pgPods = [pod('demo', 'postgres-0', 'ms01-04', 'StatefulSet/postgres'), pod('other', 'postgres-0', 'ms01-04', 'StatefulSet/postgres')]
     const elsewhere = { ...volume, name: 'pvc-2', pvc: 'other/data-postgres-0' }
     const unused = { ...volume, name: 'pvc-3', pvc: 'demo/scratch', pods: [] }
@@ -134,5 +171,31 @@ describe('draining', () => {
   it('an edit of a live workload starts by taking over what it changes', () => {
     const d = editDraft(web, 'kind: Deployment')
     expect(d).toMatchObject({ title: 'Edit Deployment demo/web', yaml: 'kind: Deployment', namespace: 'demo', force: true })
+  })
+
+  it('writes CPU and memory as people read them, against a limit', () => {
+    expect([cpu(null), cpu(3), cpu(850), cpu(1250), cpu(12500)]).toEqual(['–', '3m', '850m', '1.25 cores', '12.5 cores'])
+    expect([mem(null), mem(84 * 2 ** 20), mem(1.25 * 2 ** 30)]).toEqual(['–', '84Mi', '1.3Gi'])
+    expect(usage(84 * 2 ** 20, 2 * 2 ** 30, mem)).toBe('84Mi / 2.0Gi')
+    expect(usage(850, null, cpu)).toBe('850m')
+    expect([usageTone(50, 100), usageTone(80, 100), usageTone(95, 100), usageTone(95, null)]).toEqual(['ok', 'warn', 'bad', 'muted'])
+    expect(['Healthy', 'RollingOut', 'Degraded', 'Down', 'Idle'].map((s) => healthTone(s as never))).toEqual(['ok', 'warn', 'warn', 'bad', 'muted'])
+  })
+
+  it("a workload's events and volumes are its own", () => {
+    const ev = (namespace: string, workload: string | null): KubeEvent => ({ namespace, workload, object: 'Pod/x', reason: 'BackOff', message: '', count: 1, last: 0 })
+    expect(workloadEvents(web, [ev('demo', 'Deployment/web'), ev('other', 'Deployment/web'), ev('demo', 'Deployment/api'), ev('demo', null)])).toEqual([ev('demo', 'Deployment/web')])
+    const postgres = workload('demo', 'postgres', 'StatefulSet', 1, 1)
+    const pgPods = [pod('demo', 'postgres-0', 'ms01-04', 'StatefulSet/postgres')]
+    expect(workloadVolumes(postgres, pgPods, [volume, { ...volume, name: 'pvc-2', pvc: 'demo/other', pods: ['api-0'] }]).map((v) => v.name)).toEqual(['pvc-1'])
+    expect(workloadKey(postgres)).toBe('demo/StatefulSet/postgres')
+  })
+
+  it("says why a pod is as it is, and how it last ended if it restarted", () => {
+    const p = { ...pod('demo', 'a', null, null, 'Pending'), detail: '0/4 nodes are available' }
+    expect(podWhy(p)).toBe('0/4 nodes are available')
+    const restarted = { ...pod('demo', 'b', 'x', null), restarts: 3, last_termination: { reason: 'OOMKilled', exit_code: 137, at: null } }
+    expect(podWhy(restarted)).toBe('last ended: OOMKilled (exit 137)')
+    expect(podWhy(pod('demo', 'c', 'x', null))).toBeUndefined()
   })
 })
