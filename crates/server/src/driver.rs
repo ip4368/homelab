@@ -7,6 +7,7 @@ use control::client::{ClusterView, ClientActor};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::Svc;
 use crate::kube::{self, KubeView};
+use crate::kube_action::{self, ActionError, KubeAction};
 use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
 use model::HostId;
@@ -14,7 +15,7 @@ use node::runtime::{wall_ms, NodeHandle};
 use serde::Serialize;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use ts_rs::TS;
 
 /// The demo workloads `./lab.sh seed` and the lab panel apply.
@@ -84,6 +85,8 @@ pub struct DriverHandle {
     client: NodeHandle,
     lab: Option<Arc<Lab>>,
     published: watch::Receiver<Arc<Published>>,
+    /// Asks for a read of Kubernetes now, rather than at the next poll.
+    kube_now: Arc<Notify>,
 }
 
 fn empty_truth() -> LabTruth {
@@ -118,10 +121,10 @@ impl DriverHandle {
                 tokio::time::sleep(PUBLISH_EVERY).await;
             }
         });
-        let handle = Self { client, lab, published };
+        let handle = Self { client, lab, published, kube_now: Arc::new(Notify::new()) };
         // Reads Kubernetes with the admin kubeconfig the control plane hands out.
         let h = handle.clone();
-        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx));
+        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx, handle.kube_now.clone()));
         handle
     }
 
@@ -179,6 +182,19 @@ impl DriverHandle {
             ApiResult::Err(e) => Err(LabError::Failed(e)),
             ApiResult::NotLeader | ApiResult::Unavailable => Err(LabError::Failed("the control plane did not answer".into())),
         }
+    }
+
+    /// Makes a change the user asked for to a workload, with the admin
+    /// kubeconfig, then reads Kubernetes again so the UI shows it at once.
+    pub async fn kube_action(&self, action: KubeAction) -> Result<(), ActionError> {
+        if let Some(why) = kube_action::refusal(&action) {
+            return Err(ActionError::Refused(why));
+        }
+        let kubeconfig = self.kubeconfig().await.map_err(|e| ActionError::Unavailable(format!("no kubeconfig: {e}")))?;
+        let access = kube::Access::from_kubeconfig(&kubeconfig).map_err(|e| ActionError::Unavailable(format!("the kubeconfig: {e}")))?;
+        let done = kube_action::run(&access, &action, wall_ms()).await;
+        self.kube_now.notify_one();
+        done
     }
 
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an

@@ -4,13 +4,13 @@
 //! few seconds, the way `kubectl get` would.
 
 use base64::Engine;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use ts_rs::TS;
 
 /// The pause between reads.
@@ -36,13 +36,43 @@ pub struct KubeView {
     pub volumes: Vec<LonghornVolume>,
 }
 
+/// The kinds of workload the Workloads tab shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
+pub enum WorkloadKind {
+    Deployment,
+    StatefulSet,
+    DaemonSet,
+}
+
+impl WorkloadKind {
+    /// Its resource in the `apps/v1` API.
+    pub fn resource(self) -> &'static str {
+        match self {
+            WorkloadKind::Deployment => "deployments",
+            WorkloadKind::StatefulSet => "statefulsets",
+            WorkloadKind::DaemonSet => "daemonsets",
+        }
+    }
+}
+
+impl std::fmt::Display for WorkloadKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            WorkloadKind::Deployment => "Deployment",
+            WorkloadKind::StatefulSet => "StatefulSet",
+            WorkloadKind::DaemonSet => "DaemonSet",
+        })
+    }
+}
+
 /// A Deployment, StatefulSet or DaemonSet.
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
 #[ts(export)]
 pub struct KubeWorkload {
     pub namespace: String,
     pub name: String,
-    pub kind: String,
+    pub kind: WorkloadKind,
     pub desired: u32,
     pub ready: u32,
 }
@@ -161,6 +191,24 @@ impl Access {
     }
 
     /// Everything the view is built from, fetched at once.
+    /// Sends a `method` request to `path` (with `body` as `(content type, JSON)`):
+    /// the API's answer, or its own words for why not (a Kubernetes `Status`'s
+    /// message, as kubectl prints it).
+    pub async fn send(&self, method: reqwest::Method, path: &str, body: Option<(&str, &Value)>) -> Result<Value, SendError> {
+        let mut req = self.client.request(method, format!("{}{path}", self.server));
+        if let Some((content_type, body)) = body {
+            req = req.header(reqwest::header::CONTENT_TYPE, content_type).body(body.to_string());
+        }
+        let res = req.send().await.map_err(|e| SendError::Unreachable(e.to_string()))?;
+        let status = res.status();
+        let answer: Value = res.json().await.unwrap_or(Value::Null);
+        if status.is_success() {
+            return Ok(answer);
+        }
+        let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
+        Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message } })
+    }
+
     pub async fn read(&self) -> Result<Lists, ReadError> {
         let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines) = tokio::try_join!(
             self.list("/api/v1/pods"),
@@ -187,6 +235,23 @@ impl std::fmt::Display for ReadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ReadError::Refused(e) | ReadError::Failed(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Why the API did not do what was sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SendError {
+    /// The API answered no (4xx), saying why.
+    Refused { status: u16, message: String },
+    /// No answer, or the API failed (5xx).
+    Unreachable(String),
+}
+
+impl std::fmt::Display for SendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SendError::Refused { message, .. } | SendError::Unreachable(message) => f.write_str(message),
         }
     }
 }
@@ -219,6 +284,23 @@ fn timestamp_ms(t: &str) -> Option<u64> {
     let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + d - 1;
     let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
     u64::try_from((days * 86_400 + secs) * 1000).ok()
+}
+
+/// The Kubernetes timestamp (RFC 3339 in UTC) of Unix ms `ms`, to the second.
+pub fn rfc3339(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Howard Hinnant's civil_from_days, the inverse of `timestamp_ms`'s.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem / 60 % 60, rem % 60)
 }
 
 /// kubectl's STATUS for a pod: being deleted, or the first container's
@@ -263,17 +345,17 @@ pub fn view_of(lists: &Lists, at: u64) -> KubeView {
     for d in items(&lists.deployments) {
         let (namespace, name) = key(&d["metadata"]);
         let desired = d["spec"]["replicas"].as_u64().map_or(1, |n| n as u32);
-        workloads.push(KubeWorkload { namespace, name, kind: "Deployment".into(), desired, ready: count(&d["status"]["readyReplicas"]) });
+        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::Deployment, desired, ready: count(&d["status"]["readyReplicas"]) });
     }
     for s in items(&lists.statefulsets) {
         let (namespace, name) = key(&s["metadata"]);
         let desired = s["spec"]["replicas"].as_u64().map_or(1, |n| n as u32);
-        workloads.push(KubeWorkload { namespace, name, kind: "StatefulSet".into(), desired, ready: count(&s["status"]["readyReplicas"]) });
+        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::StatefulSet, desired, ready: count(&s["status"]["readyReplicas"]) });
     }
     for d in items(&lists.daemonsets) {
         let (namespace, name) = key(&d["metadata"]);
         let (desired, ready) = (count(&d["status"]["desiredNumberScheduled"]), count(&d["status"]["numberReady"]));
-        workloads.push(KubeWorkload { namespace, name, kind: "DaemonSet".into(), desired, ready });
+        workloads.push(KubeWorkload { namespace, name, kind: WorkloadKind::DaemonSet, desired, ready });
     }
     workloads.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
 
@@ -354,7 +436,8 @@ pub fn view_of(lists: &Lists, at: u64) -> KubeView {
 /// Keeps `tx` up to date with what Kubernetes runs, reading it with the
 /// kubeconfig `kubeconfig` gives (asked again whenever the API refuses it
 /// or keeps failing). A failed read keeps the last lists and says why.
-pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>)
+/// `now` cuts the pause between reads short (after a change from the UI).
+pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>, now: Arc<Notify>)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<String, String>>,
@@ -388,7 +471,10 @@ where
                 tx.send_replace(Arc::new(KubeView { error: Some(e.to_string()), ..last }));
             }
         }
-        tokio::time::sleep(POLL_EVERY).await;
+        tokio::select! {
+            () = tokio::time::sleep(POLL_EVERY) => {}
+            () = now.notified() => {}
+        }
     }
 }
 
@@ -407,6 +493,15 @@ mod tests {
         assert_eq!(timestamp_ms("2026-10-27T14:00:45Z"), Some(1_793_109_645_000));
         assert_eq!(timestamp_ms("2024-02-29T23:59:59Z"), Some(1_709_251_199_000));
         assert_eq!(timestamp_ms("yesterday"), None);
+    }
+
+    #[test]
+    fn unix_ms_are_written_as_timestamps() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_793_109_645_999), "2026-10-27T14:00:45Z");
+        for t in ["2024-02-29T23:59:59Z", "2000-03-01T00:00:00Z", "2026-12-31T08:09:10Z"] {
+            assert_eq!(rfc3339(timestamp_ms(t).unwrap()), t);
+        }
     }
 
     #[test]
@@ -491,8 +586,8 @@ mod tests {
     #[test]
     fn workloads_count_their_ready_replicas() {
         let v = view_of(&sample(), 0);
-        let rows: Vec<_> = v.workloads.iter().map(|w| (w.kind.as_str(), w.name.as_str(), w.ready, w.desired)).collect();
-        assert_eq!(rows, [("StatefulSet", "postgres", 0, 1), ("Deployment", "web", 2, 3), ("DaemonSet", "longhorn-manager", 5, 6)]);
+        let rows: Vec<_> = v.workloads.iter().map(|w| (w.kind, w.name.as_str(), w.ready, w.desired)).collect();
+        assert_eq!(rows, [(WorkloadKind::StatefulSet, "postgres", 0, 1), (WorkloadKind::Deployment, "web", 2, 3), (WorkloadKind::DaemonSet, "longhorn-manager", 5, 6)]);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! hardware faults, and the WebSocket.
 
 use crate::driver::{DriverHandle, LabError};
+use crate::kube_action::{ActionError, KubeAction};
 use crate::ws::ws_handler;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
@@ -21,6 +22,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/lab/fault", post(lab_fault))
         .route("/api/lab/kubeconfig", get(lab_kubeconfig))
         .route("/api/lab/seed", post(lab_seed))
+        .route("/api/kube", post(kube_action))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -120,6 +122,18 @@ async fn lab_seed(State(driver): State<DriverHandle>) -> Response {
         Err(e @ (LabError::NoLab | LabError::NoToken | LabError::NoKubeServer)) => error(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()),
         Err(LabError::Failed(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
         Err(LabError::Panicked(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+    }
+}
+
+/// 200 `{"ok": true}` once Kubernetes has taken the change; 400 if the
+/// server refuses it (a system namespace), Kubernetes' own 4xx if it does
+/// (404 no such workload, 422 invalid), 503 without a kubeconfig or an API.
+async fn kube_action(State(driver): State<DriverHandle>, Json(action): Json<KubeAction>) -> Response {
+    match driver.kube_action(action).await {
+        Ok(()) => Json(json!({ "ok": true })).into_response(),
+        Err(ActionError::Refused(message)) => error(StatusCode::BAD_REQUEST, &message),
+        Err(ActionError::Kube { status, message }) => error(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), &message),
+        Err(ActionError::Unavailable(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
     }
 }
 
@@ -251,6 +265,23 @@ pub mod tests {
         assert_eq!(msg["type"], "snapshot");
         assert_eq!(msg["view"]["leader"], "ms01-01");
         assert!(msg["clock"]["now"].as_u64().unwrap() > 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn workload_actions_are_checked_before_kubernetes_is_asked() {
+        let (driver, _host) = cluster();
+        wait_for_leader(&driver).await;
+        let app = app(driver);
+        let workload = |ns: &str, kind: &str| json!({ "namespace": ns, "kind": kind, "name": "x" });
+        let (status, body) = post_json(&app, "/api/kube", json!({ "Delete": { "workload": workload("longhorn-system", "DaemonSet") } })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("kubectl"), "{body}");
+        let (status, body) = post_json(&app, "/api/kube", json!({ "Scale": { "workload": workload("demo", "DaemonSet"), "replicas": 2 } })).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(post_json(&app, "/api/kube", json!({ "Restart": { "workload": workload("demo", "Pod") } })).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        // This one-host cluster runs no K3s server, so it hands out no kubeconfig.
+        let (status, body) = post_json(&app, "/api/kube", json!({ "Restart": { "workload": workload("demo", "Deployment") } })).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
     }
 
     #[tokio::test]

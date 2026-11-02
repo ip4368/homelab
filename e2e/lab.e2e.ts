@@ -5,7 +5,8 @@
 // done to hardware). Each step is a success criterion of the real VM lab
 // design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
-// §5, checked against the cluster's Kubernetes API through the VIP with the
+// §5 (K9 drains a host; K10 changes a workload through `POST /api/kube`, as
+// the Workloads tab does), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -24,6 +25,7 @@ import type { SwitchObj } from '../ui/src/gen/SwitchObj.ts'
 import type { Mistake } from '../ui/src/gen/Mistake.ts'
 import type { PortTruth } from '../ui/src/gen/PortTruth.ts'
 import type { SwitchPortCfg } from '../ui/src/gen/SwitchPortCfg.ts'
+import type { KubeAction } from '../ui/src/gen/KubeAction.ts'
 import { Kube } from './kube.ts'
 
 const BASE = process.env.LAB_URL ?? 'http://127.0.0.1:8080'
@@ -906,6 +908,78 @@ await step('K9', 'Drain: a drained host\'s node is cordoned and its pods move of
     note(`uncordoned: the node is schedulable ${secs(back.ms)} later`)
   } finally {
     if (victim) await op({ Uncordon: { id: victim } }).catch(() => {})
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+await step('K10', 'Workload actions: the server scales, restarts and deletes a workload as kubectl would, and refuses the system namespaces', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-actions'
+  const app = `web-${Math.random().toString(36).slice(2, 8)}`
+  const workload = { namespace: ns, kind: 'Deployment' as const, name: app }
+  /** `POST /api/kube`: the status and the server's error, if any. */
+  const act = async (a: KubeAction) => {
+    const res = await fetch(`${BASE}/api/kube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(a) })
+    return { status: res.status, error: res.ok ? null : ((await res.json().catch(() => ({}))) as { error?: string }).error ?? res.statusText }
+  }
+  const must = async (a: KubeAction) => {
+    const r = await act(a)
+    if (r.status !== 200) throw new Failed(`${JSON.stringify(a)}: ${r.status} ${r.error}`)
+  }
+  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  try {
+    await k.create(`/apis/apps/v1/namespaces/${ns}/deployments`, {
+      metadata: { name: app },
+      spec: {
+        replicas: 1,
+        selector: { matchLabels: { app } },
+        template: {
+          metadata: { labels: { app } },
+          spec: { terminationGracePeriodSeconds: 5, containers: [{ name: 'web', image: 'busybox:1.37', command: ['sh', '-c', 'exec sleep 1000000'] }] },
+        },
+      },
+    })
+    const running = async () =>
+      ((await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)).items as Obj[]).filter((p) => !p.metadata.deletionTimestamp && p.status.phase === 'Running').map((p) => p.metadata.name as string)
+    const pods = async (n: number) => {
+      const ps = await running()
+      return (ps.length === n && ps) || `${ps.length} running: ${ps}`
+    }
+    await waitAsync(`${app}'s pod running`, 5 * 60_000, () => pods(1))
+
+    let asked = now()
+    await must({ Scale: { workload, replicas: 2 } })
+    const scaled = await waitAsync(`${app} scaled to 2 running pods`, 3 * 60_000, () => pods(2))
+    note(`scaled to 2: both pods running ${secs(now() - asked)} after asking`)
+
+    asked = now()
+    await must({ Restart: { workload } })
+    const restarted = await waitAsync(`${app}'s pods replaced`, 3 * 60_000, async () => {
+      const ps = await running()
+      return (ps.length === 2 && ps.every((p) => !scaled.value.includes(p)) && ps) || `running: ${ps}; before: ${scaled.value}`
+    })
+    const annotations = (await k.must(`/apis/apps/v1/namespaces/${ns}/deployments/${app}`)).spec.template.metadata.annotations ?? {}
+    if (!annotations['kubectl.kubernetes.io/restartedAt']) throw new Failed('restarted, but the pod template has no restartedAt annotation')
+    note(`restarted: 2 new pods (${restarted.value.join(', ')}) running ${secs(now() - asked)} after asking`)
+
+    const refused = await act({ Restart: { workload: { namespace: 'kube-system', kind: 'Deployment', name: 'coredns' } } })
+    if (refused.status !== 400) throw new Failed(`restarting kube-system/coredns: ${refused.status}, not refused`)
+    const daemon = await act({ Scale: { workload: { ...workload, kind: 'DaemonSet' }, replicas: 3 } })
+    if (daemon.status !== 400) throw new Failed(`scaling a DaemonSet: ${daemon.status}, not refused`)
+    const missing = await act({ Restart: { workload: { ...workload, name: `${app}-none` } } })
+    if (missing.status !== 404) throw new Failed(`restarting a workload that does not exist: ${missing.status} ${missing.error}`)
+    note(`refused: kube-system (${refused.error}); scaling a DaemonSet; a missing workload is Kubernetes' 404 (${missing.error})`)
+
+    asked = now()
+    await must({ Delete: { workload } })
+    await waitAsync(`${app} and its pods gone`, 3 * 60_000, async () => {
+      const d = await k.get(`/apis/apps/v1/namespaces/${ns}/deployments/${app}`)
+      const left = await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)
+      return (d.status === 404 && left.items.length === 0) || `deployment ${d.status}, ${left.items.length} pods left`
+    })
+    note(`deleted: the Deployment and its pods gone ${secs(now() - asked)} after asking`)
+  } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }
 })

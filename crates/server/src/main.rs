@@ -5,6 +5,7 @@
 mod api;
 mod driver;
 mod kube;
+mod kube_action;
 mod ws;
 
 use axum::Router;
