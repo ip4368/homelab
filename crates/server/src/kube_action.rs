@@ -67,7 +67,7 @@ impl std::fmt::Display for ActionError {
 impl From<SendError> for ActionError {
     fn from(e: SendError) -> Self {
         match e {
-            SendError::Refused { status, message } => ActionError::Kube { status, message },
+            SendError::Refused { status, message, .. } => ActionError::Kube { status, message },
             SendError::Unreachable(m) => ActionError::Unavailable(format!("the Kubernetes API: {m}")),
         }
     }
@@ -76,7 +76,7 @@ impl From<SendError> for ActionError {
 /// A Kubernetes object name: a DNS subdomain (lowercase letters, digits,
 /// `-` and `.`, at most 253). Anything else could not name an object, and
 /// would not be safe in a URL path.
-fn valid_name(s: &str) -> bool {
+pub fn valid_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 253 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
 }
 

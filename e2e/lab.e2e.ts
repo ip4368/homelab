@@ -5,8 +5,8 @@
 // done to hardware). Each step is a success criterion of the real VM lab
 // design (docs/plans/2026-10-26-real-vm-lab-design.md §10), timed, and the
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
-// §5 (K9 drains a host; K10 changes a workload through `POST /api/kube`, as
-// the Workloads tab does), checked against the cluster's Kubernetes API through the VIP with the
+// §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
+// workload through `/api/kube`, as the Workloads tab does), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -25,6 +25,7 @@ import type { SwitchObj } from '../ui/src/gen/SwitchObj.ts'
 import type { Mistake } from '../ui/src/gen/Mistake.ts'
 import type { PortTruth } from '../ui/src/gen/PortTruth.ts'
 import type { SwitchPortCfg } from '../ui/src/gen/SwitchPortCfg.ts'
+import type { ApplyReport } from '../ui/src/gen/ApplyReport.ts'
 import type { KubeAction } from '../ui/src/gen/KubeAction.ts'
 import { Kube } from './kube.ts'
 
@@ -912,7 +913,7 @@ await step('K9', 'Drain: a drained host\'s node is cordoned and its pods move of
   }
 })
 
-await step('K10', 'Workload actions: the server scales, restarts and deletes a workload as kubectl would, and refuses the system namespaces', async (note) => {
+await step('K10', 'Workload changes: the server applies YAML (preview first), scales, restarts, edits and deletes a workload as kubectl would, and refuses the system namespaces', async (note) => {
   await kubeHealthy(5 * 60_000)
   const k = await kube()
   const ns = 'e2e-actions'
@@ -927,19 +928,39 @@ await step('K10', 'Workload actions: the server scales, restarts and deletes a w
     const r = await act(a)
     if (r.status !== 200) throw new Failed(`${JSON.stringify(a)}: ${r.status} ${r.error}`)
   }
-  await k.create('/api/v1/namespaces', { metadata: { name: ns } })
+  /** `POST /api/kube/apply` that must answer 200: each object's outcome, as `<kind>/<name>=<outcome>`. */
+  const apply = async (yaml: string, dry_run: boolean, force = false) => {
+    const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run, force }) })
+    if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
+    const report = (await res.json()) as ApplyReport
+    return report.objects.map((o) => `${o.kind}/${o.name}=${typeof o.outcome === 'string' ? o.outcome : Object.keys(o.outcome)[0]}`).join(' ')
+  }
+  const expect = (what: string, got: string, want: string) => {
+    if (got !== want) throw new Failed(`${what}: ${got}, not ${want}`)
+  }
+  // The Deployment first and no namespace in it: the server puts the Namespace first and the Deployment in `ns`.
+  const manifests = `apiVersion: apps/v1
+kind: Deployment
+metadata: { name: ${app} }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: ${app} } }
+  template:
+    metadata: { labels: { app: ${app} } }
+    spec:
+      terminationGracePeriodSeconds: 5
+      containers: [{ name: web, image: "busybox:1.37", command: [sh, -c, "exec sleep 1000000"] }]
+---
+apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+`
   try {
-    await k.create(`/apis/apps/v1/namespaces/${ns}/deployments`, {
-      metadata: { name: app },
-      spec: {
-        replicas: 1,
-        selector: { matchLabels: { app } },
-        template: {
-          metadata: { labels: { app } },
-          spec: { terminationGracePeriodSeconds: 5, containers: [{ name: 'web', image: 'busybox:1.37', command: ['sh', '-c', 'exec sleep 1000000'] }] },
-        },
-      },
-    })
+    expect('previewing', await apply(manifests, true), `Namespace/${ns}=Created Deployment/${app}=AfterNamespace`)
+    if ((await k.get(`/api/v1/namespaces/${ns}`)).status !== 404) throw new Failed(`the preview created ${ns}`)
+    expect('applying', await apply(manifests, false), `Namespace/${ns}=Created Deployment/${app}=Created`)
+    expect('previewing again', await apply(manifests, true), `Namespace/${ns}=Unchanged Deployment/${app}=Unchanged`)
+    note(`applied YAML: the preview said what would be created and created nothing; then ${ns} and ${app} were created, and a second preview finds them unchanged`)
     const running = async () =>
       ((await k.must(`/api/v1/namespaces/${ns}/pods?labelSelector=app%3D${app}`)).items as Obj[]).filter((p) => !p.metadata.deletionTimestamp && p.status.phase === 'Running').map((p) => p.metadata.name as string)
     const pods = async (n: number) => {
@@ -970,6 +991,29 @@ await step('K10', 'Workload actions: the server scales, restarts and deletes a w
     const missing = await act({ Restart: { workload: { ...workload, name: `${app}-none` } } })
     if (missing.status !== 404) throw new Failed(`restarting a workload that does not exist: ${missing.status} ${missing.error}`)
     note(`refused: kube-system (${refused.error}); scaling a DaemonSet; a missing workload is Kubernetes' 404 (${missing.error})`)
+
+    // Edit YAML: the live Deployment as a manifest, changed and applied again.
+    const res = await fetch(`${BASE}/api/kube/manifest?namespace=${ns}&kind=Deployment&name=${app}`)
+    const live = await res.text()
+    if (!res.ok || !live.includes('replicas: 2') || live.includes('resourceVersion') || live.includes('status:')) throw new Failed(`the manifest to edit: ${res.status} ${live.slice(0, 300)}`)
+    // The UI's Scale set replicas through the scale subresource: an edit takes it over, as the Edit YAML dialog does.
+    const edited = live.replace('replicas: 2', 'replicas: 1')
+    expect('previewing the edit without taking over', await apply(edited, true), `Deployment/${app}=Conflict`)
+    expect('previewing the edit', await apply(edited, true, true), `Deployment/${app}=Configured`)
+    expect('applying the edit', await apply(edited, false, true), `Deployment/${app}=Configured`)
+    await waitAsync(`${app} back to 1 running pod`, 3 * 60_000, () => pods(1))
+    note('edited: the live manifest came without status or bookkeeping, and applying it with 1 replica scaled the Deployment down')
+
+    // A field another manager set: a conflict, until taken over.
+    await k.create(`/api/v1/namespaces/${ns}/configmaps`, { metadata: { name: 'settings' }, data: { mode: 'a' } })
+    const settings = 'apiVersion: v1\nkind: ConfigMap\nmetadata: { name: settings }\ndata: { mode: b }\n'
+    expect('previewing a change to a field another manager owns', await apply(settings, true), 'ConfigMap/settings=Conflict')
+    expect('taking it over', await apply(settings, false, true), 'ConfigMap/settings=Configured')
+    const mode = (await k.must(`/api/v1/namespaces/${ns}/configmaps/settings`)).data.mode
+    if (mode !== 'b') throw new Failed(`taken over, but mode is ${mode}`)
+    const intoSystem = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: settings, namespace: 'kube-system', dry_run: true, force: false }) })
+    if (intoSystem.status !== 400) throw new Failed(`applying into kube-system: ${intoSystem.status}, not refused`)
+    note('a field another manager set conflicts until taken over; applying into kube-system is refused')
 
     asked = now()
     await must({ Delete: { workload } })

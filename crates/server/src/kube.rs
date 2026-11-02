@@ -206,7 +206,7 @@ impl Access {
             return Ok(answer);
         }
         let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
-        Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message } })
+        Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
     }
 
     pub async fn read(&self) -> Result<Lists, ReadError> {
@@ -242,8 +242,9 @@ impl std::fmt::Display for ReadError {
 /// Why the API did not do what was sent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendError {
-    /// The API answered no (4xx), saying why.
-    Refused { status: u16, message: String },
+    /// The API answered no (4xx), saying why: its `Status`'s message, and the
+    /// whole `Status` (a conflict's details are in it).
+    Refused { status: u16, message: String, status_body: Value },
     /// No answer, or the API failed (5xx).
     Unreachable(String),
 }

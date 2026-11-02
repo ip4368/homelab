@@ -2,7 +2,8 @@
 //! hardware faults, and the WebSocket.
 
 use crate::driver::{DriverHandle, LabError};
-use crate::kube_action::{ActionError, KubeAction};
+use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
+use crate::kube_apply::ApplyRequest;
 use crate::ws::ws_handler;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
@@ -23,6 +24,8 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/lab/kubeconfig", get(lab_kubeconfig))
         .route("/api/lab/seed", post(lab_seed))
         .route("/api/kube", post(kube_action))
+        .route("/api/kube/apply", post(kube_apply))
+        .route("/api/kube/manifest", get(kube_manifest))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -125,15 +128,40 @@ async fn lab_seed(State(driver): State<DriverHandle>) -> Response {
     }
 }
 
-/// 200 `{"ok": true}` once Kubernetes has taken the change; 400 if the
-/// server refuses it (a system namespace), Kubernetes' own 4xx if it does
-/// (404 no such workload, 422 invalid), 503 without a kubeconfig or an API.
+/// 400 if the server refuses, Kubernetes' own 4xx if it does (404 no such
+/// workload, 422 invalid), 503 without a kubeconfig or an API.
+fn action_error(e: ActionError) -> Response {
+    match e {
+        ActionError::Refused(message) => error(StatusCode::BAD_REQUEST, &message),
+        ActionError::Kube { status, message } => error(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), &message),
+        ActionError::Unavailable(message) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
+    }
+}
+
+/// 200 `{"ok": true}` once Kubernetes has taken the change; else as [`action_error`].
 async fn kube_action(State(driver): State<DriverHandle>, Json(action): Json<KubeAction>) -> Response {
     match driver.kube_action(action).await {
         Ok(()) => Json(json!({ "ok": true })).into_response(),
-        Err(ActionError::Refused(message)) => error(StatusCode::BAD_REQUEST, &message),
-        Err(ActionError::Kube { status, message }) => error(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST), &message),
-        Err(ActionError::Unavailable(message)) => error(StatusCode::SERVICE_UNAVAILABLE, &message),
+        Err(e) => action_error(e),
+    }
+}
+
+/// 200 with an [`ApplyReport`](crate::kube_apply::ApplyReport): what became
+/// of each object, Kubernetes' refusals and conflicts among them. 400 if the
+/// YAML does not parse or the server refuses an object (then nothing is
+/// applied); else as [`action_error`].
+async fn kube_apply(State(driver): State<DriverHandle>, Json(req): Json<ApplyRequest>) -> Response {
+    match driver.kube_apply(req).await {
+        Ok(report) => Json(report).into_response(),
+        Err(e) => action_error(e),
+    }
+}
+
+/// `?namespace=&kind=&name=`: 200 with the workload as YAML to edit; else as [`action_error`].
+async fn kube_manifest(State(driver): State<DriverHandle>, Query(w): Query<WorkloadRef>) -> Response {
+    match driver.kube_manifest(w).await {
+        Ok(yaml) => ([("content-type", "application/yaml")], yaml).into_response(),
+        Err(e) => action_error(e),
     }
 }
 
@@ -282,6 +310,10 @@ pub mod tests {
         // This one-host cluster runs no K3s server, so it hands out no kubeconfig.
         let (status, body) = post_json(&app, "/api/kube", json!({ "Restart": { "workload": workload("demo", "Deployment") } })).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        let apply = json!({ "yaml": "kind: Namespace", "namespace": "", "dry_run": true, "force": false });
+        assert_eq!(post_json(&app, "/api/kube/apply", apply).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get_json(&app, "/api/kube/manifest?namespace=demo&kind=Deployment&name=web").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get_json(&app, "/api/kube/manifest?namespace=demo&kind=Pod&name=web").await.0, StatusCode::BAD_REQUEST, "not a workload kind");
     }
 
     #[tokio::test]

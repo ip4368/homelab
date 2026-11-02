@@ -7,7 +7,8 @@ use control::client::{ClusterView, ClientActor};
 use control::proto::{ApiOp, ApiResult};
 use control::runtime::Svc;
 use crate::kube::{self, KubeView};
-use crate::kube_action::{self, ActionError, KubeAction};
+use crate::kube_action::{self, ActionError, KubeAction, WorkloadRef};
+use crate::kube_apply::{self, ApplyReport, ApplyRequest};
 use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
 use model::HostId;
@@ -190,11 +191,30 @@ impl DriverHandle {
         if let Some(why) = kube_action::refusal(&action) {
             return Err(ActionError::Refused(why));
         }
-        let kubeconfig = self.kubeconfig().await.map_err(|e| ActionError::Unavailable(format!("no kubeconfig: {e}")))?;
-        let access = kube::Access::from_kubeconfig(&kubeconfig).map_err(|e| ActionError::Unavailable(format!("the kubeconfig: {e}")))?;
-        let done = kube_action::run(&access, &action, wall_ms()).await;
+        let done = kube_action::run(&self.kube_access().await?, &action, wall_ms()).await;
         self.kube_now.notify_one();
         done
+    }
+
+    /// Applies manifests the user pasted (or only checks them, with `dry_run`),
+    /// then reads Kubernetes again if anything may have changed.
+    pub async fn kube_apply(&self, req: ApplyRequest) -> Result<ApplyReport, ActionError> {
+        let report = kube_apply::apply(&self.kube_access().await?, &req).await;
+        if !req.dry_run {
+            self.kube_now.notify_one();
+        }
+        report
+    }
+
+    /// A live workload as YAML, to edit and apply again.
+    pub async fn kube_manifest(&self, w: WorkloadRef) -> Result<String, ActionError> {
+        kube_apply::manifest(&self.kube_access().await?, &w).await
+    }
+
+    /// The Kubernetes API, with a fresh admin kubeconfig from the control plane.
+    async fn kube_access(&self) -> Result<kube::Access, ActionError> {
+        let kubeconfig = self.kubeconfig().await.map_err(|e| ActionError::Unavailable(format!("no kubeconfig: {e}")))?;
+        kube::Access::from_kubeconfig(&kubeconfig).map_err(|e| ActionError::Unavailable(format!("the kubeconfig: {e}")))
     }
 
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an
