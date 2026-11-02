@@ -92,8 +92,9 @@ the **Ground truth** checkbox; the lab host's clock.
   editor and suggested fixes.
 - **Networks:** logical networks (VLAN, subnet, MTU), network templates (with staged rollouts) and
   auto-approve rules.
-- **Workloads:** what Kubernetes runs, read from the K3s API: workloads, their pods and where they
-  run, and Longhorn's volumes with their replicas. Scale, restart, edit or delete a workload from
+- **Workloads:** what Kubernetes runs, read from the K3s API: workloads with their health and why,
+  CPU and memory (metrics-server) and endpoints, their pods and where they run, and Longhorn's
+  volumes with their replicas. A workload's drawer adds its pods' details and Warning events. Scale, restart, edit or delete a workload from
   its row, and apply YAML after a dry-run preview, pasted or written by a small form for an app
   from an image (not in the K3s and Longhorn namespaces).
 

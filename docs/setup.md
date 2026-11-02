@@ -137,6 +137,13 @@ The stateful pods tolerate an unreachable node for only 20 s, so powering off th
 
 The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with its host, and the Longhorn volumes with where their replicas are and whether they are in sync or rebuilding. The server asks the control plane for the admin kubeconfig, then reads the Kubernetes API through the VIP every 3 s, so it needs no access to the hosts themselves.
 
+Each workload's row also shows:
+- **Health**, with the reason when it is not healthy: down, degraded, rolling out (`1/3 updated`) or idle (scaled to 0). The reason is the stuck pods' (`CrashLoopBackOff`, `ImagePullBackOff`, `Unschedulable: 0/4 nodes are available…`) or the controller's (`ReplicaFailure`, a rollout past its deadline). A healthy workload whose pod last restarted for `OOMKilled` or `Error` says so.
+- **CPU and memory**, from metrics-server (K3s ships it), summed over its pods and shown against their limits when every container has one. Without metrics-server the tab says why and shows the rest.
+- **Endpoints**: an Ingress rule as `http://<VIP or host><path>`, a `LoadBalancer` Service as `<VIP>:<port>` (K3s's ServiceLB answers on every node, the VIP's holder too), a `NodePort` as `<VIP>:<nodePort>`, and a `ClusterIP` Service as `<name>.<namespace>:<port>`, greyed because only pods reach it. Web ones are links.
+
+Click a workload's name for its drawer: health and the conditions that are not as they should be, usage, every endpoint, images, each pod with its host, why it is as it is (the scheduler's message, how a container last ended), restarts and usage, its Longhorn volumes, and the Warning events of the last hour on it, its ReplicaSets and its pods.
+
 Each workload's row can also change it, as kubectl would: type a new replica count and click **Scale** (Deployments and StatefulSets), **Restart** its pods a few at a time (`kubectl rollout restart`), or **Delete** it. Deleting a StatefulSet keeps its volume claims and their data; delete those with kubectl once you no longer need them. Nothing in `kube-system`, `kube-public`, `kube-node-lease` or `longhorn-system` can be changed from the UI: K3s and Longhorn run there, installed and supervised by homelabd, so use kubectl. The same changes can be scripted:
 
 ```sh
