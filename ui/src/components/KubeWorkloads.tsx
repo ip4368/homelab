@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
-import { kubeAction } from '../api'
+import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, deletePrompt, filterKube, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, deletePrompt, editDraft, filterKube, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { useAction } from './useAction'
 
 /** Pod tables can be long; the filters narrow them. */
@@ -24,8 +25,8 @@ function Hosts({ hosts, onSelectHost }: { hosts: string[]; onSelectHost(id: stri
   )
 }
 
-/** A workload's row: its replicas (editable, to scale it), Restart and Delete, and Kubernetes' answer when it says no. */
-function WorkloadRow({ w, hosts, onSelectHost }: { w: KubeWorkload; hosts: string[]; onSelectHost(id: string): void }) {
+/** A workload's row: its replicas (editable, to scale it), Restart, Edit YAML and Delete, and Kubernetes' answer when it says no. */
+function WorkloadRow({ w, hosts, onSelectHost, onEdit }: { w: KubeWorkload; hosts: string[]; onSelectHost(id: string): void; onEdit(d: ApplyDraft): void }) {
   const pods = useStore((s) => s.kube.pods)
   const volumes = useStore((s) => s.kube.volumes)
   const { error, busy, run } = useAction()
@@ -106,6 +107,11 @@ function WorkloadRow({ w, hosts, onSelectHost }: { w: KubeWorkload; hosts: strin
               Restart
             </button>
           )}{' '}
+          {can.edit && (
+            <button disabled={busy} onClick={() => run(async () => onEdit(editDraft(w, await kubeManifest(workload))))}>
+              Edit YAML
+            </button>
+          )}{' '}
           {can.remove && (
             <button
               disabled={busy}
@@ -139,6 +145,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
   const rows = useMemo(() => filterKube(kube, filter), [kube, filter])
   const namespaces = useMemo(() => [...new Set(kube.pods.map((p) => p.namespace))].sort(), [kube.pods])
   const hosts = useMemo(() => [...new Set(kube.pods.flatMap((p) => (p.node ? [p.node] : [])))].sort(), [kube.pods])
+  const [draft, setDraft] = useState<ApplyDraft | null>(null)
 
   return (
     <section className="workloads kube-workloads">
@@ -166,6 +173,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
           </select>
         </label>
         <input placeholder="search name" value={filter.text} onChange={(e) => set({ text: e.target.value })} aria-label="search kube name" size={16} />
+        <button onClick={() => setDraft({ title: 'Apply YAML', yaml: '', namespace: filter.namespace })}>Apply YAML…</button>
         <span className="muted">
           {kube.pods.length} pods in {kube.workloads.length} workloads, {kube.volumes.length} Longhorn volumes
           {kube.at > 0 && ` · read ${age(kube.at, now)} ago`}
@@ -187,12 +195,12 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
         </thead>
         <tbody>
           {rows.workloads.map(({ workload: w, hosts }) => (
-            <WorkloadRow key={`${w.namespace}/${w.kind}/${w.name}`} w={w} hosts={hosts} onSelectHost={onSelectHost} />
+            <WorkloadRow key={`${w.namespace}/${w.kind}/${w.name}`} w={w} hosts={hosts} onSelectHost={onSelectHost} onEdit={setDraft} />
           ))}
           {rows.workloads.length === 0 && (
             <tr>
               <td colSpan={6} className="muted">
-                {kube.workloads.length === 0 ? 'None yet. "Seed workloads" in the lab panel adds a few.' : 'Nothing matches the filters.'}
+                {kube.workloads.length === 0 ? 'None yet. Apply YAML adds some, or "Seed workloads" in the lab panel.' : 'Nothing matches the filters.'}
               </td>
             </tr>
           )}
@@ -296,6 +304,7 @@ export function KubeWorkloads({ onSelectHost }: { onSelectHost(id: string): void
           )}
         </tbody>
       </table>
+      {draft && <ApplyDialog draft={draft} namespaces={namespaces} onClose={() => setDraft(null)} />}
     </section>
   )
 }

@@ -1,3 +1,6 @@
+import type { ApplyOutcome } from './gen/ApplyOutcome'
+import type { ApplyReport } from './gen/ApplyReport'
+import type { FieldConflict } from './gen/FieldConflict'
 import type { KubePod } from './gen/KubePod'
 import type { KubeView } from './gen/KubeView'
 import type { KubeWorkload } from './gen/KubeWorkload'
@@ -124,9 +127,9 @@ export function removeHostPrompt(host: string, pods: KubePod[]): string {
 }
 
 /** What the Workloads tab offers to do to `w`: nothing in a protected namespace, and no scaling of a DaemonSet (one pod per node). */
-export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind'>): { scale: boolean; restart: boolean; remove: boolean } {
-  if (PROTECTED_NAMESPACES.includes(w.namespace)) return { scale: false, restart: false, remove: false }
-  return { scale: w.kind !== 'DaemonSet', restart: true, remove: true }
+export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind'>): { scale: boolean; restart: boolean; edit: boolean; remove: boolean } {
+  if (PROTECTED_NAMESPACES.includes(w.namespace)) return { scale: false, restart: false, edit: false, remove: false }
+  return { scale: w.kind !== 'DaemonSet', restart: true, edit: true, remove: true }
 }
 
 /** The claims of a StatefulSet's pods: the Longhorn volumes its pods use. */
@@ -145,4 +148,39 @@ export function deletePrompt(w: KubeWorkload, claims: string[]): string {
   if (w.kind !== 'StatefulSet') return ask
   const kept = claims.length === 0 ? 'Its volume claims stay' : `Its volume claims stay, with their data: ${claims.join(', ')}`
   return `${ask} ${kept}. Delete them with kubectl once you no longer need them.`
+}
+
+/** What became of an applied object, in words, as done or (in a dry run) as it would be. */
+export function outcomeLabel(o: ApplyOutcome, dryRun: boolean): { text: string; tone: Tone } {
+  if (o === 'Created') return { text: dryRun ? 'will be created' : 'created', tone: 'ok' }
+  if (o === 'Configured') return { text: dryRun ? 'will change' : 'changed', tone: 'ok' }
+  if (o === 'Unchanged') return { text: 'unchanged', tone: 'muted' }
+  if (o === 'AfterNamespace') return { text: 'checked once its namespace is created', tone: 'muted' }
+  if (o === 'Skipped') return { text: 'not tried: stopped at the object above', tone: 'muted' }
+  if ('Failed' in o) return { text: o.Failed.message, tone: 'bad' }
+  return { text: 'conflict', tone: 'warn' }
+}
+
+/**
+ * What a preview allows. Applying, if nothing failed or conflicted (a preview
+ * stops at the first, so what follows went unchecked). And the fields other
+ * managers own: previewing again with `force` takes them over.
+ */
+export function previewVerdict(r: ApplyReport): { canApply: boolean; conflicts: (FieldConflict & { object: string })[] } {
+  const failed = r.objects.some((o) => typeof o.outcome === 'object' && 'Failed' in o.outcome)
+  const conflicts = r.objects.flatMap((o) =>
+    typeof o.outcome === 'object' && 'Conflict' in o.outcome ? o.outcome.Conflict.conflicts.map((c) => ({ ...c, object: `${o.kind} ${o.name}` })) : [],
+  )
+  return { canApply: !failed && conflicts.length === 0, conflicts }
+}
+
+/** The Apply dialog's start for editing `w`, whose live manifest is `yaml`: an edit takes over what it changes, as `kubectl edit` does. */
+export function editDraft(w: KubeWorkload, yaml: string): { title: string; yaml: string; namespace: string; force: boolean; note: string } {
+  return {
+    title: `Edit ${w.kind} ${w.namespace}/${w.name}`,
+    yaml,
+    namespace: w.namespace,
+    force: true,
+    note: 'As kubectl edit: what you change is set, whoever set it before (a scale from this page, kubectl). Untick "take over" to see who that was instead.',
+  }
 }

@@ -1,7 +1,7 @@
 # Homelab Cluster Manager — Creating and Managing Workloads from the UI
 
 Date: 2026-11-02
-Status: Step 1 (workload actions) built; steps 2–4 not yet.
+Status: Steps 1 (workload actions) and 2 (Apply YAML, Edit YAML) built; step 3 not yet.
 Builds on: `2026-10-29-homelabd-k3s-responsibilities-design.md` (who owns what) and the Workloads tab, which reads Kubernetes through the VIP with the admin kubeconfig (`crates/server/src/kube.rs`).
 
 ## 1. Intent
@@ -60,7 +60,8 @@ An **Apply YAML** button above the Workloads table opens a dialog: a text box, a
 - **Applying**: `PATCH <url>?fieldManager=homelab-ui[&dryRun=All][&force=true]`, `content-type: application/apply-patch+yaml`, the document as JSON. One object at a time, in the order given, stopping at the first failure. Namespaces go first; kubectl keeps the given order, but this saves the usual "namespace not found".
 - **Preview** is the same request with `dryRun=All`. It shows each object as *created* or *configured*, or the API's error (validation, admission, quota) next to that object. An object in a namespace the same batch creates cannot be dry-run (the namespace does not exist yet). It shows as "checked when its namespace is created" rather than failing.
 - **Conflicts.** If another manager owns a field (typically `kubectl-client-side-apply` on objects made with plain `kubectl apply`), the API answers 409. The dialog lists the conflicting fields and their managers and offers **Apply anyway** (`force=true`), which makes `homelab-ui` the owner of those fields.
-- **Edit YAML** on a workload row: `GET` the object and drop `status`, `metadata.managedFields`, `uid`, `resourceVersion`, `generation`, `creationTimestamp` and the `last-applied-configuration` annotation. The server serialises the rest to YAML and the dialog opens with it.
+- **Edit YAML** on a workload row: `GET` the object and drop `status`, `metadata.managedFields`, `uid`, `resourceVersion`, `generation`, `creationTimestamp`, the `last-applied-configuration` and `deployment.kubernetes.io/revision` annotations. The server serialises the rest to YAML and the dialog opens with it, with **take over** (`force`) already ticked. An edit means "make the live object this", as `kubectl edit`. Without it, an edit conflicts with whatever set the fields it changes, including a Scale from the UI itself: Kubernetes counts `homelab-ui` through the `scale` subresource (an Update) as another manager than `homelab-ui`'s apply.
+- **A conflict stops the preview**, so the objects after it go unchecked. Apply is offered only after a preview with no failure and no conflict: tick **take over**, preview again, then apply.
 
 ## 6. New from image
 
@@ -79,7 +80,8 @@ A pure function in `ui/src/kube.ts` turns the form into YAML text, with template
 
 ## 7. Server changes
 
-- `POST /api/kube` takes a `KubeAction` (ts-rs exported, like `LabFault`): `Apply { yaml, namespace, dry_run, force }`, `Scale { namespace, kind, name, replicas }`, `Restart { … }`, `Delete { … }`. It answers 200 with per-object results, 400 refused by the guard rails or the API, 409 with the conflicts, and 503 with no kubeconfig or no API.
+- `POST /api/kube` takes a `KubeAction` (ts-rs exported, like `LabFault`): `Scale { workload, replicas }`, `Restart { workload }`, `Delete { workload }`. It answers 200, 400 refused by the guard rails, Kubernetes' own 4xx, or 503 with no kubeconfig or no API.
+- `POST /api/kube/apply` takes an `ApplyRequest { yaml, namespace, dry_run, force }` and answers 200 with an `ApplyReport`: each object's outcome (created, configured, unchanged, after its namespace, failed, conflict with the fields and managers, skipped). It answers 400 if the YAML does not parse or the guard rails refuse an object, and then nothing is applied.
 - `GET /api/kube/manifest?namespace=&kind=&name=` returns the cleaned YAML (§5).
 - `kube.rs`: `Access` gains `apply`, `patch`, `delete`, `get` and `discover`. Each request builds its `Access` from `DriverHandle::kubeconfig()`: one control-plane round trip, fine for the rate of user writes, and the kubeconfig is always current after a reinstall.
 - `kube::watch` takes a `tokio::sync::Notify`, so a write can ask for a read now.

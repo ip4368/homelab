@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
+import type { ApplyReport } from './gen/ApplyReport'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, deletePrompt, filterKube, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, deletePrompt, editDraft, filterKube, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return { namespace, name, owner, node, status, ready: 1, containers: 1, restarts: 0, created: 0 }
@@ -88,10 +89,10 @@ describe('draining', () => {
   })
 
   it('offers no changes in the system namespaces, and no scaling of a DaemonSet', () => {
-    expect(workloadActions(web)).toEqual({ scale: true, restart: true, remove: true })
-    expect(workloadActions({ namespace: 'demo', kind: 'DaemonSet' })).toEqual({ scale: false, restart: true, remove: true })
+    expect(workloadActions(web)).toEqual({ scale: true, restart: true, edit: true, remove: true })
+    expect(workloadActions({ namespace: 'demo', kind: 'DaemonSet' })).toEqual({ scale: false, restart: true, edit: true, remove: true })
     for (const namespace of ['kube-system', 'longhorn-system', 'kube-public', 'kube-node-lease']) {
-      expect(workloadActions({ namespace, kind: 'Deployment' })).toEqual({ scale: false, restart: false, remove: false })
+      expect(workloadActions({ namespace, kind: 'Deployment' })).toEqual({ scale: false, restart: false, edit: false, remove: false })
     }
   })
 
@@ -108,5 +109,30 @@ describe('draining', () => {
     expect(deletePrompt(postgres, [])).toContain('Its volume claims stay.')
     expect(deletePrompt(web, [])).toBe('Delete Deployment demo/web and its pods?')
     expect(restartPrompt(web)).toContain('Restart Deployment demo/web?')
+  })
+
+  it('says what became of each applied object, done or to be done', () => {
+    expect(outcomeLabel('Created', true)).toEqual({ text: 'will be created', tone: 'ok' })
+    expect(outcomeLabel('Created', false)).toEqual({ text: 'created', tone: 'ok' })
+    expect(outcomeLabel('Configured', true).text).toBe('will change')
+    expect(outcomeLabel('Unchanged', false).tone).toBe('muted')
+    expect(outcomeLabel({ Failed: { message: 'spec.replicas: Invalid value: -1' } }, true)).toEqual({ text: 'spec.replicas: Invalid value: -1', tone: 'bad' })
+    expect(outcomeLabel({ Conflict: { message: 'x', conflicts: [] } }, true).tone).toBe('warn')
+  })
+
+  it('a preview allows applying only if nothing failed or conflicted, and lists what conflicts', () => {
+    const report = (outcomes: ApplyReport['objects'][number]['outcome'][]): ApplyReport => ({
+      dry_run: true,
+      objects: outcomes.map((outcome, n) => ({ kind: 'Deployment', namespace: 'demo', name: `w${n}`, outcome })),
+    })
+    expect(previewVerdict(report(['Created', 'Unchanged', 'AfterNamespace']))).toEqual({ canApply: true, conflicts: [] })
+    expect(previewVerdict(report(['Created', { Failed: { message: 'no' } }, 'Skipped'])).canApply).toBe(false)
+    const conflicted = previewVerdict(report([{ Conflict: { message: 'x', conflicts: [{ manager: 'kubectl-client-side-apply', field: '.spec.replicas' }] } }, 'Skipped']))
+    expect(conflicted).toEqual({ canApply: false, conflicts: [{ manager: 'kubectl-client-side-apply', field: '.spec.replicas', object: 'Deployment w0' }] })
+  })
+
+  it('an edit of a live workload starts by taking over what it changes', () => {
+    const d = editDraft(web, 'kind: Deployment')
+    expect(d).toMatchObject({ title: 'Edit Deployment demo/web', yaml: 'kind: Deployment', namespace: 'demo', force: true })
   })
 })

@@ -631,6 +631,23 @@ label.inline {
   width: min(560px, 94vw);
 }
 
+.apply-dialog {
+  width: min(880px, 94vw);
+}
+
+.yaml-box {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 300px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  tab-size: 2;
+}
+
+.apply-report {
+  width: 100%;
+}
+
 .handoff-plan {
   border-collapse: collapse;
   margin: 8px 0;

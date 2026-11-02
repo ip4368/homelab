@@ -146,6 +146,16 @@ curl -X POST http://<server>:8080/api/kube -H 'content-type: application/json' \
 
 (`Restart` and `Delete` take just `{"workload": …}`.) A later `kubectl apply` of a manifest that sets `replicas:` sets it back, as after `kubectl scale`.
 
+**Apply YAML…** above the table takes one or more manifests (`---` between them), as `kubectl apply --server-side` does. **Preview** checks them with the API's dry run and says what each object would become: created, changed or unchanged, or Kubernetes' reason for refusing it. **Apply** is offered once a preview of exactly that YAML found no problem. Namespaces are applied first; objects that name no namespace go in the one the dialog names (`default` if none). The same namespaces as above are refused, and so is anything cluster-wide but a Namespace (Nodes, CRDs, ClusterRoles…): use kubectl for those.
+
+If another tool set a field the YAML sets to another value (plain `kubectl apply`, `kubectl edit`, a Scale from this page), the preview names the field and who set it. Tick **take over** and preview again to apply anyway (`--force-conflicts`). **Edit YAML** on a workload's row opens its live manifest in the same dialog, without status and bookkeeping, with **take over** already ticked: like `kubectl edit`, what you change is set, whoever set it before.
+
+```sh
+curl -X POST http://<server>:8080/api/kube/apply -H 'content-type: application/json' \
+  -d "$(jq -n --rawfile yaml app.yaml '{yaml: $yaml, namespace: "demo", dry_run: true, force: false}')"
+curl 'http://<server>:8080/api/kube/manifest?namespace=demo&kind=Deployment&name=web'
+```
+
 ## Upgrading homelabd
 
 ```sh
