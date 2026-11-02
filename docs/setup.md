@@ -61,6 +61,19 @@ Machines can be joined in any order and at any time.
   ssh <a member> sudo homelabd kubeconfig > ~/.kube/config
   kubectl get nodes
   ```
+  The UI's server hands out the same kubeconfig, so you need no SSH to a member:
+  ```sh
+  curl -s http://<server>:8080/api/lab/kubeconfig > ~/.kube/homelab
+  export KUBECONFIG=~/.kube/homelab
+  ```
+  The kubeconfig reaches the cluster at the VIP, so it keeps working when the leader fails over. Your machine must be on the management network to use it. The lab host is (as `10.0.0.1`), so in the lab this works as it stands. From any other machine, forward the API over SSH and point the kubeconfig at the tunnel (the API's certificate is valid for `127.0.0.1`):
+  ```sh
+  ssh -N -L 6443:10.0.3.253:6443 <lab host or a member> &
+  kubectl --server https://127.0.0.1:6443 get nodes   # or edit the kubeconfig's server: line
+  ```
+  In the lab, `./lab.sh kubectl …` also works without a kubeconfig: it runs `k3s kubectl` on a control-plane VM over SSH. A `-f <file>` there names a file on the VM, so pipe local files in: `./lab.sh kubectl apply -f - < app.yaml`.
+
+  The kubeconfig is cluster-admin, and anyone who can reach the server or the management network can fetch it (see [Not covered yet](#not-covered-yet)).
 - `longhorn` is the default StorageClass (3 replicas). If a node dies, Longhorn deletes the pods stuck on it so that they restart elsewhere (`nodeDownPodDeletionPolicy`). Give your pods short `node.kubernetes.io/unreachable` and `not-ready` tolerations (for example 30 s) for a fast failover.
 - Longhorn's replication runs on the storage network (VLAN 20), not the management network. Multus gives Longhorn's instance managers a second interface (`lhnet1`), a macvlan on each host's own VLAN 20 interface, with an address from the storage network's reserved range. Longhorn runs only on hosts attached to the storage network (node label `homelab.io/storage-network=true`), so a pod with a Longhorn volume must run on one of them; every MS-01 and mini PC is.
 - Node labels: `homelab.io/profile=<profile>` and `homelab.io/<role>=true` for each of the host's roles (`control-plane`, `storage`, `compute`, `vm`, `transcode`), and `homelab.io/storage-network=true` on hosts attached to the storage network. Labels you set on a host in the UI are added to its node too, when Kubernetes accepts them.
