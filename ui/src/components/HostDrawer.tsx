@@ -7,7 +7,7 @@ import type { KubeRole } from '../gen/KubeRole'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
 import { podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
-import { useStore } from '../store'
+import { store, useStore, type Store } from '../store'
 import { Charts } from './Charts'
 import { downVoters, HandoffDialog, handoffChoices, isDown } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
@@ -158,6 +158,33 @@ export function leadership(host: HostObj, voters: string[], leader: string | nul
   return isDown(host) ? 'down' : 'offer'
 }
 
+/** How long (ms) to wait to see a voter lead after asking to move the VIP to it: the leader gives up after 1.5 s, and the view syncs every 0.5 s. */
+export const MOVE_VIP_WAIT_MS = 4000
+
+/**
+ * Resolves once `s` shows `to` leading. The leader answers a VIP move as soon
+ * as it starts and gives up on it quietly, so this rejects, saying who still
+ * leads, if `to` has not taken over within `ms`.
+ */
+export function untilLeads(s: Store, to: string, ms = MOVE_VIP_WAIT_MS): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const leads = () => s.getState().view.leader === to
+    const timer = setTimeout(() => {
+      unsubscribe()
+      const leader = s.getState().view.leader
+      reject(`${to} did not take over${leader ? `: ${leader} still leads` : ''}. Try again, or check that ${to} is healthy.`)
+    }, ms)
+    const check = () => {
+      if (!leads()) return
+      clearTimeout(timer)
+      unsubscribe()
+      resolve()
+    }
+    const unsubscribe = s.subscribe(check)
+    check()
+  })
+}
+
 function ControlPlane({ host }: { host: HostObj }) {
   const cp = useStore((s) => s.view.cp)
   const hosts = useStore((s) => s.view.hosts)
@@ -181,7 +208,12 @@ function ControlPlane({ host }: { host: HostObj }) {
       {lead === 'offer' && (
         <div className="actions">
           <button
-            onClick={() => run(() => op({ TransferCpLeadership: { to: host.id } }))}
+            onClick={() =>
+              run(async () => {
+                await op({ TransferCpLeadership: { to: host.id } })
+                await untilLeads(store, host.id)
+              })
+            }
             disabled={busy}
             title={`${leader} hands leadership, and the VIP, to ${host.id}`}
           >

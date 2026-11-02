@@ -1,7 +1,10 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { HostNetworkConfig } from '../gen/HostNetworkConfig'
 import type { HostObj } from '../gen/HostObj'
-import { kubeSummary, leadership, linkPorts, nicState } from './HostDrawer'
+import type { ServerMsg } from '../gen/ServerMsg'
+import type { ViewSnapshot } from '../gen/ViewSnapshot'
+import { createStore, emptyKube } from '../store'
+import { kubeSummary, leadership, linkPorts, MOVE_VIP_WAIT_MS, nicState, untilLeads } from './HostDrawer'
 
 const cfg: HostNetworkConfig = {
   links: [
@@ -75,5 +78,52 @@ describe('host drawer leadership', () => {
   it('offers nothing on a non-voter, or with no leader to ask', () => {
     expect(leadership(host('m1'), voters, 'v1')).toBeNull()
     expect(leadership(host('v2'), voters, null)).toBeNull()
+  })
+})
+
+describe('moving the VIP', () => {
+  const led = (leader: string): ServerMsg => {
+    const view: ViewSnapshot = {
+      version: 1,
+      leader,
+      term: 1,
+      last_sync_at: 0,
+      hosts: [],
+      tokens: [],
+      rules: [],
+      switches: [],
+      networks: [],
+      templates: [],
+      rollouts: [],
+      alerts: [],
+      events: [],
+      cp: { voters: ['v1', 'v2', 'v3'], mode: 'Suggest', handoff: null, version: 1 },
+      metrics: {},
+    }
+    return { type: 'snapshot', view, truth: { vms: [], switches: [], ports: [], partitions: [], vip_holders: [], at: 0 }, kube: emptyKube, clock: { now: 0 } }
+  }
+
+  it('waits for the voter to lead', async () => {
+    vi.useFakeTimers()
+    const s = createStore()
+    s.applyMessage(led('v1'))
+    let done = false
+    const wait = untilLeads(s, 'v2').then(() => (done = true))
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(done).toBe(false)
+    s.applyMessage(led('v2'))
+    await wait
+    expect(done).toBe(true)
+    vi.useRealTimers()
+  })
+
+  it('says so when the voter does not take over', async () => {
+    vi.useFakeTimers()
+    const s = createStore()
+    s.applyMessage(led('v1'))
+    const wait = expect(untilLeads(s, 'v2')).rejects.toBe('v2 did not take over: v1 still leads. Try again, or check that v2 is healthy.')
+    await vi.advanceTimersByTimeAsync(MOVE_VIP_WAIT_MS)
+    await wait
+    vi.useRealTimers()
   })
 })
