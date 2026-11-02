@@ -87,7 +87,7 @@ curl -X POST http://<server>:8080/api/ops -H 'content-type: application/json' \
   -d '{"TransferCpLeadership": {"to": "<voter>"}}'
 ```
 
-The leader sends the voter whatever log it lacks, then tells it to run for leader at once. The voter wins in one election, takes the VIP, and the old leader becomes a follower, normally within a second. While this happens the leader answers other operations `NotLeader`, which clients retry through the VIP. An operation sent in the few tens of milliseconds while the VIP moves between machines can be lost, as with any change of leader. The UI then says the control plane is unavailable after 5 s, and the operation may or may not have been applied, so check before submitting it again. The leader refuses a voter that has not answered in the last 1.5 s. If the voter has not taken over within 1.5 s, the leader keeps the VIP and carries on.
+The leader sends the voter whatever log it lacks, then tells it to run for leader at once. The voter wins in one election, takes the VIP, and the old leader becomes a follower, normally within a second. While this happens the leader answers other operations `NotLeader`, which clients retry through the VIP. An operation sent in the few tens of milliseconds while the VIP moves between machines can be lost, as with any change of leader. The UI then says the control plane is unavailable after 5 s, and the operation may or may not have been applied, so check before submitting it again. The leader refuses a voter that has not answered in the last 1.5 s, or one whose homelabd predates moving the VIP (upgrade it first). If the voter has not taken over within 1.5 s, the leader keeps the VIP and carries on.
 
 ## When a control-plane machine dies
 
@@ -131,6 +131,8 @@ curl -fsSL <url>/install.sh | sudo sh -s -- upgrade
 ```
 
 Upgrade every K3s server before relying on new Kubernetes features: each server writes the Longhorn manifest from its own version.
+
+Until a voter runs a homelabd that can take over by a VIP move, the leader refuses to move the VIP to it. Upgrading voters one at a time, leader last, works as before: the leader's restart is an ordinary failover.
 
 On a cluster created before Longhorn moved to the storage network, the storage network has no reserved range, so Longhorn stays on the pod network. To move it, give the storage network a reserved range that no host uses, as a network change rollout (for the seed network):
 

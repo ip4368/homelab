@@ -122,8 +122,17 @@ pub enum RaftMsg<T> {
     Append { term: u64, prev_log_index: u64, prev_log_term: u64, entries: Vec<Entry<T>>, leader_commit: u64 },
     /// On success `match_index` is the last index known to match the
     /// leader. On rejection `conflict_index` is where the leader should
-    /// resume sending.
-    AppendResp { term: u64, success: bool, match_index: u64, conflict_index: u64 },
+    /// resume sending. `takes_transfer` says the sender understands
+    /// [`RaftMsg::TimeoutNow`]; replicas from before leadership transfer
+    /// leave it out, and a `TimeoutNow` sent to one would not decode.
+    AppendResp {
+        term: u64,
+        success: bool,
+        match_index: u64,
+        conflict_index: u64,
+        #[serde(default)]
+        takes_transfer: bool,
+    },
     /// Leader to the voter it hands leadership to, once that voter's log
     /// matches its own: campaign now, without a pre-vote.
     TimeoutNow { term: u64 },

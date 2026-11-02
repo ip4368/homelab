@@ -277,7 +277,7 @@ mod tests {
         n.step(3000, hid(1), RaftMsg::VoteResp { term: 1, granted: true, pre_vote: false });
         assert!(n.is_leader());
         assert_eq!(n.add_learner(hid(3)), Err(MembershipError::ChangePending));
-        n.step(3001, hid(1), RaftMsg::AppendResp { term: 1, success: true, match_index: 1, conflict_index: 0 });
+        n.step(3001, hid(1), RaftMsg::AppendResp { term: 1, success: true, match_index: 1, conflict_index: 0, takes_transfer: true });
         assert_eq!(n.commit_index(), 1);
         assert_eq!(n.add_learner(hid(3)), Ok(2));
     }
@@ -315,7 +315,7 @@ mod tests {
         use crate::raft::{Durable, RaftConfig, RaftMsg};
         use crate::runtime::SimTime;
         let ack = |n: &mut RaftNode<u64>, now: SimTime, from: usize, match_index: u64| {
-            n.step(now, hid(from), RaftMsg::AppendResp { term: 1, success: true, match_index, conflict_index: 0 });
+            n.step(now, hid(from), RaftMsg::AppendResp { term: 1, success: true, match_index, conflict_index: 0, takes_transfer: true });
         };
         // Leader n0 of {n0, n1, n2} with caught-up learner n3.
         let mut n = RaftNode::<u64>::new(hid(0), Durable::new(set(&[0, 1, 2])), RaftConfig::default(), 1);

@@ -43,6 +43,9 @@ struct Progress {
     last_ack: BTreeMap<HostId, SimTime>,
     next_heartbeat: SimTime,
     transfer: Option<Transfer>,
+    /// The peers whose latest ack said they can take leadership by
+    /// transfer.
+    takes_transfer: BTreeSet<HostId>,
 }
 
 /// A leadership transfer in progress.
@@ -143,8 +146,8 @@ impl<T: Clone> RaftNode<T> {
             RaftMsg::Append { term, prev_log_index, prev_log_term, entries, leader_commit } => {
                 self.on_append(now, from, term, prev_log_index, prev_log_term, entries, leader_commit)
             }
-            RaftMsg::AppendResp { term, success, match_index, conflict_index } => {
-                self.on_append_resp(now, from, term, success, match_index, conflict_index)
+            RaftMsg::AppendResp { term, success, match_index, conflict_index, takes_transfer } => {
+                self.on_append_resp(now, from, term, success, match_index, conflict_index, takes_transfer)
             }
             RaftMsg::TimeoutNow { term } => self.on_timeout_now(now, term),
         }
@@ -344,6 +347,7 @@ impl<T: Clone> RaftNode<T> {
             last_ack: peers.iter().map(|p| (p.clone(), now)).collect(),
             next_heartbeat: now + self.cfg.heartbeat_ms,
             transfer: None,
+            takes_transfer: BTreeSet::new(),
         });
         self.leader = Some(self.me.clone());
         self.out.push(RaftOut::BecameLeader(self.durable.term));
@@ -425,7 +429,7 @@ impl<T: Clone> RaftNode<T> {
         leader_commit: u64,
     ) {
         let reply = |s: &mut Self, success: bool, match_index: u64, conflict_index: u64| {
-            let m = RaftMsg::AppendResp { term: s.durable.term, success, match_index, conflict_index };
+            let m = RaftMsg::AppendResp { term: s.durable.term, success, match_index, conflict_index, takes_transfer: true };
             s.out.push(RaftOut::Send(from.clone(), m));
         };
         if term < self.durable.term {
@@ -470,12 +474,27 @@ impl<T: Clone> RaftNode<T> {
         reply(self, true, last_new, 0);
     }
 
-    fn on_append_resp(&mut self, now: SimTime, from: HostId, term: u64, success: bool, match_index: u64, conflict_index: u64) {
+    #[allow(clippy::too_many_arguments)]
+    fn on_append_resp(
+        &mut self,
+        now: SimTime,
+        from: HostId,
+        term: u64,
+        success: bool,
+        match_index: u64,
+        conflict_index: u64,
+        takes_transfer: bool,
+    ) {
         let Role::Leader(p) = &mut self.role else { return };
         if term != self.durable.term || !p.next_index.contains_key(&from) {
             return;
         }
         p.last_ack.insert(from.clone(), now);
+        if takes_transfer {
+            p.takes_transfer.insert(from.clone());
+        } else {
+            p.takes_transfer.remove(&from);
+        }
         let matched = p.match_index[&from];
         let next = p.next_index[&from];
         if success {
@@ -598,6 +617,7 @@ impl<T: Clone> RaftNode<T> {
         p.next_index.retain(|h, _| peers.contains(h));
         p.match_index.retain(|h, _| peers.contains(h));
         p.last_ack.retain(|h, _| peers.contains(h));
+        p.takes_transfer.retain(|h| peers.contains(h));
         for h in peers {
             p.next_index.entry(h.clone()).or_insert(next);
             p.match_index.entry(h).or_insert(0);
@@ -608,6 +628,13 @@ impl<T: Clone> RaftNode<T> {
 
     pub(super) fn id(&self) -> &HostId {
         &self.me
+    }
+
+    /// Whether peer `id`'s latest ack said it can take leadership by
+    /// transfer; `false` on a follower.
+    pub(super) fn takes_transfer(&self, id: &HostId) -> bool {
+        let Role::Leader(p) = &self.role else { return false };
+        p.takes_transfer.contains(id)
     }
 
     /// Hands leadership to `to`: tells it to campaign now if its log matches

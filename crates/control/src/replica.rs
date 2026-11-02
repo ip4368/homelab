@@ -604,7 +604,7 @@ mod tests {
         /// h2 acknowledges the whole log: everything commits and applies.
         fn ack(&mut self) {
             let (term, last) = (self.r.raft().term(), self.r.log_len() as u64);
-            self.h2_says(RaftMsg::AppendResp { term, success: true, match_index: last, conflict_index: 0 });
+            self.h2_says(RaftMsg::AppendResp { term, success: true, match_index: last, conflict_index: 0, takes_transfer: true });
         }
 
         fn controllers(&mut self) {

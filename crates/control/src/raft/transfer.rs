@@ -6,7 +6,9 @@
 //! leader stickiness; the old leader steps down on the first one. Since the
 //! voter's log is as long as any, it wins unless it fails on the way. A
 //! transfer not done within `election_min_ms` is abandoned and the leader
-//! carries on.
+//! carries on. A voter running a replica from before transfer, as during a
+//! rolling upgrade, is refused: it cannot decode `TimeoutNow`, and its
+//! connection drops on it.
 //!
 //! [`RaftMsg::TimeoutNow`]: super::RaftMsg::TimeoutNow
 
@@ -26,6 +28,8 @@ pub enum TransferError {
     NotVoter,
     /// The voter has not answered within the check-quorum window.
     Unresponsive,
+    /// The voter's replica predates leadership transfer.
+    TooOld,
 }
 
 impl fmt::Display for TransferError {
@@ -36,6 +40,7 @@ impl fmt::Display for TransferError {
             TransferError::ToSelf => "already the leader",
             TransferError::NotVoter => "not a control-plane voter",
             TransferError::Unresponsive => "the voter has not answered recently",
+            TransferError::TooOld => "the voter runs a homelabd too old to take over: upgrade it first",
         };
         f.write_str(s)
     }
@@ -43,8 +48,9 @@ impl fmt::Display for TransferError {
 
 impl<T: Clone> RaftNode<T> {
     /// Starts handing leadership to voter `to`, which must have answered
-    /// within the check-quorum window: a dead voter would only hold up
-    /// proposals for the length of the attempt. As with `propose`, the
+    /// within the check-quorum window (a dead voter would only hold up
+    /// proposals for the length of the attempt), and said in its latest ack
+    /// that it can take over this way. As with `propose`, the
     /// effects come out of the next `tick`/`step`. Leadership has moved once
     /// this node reports `SteppedDown`; [`RaftNode::transferee`] is `None`
     /// again if the attempt was abandoned.
@@ -64,6 +70,9 @@ impl<T: Clone> RaftNode<T> {
         if !self.acked_recently(&to) {
             return Err(TransferError::Unresponsive);
         }
+        if !self.takes_transfer(&to) {
+            return Err(TransferError::TooOld);
+        }
         self.begin_transfer(now, to);
         Ok(())
     }
@@ -73,7 +82,7 @@ impl<T: Clone> RaftNode<T> {
 mod tests {
     use super::*;
     use crate::raft::node::tests::{hid, Cluster};
-    use crate::raft::{RaftConfig, RaftOut};
+    use crate::raft::{RaftConfig, RaftMsg, RaftOut};
 
     /// An `n`-voter cluster whose leader has committed its no-op.
     fn settled(n: usize) -> (Cluster, usize) {
@@ -172,6 +181,25 @@ mod tests {
         c.frozen.insert(f);
         c.run_for(RaftConfig::default().election_min_ms + 100);
         assert_eq!(c.nodes[l].transfer_leadership(c.now, hid(f)), Err(TransferError::Unresponsive));
+    }
+
+    #[test]
+    fn a_voter_from_before_transfer_is_refused_until_upgraded() {
+        let (mut c, l) = settled(3);
+        let f = (l + 1) % 3;
+        let (term, last) = (c.nodes[l].term(), c.nodes[l].last_log_index());
+        // What an old replica's ack decodes to: it has no `takes_transfer`.
+        let old = format!(r#"{{"AppendResp":{{"term":{term},"success":true,"match_index":{last},"conflict_index":0}}}}"#);
+        let ack: RaftMsg<u64> = serde_json::from_str(&old).expect("an old ack still decodes");
+        let outs = c.nodes[l].step(c.now, hid(f), ack);
+        c.handle(l, outs);
+        assert_eq!(c.nodes[l].transfer_leadership(c.now, hid(f)), Err(TransferError::TooOld));
+        assert!(c.nodes[l].transferee().is_none());
+
+        // Upgraded, its next ack says it can take over.
+        assert!(c.run_until(1000, |c| c.nodes[l].takes_transfer(&hid(f))));
+        c.nodes[l].transfer_leadership(c.now, hid(f)).expect("an upgraded voter");
+        assert!(c.run_until(1000, |c| c.leaders() == [f]), "leaders {:?}", c.leaders());
     }
 
     #[test]
