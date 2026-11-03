@@ -4,7 +4,7 @@
 //! again (docs/plans/2026-11-02-ui-workload-actions-design.md §5).
 
 use crate::kube::{Access, SendError};
-use crate::kube_action::{valid_name, ActionError, WorkloadRef, FIELD_MANAGER, PROTECTED_NAMESPACES};
+use crate::kube_action::{valid_api_version, valid_name, valid_namespace, ActionError, WorkloadRef, FIELD_MANAGER, PROTECTED_NAMESPACES};
 use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -141,13 +141,16 @@ pub fn targets(docs: Vec<Value>, namespace: &str, discovered: &BTreeMap<String, 
         if !valid_name(&name) {
             return Err(format!("{what}: {name:?} is not a Kubernetes name"));
         }
+        if !valid_api_version(&api_version) {
+            return Err(format!("{what}: {api_version:?} is not an apiVersion (v1, or <group>/<version>)"));
+        }
         let Some(res) = discovered.get(&api_version).and_then(|list| resource_for(list, &kind)) else {
             return Err(format!("{what}: Kubernetes has no {kind} in {api_version}. If a CRD defines it, apply the CRD with kubectl first"));
         };
         let base = group_version_path(&api_version);
         let (ns, path) = if res.namespaced {
             let ns = obj["metadata"]["namespace"].as_str().filter(|s| !s.is_empty()).unwrap_or(default_ns).to_string();
-            if !valid_name(&ns) {
+            if !valid_namespace(&ns) {
                 return Err(format!("{what}: {ns:?} is not a Kubernetes namespace"));
             }
             if PROTECTED_NAMESPACES.contains(&ns.as_str()) {
@@ -157,6 +160,9 @@ pub fn targets(docs: Vec<Value>, namespace: &str, discovered: &BTreeMap<String, 
             let path = format!("{base}/namespaces/{ns}/{}/{name}", res.name);
             (Some(ns), path)
         } else if kind == "Namespace" && api_version == "v1" {
+            if !valid_namespace(&name) {
+                return Err(format!("{what}: {name:?} is not a Kubernetes namespace"));
+            }
             if PROTECTED_NAMESPACES.contains(&name.as_str()) {
                 return Err(format!("{what}: it belongs to K3s and Longhorn, which homelabd installs and supervises: change it with kubectl"));
             }
@@ -246,7 +252,8 @@ async fn apply_one(access: &Access, t: &Target, dry_run: bool, force: bool) -> A
 pub async fn apply(access: &Access, req: &ApplyRequest) -> Result<ApplyReport, ActionError> {
     let docs = documents(&req.yaml).map_err(ActionError::Refused)?;
     let mut discovered = BTreeMap::new();
-    for api_version in docs.iter().filter_map(|d| d["apiVersion"].as_str()) {
+    // An apiVersion that is not one is not looked up: `targets` refuses it.
+    for api_version in docs.iter().filter_map(|d| d["apiVersion"].as_str()).filter(|v| valid_api_version(v)) {
         if discovered.contains_key(api_version) {
             continue;
         }
@@ -300,7 +307,7 @@ pub fn cleaned(obj: &Value) -> Value {
 
 /// The workload `w` as YAML to edit (see [`cleaned`]).
 pub async fn manifest(access: &Access, w: &WorkloadRef) -> Result<String, ActionError> {
-    if !valid_name(&w.namespace) || !valid_name(&w.name) {
+    if !valid_namespace(&w.namespace) || !valid_name(&w.name) {
         return Err(ActionError::Refused(format!("{:?}/{:?} is not a Kubernetes namespace and name", w.namespace, w.name)));
     }
     let obj = access.send(Method::GET, &format!("/apis/apps/v1/namespaces/{}/{}/{}", w.namespace, w.kind.resource(), w.name), None).await?;
@@ -384,6 +391,9 @@ metadata: { name: shop }
         assert!(refused("apiVersion: v1\nkind: Service\nmetadata: {generateName: x-}").contains("metadata.name"));
         assert!(refused("kind: Service\nmetadata: {name: x}").contains("apiVersion"));
         assert!(refused("apiVersion: v1\nkind: Service\nmetadata: {name: x, namespace: ../etc}").contains("namespace"));
+        assert!(refused("apiVersion: v1\nkind: Service\nmetadata: {name: '..'}").contains("not a Kubernetes name"));
+        assert!(refused("apiVersion: v1\nkind: Namespace\nmetadata: {name: a.b}").contains("namespace"));
+        assert!(refused("apiVersion: ../api/v1\nkind: Service\nmetadata: {name: x}").contains("not an apiVersion"));
     }
 
     #[test]

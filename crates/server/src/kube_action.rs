@@ -73,17 +73,40 @@ impl From<SendError> for ActionError {
     }
 }
 
-/// A Kubernetes object name: a DNS subdomain (lowercase letters, digits,
-/// `-` and `.`, at most 253). Anything else could not name an object, and
-/// would not be safe in a URL path.
+/// A DNS label: lowercase letters, digits and `-`, at most 63, starting and
+/// ending with a letter or digit.
+fn dns_label(s: &str) -> bool {
+    let b = s.as_bytes();
+    let alnum = |c: &u8| c.is_ascii_lowercase() || c.is_ascii_digit();
+    !b.is_empty() && b.len() <= 63 && b.iter().all(|c| alnum(c) || *c == b'-') && alnum(&b[0]) && alnum(&b[b.len() - 1])
+}
+
+/// A Kubernetes object name: a DNS subdomain (DNS labels joined by `.`, at
+/// most 253). Anything else could not name an object, and would not be safe
+/// in a URL path (`..` would climb out of it).
 pub fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 253 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'.')
+    s.len() <= 253 && s.split('.').all(dns_label)
+}
+
+/// A namespace name: a DNS label, so no `.` either.
+pub fn valid_namespace(s: &str) -> bool {
+    dns_label(s)
+}
+
+/// A manifest's `apiVersion`: `v1` for the core group, else `<group>/<version>`
+/// with the group a DNS subdomain. It becomes a URL path, so nothing else is
+/// asked of the API.
+pub fn valid_api_version(s: &str) -> bool {
+    match s.split_once('/') {
+        Some((group, version)) => valid_name(group) && dns_label(version),
+        None => dns_label(s),
+    }
 }
 
 /// Why the server will not do `action`, if it will not.
 pub fn refusal(action: &KubeAction) -> Option<String> {
     let w = action.workload();
-    if !valid_name(&w.namespace) || !valid_name(&w.name) {
+    if !valid_namespace(&w.namespace) || !valid_name(&w.name) {
         return Some(format!("{:?}/{:?} is not a Kubernetes namespace and name", w.namespace, w.name));
     }
     if PROTECTED_NAMESPACES.contains(&w.namespace.as_str()) {
@@ -153,8 +176,31 @@ mod tests {
             let why = refusal(&KubeAction::Delete { workload: w(ns, WorkloadKind::DaemonSet, "x") }).expect(ns);
             assert!(why.contains("kubectl"), "{why}");
         }
-        for (ns, name) in [("demo", ""), ("", "web"), ("demo", "web/scale"), ("demo", "Web"), ("../x", "web")] {
+        for (ns, name) in [
+            ("demo", ""),
+            ("", "web"),
+            ("demo", "web/scale"),
+            ("demo", "Web"),
+            ("../x", "web"),
+            ("demo", ".."),
+            ("..", "web"),
+            ("demo", ".web"),
+            ("demo", "web-"),
+            ("demo", "a..b"),
+            ("de.mo", "web"),
+        ] {
             assert!(refusal(&KubeAction::Restart { workload: w(ns, WorkloadKind::Deployment, name) }).is_some(), "{ns:?}/{name:?}");
+        }
+        assert_eq!(refusal(&KubeAction::Restart { workload: w("demo", WorkloadKind::Deployment, "web.v2-1") }), None);
+    }
+
+    #[test]
+    fn api_versions_are_a_group_and_version_or_core() {
+        for ok in ["v1", "apps/v1", "networking.k8s.io/v1", "example.com/v1beta1"] {
+            assert!(valid_api_version(ok), "{ok}");
+        }
+        for bad in ["", "/v1", "apps/", "apps/v1/x", "../api/v1", "apps/v1?watch=1", "Apps/v1", "apps/../v1"] {
+            assert!(!valid_api_version(bad), "{bad}");
         }
     }
 

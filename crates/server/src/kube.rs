@@ -87,7 +87,8 @@ pub struct KubeWorkload {
     /// Pods (or for a DaemonSet, nodes) already on the latest spec.
     pub updated: u32,
     pub health: Health,
-    /// Usage summed over its pods, from metrics-server; none without it.
+    /// Usage summed over the pods metrics-server has measured (a new pod has
+    /// no usage yet for a minute); none without it, or before any is measured.
     #[ts(type = "number | null")]
     pub cpu_milli: Option<u64>,
     #[ts(type = "number | null")]
@@ -586,7 +587,9 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 controller_problem,
                 pods: mine.clone(),
             });
+            // Limits need every pod's (one without is unlimited); usage counts the pods measured so far.
             let sum = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { if mine.is_empty() { None } else { mine.iter().map(|p| f(p)).sum() } };
+            let used = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { mine.iter().filter_map(|p| f(p)).reduce(|a, b| a + b) };
             let template = &w["spec"]["template"];
             workloads.push(KubeWorkload {
                 kind,
@@ -594,8 +597,8 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 ready,
                 updated,
                 health,
-                cpu_milli: if metrics_ok { sum(|p| p.cpu_milli) } else { None },
-                memory_bytes: if metrics_ok { sum(|p| p.memory_bytes) } else { None },
+                cpu_milli: if metrics_ok { used(|p| p.cpu_milli) } else { None },
+                memory_bytes: if metrics_ok { used(|p| p.memory_bytes) } else { None },
                 cpu_limit_milli: sum(|p| p.cpu_limit_milli),
                 memory_limit_bytes: sum(|p| p.memory_limit_bytes),
                 images: template["spec"]["containers"].as_array().into_iter().flatten().filter_map(|c| text(&c["image"])).collect(),
@@ -878,6 +881,17 @@ mod tests {
         let pg = v.workloads.iter().find(|w| w.name == "postgres").unwrap();
         assert_eq!((pg.cpu_milli, pg.memory_bytes), (None, None), "its pod has no usage yet");
         assert_eq!(v.metrics_error, None);
+    }
+
+    #[test]
+    fn a_new_pod_without_usage_leaves_its_workloads_usage_to_the_others() {
+        let mut lists = sample();
+        let mut fresh = items(&lists.pods).iter().find(|p| p["metadata"]["name"] == "web-6d4-x2").unwrap().clone();
+        fresh["metadata"]["name"] = json!("web-6d4-new");
+        lists.pods["items"].as_array_mut().unwrap().push(fresh);
+        let v = view_of(&lists, NOW, VIP);
+        let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
+        assert_eq!((web.cpu_milli, web.memory_bytes), (Some(15), Some(32 << 20)), "web-6d4-new is not measured yet");
     }
 
     #[test]

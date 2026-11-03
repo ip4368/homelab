@@ -13,7 +13,8 @@ export type KubeWorkload = { namespace: string, name: string, kind: WorkloadKind
  */
 updated: number, health: Health, 
 /**
- * Usage summed over its pods, from metrics-server; none without it.
+ * Usage summed over the pods metrics-server has measured (a new pod has
+ * no usage yet for a minute); none without it, or before any is measured.
  */
 cpu_milli: number | null, memory_bytes: number | null, 
 /**
