@@ -4,6 +4,7 @@
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
+use crate::kube_logs::LogQuery;
 use crate::ws::ws_handler;
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
@@ -27,6 +28,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube/apply", post(kube_apply))
         .route("/api/kube/manifest", get(kube_manifest))
         .route("/api/kube/metrics", get(kube_metrics))
+        .route("/api/kube/logs", get(kube_logs))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -171,6 +173,29 @@ async fn kube_manifest(State(driver): State<DriverHandle>, Query(w): Query<Workl
 /// with no pods or none measured yet.
 async fn kube_metrics(State(driver): State<DriverHandle>, Query(w): Query<WorkloadRef>) -> Response {
     Json(driver.kube_metrics(&w)).into_response()
+}
+
+/// `?namespace=&pod=&container=&previous=&tail=&since=&follow=`: 200 with the
+/// container's log as `text/plain`, streamed as it arrives (with `follow=false`,
+/// the log so far as a download); else as [`action_error`].
+async fn kube_logs(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>) -> Response {
+    match driver.kube_logs(&q).await {
+        Ok(res) => {
+            use axum::http::header::{HeaderValue, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE};
+            let mut out = axum::body::Body::from_stream(res.bytes_stream()).into_response();
+            let h = out.headers_mut();
+            h.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+            h.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            if !q.follows() {
+                // Its names are Kubernetes names (checked), so it makes a valid header.
+                if let Ok(v) = HeaderValue::from_str(&format!("attachment; filename=\"{}\"", q.file_name())) {
+                    h.insert(CONTENT_DISPOSITION, v);
+                }
+            }
+            out
+        }
+        Err(e) => action_error(e),
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +347,19 @@ pub mod tests {
         assert_eq!(post_json(&app, "/api/kube/apply", apply).await.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(get_json(&app, "/api/kube/manifest?namespace=demo&kind=Deployment&name=web").await.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(get_json(&app, "/api/kube/manifest?namespace=demo&kind=Pod&name=web").await.0, StatusCode::BAD_REQUEST, "not a workload kind");
+    }
+
+    #[tokio::test]
+    async fn logs_are_checked_before_kubernetes_is_asked() {
+        let (driver, _host) = cluster();
+        wait_for_leader(&driver).await;
+        let app = app(driver);
+        let (status, body) = get_json(&app, "/api/kube/logs?namespace=demo&pod=web%2F..%2Fsecrets").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(get_json(&app, "/api/kube/logs?namespace=demo").await.0, StatusCode::BAD_REQUEST, "a pod is needed");
+        // Logs are a read: the system namespaces are not refused, only unreachable here (no K3s).
+        assert_eq!(get_json(&app, "/api/kube/logs?namespace=kube-system&pod=coredns-1").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(get_json(&app, "/api/kube/metrics?namespace=demo&kind=Deployment&name=web").await.1["series"]["cpu_milli"], json!([]));
     }
 
     #[tokio::test]

@@ -9,6 +9,7 @@ use control::runtime::Svc;
 use crate::kube::{self, KubeView};
 use crate::kube_action::{self, ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::{self, ApplyReport, ApplyRequest};
+use crate::kube_logs::{self, LogQuery};
 use crate::kube_stats;
 use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
@@ -220,6 +221,14 @@ impl DriverHandle {
         let owner = format!("{}/{}", w.kind, w.name);
         let pods: Vec<String> = self.published.borrow().kube.pods.iter().filter(|p| p.namespace == w.namespace && p.owner.as_deref() == Some(owner.as_str())).map(|p| p.name.clone()).collect();
         self.kube_stats.lock().expect("the stats store").series(&w.namespace, &pods)
+    }
+
+    /// A container's log, streaming once Kubernetes has started it.
+    pub async fn kube_logs(&self, q: &LogQuery) -> Result<reqwest::Response, ActionError> {
+        if let Some(why) = q.refusal() {
+            return Err(ActionError::Refused(why));
+        }
+        kube_logs::open(&self.kube_access().await?, q).await
     }
 
     /// The Kubernetes API, with a fresh admin kubeconfig from the control plane.

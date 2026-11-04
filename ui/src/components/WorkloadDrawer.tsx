@@ -1,5 +1,6 @@
 import { Fragment, useState } from 'react'
 import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
+import { dock, logsSession } from '../dock'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { Containers, History, PodDetail } from './WorkloadContainers'
@@ -100,6 +101,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
             <th>CPU</th>
             <th>Memory</th>
             <th>Network</th>
+            <th />
           </tr>
         </thead>
         <tbody>
@@ -124,10 +126,13 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                   <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
                 </td>
                 <td className="num muted">{netRate(p.rx_bps, p.tx_bps)}</td>
+                <td className="row-actions">
+                  <button onClick={() => dock.open(logsSession(p))}>Logs</button>
+                </td>
               </tr>
               {open === p.name && (
                 <tr>
-                  <td colSpan={7}>
+                  <td colSpan={8}>
                     <PodDetail pod={p} />
                   </td>
                 </tr>
@@ -136,7 +141,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
           ))}
           {pods.length === 0 && (
             <tr>
-              <td colSpan={7} className="muted">
+              <td colSpan={8} className="muted">
                 No pods.
               </td>
             </tr>

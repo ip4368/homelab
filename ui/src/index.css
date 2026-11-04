@@ -1073,3 +1073,95 @@ table.data.mounts td {
   font-size: 12px;
   overflow-wrap: anywhere;
 }
+
+.dock {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  position: relative;
+}
+
+.dock-resize {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 6px;
+  cursor: ns-resize;
+}
+
+.dock-tabs {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 8px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  overflow-x: auto;
+}
+
+.dock-tab {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.dock-tab > button[role='tab'] {
+  border: none;
+  background: none;
+  padding: 3px 6px;
+}
+
+.dock-tab.active > button[role='tab'] {
+  font-weight: 600;
+  border-bottom: 2px solid var(--accent);
+}
+
+.dock-body {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.log-viewer {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+}
+
+.log-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.log-lines {
+  flex: 1;
+  overflow: auto;
+  padding: 4px 8px;
+  font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: #0f1419;
+  color: #d8dee9;
+  white-space: pre;
+}
+
+.log-lines.wrap {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.log-lines .muted {
+  color: #7d8799;
+}
+
+.log-end {
+  position: absolute;
+  right: 24px;
+  bottom: 12px;
+}

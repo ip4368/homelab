@@ -7,7 +7,7 @@
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
-// health, usage, endpoints and events the tab shows; K13 network and
+// health, usage, endpoints and events the tab shows; K12 logs, K13 network and
 // volume usage), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
@@ -1136,6 +1136,88 @@ async function apply(yaml: string, namespace: string) {
   const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace, dry_run: false, force: false }) })
   if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
 }
+
+/** Reads `GET /api/kube/logs?<query>` for at most `ms` (or to its end): its status, and its lines without their timestamps. */
+async function readLog(query: Record<string, string>, ms: number): Promise<{ status: number; lines: string[]; body: string }> {
+  const abort = new AbortController()
+  const timer = setTimeout(() => abort.abort(), ms)
+  let body = ''
+  let status = 0
+  try {
+    const res = await fetch(`${BASE}/api/kube/logs?${new URLSearchParams(query)}`, { signal: abort.signal })
+    status = res.status
+    const reader = res.body!.getReader()
+    const decoder = new TextDecoder()
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      body += decoder.decode(value, { stream: true })
+    }
+  } catch (e) {
+    if (!abort.signal.aborted) throw e
+  } finally {
+    clearTimeout(timer)
+  }
+  const lines = body.split('\n').filter(Boolean).map((l) => l.replace(/^\S+Z /, ''))
+  return { status, lines, body }
+}
+
+await step('K12', 'Logs: the server streams a container\'s log, follows it, gives the run before a crash, and refuses names that are not names', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-logs'
+  await namespaceGone(ns)
+  // Counts to 8 a second apart, then fails: Kubernetes restarts it, and the run before is the previous log.
+  await apply(
+    `apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: counter }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: counter } }
+  template:
+    metadata: { labels: { app: counter } }
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers:
+        - name: counter
+          image: "busybox:1.37"
+          command: [sh, -c, "i=0; while [ $i -lt 8 ]; do i=$((i+1)); echo line $i; sleep 1; done; exit 3"]
+`,
+    ns,
+  )
+  try {
+    const pod = await waitFor('the counter pod running', 3 * 60_000, () => watch.seen!.kube.pods.find((p) => p.namespace === ns && p.status === 'Running'))
+    const name = pod.value.name
+    await sleep(3000)
+    const tail = await readLog({ namespace: ns, pod: name, tail: '2', follow: 'false' }, 10_000)
+    if (tail.status !== 200 || tail.lines.length !== 2 || !tail.lines.every((l) => /^line \d$/.test(l))) throw new Failed(`tail=2: ${tail.status} ${JSON.stringify(tail.lines)}`)
+    const followed = await readLog({ namespace: ns, pod: name, tail: '1' }, 4000)
+    const numbers = followed.lines.map((l) => Number(l.split(' ')[1]))
+    if (numbers.length < 2 || numbers.some((n, i) => i > 0 && n !== numbers[i - 1] + 1)) throw new Failed(`following gave ${JSON.stringify(followed.lines)}`)
+    note(`tail=2 gave "${tail.lines.join('", "')}"; following for 4 s gave ${numbers.length} lines in order (${numbers[0]}…${numbers.at(-1)})`)
+
+    const restarted = await waitFor('the counter restarted', 2 * 60_000, () => watch.seen!.kube.pods.find((p) => p.name === name && p.restarts > 0))
+    const previous = await readLog({ namespace: ns, pod: name, previous: 'true', follow: 'false', tail: '0' }, 10_000)
+    if (previous.lines.at(-1) !== 'line 8') throw new Failed(`previous run's log ends with ${JSON.stringify(previous.lines.slice(-2))}`)
+    note(`after a restart ${secs(restarted.ms)} later (exit ${restarted.value.last_termination?.exit_code}), previous=true ends with "line 8"`)
+
+    const bad = await readLog({ namespace: ns, pod: '../secrets' }, 5000)
+    const missing = await readLog({ namespace: ns, pod: 'nope', follow: 'false' }, 5000)
+    if (bad.status !== 400 || missing.status !== 404) throw new Failed(`bad name: ${bad.status}, missing pod: ${missing.status} ${missing.body}`)
+    const system = watch.seen!.kube.pods.find((p) => p.namespace === 'kube-system' && p.status === 'Running')!
+    const sys = await readLog({ namespace: 'kube-system', pod: system.name, tail: '1', follow: 'false' }, 10_000)
+    if (sys.status !== 200) throw new Failed(`a kube-system pod's log: ${sys.status} ${sys.body}`)
+    note(`a bad name is refused (400), a missing pod is Kubernetes' 404 (${JSON.parse(missing.body).error}), and ${system.name}'s log reads (logs are reads)`)
+
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
 
 await step('K13', 'Network and disk: a workload serving a file through its Ingress shows its send rate; writing to a Longhorn claim shows in its used bytes', async (note) => {
   await kubeHealthy(5 * 60_000)

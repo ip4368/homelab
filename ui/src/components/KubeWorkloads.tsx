@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
+import { dock, logsSession } from '../dock'
 import { useStore } from '../store'
 import { age, bytesUsed, cpu, deletePrompt, netRate, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
@@ -232,6 +233,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
             <th>Memory</th>
             <th>Host</th>
             <th>Age</th>
+            <th />
           </tr>
         </thead>
         <tbody>
@@ -258,11 +260,14 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
               </td>
               <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">unscheduled</span>}</td>
               <td className="muted">{age(p.created, now)}</td>
+              <td className="row-actions">
+                <button onClick={() => dock.open(logsSession(p))}>Logs</button>
+              </td>
             </tr>
           ))}
           {rows.pods.length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 {kube.pods.length === 0 ? 'No pods yet.' : 'Nothing matches the filters.'}
               </td>
             </tr>

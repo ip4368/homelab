@@ -319,6 +319,8 @@ impl Default for Lists {
 pub struct Access {
     server: String,
     client: reqwest::Client,
+    /// The same, without the timeout on whole requests: for streams that stay open (logs).
+    streaming: reqwest::Client,
 }
 
 /// A base64 field of the kubeconfig (`homelabd kubeconfig` writes the one
@@ -340,13 +342,10 @@ impl Access {
         identity.push(b'\n');
         identity.extend(decoded(kubeconfig, "client-key-data")?);
         let identity = reqwest::Identity::from_pem(&identity).map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder()
-            .tls_certs_only([ca])
-            .identity(identity)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { server, client })
+        let builder = || reqwest::Client::builder().tls_certs_only([ca.clone()]).identity(identity.clone());
+        let client = builder().timeout(REQUEST_TIMEOUT).build().map_err(|e| e.to_string())?;
+        let streaming = builder().connect_timeout(REQUEST_TIMEOUT).build().map_err(|e| e.to_string())?;
+        Ok(Self { server, client, streaming })
     }
 
     /// The list at `path`; an empty one if the API does not have it (Longhorn not installed yet).
@@ -384,6 +383,19 @@ impl Access {
         if status.is_success() {
             return Ok(answer);
         }
+        let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
+        Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
+    }
+
+    /// A `GET` of `path` whose body is a stream that may stay open (a followed
+    /// log): the response once its status is a success, else as [`Access::send`].
+    pub async fn stream(&self, path: &str) -> Result<reqwest::Response, SendError> {
+        let res = self.streaming.get(format!("{}{path}", self.server)).send().await.map_err(|e| SendError::Unreachable(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(res);
+        }
+        let answer: Value = res.json().await.unwrap_or(Value::Null);
         let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
         Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
     }
@@ -1031,7 +1043,7 @@ mod tests {
 
     #[test]
     fn the_vip_is_the_kubeconfigs_server_host() {
-        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new() }.host().to_string();
+        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new(), streaming: reqwest::Client::new() }.host().to_string();
         assert_eq!(host("https://10.0.3.253:6443"), "10.0.3.253");
         assert_eq!(host("https://k3s.home"), "k3s.home");
     }

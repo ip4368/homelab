@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { Dock } from './components/Dock'
 import { LabPanel } from './components/LabPanel'
 import { FleetGrid } from './components/FleetGrid'
 import { HostDrawer } from './components/HostDrawer'
@@ -99,6 +100,7 @@ export default function App() {
         </div>
         <RightRail onSelect={selectHost} showTruth={showTruth} />
       </div>
+      <Dock />
     </div>
   )
 }
