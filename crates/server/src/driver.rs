@@ -242,6 +242,12 @@ impl DriverHandle {
         crate::kube_log::follow(&self.kube_access().await?, &q).await
     }
 
+    /// A shell in a container: the upstream end of the bridge.
+    pub async fn kube_exec(&self, q: crate::kube_exec::ExecQuery) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, ActionError> {
+        eprintln!("exec: shell {} in {}/{} container {:?}", q.shell(), q.namespace, q.pod, q.container);
+        crate::kube_exec::connect(&self.kube_access().await?, &q).await
+    }
+
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an
     /// admin would with `kubectl apply` on a K3s server; kubectl's output.
     pub async fn seed_workloads(&self) -> Result<String, LabError> {

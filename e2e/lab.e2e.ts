@@ -8,7 +8,7 @@
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
 // health, usage, endpoints and events the tab shows; K12 the kubelet
-// network/volume metrics and their history), checked against the cluster's Kubernetes API through the VIP with the
+// network/volume metrics and their history; K13 logs and exec), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -1237,6 +1237,91 @@ spec:
     const wl = await fetch(`${BASE}/api/kube/metrics?workload=${ns}/Deployment/load&m=net_tx_bps`)
     if (!wl.ok) throw new Failed(`workload history: ${wl.status} ${await wl.text()}`)
     note(`history since ${series.value.since}: ${series.value.series.net_rx_bps.length} rx points for the pod, and the workload answers too`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+await step('K13', 'Workload debugging: log tails, following, the previous instance after a crash, and a shell through the exec WebSocket', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-debug'
+  const tag = Math.random().toString(36).slice(2, 8)
+  const manifests = `apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: chatty }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: chatty } }
+  template:
+    metadata: { labels: { app: chatty } }
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: chatty
+          image: "busybox:1.37"
+          command: [sh, -c, "i=0; while true; do i=$((i+1)); echo k13-${tag}-line-$i; sleep 1; done"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: crasher }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: crasher } }
+  template:
+    metadata: { labels: { app: crasher } }
+    spec:
+      containers:
+        - name: crasher
+          image: "busybox:1.37"
+          command: [sh, -c, "echo k13-${tag}-before-crash; sleep 3; exit 1"]
+`
+  await applyYaml(manifests, ns)
+  try {
+    const chatty = await waitFor('chatty running', 3 * 60_000, () => {
+      const p = watch.seen!.kube.pods.find((x) => x.namespace === ns && x.owner === 'Deployment/chatty')
+      return p?.status === 'Running' ? p : null
+    })
+    const pod = chatty.value.name
+
+    const tail = await waitAsync('a log tail with its lines', 60_000, async () => {
+      const r = await fetch(`${BASE}/api/kube/logs?namespace=${ns}&pod=${pod}&container=chatty&tail=50`)
+      const body = await r.text()
+      return r.ok && body.includes(`k13-${tag}-line-`) ? { body } : `${r.status} ${body.slice(0, 120)}`
+    })
+    const firstAt = Number(/line-(\d+)/.exec(tail.value.body.trim().split('\n').pop() ?? '')?.[1] ?? 0)
+    const followed = await wsCollect(`${wsBase}/api/kube/logs/ws?namespace=${ns}&pod=${pod}&container=chatty&tail=1`, null, (t) => {
+      const nums = [...t.matchAll(/line-(\d+)/g)].map((m) => Number(m[1]))
+      return nums.length > 0 && Math.max(...nums) > firstAt
+    }, 60_000)
+    note(`logs: tail reached line ${firstAt}; follow then streamed past it (${followed.trim().split('\n').length} chunks of lines)`)
+
+    const out = await wsCollect(`${wsBase}/api/kube/exec/ws?namespace=${ns}&pod=${pod}&container=chatty&shell=${encodeURIComponent('/bin/sh')}`, `echo k13-${tag}-exec; exit\n`, (t) => t.includes(`k13-${tag}-exec`), 60_000)
+    note(`exec: a shell in ${pod} answered (${out.includes('"status"') ? 'and reported how it ended' : 'output received'})`)
+
+    const refused = await wsCollect(`${wsBase}/api/kube/exec/ws?namespace=kube-system&pod=whatever&shell=${encodeURIComponent('/bin/sh')}`, null, (t) => t.includes('"error"'), 30_000)
+    if (!refused.includes('kubectl')) throw new Failed(`exec into kube-system was not refused as a system namespace: ${refused}`)
+    const corePod = watch.seen!.kube.pods.find((x) => x.namespace === 'kube-system' && x.status === 'Running')
+    if (corePod) {
+      const lr = await fetch(`${BASE}/api/kube/logs?namespace=kube-system&pod=${corePod.name}&tail=5`)
+      if (!lr.ok) throw new Failed(`logs in kube-system (read-only, allowed): ${lr.status} ${await lr.text()}`)
+      note('exec into kube-system refused; its logs still read')
+    }
+
+    const crashed = await waitFor('crasher restarted', 3 * 60_000, () => {
+      const p = watch.seen!.kube.pods.find((x) => x.namespace === ns && x.owner === 'Deployment/crasher')
+      return p && p.restarts >= 1 ? p : null
+    })
+    const prev = await waitAsync('previous-instance logs', 60_000, async () => {
+      const r = await fetch(`${BASE}/api/kube/logs?namespace=${ns}&pod=${crashed.value.name}&container=crasher&previous=true&tail=50`)
+      const body = await r.text()
+      return r.ok && body.includes(`k13-${tag}-before-crash`) ? { body } : `${r.status} ${body.slice(0, 120)}`
+    })
+    note(`previous logs of the crashed instance: "${prev.value.body.trim().split('\n')[0]}"`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }

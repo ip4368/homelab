@@ -4,6 +4,7 @@
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
+use crate::kube_exec::ExecQuery;
 use crate::kube_log::LogQuery;
 use crate::ws::ws_handler;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -31,6 +32,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube/metrics", get(kube_metrics))
         .route("/api/kube/logs", get(kube_logs))
         .route("/api/kube/logs/ws", get(kube_logs_ws))
+        .route("/api/kube/exec/ws", get(kube_exec_ws))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -235,6 +237,69 @@ async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQue
                 Some(Ok(_)) => {}
             },
             () = tokio::time::sleep_until(deadline) => return,
+        }
+    }
+}
+
+/// A shell in a container: binary frames are keystrokes (browser → server)
+/// and terminal output (server → browser); text frames carry
+/// `{"resize":{width,height}}` in and `{"status":…}` / `{"error":…}` out.
+async fn kube_exec_ws(State(driver): State<DriverHandle>, Query(q): Query<ExecQuery>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve_exec(socket, driver, q))
+}
+
+async fn serve_exec(mut socket: WebSocket, driver: DriverHandle, q: ExecQuery) {
+    use futures_util::{SinkExt, StreamExt};
+    let upstream = match driver.kube_exec(q).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = socket.send(Message::Text(json!({ "error": e.to_string() }).to_string().into())).await;
+            return;
+        }
+    };
+    let (mut up_sink, mut up_stream) = crate::kube_exec::split(upstream);
+    let deadline = tokio::time::Instant::now() + crate::kube_exec::MAX_SESSION;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Binary(data))) => {
+                    let framed = crate::kube_exec::frame(crate::kube_exec::CH_STDIN, &data);
+                    if up_sink.send(tokio_tungstenite::tungstenite::Message::Binary(framed.into())).await.is_err() {
+                        return;
+                    }
+                }
+                Some(Ok(Message::Text(text))) => {
+                    let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                    if let (Some(w), Some(h)) = (v["resize"]["width"].as_u64(), v["resize"]["height"].as_u64()) {
+                        let framed = crate::kube_exec::resize_frame(w.min(1000) as u16, h.min(1000) as u16);
+                        if up_sink.send(tokio_tungstenite::tungstenite::Message::Binary(framed.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            },
+            next = up_stream.next() => match next {
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(bytes))) => match crate::kube_exec::decode(&bytes) {
+                    Some(crate::kube_exec::Upstream::Output(out)) => {
+                        if socket.send(Message::Binary(out.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Some(crate::kube_exec::Upstream::Ended(why)) => {
+                        let _ = socket.send(Message::Text(json!({ "status": why }).to_string().into())).await;
+                        return;
+                    }
+                    None => {}
+                },
+                Some(Ok(tokio_tungstenite::tungstenite::Message::Close(_))) | None | Some(Err(_)) => return,
+                Some(Ok(_)) => {}
+            },
+            () = tokio::time::sleep_until(deadline) => {
+                let _ = socket.send(Message::Text(json!({ "status": "session ended: 15 minutes is the most one shell may run" }).to_string().into())).await;
+                return;
+            }
         }
     }
 }
