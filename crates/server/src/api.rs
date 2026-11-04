@@ -4,7 +4,9 @@
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
+use crate::kube_log::LogQuery;
 use crate::ws::ws_handler;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -27,6 +29,8 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube/apply", post(kube_apply))
         .route("/api/kube/manifest", get(kube_manifest))
         .route("/api/kube/metrics", get(kube_metrics))
+        .route("/api/kube/logs", get(kube_logs))
+        .route("/api/kube/logs/ws", get(kube_logs_ws))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -191,6 +195,50 @@ async fn kube_metrics(State(driver): State<DriverHandle>, Query(q): Query<KubeMe
     }
 }
 
+/// A container's log tail as text; else as [`action_error`].
+async fn kube_logs(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>) -> Response {
+    if let Some(why) = crate::kube_log::refusal(&q) {
+        return error(StatusCode::BAD_REQUEST, &why);
+    }
+    match driver.kube_logs(q).await {
+        Ok(text) => ([("content-type", "text/plain; charset=utf-8")], text).into_response(),
+        Err(e) => action_error(e),
+    }
+}
+
+/// The follow stream: text frames as log chunks arrive, an hour at most.
+async fn kube_logs_ws(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve_log_follow(socket, driver, q))
+}
+
+async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQuery) {
+    let mut res = match driver.kube_log_follow(q).await {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = socket.send(Message::Text(json!({ "error": e.to_string() }).to_string().into())).await;
+            return;
+        }
+    };
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    loop {
+        tokio::select! {
+            chunk = res.chunk() => match chunk {
+                Ok(Some(bytes)) => {
+                    if socket.send(Message::Text(String::from_utf8_lossy(&bytes).into_owned().into())).await.is_err() {
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => return,
+            },
+            incoming = socket.recv() => match incoming {
+                None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                Some(Ok(_)) => {}
+            },
+            () = tokio::time::sleep_until(deadline) => return,
+        }
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -351,10 +399,16 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn kube_metrics_are_validated() {
+    async fn debug_endpoints_validate_before_any_cluster_or_lab_is_asked() {
         let (driver, _host) = cluster();
         wait_for_leader(&driver).await;
         let app = app(driver);
+        // Logs: a bad pod name is refused here; a good one reaches for a
+        // kubeconfig this cluster cannot hand out (503).
+        assert_eq!(get_json(&app, "/api/kube/logs?namespace=demo&pod=..%2F..").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get_json(&app, "/api/kube/logs?namespace=demo&pod=web-1&container=a%20b").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get_json(&app, "/api/kube/logs?namespace=demo&pod=web-1").await.0, StatusCode::SERVICE_UNAVAILABLE);
+        // Metrics: exactly one entity, known metrics, and history to show.
         assert_eq!(get_json(&app, "/api/kube/metrics?m=cpu_milli").await.0, StatusCode::BAD_REQUEST);
         assert_eq!(get_json(&app, "/api/kube/metrics?pod=demo/web-1&workload=demo/Deployment/web&m=cpu_milli").await.0, StatusCode::BAD_REQUEST);
         assert_eq!(get_json(&app, "/api/kube/metrics?pod=demo/web-1&m=bogus").await.0, StatusCode::BAD_REQUEST);

@@ -229,6 +229,19 @@ impl DriverHandle {
         self.kube_history.query(entity, metrics)
     }
 
+    /// A container's log tail.
+    pub async fn kube_logs(&self, q: crate::kube_log::LogQuery) -> Result<String, ActionError> {
+        if let Some(why) = crate::kube_log::refusal(&q) {
+            return Err(ActionError::Refused(why));
+        }
+        crate::kube_log::fetch(&self.kube_access().await?, &q).await
+    }
+
+    /// A container's live log stream, to relay.
+    pub async fn kube_log_follow(&self, q: crate::kube_log::LogQuery) -> Result<reqwest::Response, ActionError> {
+        crate::kube_log::follow(&self.kube_access().await?, &q).await
+    }
+
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an
     /// admin would with `kubectl apply` on a K3s server; kubectl's output.
     pub async fn seed_workloads(&self) -> Result<String, LabError> {
