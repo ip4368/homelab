@@ -12,8 +12,8 @@ import type { Mount } from './gen/Mount'
 import type { Pdb } from './gen/Pdb'
 import { formatBps } from './metrics'
 
-/** Namespaces K3s and Longhorn run their own pods in. */
-export const SYSTEM_NAMESPACES = ['kube-system', 'longhorn-system']
+/** Namespaces K3s, Longhorn and KubeVirt run their own pods in. */
+export const SYSTEM_NAMESPACES = ['kube-system', 'longhorn-system', 'kubevirt']
 
 /** Namespaces the server changes nothing in (as `PROTECTED_NAMESPACES` in crates/server/src/kube_action.rs): kubectl only. */
 export const PROTECTED_NAMESPACES = [...SYSTEM_NAMESPACES, 'kube-public', 'kube-node-lease']

@@ -215,6 +215,22 @@ fn base_image(state: &Path) -> io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Why VMs inside the lab's VMs (KubeVirt on the vm hosts) will not run, if
+/// they will not: the VMs get `/dev/kvm` only when this machine's KVM
+/// allows nested virtualisation.
+fn nested_virt_warning() -> Option<String> {
+    let read = |m: &str| std::fs::read_to_string(format!("/sys/module/{m}/parameters/nested")).ok();
+    let (module, value) = [("kvm_intel", read("kvm_intel")), ("kvm_amd", read("kvm_amd"))].into_iter().find_map(|(m, v)| Some((m, v?)))?;
+    nested_off(value.trim()).then(|| {
+        format!("nested virtualisation is off, so KubeVirt's VMs cannot run on the vm hosts: `echo 'options {module} nested=1' | sudo tee /etc/modprobe.d/kvm-nested.conf`, then reload {module} with no VM running")
+    })
+}
+
+/// Whether a KVM module's `nested` parameter (`Y`, `N`, `1`, `0`) says off.
+fn nested_off(value: &str) -> bool {
+    matches!(value, "N" | "0")
+}
+
 fn ssh_key(state: &Path) -> io::Result<String> {
     let key = state.join("id_ed25519");
     if !key.exists() {
@@ -272,6 +288,9 @@ impl Lab {
     /// time, proxy, binary server, switch management) and adopts VMs still
     /// running from before. Boots nothing new. Needs root, and a tokio runtime.
     pub async fn start(cfg: LabConfig) -> io::Result<Arc<Lab>> {
+        if let Some(warning) = nested_virt_warning() {
+            eprintln!("lab: {warning}");
+        }
         std::fs::create_dir_all(&cfg.state)?;
         std::fs::create_dir_all(cfg.run.join("sw"))?;
         let ssh_pub = ssh_key(&cfg.state)?;
@@ -842,5 +861,16 @@ impl Lab {
 
     pub fn truth(&self) -> LabTruth {
         self.truth.lock().expect("truth lock").clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nested_virtualisation_reads_as_kvm_writes_it() {
+        assert!(nested_off("N") && nested_off("0"));
+        assert!(!nested_off("Y") && !nested_off("1"));
     }
 }

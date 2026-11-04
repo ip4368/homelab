@@ -27,4 +27,8 @@ metrics_error: string | null,
 /**
  * The nodes whose kubelet gave no network and disk figures on the last read, and why.
  */
-stats_error: string | null, };
+stats_error: string | null, 
+/**
+ * KubeVirt's phase (`Deploying`, `Deployed`…); none while it is not installed.
+ */
+kubevirt: string | null, };

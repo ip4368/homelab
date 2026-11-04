@@ -87,6 +87,10 @@ pub struct KubeSpec {
     /// holds it carries Longhorn's attachment. `None` if it has none.
     #[serde(default)]
     pub storage_ip: Option<Ipv4Addr>,
+    /// On a server: install KubeVirt, as some host has the vm role. Its
+    /// manifest stays once written: removing it would delete every VM.
+    #[serde(default)]
+    pub kubevirt: bool,
 }
 
 /// The storage network as Longhorn's pods use it: each host attaches them
@@ -205,12 +209,23 @@ pub struct KubeStatus {
     /// all be evicted yet, by host.
     #[serde(default)]
     pub drain_blocked: BTreeMap<HostId, String>,
+    /// Whether the host has `/dev/kvm`, which VMs need; `None` from an agent
+    /// too old to say.
+    #[serde(default)]
+    pub kvm: Option<bool>,
+    /// On a server: it has written the KubeVirt manifest ([`KubeSpec::kubevirt`]).
+    #[serde(default)]
+    pub kubevirt: bool,
 }
 
 impl KubeStatus {
     /// Whether the host runs what `spec` asks for.
     pub fn satisfies(&self, spec: &KubeSpec) -> bool {
-        self.role == Some(spec.role) && self.phase == KubePhase::Running && self.labels == spec.labels && self.storage_disks == spec.storage_disks
+        self.role == Some(spec.role)
+            && self.phase == KubePhase::Running
+            && self.labels == spec.labels
+            && self.storage_disks == spec.storage_disks
+            && (self.kubevirt || !spec.kubevirt)
     }
 }
 

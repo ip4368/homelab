@@ -47,6 +47,8 @@ pub struct KubeView {
     pub metrics_error: Option<String>,
     /// The nodes whose kubelet gave no network and disk figures on the last read, and why.
     pub stats_error: Option<String>,
+    /// KubeVirt's phase (`Deploying`, `Deployed`…); none while it is not installed.
+    pub kubevirt: Option<String>,
 }
 
 /// The kinds of workload the Workloads tab shows.
@@ -303,6 +305,7 @@ pub struct Lists {
     pub events: Value,
     pub controllerrevisions: Value,
     pub pdbs: Value,
+    pub kubevirts: Value,
     /// Pod usage from metrics-server, or why there is none.
     pub metrics: Result<Value, String>,
 }
@@ -310,7 +313,7 @@ pub struct Lists {
 impl Default for Lists {
     fn default() -> Self {
         let v = Value::Null;
-        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v.clone(), controllerrevisions: v.clone(), pdbs: v, metrics: Ok(Value::Null) }
+        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v.clone(), controllerrevisions: v.clone(), pdbs: v.clone(), kubevirts: v, metrics: Ok(Value::Null) }
     }
 }
 
@@ -462,7 +465,7 @@ impl Access {
                 Err(e) => Err(format!("metrics-server: {e}")),
             }
         };
-        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, controllerrevisions, pdbs, metrics) = tokio::join!(
+        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, controllerrevisions, pdbs, kubevirts, metrics) = tokio::join!(
             self.list("/api/v1/pods"),
             self.list("/apis/apps/v1/replicasets"),
             self.list("/apis/apps/v1/deployments"),
@@ -476,6 +479,7 @@ impl Access {
             self.list("/api/v1/events?fieldSelector=type%3DWarning"),
             self.list("/apis/apps/v1/controllerrevisions"),
             self.list("/apis/policy/v1/poddisruptionbudgets"),
+            self.list("/apis/kubevirt.io/v1/kubevirts"),
             metrics,
         );
         Ok(Lists {
@@ -492,6 +496,7 @@ impl Access {
             events: events?,
             controllerrevisions: controllerrevisions?,
             pdbs: pdbs?,
+            kubevirts: kubevirts?,
             metrics,
         })
     }
@@ -813,7 +818,8 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> 
         let nodes: Vec<String> = stats.errors.iter().map(|(n, e)| format!("{n} ({e})")).collect();
         format!("no network and disk figures from {}", nodes.join(", "))
     });
-    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned(), stats_error }
+    let kubevirt = items(&lists.kubevirts).first().map(|k| text(&k["status"]["phase"]).unwrap_or_else(|| "Deploying".into()));
+    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned(), stats_error, kubevirt }
 }
 
 /// Keeps `tx` up to date with what Kubernetes runs, reading it with the
@@ -972,6 +978,7 @@ mod tests {
                 json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "web-6d4-x2" }, "reason": "Unhealthy", "message": "old", "lastTimestamp": "1970-01-01T00:00:01Z" }),
             ]),
             controllerrevisions: list(vec![]),
+            kubevirts: list(vec![json!({ "metadata": { "namespace": "kubevirt", "name": "kubevirt" }, "status": { "phase": "Deployed" } })]),
             pdbs: list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "selector": { "matchLabels": { "app": "web" } } }, "status": { "disruptionsAllowed": 0 } })]),
             metrics: Ok(json!({ "items": [{ "metadata": { "namespace": "demo", "name": "web-6d4-x2" }, "containers": [{ "usage": { "cpu": "12m", "memory": "30Mi" } }, { "usage": { "cpu": "3m", "memory": "2Mi" } }] }] })),
         }
@@ -1097,5 +1104,7 @@ mod tests {
     fn missing_lists_are_empty() {
         let v = view_of(&Lists::default(), 1, VIP, &kube_stats::Store::default());
         assert!(v.pods.is_empty() && v.workloads.is_empty() && v.volumes.is_empty());
+        assert_eq!(v.kubevirt, None, "KubeVirt not installed");
+        assert_eq!(view_of(&sample(), 1, VIP, &kube_stats::Store::default()).kubevirt.as_deref(), Some("Deployed"));
     }
 }

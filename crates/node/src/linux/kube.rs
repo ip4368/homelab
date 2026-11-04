@@ -12,7 +12,8 @@
 //!    uninstalled first; a server deletes its own node before it goes, so
 //!    its etcd member leaves the cluster.
 //! 2. Starts the service if it stopped, and waits for the node to register.
-//! 3. On a server, writes the Longhorn `HelmChart` manifest K3s deploys.
+//! 3. On a server, writes the Longhorn `HelmChart` manifest K3s deploys,
+//!    and once some host has the vm role, KubeVirt's ([`kubevirt_manifest`]).
 //! 4. Labels the node, and on a storage host gives Longhorn its data disks
 //!    (`node.longhorn.io/default-disks-config`, then the label that tells
 //!    Longhorn to use it). A host that stores no more loses that label.
@@ -57,6 +58,11 @@ pub const KUBECONFIG: &str = "/etc/rancher/k3s/k3s.yaml";
 /// What an agent's kubelet authenticates with: enough to label its own node.
 const KUBELET_KUBECONFIG: &str = "/var/lib/rancher/k3s/agent/kubelet.kubeconfig";
 const MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-longhorn.yaml";
+/// KubeVirt has no Helm chart of its own, so its release's operator
+/// manifest is vendored, and written for K3s to deploy with a `KubeVirt`.
+pub const KUBEVIRT_VERSION: &str = "v1.9.1";
+const KUBEVIRT_OPERATOR: &str = include_str!("../../assets/kubevirt-operator-v1.9.1.yaml");
+const KUBEVIRT_MANIFEST: &str = "/var/lib/rancher/k3s/server/manifests/homelab-kubevirt.yaml";
 /// How often the worker looks again when nothing changed.
 const EVERY: Duration = Duration::from_secs(10);
 /// How long it waits after a failed step before trying again.
@@ -108,6 +114,39 @@ fn unit(role: KubeRole) -> &'static str {
         KubeRole::Server => "k3s",
         KubeRole::Agent => "k3s-agent",
     }
+}
+
+/// KubeVirt, as a manifest K3s deploys: its operator, and a `KubeVirt` that
+/// runs virt-handler (and so VMs) only on hosts labelled with the vm role.
+pub fn kubevirt_manifest() -> &'static str {
+    static MANIFEST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    MANIFEST.get_or_init(kubevirt_manifest_text)
+}
+
+fn kubevirt_manifest_text() -> String {
+    let label = format!("{}{}", control::controllers::kube::LABEL_PREFIX, control::controllers::kube::role_label(model::Role::Vm));
+    format!(
+        "# Written by homelabd on every K3s server once a host has the vm role:
+# KubeVirt {KUBEVIRT_VERSION}'s operator, and VMs on the vm hosts only.
+{KUBEVIRT_OPERATOR}
+---
+apiVersion: kubevirt.io/v1
+kind: KubeVirt
+metadata:
+  name: kubevirt
+  namespace: kubevirt
+spec:
+  certificateRotateStrategy: {{}}
+  configuration:
+    developerConfiguration:
+      featureGates: []
+  imagePullPolicy: IfNotPresent
+  workloads:
+    nodePlacement:
+      nodeSelector:
+        {label}: \"true\"
+"
+    )
 }
 
 /// The Longhorn deployment, as a manifest K3s's helm controller installs.
@@ -645,6 +684,8 @@ impl Worker {
             cordon_noted: drains.noted,
             drained_since: drains.drained_since,
             drain_blocked: drains.blocked,
+            kvm: Some(Path::new("/dev/kvm").exists()),
+            kubevirt: server && std::fs::read_to_string(KUBEVIRT_MANIFEST).is_ok_and(|m| m == kubevirt_manifest()),
         }
     }
 
@@ -689,6 +730,11 @@ impl Worker {
             };
             if let Err(e) = multus.and_then(|()| write_if_changed(Path::new(MANIFEST), &longhorn_manifest(spec.storage_network.is_some()))) {
                 return (self.status(&o, KubePhase::Failed(format!("write the Longhorn manifests: {e}"))), false);
+            }
+            if spec.kubevirt
+                && let Err(e) = write_if_changed(Path::new(KUBEVIRT_MANIFEST), kubevirt_manifest())
+            {
+                return (self.status(&o, KubePhase::Failed(format!("write the KubeVirt manifest: {e}"))), false);
             }
         }
         if spec.storage_network.is_some() && spec.storage_ip.is_some() {
@@ -1040,7 +1086,19 @@ mod tests {
             storage_disks: vec!["nvme0".into()],
             storage_network: None,
             storage_ip: None,
+            kubevirt: false,
         }
+    }
+
+    #[test]
+    fn kubevirt_is_its_vendored_operator_and_runs_vms_on_the_vm_hosts_only() {
+        let m = kubevirt_manifest();
+        assert!(m.contains(&format!("image: quay.io/kubevirt/virt-operator:{KUBEVIRT_VERSION}")), "the vendored release");
+        let cr = &m[m.rfind("kind: KubeVirt").unwrap()..];
+        assert!(cr.contains("namespace: kubevirt\n"), "{cr}");
+        assert!(cr.contains("    nodePlacement:\n      nodeSelector:\n        homelab.io/vm: \"true\"\n"), "{cr}");
+        let docs: Vec<&str> = m.split("\n---\n").filter(|d| d.lines().any(|l| l.starts_with("kind:"))).collect();
+        assert!(docs.len() >= 10, "the operator's objects and the KubeVirt: {}", docs.len());
     }
 
     #[test]

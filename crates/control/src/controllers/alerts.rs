@@ -26,7 +26,7 @@ use super::observe::SWITCH_UNREACHABLE;
 use super::{Action, Volatile};
 use crate::runtime::SimTime;
 use crate::state::{Alert, ClusterState, Command, HostObj, ObjectKind, ObjectRef, Severity};
-use model::{HostId, LinkKind, PortName, SwitchId};
+use model::{HostId, LinkKind, PortName, Role, SwitchId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Every kind of alert the cluster raises.
@@ -43,10 +43,11 @@ pub enum AlertKind {
     SwitchUnreachable,
     CpReplacementSuggested,
     DrainBlocked,
+    NoKvm,
 }
 
 impl AlertKind {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::HostDown,
         Self::CpQuorumAtRisk,
         Self::BondDegraded,
@@ -58,6 +59,7 @@ impl AlertKind {
         Self::SwitchUnreachable,
         Self::CpReplacementSuggested,
         Self::DrainBlocked,
+        Self::NoKvm,
     ];
 
     /// The name an alert of this kind carries in `Alert::kind`.
@@ -74,6 +76,7 @@ impl AlertKind {
             Self::SwitchUnreachable => "SwitchUnreachable",
             Self::CpReplacementSuggested => "CpReplacementSuggested",
             Self::DrainBlocked => "DrainBlocked",
+            Self::NoKvm => "NoKvm",
         }
     }
 
@@ -92,7 +95,8 @@ impl AlertKind {
             | Self::LinkSpeedLow
             | Self::SwitchUnreachable
             | Self::CpReplacementSuggested
-            | Self::DrainBlocked => Severity::Warning,
+            | Self::DrainBlocked
+            | Self::NoKvm => Severity::Warning,
         }
     }
 }
@@ -101,11 +105,12 @@ pub const PORT_DOWN: &str = AlertKind::PortDown.as_str();
 pub const BOND_DEGRADED: &str = AlertKind::BondDegraded.as_str();
 pub const LINK_SPEED_LOW: &str = AlertKind::LinkSpeedLow.as_str();
 pub const DISK_USAGE_HIGH: &str = AlertKind::DiskUsageHigh.as_str();
+pub const NO_KVM: &str = AlertKind::NoKvm.as_str();
 /// A disk fuller than this, in percent, raises `DiskUsageHigh`.
 pub const DISK_USAGE_HIGH_PCT: f32 = 85.0;
 
 /// The kinds this controller owns.
-const HOST_KINDS: [&str; 4] = [PORT_DOWN, BOND_DEGRADED, LINK_SPEED_LOW, DISK_USAGE_HIGH];
+const HOST_KINDS: [&str; 5] = [PORT_DOWN, BOND_DEGRADED, LINK_SPEED_LOW, DISK_USAGE_HIGH, NO_KVM];
 
 pub fn run(state: &ClusterState, v: &Volatile) -> Vec<Action> {
     let mut open: BTreeMap<HostId, Vec<&Alert>> = BTreeMap::new();
@@ -223,6 +228,11 @@ fn conditions(host: &HostObj, v: &Volatile, unreachable: &BTreeSet<SwitchId>) ->
             let message = format!("{id} {}: {} Mbps, expected {expected} Mbps", n.name, n.speed_mbps);
             out.push(condition(LINK_SPEED_LOW, "linkspeedlow", &n.name, message));
         }
+    }
+    let kube = v.kube_status.get(id).or(host.kube.as_ref());
+    if host.roles.contains(&Role::Vm) && kube.is_some_and(|k| k.kvm == Some(false)) {
+        let message = format!("{id} has the vm role but no /dev/kvm: turn on virtualisation in its firmware; no VM runs there until then");
+        out.push(condition(NO_KVM, "nokvm", "kvm", message));
     }
     if let Some(sample) = v.metrics.get(id) {
         for (disk, _) in sample.disk_pct.iter().filter(|(_, pct)| **pct > DISK_USAGE_HIGH_PCT) {
@@ -379,11 +389,28 @@ mod tests {
             SWITCH_UNREACHABLE,
             CP_REPLACEMENT_SUGGESTED,
             crate::controllers::drain::DRAIN_BLOCKED,
+            NO_KVM,
         ] {
             assert_eq!(severity(kind), Severity::Warning, "{kind}");
         }
         assert_eq!(AlertKind::parse("Gremlins"), None);
         assert!(AlertKind::ALL.iter().all(|k| AlertKind::parse(k.as_str()) == Some(*k)));
+    }
+
+    #[test]
+    fn a_vm_host_without_kvm_is_flagged_until_it_has_it_or_loses_the_role() {
+        let mut s = state();
+        let mut v = Volatile::new(0, 1);
+        let kvm = |k: Option<bool>| crate::proto::KubeStatus { kvm: k, ..Default::default() };
+        v.kube_status.insert(hid("m"), kvm(Some(false)));
+        assert!(proposals(run(&s, &v)).is_empty(), "m has no vm role");
+        s.apply(1, Command::SetRoles { id: hid("m"), roles: [Role::Compute, Role::Vm].into() }).unwrap();
+        let message = "m has the vm role but no /dev/kvm: turn on virtualisation in its firmware; no VM runs there until then";
+        assert_eq!(proposals(run(&s, &v)), [raise("nokvm-m-kvm-1-0", NO_KVM, message)]);
+        let Command::RaiseAlert { id, kind, entity, subject, message } = raise("nokvm-m-kvm-1-0", NO_KVM, message) else { unreachable!() };
+        s.apply(2, Command::RaiseAlert { id: id.clone(), kind, entity, subject, message }).unwrap();
+        v.kube_status.insert(hid("m"), kvm(None));
+        assert_eq!(proposals(run(&s, &v)), [Command::ResolveAlert { id }], "an agent that cannot say raises nothing");
     }
 
     /// `m` runs bonds `data` (sfp0 + sfp1) and `data-2` (eth0 + eth1).

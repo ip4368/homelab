@@ -68,4 +68,13 @@ drained_since: { [key in HostId]: number },
  * On a server: why the pods of a host it was asked to drain could not
  * all be evicted yet, by host.
  */
-drain_blocked: { [key in HostId]: string }, };
+drain_blocked: { [key in HostId]: string }, 
+/**
+ * Whether the host has `/dev/kvm`, which VMs need; `None` from an agent
+ * too old to say.
+ */
+kvm: boolean | null, 
+/**
+ * On a server: it has written the KubeVirt manifest ([`KubeSpec::kubevirt`]).
+ */
+kubevirt: boolean, };

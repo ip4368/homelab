@@ -48,6 +48,8 @@ describe('host drawer kubernetes', () => {
     cordon_noted: [],
     drained_since: {},
     drain_blocked: {},
+    kvm: true,
+    kubevirt: false,
     ...over,
   })
   it('says what the host runs and how far it got', () => {

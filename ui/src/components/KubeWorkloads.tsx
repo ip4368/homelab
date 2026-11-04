@@ -127,7 +127,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
               Delete
             </button>
           )}
-          {!can.remove && <span className="muted" title="K3s and Longhorn run here, installed and supervised by homelabd: change it with kubectl">system</span>}
+          {!can.remove && <span className="muted" title="K3s, Longhorn and KubeVirt run here, installed by homelabd: change it with kubectl">system</span>}
         </td>
       </tr>
       {error && (
@@ -168,7 +168,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           </select>
         </label>
         <label className="inline">
-          <input type="checkbox" checked={filter.hideSystem} onChange={(e) => set({ hideSystem: e.target.checked })} /> hide K3s and Longhorn
+          <input type="checkbox" checked={filter.hideSystem} onChange={(e) => set({ hideSystem: e.target.checked })} /> hide K3s, Longhorn and KubeVirt
         </label>
         <label className="inline">
           Host{' '}
@@ -184,6 +184,12 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
         <span className="muted">
           {kube.pods.length} pods in {kube.workloads.length} workloads, {kube.volumes.length} Longhorn volumes
           {kube.at > 0 && ` · read ${age(kube.at, now)} ago`}
+          {kube.kubevirt && (
+            <span className={kube.kubevirt === 'Deployed' ? undefined : 'warn'} title="VMs run on the hosts with the vm role">
+              {' '}
+              · KubeVirt {kube.kubevirt.toLowerCase()}
+            </span>
+          )}
         </span>
       </div>
       {kube.metrics_error && kube.at > 0 && <p className="muted">No CPU and memory usage: {kube.metrics_error}</p>}

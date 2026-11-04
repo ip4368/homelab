@@ -231,7 +231,12 @@ pub fn desired(state: &ClusterState, id: &HostId, status: &impl Fn(&HostId) -> O
     if storage_ip.is_some() {
         labels.insert(STORAGE_NETWORK_LABEL.into(), "true".into());
     }
-    Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels, storage_disks, storage_network: net.map(|(_, n)| n), storage_ip })
+    // A vm host without KVM can run no VM: KubeVirt is kept off it (its alert says why).
+    if status(id).is_some_and(|s| s.kvm == Some(false)) {
+        labels.remove(&format!("{LABEL_PREFIX}{}", role_label(Role::Vm)));
+    }
+    let kubevirt = role == KubeRole::Server && state.hosts.values().any(|o| member(o) && o.roles.contains(&Role::Vm));
+    Some(KubeSpec { role, init, token: kube.token.clone(), node_ip, labels, storage_disks, storage_network: net.map(|(_, n)| n), storage_ip, kubevirt })
 }
 
 /// What a running server is to do for the cluster now, sent to the first
@@ -479,11 +484,32 @@ mod tests {
         v.kube_sent.insert(hid("ms01-01"), 1000);
         assert!(sent(&run(&s, &v, 1000 + KUBE_RESEND_MS - 1)).is_empty(), "sent a moment ago");
         assert_eq!(sent(&run(&s, &v, 1000 + KUBE_RESEND_MS)).len(), 1);
-        let done = KubeStatus { labels: spec.labels.clone(), storage_disks: spec.storage_disks.clone(), ..running(KubeRole::Server) };
+        let done = KubeStatus { labels: spec.labels.clone(), storage_disks: spec.storage_disks.clone(), kubevirt: spec.kubevirt, ..running(KubeRole::Server) };
         v.kube_status.insert(hid("ms01-01"), done.clone());
         let actions = run(&s, &v, 1000 + KUBE_RESEND_MS);
         assert!(sent(&actions).is_empty());
         assert_eq!(actions, [Action::Propose(Command::RecordKube { id: hid("ms01-01"), status: done })], "what it reports is recorded");
+    }
+
+    #[test]
+    fn servers_install_kubevirt_once_a_host_has_the_vm_role_and_a_vm_host_without_kvm_gets_no_vm_label() {
+        let mut s = cluster(&[("pi5-01", ProfileId::Pi5)]);
+        let spec = desired(&s, &hid("ms01-01"), &|_| None).unwrap();
+        assert!(spec.kubevirt, "ms01-01 has the vm role");
+        assert_eq!(spec.labels.get("homelab.io/vm").map(String::as_str), Some("true"));
+        let written = KubeStatus { labels: spec.labels.clone(), storage_disks: spec.storage_disks.clone(), ..running(KubeRole::Server) };
+        assert!(!written.satisfies(&spec), "not until the manifest is written");
+        assert!(KubeStatus { kubevirt: true, ..written }.satisfies(&spec));
+        let server = |id: &HostId| (id.as_str() == "ms01-01").then(|| running(KubeRole::Server));
+        assert!(!desired(&s, &hid("pi5-01"), &server).unwrap().kubevirt, "only servers write manifests");
+
+        let no_kvm = |_: &HostId| Some(KubeStatus { kvm: Some(false), ..running(KubeRole::Server) });
+        assert_eq!(desired(&s, &hid("ms01-01"), &no_kvm).unwrap().labels.get("homelab.io/vm"), None);
+        let unknown = |_: &HostId| Some(KubeStatus { kvm: None, ..running(KubeRole::Server) });
+        assert!(desired(&s, &hid("ms01-01"), &unknown).unwrap().labels.contains_key("homelab.io/vm"), "an agent too old to say keeps it");
+
+        s.apply(0, Command::SetRoles { id: hid("ms01-01"), roles: [Role::ControlPlane, Role::Storage].into() }).unwrap();
+        assert!(!desired(&s, &hid("ms01-01"), &|_| None).unwrap().kubevirt, "no host has the vm role");
     }
 
     #[test]

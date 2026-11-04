@@ -12,9 +12,9 @@ use ts_rs::TS;
 /// Who the server's changes are recorded as, in each object's managed fields.
 pub const FIELD_MANAGER: &str = "homelab-ui";
 
-/// Namespaces the server changes nothing in. K3s, Longhorn and Multus run
-/// there, installed and supervised by homelabd; kubectl can still change them.
-pub const PROTECTED_NAMESPACES: [&str; 4] = ["kube-system", "kube-public", "kube-node-lease", "longhorn-system"];
+/// Namespaces the server changes nothing in. K3s, Longhorn, Multus and
+/// KubeVirt run there, installed by homelabd; kubectl can still change them.
+pub const PROTECTED_NAMESPACES: [&str; 5] = ["kube-system", "kube-public", "kube-node-lease", "longhorn-system", "kubevirt"];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[ts(export)]
@@ -110,7 +110,7 @@ pub fn refusal(action: &KubeAction) -> Option<String> {
         return Some(format!("{:?}/{:?} is not a Kubernetes namespace and name", w.namespace, w.name));
     }
     if PROTECTED_NAMESPACES.contains(&w.namespace.as_str()) {
-        return Some(format!("{} belongs to K3s and Longhorn, which homelabd installs and supervises: change it with kubectl", w.namespace));
+        return Some(format!("{} belongs to K3s, Longhorn or KubeVirt, which homelabd installs: change it with kubectl", w.namespace));
     }
     if matches!(action, KubeAction::Scale { .. }) && w.kind == WorkloadKind::DaemonSet {
         return Some(format!("{} is a DaemonSet: it runs one pod on each node it may, so it has no replicas to scale", w.name));
