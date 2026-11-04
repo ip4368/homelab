@@ -140,11 +140,23 @@ The UI's Workloads tab shows what Kubernetes runs: the workloads, each pod with 
 Each workload's row also shows:
 - **Health**, with the reason when it is not healthy: down, degraded, rolling out (`1/3 updated`) or idle (scaled to 0). The reason is the stuck pods' (`CrashLoopBackOff`, `ImagePullBackOff`, `Unschedulable: 0/4 nodes are available…`) or the controller's (`ReplicaFailure`, a rollout past its deadline). A healthy workload whose pod last restarted for `OOMKilled` or `Error` says so.
 - **CPU and memory**, from metrics-server (K3s ships it), summed over its pods and shown against their limits when every container has one. Without metrics-server the tab says why and shows the rest.
+- **Network**: what its pods receive and send, from each node's kubelet (`/api/v1/nodes/<node>/proxy/stats/summary`, read every 15 s). A node whose kubelet does not answer is named above the table.
 - **Endpoints**: an Ingress rule as `http://<VIP or host><path>`, a `LoadBalancer` Service as `<VIP>:<port>` (K3s's ServiceLB answers on every node, the VIP's holder too), a `NodePort` as `<VIP>:<nodePort>`, and a `ClusterIP` Service as `<name>.<namespace>:<port>`, greyed because only pods reach it. Web ones are links.
 
-Click a workload's name for its drawer: health and the conditions that are not as they should be, usage, every endpoint, images, each pod with its host, why it is as it is (the scheduler's message, how a container last ended), restarts and usage, its Longhorn volumes, and the Warning events of the last hour on it, its ReplicaSets and its pods.
+The Longhorn volumes table shows how full each volume's filesystem is, as the kubelet of a pod using it sees it (Longhorn itself knows only the blocks written).
 
-Each workload's row can also change it, as kubectl would: type a new replica count and click **Scale** (Deployments and StatefulSets), **Restart** its pods a few at a time (`kubectl rollout restart`), or **Delete** it. Deleting a StatefulSet keeps its volume claims and their data; delete those with kubectl once you no longer need them. Nothing in `kube-system`, `kube-public`, `kube-node-lease` or `longhorn-system` can be changed from the UI: K3s and Longhorn run there, installed and supervised by homelabd, so use kubectl. The same changes can be scripted:
+Click a workload's name for its drawer: health and the conditions that are not as they should be, a PodDisruptionBudget that allows no eviction now (draining its pods' hosts waits for it), usage with an hour of CPU, memory and network charts (kept in the server's memory, so they start again when it restarts), every endpoint, and each container: its image and the digests its pods run (two digests mean a tag moved), requests and limits, ports, probes, environment variables by name and source (never their values), mounts with what each volume is, devices (host paths under `/dev`, raw block claims, device plugins' resources, privilege) and what it may do beyond a plain container. Then each pod with its host, why it is as it is (the scheduler's message, how a container last ended), restarts, usage and network; expand a pod for each container's state and digest, its IPs, Multus attachments and how much of its node's disk it uses. Then its Longhorn volumes, its rollout history (a Deployment's ReplicaSets, a StatefulSet's or DaemonSet's ControllerRevisions), and the Warning events of the last hour on it, its ReplicaSets and its pods.
+
+**Logs** on a pod's row opens its log in a dock at the bottom of the page: the last 500 lines, then new ones as they come. It follows the end unless you scroll up, filters, wraps and shows timestamps, and keeps the last 5000 lines; pick another container, or **Previous run** for the log of the run before the last restart (what a `CrashLoopBackOff` needs). **Download** saves the whole log. Logs can be read in every namespace, K3s's and Longhorn's included. The dock keeps its tabs while you move around the page, and hidden ones keep following.
+
+**Shell** on a running pod's row opens a terminal in the dock: bash in the container if it has it, else sh, as `kubectl exec -it` would. An image without a shell says so. There is no shell in the namespaces the UI does not change (below): use `kubectl exec` there. The server logs each terminal's opening and closing, and keeps at most 16 open.
+
+```sh
+curl 'http://<server>:8080/api/kube/logs?namespace=demo&pod=web-6d4-x2&tail=100'       # follows; add &follow=false for the log so far
+curl 'http://<server>:8080/api/kube/metrics?namespace=demo&kind=Deployment&name=web'   # the last hour, as /api/metrics
+```
+
+Each workload's row can also change it, as kubectl would: type a new replica count and click **Scale** (Deployments and StatefulSets), **Restart** its pods a few at a time (`kubectl rollout restart`), or **Delete** it. Deleting a StatefulSet keeps its volume claims and their data; delete those with kubectl once you no longer need them. Nothing in `kube-system`, `kube-public`, `kube-node-lease`, `longhorn-system` or `kubevirt` can be changed from the UI: K3s, Longhorn and KubeVirt run there, installed by homelabd, so use kubectl. The same changes can be scripted:
 
 ```sh
 curl -X POST http://<server>:8080/api/kube -H 'content-type: application/json' \
@@ -165,13 +177,26 @@ curl -X POST http://<server>:8080/api/kube/apply -H 'content-type: application/j
 curl 'http://<server>:8080/api/kube/manifest?namespace=demo&kind=Deployment&name=web'
 ```
 
+### VMs
+
+Once a host has the vm role (every MS-01 does), homelabd's K3s servers install KubeVirt (v1.9.1, its operator manifest vendored in homelabd). It runs VMs only on the vm hosts. A VM needs `/dev/kvm`: a vm host without it gets a `NoKvm` alert and loses its `homelab.io/vm` label until it has it, so turn on virtualisation in its firmware. In the lab, the VMs have `/dev/kvm` when the lab machine allows nested virtualisation; `./lab.sh up` warns when it does not. The Workloads tab says how KubeVirt stands above its table.
+
+A VirtualMachine shows in the Workloads tab like any workload: its health from KubeVirt's status (running, stopped, starting, or why not, such as `ErrorUnschedulable`), its launcher pod's usage, its endpoints (Services that select its template's labels), and in its drawer its guest (OS, kernel and addresses from the guest agent, when the guest runs one), its disks and whether it can move to another host while it runs. **Start**, **Stop** and **Restart** on its row do what `virtctl` does. **Console** in its drawer opens its serial console in the dock (KubeVirt allows one connection at a time), and **Console log** what the console printed, even with nobody attached. A drained host's VMs restart on another vm host, or move while running if their disks allow it.
+
+Apply YAML's **New VM** tab writes a VM: a name, a containerDisk image (its root disk, reset on every restart; Debian 13 by default), cores and memory, a user with an SSH key or a password (to log in on the console; it is stored in the VM's spec), optionally a Longhorn data disk that survives restarts and a port for a Service. The guest agent is installed by cloud-init.
+
+```sh
+curl -X POST http://<server>:8080/api/kube -H 'content-type: application/json' \
+  -d '{"Stop": {"workload": {"namespace": "demo", "kind": "VirtualMachine", "name": "deb"}}}'
+```
+
 ## Upgrading homelabd
 
 ```sh
 curl -fsSL <url>/install.sh | sudo sh -s -- upgrade
 ```
 
-Upgrade every K3s server before relying on new Kubernetes features: each server writes the Longhorn manifest from its own version.
+Upgrade every K3s server before relying on new Kubernetes features: each server writes the Longhorn and KubeVirt manifests from its own version.
 
 Until a voter runs a homelabd that can take over by a VIP move, the leader refuses to move the VIP to it. Upgrading voters one at a time, leader last, works as before: the leader's restart is an ordinary failover.
 

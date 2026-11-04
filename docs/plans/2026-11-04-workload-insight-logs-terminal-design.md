@@ -1,7 +1,7 @@
 # Homelab Cluster Manager — More About a Workload, Its Logs and a Terminal, and VMs as Workloads
 
 Date: 2026-11-04
-Status: Design; nothing built yet.
+Status: Steps 1–7 built; the later items of §2 not yet. §7.4 changed when built (see there).
 Builds on: `2026-11-02-workload-details-design.md` (health, usage, endpoints, the workload drawer; its step 3, usage history, is folded in here), `2026-11-02-ui-workload-actions-design.md` (writes from the UI's server, guard rails) and `2026-10-29-homelabd-k3s-responsibilities-design.md` (who owns what).
 
 ## 1. Intent
@@ -241,6 +241,8 @@ A VM needs `/dev/kvm`. KubeVirt can emulate without it, but too slowly to be use
 ### 7.4 Supervision
 
 `KubeHealth` (from servers) gains the `KubeVirt` object's `status.phase`. A `KubeVirtNotReady` warning is raised when it has not been `Deployed` for 5 min. Alert only, like Longhorn's: homelabd does not repair KubeVirt beyond keeping its manifest written.
+
+*As built:* `KubeHealth` and the supervision of the responsibilities design are not built yet, so there is no `KubeVirtNotReady`. Instead the UI's server reads the `KubeVirt` object with the rest (`KubeView.kubevirt`), and the Workloads tab and the New VM form say how it stands. The alert comes with `KubeHealth`.
 
 ### 7.5 Draining
 

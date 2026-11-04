@@ -29,18 +29,18 @@ homelabd keeps its own Raft control plane beside K3s on purpose: it does not dep
 can still see, report and repair K3s when K3s breaks. The rule: **homelabd owns the machines and
 everything K3s stands on, and supervises K3s; K3s owns everything that runs on it.**
 
-| homelabd | K3s and Longhorn |
+| homelabd | K3s, Longhorn and KubeVirt |
 |---|---|
 | Hosts: join, approval, roles, lifecycle, removal | Pods, scheduling, restarts, eviction timing |
 | Host networking and switches | PVCs, Longhorn volumes and replicas |
-| The VIP; which hosts are K3s servers; etcd membership | |
-| Installing K3s and Longhorn; `homelab.io/` node labels; which disks Longhorn may use | |
+| The VIP; which hosts are K3s servers; etcd membership | VirtualMachines, their instances, disks and consoles |
+| Installing K3s, Longhorn and KubeVirt; `homelab.io/` node labels; which disks Longhorn may use | |
 | Starting cordon and drain | Evicting the pods |
 | Host metrics; K3s's health: alerts and safe repairs | |
 
-The Workloads tab's changes (applying YAML, scale, restart, delete) come from the UI's server on the user's
-behalf, as kubectl would make them with the admin kubeconfig. homelabd itself still never writes a
-workload.
+The Workloads tab's changes (applying YAML, scale, restart, delete, starting and stopping VMs) and its
+shells and consoles come from the UI's server on the user's behalf, as kubectl and virtctl would with
+the admin kubeconfig. homelabd itself still never writes a workload.
 
 The full split, the two kinds of "down" (host NotReady, node not Ready) and how homelabd supervises
 K3s: [docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md](docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md).
@@ -92,11 +92,15 @@ the **Ground truth** checkbox; the lab host's clock.
   editor and suggested fixes.
 - **Networks:** logical networks (VLAN, subnet, MTU), network templates (with staged rollouts) and
   auto-approve rules.
-- **Workloads:** what Kubernetes runs, read from the K3s API: workloads with their health and why,
-  CPU and memory (metrics-server) and endpoints, their pods and where they run, and Longhorn's
-  volumes with their replicas. A workload's drawer adds its pods' details and Warning events. Scale, restart, edit or delete a workload from
-  its row, and apply YAML after a dry-run preview, pasted or written by a small form for an app
-  from an image (not in the K3s and Longhorn namespaces).
+- **Workloads:** what Kubernetes runs, read from the K3s API: workloads (KubeVirt VMs among them)
+  with their health and why, CPU, memory and network, and endpoints; their pods and where they run;
+  and Longhorn's volumes with their replicas and how full they are. A workload's drawer adds its
+  containers (resources, ports, probes, environment names, mounts, devices), an hour of charts, its
+  rollout history, its pods' details and Warning events; a VM's adds its guest and disks. Scale,
+  restart, edit or delete a workload from its row, start or stop a VM, and apply YAML after a
+  dry-run preview, pasted or written by a small form for an app from an image or a VM (not in the
+  K3s, Longhorn and KubeVirt namespaces). A dock at the bottom follows pods' logs and holds shells
+  in containers and VMs' serial consoles.
 
 **Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
 
