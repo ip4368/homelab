@@ -159,8 +159,8 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
   }
 
   return (
-    <aside className="drawer switch-drawer" aria-label={`switch ${id}`}>
-      <div className="drawer-head">
+    <aside className="drawer switch-drawer inspector" aria-label={`switch ${id}`}>
+      <div className="drawer-head inspector-head">
         <h3>{id}</h3>
         <span className="muted">{sw.model}</span>
         <div className="spacer" />
@@ -168,8 +168,14 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
           ×
         </button>
       </div>
+      <div className="inspector-summary switch-summary">
+        <span><b>{sw.ports.length}</b><small>ports</small></span>
+        <span><b>{rows.length}</b><small>cabled or notable</small></span>
+        <span><b>{fixes.length}</b><small>suggested fixes</small></span>
+        <span><b>{formatClock(sw.last_seen)}</b><small>last poll</small></span>
+      </div>
       <p className="muted">
-        {sw.mlag_peer ? `MLAG peer ${sw.mlag_peer}. ` : ''}Last seen at {formatClock(sw.last_seen)}. Ports show the last poll.
+        {sw.mlag_peer ? `MLAG peer ${sw.mlag_peer}. ` : ''}Ports show the last poll.
       </p>
       {fixes.length > 0 && (
         <div className="section">
@@ -190,14 +196,15 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
           </ul>
         </div>
       )}
-      <div className="section">
+      <div className="switch-workspace">
+      <div className="section switch-ports-pane">
         <h4>
           Ports{' '}
           <label className="inline">
             <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> show all {sw.ports.length}
           </label>
         </h4>
-        <table className="ports">
+        <div className="table-scroll switch-table-scroll"><table className="ports">
           <thead>
             <tr>
               <th>Port</th>
@@ -251,14 +258,17 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
               </tr>
             )}
           </tbody>
-        </table>
+        </table></div>
       </div>
+      <div className="switch-editor-pane">
       {editing ? (
         // Re-mount when the switch reports a different config for the port.
         <PortEditor key={`${id}:${editing.port}:${JSON.stringify(editing.cfg)}`} switchId={id} port={editing.port} cfg={editing.cfg} />
       ) : (
-        <p className="muted">Pick a port to edit its config.</p>
+        <div className="empty-editor"><strong>No port selected</strong><p className="muted">Pick a port to edit its config here, beside the port table.</p></div>
       )}
+      </div>
+      </div>
     </aside>
   )
 }

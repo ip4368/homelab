@@ -32,8 +32,9 @@ export function partitionOf(hosts: string, sw: string): LabFault | null {
 
 const POWER_LABEL: Record<Power, string> = { Off: 'off', Running: 'running', Paused: 'frozen', Unknown: 'not answering' }
 
-export function LabPanel({ selected }: { selected: string | null }) {
-  const [open, setOpen] = useState(true)
+export function LabPanel({ selected, collapsible = true }: { selected: string | null; collapsible?: boolean }) {
+  const [ownOpen, setOpen] = useState(true)
+  const open = collapsible ? ownOpen : true
   const truth = useStore((s) => s.truth)
   // The machine picked here, and the fleet selection it was picked under.
   const [chosen, setChosen] = useState({ vm: '', under: selected })
@@ -73,9 +74,11 @@ export function LabPanel({ selected }: { selected: string | null }) {
 
   return (
     <section className="faultpanel">
-      <button className="link" onClick={() => setOpen(!open)} aria-expanded={open}>
-        {open ? '▾' : '▸'} Lab
-      </button>
+      {collapsible && (
+        <button className="link" onClick={() => setOpen(!open)} aria-expanded={open}>
+          {open ? '▾' : '▸'} Lab
+        </button>
+      )}
       {open && (
         <div className="fault-body">
           <div className="fault-group">

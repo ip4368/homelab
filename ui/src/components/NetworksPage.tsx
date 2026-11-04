@@ -129,7 +129,8 @@ function NetworksTab({ onRollout }: { onRollout(c: Change): void }) {
   const [editing, setEditing] = useState<NetworkForm | 'new' | null>(null)
   const ids = Object.keys(networks).sort()
   return (
-    <div>
+    <div className="split-editor">
+      <div className="split-main">
       <table className="ports data">
         <thead>
           <tr>
@@ -156,6 +157,7 @@ function NetworksTab({ onRollout }: { onRollout(c: Change): void }) {
       </table>
       <div className="actions">
         <button onClick={() => setEditing('new')}>New network</button>
+      </div>
       </div>
       {editing && (
         <NetworkEditorForm
@@ -289,7 +291,8 @@ function TemplatesTab({ onRollout }: { onRollout(c: Change): void }) {
     setEditing({ id: t.id, profile: t.profile, role: t.role ?? '', config: t.config })
   }
   return (
-    <div>
+    <div className="split-editor">
+      <div className="split-main">
       <table className="ports data">
         <thead>
           <tr>
@@ -323,6 +326,7 @@ function TemplatesTab({ onRollout }: { onRollout(c: Change): void }) {
         >
           New template
         </button>
+      </div>
       </div>
       {editing && <TemplateEditorForm key={`${existing}:${editing.id}`} initial={editing} existing={existing} onRollout={onRollout} onCancel={() => setEditing(null)} />}
     </div>
@@ -417,7 +421,8 @@ function RulesTab() {
   const [editing, setEditing] = useState<{ draft: RuleDraft; existing: boolean } | null>(null)
   const rows = Object.values(rules).sort((a, b) => a.id.localeCompare(b.id))
   return (
-    <div>
+    <div className="split-editor">
+      <div className="split-main">
       <table className="ports data">
         <thead>
           <tr>
@@ -444,6 +449,7 @@ function RulesTab() {
       <div className="actions">
         <button onClick={() => setEditing({ existing: false, draft: { id: '', profile: 'Ms01', roles: ['Compute'], template: '' } })}>New rule</button>
       </div>
+      </div>
       {editing && <RuleEditorForm key={`${editing.existing}:${editing.draft.id}`} initial={editing.draft} existing={editing.existing} onDone={() => setEditing(null)} />}
     </div>
   )
@@ -456,21 +462,27 @@ export function NetworksPage() {
   const rollouts = useStore((s) => s.view.rollouts)
   const active = Object.values(rollouts).filter((r) => r.state !== 'Done' && r.state !== 'Aborted').length
   return (
-    <section className="networks-page">
-      <div className="fleet-bar">
-        <div className="tabs inline-tabs" role="tablist">
+    <section className="networks-page workspace-page">
+      <aside className="networks-nav">
+        <div>
+          <span className="eyebrow">Configuration</span>
+          <h2>Networks</h2>
+          <p className="muted">Logical networks, host templates, and join policy stay side by side with the editor you open.</p>
+        </div>
+        <div className="tabs inline-tabs vertical-tabs" role="tablist">
           {TABS.map((t) => (
             <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
               {t}
             </button>
           ))}
         </div>
-        <div className="spacer" />
         <button onClick={() => setShowRollouts(true)}>Rollouts{active > 0 ? ` (${active} active)` : ''}</button>
-      </div>
+      </aside>
+      <div className="networks-content">
       {tab === 'Networks' && <NetworksTab onRollout={setChange} />}
       {tab === 'Templates' && <TemplatesTab onRollout={setChange} />}
       {tab === 'Auto-approve rules' && <RulesTab />}
+      </div>
       {(change || showRollouts) && (
         <RolloutDialog
           key={change ? JSON.stringify(change) : 'list'}

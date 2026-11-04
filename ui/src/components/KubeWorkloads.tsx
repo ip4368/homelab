@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, byteRate, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, byteRate, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, usedPct, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
@@ -154,11 +154,40 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
   const namespaces = useMemo(() => [...new Set(kube.pods.map((p) => p.namespace))].sort(), [kube.pods])
   const hosts = useMemo(() => [...new Set(kube.pods.flatMap((p) => (p.node ? [p.node] : [])))].sort(), [kube.pods])
   const [draft, setDraft] = useState<ApplyDraft | null>(null)
+  const [tab, setTab] = useState<'Workloads' | 'Pods' | 'Storage'>('Workloads')
+  const claims = useMemo(() => {
+    const text = filter.text.trim().toLowerCase()
+    return kube.claims.filter((c) => (filter.namespace ? c.namespace === filter.namespace : !(filter.hideSystem && ['kube-system', 'longhorn-system'].includes(c.namespace))) && (text === '' || c.name.toLowerCase().includes(text) || c.namespace.toLowerCase().includes(text)))
+  }, [kube.claims, filter])
+  const summary = useMemo(
+    () => ({
+      healthy: rows.workloads.filter(({ workload: w }) => w.health.state === 'Healthy').length,
+      issues: rows.workloads.filter(({ workload: w }) => w.health.state === 'Down' || w.health.state === 'Degraded').length,
+      readyPods: rows.pods.filter((p) => p.ready > 0 && p.ready === p.containers).length,
+      restarts: rows.pods.reduce((n, p) => n + p.restarts, 0),
+      rx: rows.pods.reduce((n, p) => n + (p.net_rx_bps ?? 0), 0),
+      tx: rows.pods.reduce((n, p) => n + (p.net_tx_bps ?? 0), 0),
+      unhealthyVolumes: rows.volumes.filter((v) => v.robustness === 'degraded' || v.robustness === 'faulted').length,
+    }),
+    [rows],
+  )
 
   return (
-    <section className="workloads kube-workloads">
-      <h3>Kubernetes</h3>
-      <div className="fleet-bar">
+    <section className="workloads kube-workloads workspace-page">
+      <div className="page-heading compact-heading">
+        <div>
+          <span className="eyebrow">Kubernetes</span>
+          <h2>Workloads</h2>
+          <p className="muted">Operate applications, then drill into pods, storage, logs, and shells without scrolling past unrelated tables.</p>
+        </div>
+        <div className="summary-pills" aria-label="Workload summary">
+          <span><b className="ok">{summary.healthy}</b> healthy</span>
+          <span><b className={summary.issues ? 'bad' : ''}>{summary.issues}</b> need attention</span>
+          <span><b>{summary.readyPods}/{rows.pods.length}</b> pods ready</span>
+          <span><b>↓{byteRate(summary.rx)}</b> <b>↑{byteRate(summary.tx)}</b></span>
+        </div>
+      </div>
+      <div className="fleet-bar toolbar-card kube-toolbar">
         <label className="inline">
           Namespace{' '}
           <select value={filter.namespace} onChange={(e) => set({ namespace: e.target.value })} aria-label="namespace">
@@ -187,12 +216,27 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           {kube.at > 0 && ` · read ${age(kube.at, now)} ago`}
         </span>
       </div>
-      {kube.metrics_error && kube.at > 0 && <p className="muted">No CPU and memory usage: {kube.metrics_error}</p>}
-      {kube.stats_error && kube.at > 0 && <p className="muted">No network and storage usage: {kube.stats_error}</p>}
-      {kube.error && <p className={kube.at > 0 ? 'warn' : 'muted'}>{kube.at > 0 ? `Last read failed: ${kube.error}` : `Waiting for Kubernetes: ${kube.error}`}</p>}
+      {(kube.metrics_error || kube.stats_error || kube.error) && kube.at > 0 && (
+        <div className="notice-strip" role="status">
+          {kube.error && <span className="warn">Last read failed: {kube.error}</span>}
+          {kube.metrics_error && <span>No CPU/memory: {kube.metrics_error}</span>}
+          {kube.stats_error && <span>No network/storage: {kube.stats_error}</span>}
+        </div>
+      )}
+      {kube.error && kube.at === 0 && <p className="muted">Waiting for Kubernetes: {kube.error}</p>}
 
-      <h4>Workloads</h4>
-      <table className="data workload-table">
+      <div className="segmented-control" role="tablist" aria-label="Kubernetes objects">
+        {(['Workloads', 'Pods', 'Storage'] as const).map((t) => (
+          <button key={t} role="tab" aria-selected={tab === t} className={tab === t ? 'active' : ''} onClick={() => setTab(t)}>
+            {t} <span>{t === 'Workloads' ? rows.workloads.length : t === 'Pods' ? rows.pods.length : rows.volumes.length + claims.length}</span>
+          </button>
+        ))}
+      </div>
+
+      {tab === 'Workloads' && (
+        <div className="table-pane">
+      <h4 className="sr-only">Workloads</h4>
+      <table className="data workload-table workloads-main-table">
         <thead>
           <tr>
             <th>Namespace</th>
@@ -221,8 +265,13 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
         </tbody>
       </table>
 
-      <h4>Pods</h4>
-      <table className="data workload-table">
+        </div>
+      )}
+
+      {tab === 'Pods' && (
+        <div className="table-pane">
+      <h4 className="sr-only">Pods</h4>
+      <table className="data workload-table pods-main-table">
         <thead>
           <tr>
             <th>Namespace</th>
@@ -281,6 +330,12 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
         </p>
       )}
 
+        </div>
+      )}
+
+      {tab === 'Storage' && (
+        <div className="storage-workspace">
+          <div className="table-pane">
       <h4>Longhorn volumes</h4>
       <table className="data workload-table">
         <thead>
@@ -334,6 +389,44 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           )}
         </tbody>
       </table>
+          </div>
+          <div className="table-pane">
+            <h4>Volume claims</h4>
+            <table className="data workload-table">
+              <thead>
+                <tr>
+                  <th>Claim</th>
+                  <th>Phase</th>
+                  <th>Used</th>
+                  <th>Capacity</th>
+                  <th>Class</th>
+                  <th>Access</th>
+                </tr>
+              </thead>
+              <tbody>
+                {claims.map((c) => {
+                  const pct = usedPct(c.used_bytes, c.capacity_bytes ?? c.requested_bytes)
+                  return (
+                    <tr key={`${c.namespace}/${c.name}`}>
+                      <td><strong>{c.name}</strong><div className="muted">{c.namespace}</div></td>
+                      <td className={c.phase === 'Bound' ? 'ok' : 'warn'}>{c.phase}</td>
+                      <td className="num">{c.used_bytes === null ? '—' : mem(c.used_bytes)}{pct !== null && <span className="muted"> ({pct}%)</span>}</td>
+                      <td>{gib(c.capacity_bytes ?? c.requested_bytes ?? 0)}</td>
+                      <td className="muted">{c.storage_class ?? '—'}</td>
+                      <td className="muted">{c.access_modes.join(', ') || '—'}</td>
+                    </tr>
+                  )
+                })}
+                {claims.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="muted">{kube.claims.length === 0 ? 'No claims yet.' : 'Nothing matches the filters.'}</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
       {draft && <ApplyDialog draft={draft} namespaces={namespaces} onClose={() => setDraft(null)} />}
     </section>
   )

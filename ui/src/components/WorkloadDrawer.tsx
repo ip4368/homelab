@@ -7,6 +7,7 @@ import { age, byteRate, cpu, gib, mem, podClaims, podTone, podWhy, PROTECTED_NAM
 import { useStore } from '../store'
 import { KubeCharts } from './Charts'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
+import { InspectorTabs } from './InspectorTabs'
 import { LogPanel } from './LogPanel'
 import { Terminal } from './Terminal'
 
@@ -16,6 +17,11 @@ interface ShellTarget {
   shell: string
 }
 
+const WORKLOAD_TABS = ['Overview', 'Pods & debug', 'Storage', 'Events'] as const
+type WorkloadTab = (typeof WORKLOAD_TABS)[number]
+const POD_TABS = ['Containers', 'Mounts', 'Metrics', 'Logs'] as const
+type PodTab = (typeof POD_TABS)[number]
+
 /** A claim's fullness, when the kubelet reports it: `1.2Gi of 2Gi used (60%)`. */
 function claimUse(c: KubeClaim): string | null {
   const pct = usedPct(c.used_bytes, c.capacity_bytes ?? c.requested_bytes)
@@ -23,9 +29,10 @@ function claimUse(c: KubeClaim): string | null {
   return `${mem(c.used_bytes)} of ${mem(c.capacity_bytes ?? c.requested_bytes)} used (${pct}%)`
 }
 
-/** One pod in full: where it sits, its containers, mounts, history, logs, and a shell into each container. */
+/** One pod in full, one job at a time: containers, storage, metrics or logs. */
 function PodDetail({ p, claims, nodes, canExec, onSelectHost, onShell }: { p: KubePod; claims: KubeClaim[]; nodes: KubeNode[]; canExec: boolean; onSelectHost(id: string): void; onShell(t: ShellTarget): void }) {
   const [shell, setShell] = useState<string>(SHELLS[0])
+  const [tab, setTab] = useState<PodTab>('Containers')
   const node = nodes.find((n) => n.name === p.node)
   const mine = podClaims(p, claims)
   const bySource = new Map(mine.map((c) => [c.name, c]))
@@ -68,7 +75,10 @@ function PodDetail({ p, claims, nodes, canExec, onSelectHost, onShell }: { p: Ku
           {node.pressures.length > 0 && <span className="warn"> · under {node.pressures.join(', ')}</span>}
         </div>
       )}
-      <h5>Containers</h5>
+      <InspectorTabs tabs={POD_TABS} value={tab} onChange={(next) => setTab(next)} label={`Pod ${p.name} sections`} />
+
+      {tab === 'Containers' && (
+        <>
           <div className="table-scroll compact-scroll">
             <table className="data">
               <thead>
@@ -115,7 +125,7 @@ function PodDetail({ p, claims, nodes, canExec, onSelectHost, onShell }: { p: Ku
             </table>
           </div>
           {canExec && (
-            <label className="inline">
+            <label className="inline shell-picker">
               Shell{' '}
               <select value={shell} onChange={(e) => setShell(e.target.value)} aria-label="shell">
                 {SHELLS.map((s) => (
@@ -124,9 +134,11 @@ function PodDetail({ p, claims, nodes, canExec, onSelectHost, onShell }: { p: Ku
               </select>
             </label>
           )}
+        </>
+      )}
 
-      <h5>Mounts and devices</h5>
-      {mounts.length === 0 ? <span className="muted">none</span> : (
+      {tab === 'Mounts' && (
+        mounts.length === 0 ? <span className="muted">No mounts or devices.</span> : (
           <div className="table-scroll compact-scroll">
             <table className="data">
               <thead><tr><th>Path</th><th>From</th><th /></tr></thead>
@@ -145,24 +157,24 @@ function PodDetail({ p, claims, nodes, canExec, onSelectHost, onShell }: { p: Ku
               </tbody>
             </table>
           </div>
+        )
       )}
-      <KubeCharts entity={{ pod: `${p.namespace}/${p.name}` }} title="Pod usage, last hour" />
-      <h5>Logs</h5>
-      <LogPanel namespace={p.namespace} pod={p.name} containers={p.container_details.map((c) => c.name)} restarts={p.restarts} />
+      {tab === 'Metrics' && <KubeCharts entity={{ pod: `${p.namespace}/${p.name}` }} title="Pod usage, last hour" row />}
+      {tab === 'Logs' && <LogPanel namespace={p.namespace} pod={p.name} containers={p.container_details.map((c) => c.name)} restarts={p.restarts} />}
     </div>
   )
 }
 
 /**
- * One workload in full, as Kubernetes reports it: health and why, usage and
- * requests, endpoints, images, its pods in full (containers, mounts,
- * history, logs, shells), volumes and Warning events of the last hour.
+ * One workload as a docked workspace: status once at the top, then the one
+ * job the operator picked — overview, pods and debugging, storage, or events.
  */
 export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onClose(): void; onSelectHost(id: string): void }) {
   const kube = useStore((s) => s.kube)
   const now = useStore((s) => s.clock.now)
   const [selected, setSelected] = useState<string | null>(null)
   const [shellTarget, setShellTarget] = useState<ShellTarget | null>(null)
+  const [tab, setTab] = useState<WorkloadTab>('Overview')
   const w = kube.workloads.find((x) => workloadKey(x) === id)
   if (!w) return null
   const owner = `${w.kind}/${w.name}`
@@ -173,18 +185,29 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
   const canExec = !PROTECTED_NAMESPACES.includes(w.namespace)
 
   return (
-    <aside className="drawer workload-drawer" aria-label={`workload ${w.namespace}/${w.name}`}>
-      <div className="drawer-head">
-        <h3>{w.name}</h3>
-        <span className="muted">
-          {w.kind} in {w.namespace}
-        </span>
+    <aside className="drawer workload-drawer inspector" aria-label={`workload ${w.namespace}/${w.name}`}>
+      <div className="drawer-head inspector-head">
+        <div>
+          <span className="eyebrow">{w.kind} · {w.namespace}</span>
+          <h3>{w.name}</h3>
+        </div>
         <div className="spacer" />
-        <button onClick={onClose} aria-label="close">
-          ×
-        </button>
+        <HealthBadge health={w.health} />
+        <button className="icon-button" onClick={onClose} aria-label="close">×</button>
       </div>
 
+      <div className="inspector-summary workload-summary">
+        <span><b>{w.ready}/{w.desired}</b><small>ready replicas</small></span>
+        <span><b>{cpu(w.cpu_milli)}</b><small>CPU {w.cpu_limit_milli ? `of ${cpu(w.cpu_limit_milli)}` : 'in use'}</small></span>
+        <span><b>{mem(w.memory_bytes)}</b><small>memory {w.memory_limit_bytes ? `of ${mem(w.memory_limit_bytes)}` : 'in use'}</small></span>
+        <span><b>↓{byteRate(w.net_rx_bps)}</b><small>network in</small></span>
+        <span><b>↑{byteRate(w.net_tx_bps)}</b><small>network out</small></span>
+      </div>
+      <InspectorTabs tabs={WORKLOAD_TABS} value={tab} onChange={(next) => setTab(next)} label={`Workload ${w.name} sections`} />
+
+      <div className="inspector-body">
+        {tab === 'Overview' && (
+          <>
             <section className="inspector-section">
               <h4>Health</h4>
               <HealthBadge health={w.health} full />
@@ -204,7 +227,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                   <div className="metric-card"><span>Network</span><strong>↓ {byteRate(w.net_rx_bps)}</strong><small>↑ {byteRate(w.net_tx_bps)}{kube.stats_error ? ` · ${kube.stats_error}` : ''}</small></div>
                 </div>
               )}
-              <KubeCharts entity={{ workload: `${w.namespace}/${w.kind}/${w.name}` }} title="Usage, last hour" />
+              <KubeCharts entity={{ workload: `${w.namespace}/${w.kind}/${w.name}` }} title="Usage, last hour" row />
             </section>
             <div className="inspector-two-col">
               <section className="inspector-section">
@@ -218,8 +241,11 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                 <ul className="plain">{w.images.map((i) => <li key={i}><code>{i}</code></li>)}</ul>
               </section>
             </div>
+          </>
+        )}
 
-      <h4>Pods</h4>
+        {tab === 'Pods & debug' && (
+          <>
             <div className="table-scroll pod-table-scroll">
               <table className="data">
                 <thead><tr><th>Name</th><th>Host</th><th>Status</th><th>Restarts</th><th>CPU</th><th>Memory</th><th>Network</th></tr></thead>
@@ -241,10 +267,11 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
             </div>
             {pod && <PodDetail key={pod.name} p={pod} claims={kube.claims} nodes={kube.nodes} canExec={canExec} onSelectHost={onSelectHost} onShell={setShellTarget} />}
             {!canExec && pods.length > 0 && <p className="muted">No shells in {w.namespace}: K3s and Longhorn run here — use kubectl exec. Logs still work.</p>}
+          </>
+        )}
 
-      {volumes.length > 0 && (
-        <>
-          <h4>Volumes</h4>
+        {tab === 'Storage' && (
+          volumes.length === 0 ? <p className="muted">This workload has no Longhorn volumes.</p> : (
             <div className="volume-cards">
               {volumes.map((v) => {
                 const claim = v.pvc ? kube.claims.find((c) => `${c.namespace}/${c.name}` === v.pvc) : undefined
@@ -263,19 +290,24 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                 )
               })}
             </div>
-        </>
-      )}
+          )
+        )}
 
-      <h4>Warning events</h4>
-      {          events.length === 0 ? <span className="muted">No warning events in the last hour.</span> : (
+        {tab === 'Events' && (
+          events.length === 0 ? <span className="muted">No warning events in the last hour.</span> : (
             <ul className="plain kube-events">
               {events.map((e, n) => (
                 <li key={n}><span className="muted">{e.last ? `${age(e.last, now)} ago` : ''}</span> <strong className="warn">{e.reason}</strong>{e.count > 1 && <span className="muted"> ×{e.count}</span>} <span className="muted">{e.object}</span><div>{e.message}</div></li>
               ))}
             </ul>
+          )
         )}
+      </div>
+
       {shellTarget && (
-        <Terminal key={`${shellTarget.pod}/${shellTarget.container}/${shellTarget.shell}`} url={execUrl({ namespace: w.namespace, pod: shellTarget.pod, container: shellTarget.container, shell: shellTarget.shell })} title={`${shellTarget.shell} in ${shellTarget.pod} (${shellTarget.container})`} onClose={() => setShellTarget(null)} />
+        <div className="terminal-dock">
+          <Terminal key={`${shellTarget.pod}/${shellTarget.container}/${shellTarget.shell}`} url={execUrl({ namespace: w.namespace, pod: shellTarget.pod, container: shellTarget.container, shell: shellTarget.shell })} title={`${shellTarget.shell} in ${shellTarget.pod} (${shellTarget.container})`} onClose={() => setShellTarget(null)} />
+        </div>
       )}
     </aside>
   )

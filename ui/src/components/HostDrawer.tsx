@@ -11,6 +11,7 @@ import { store, useStore, type Store } from '../store'
 import { Charts } from './Charts'
 import { LabDebug } from './LabDebug'
 import { downVoters, HandoffDialog, handoffChoices, isDown } from './HandoffDialog'
+import { InspectorTabs } from './InspectorTabs'
 import { NetworkEditor } from './NetworkEditor'
 import { ReplaceDialog, replaceChoices } from './ReplaceDialog'
 import { RolePicker } from './RolePicker'
@@ -274,10 +275,15 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
   )
 }
 
+const HOST_TABS = ['Overview', 'Metrics', 'Operate', 'Network', 'Debug'] as const
+type HostTab = (typeof HOST_TABS)[number]
+
 export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
   const host = useStore((s) => s.view.hosts[id])
   const kube = useStore((s) => s.kube)
+  const metric = useStore((s) => s.view.metrics[id])
   const { error, busy, run } = useAction()
+  const [tab, setTab] = useState<HostTab>('Overview')
   if (!host) return null
 
   const remove = () => {
@@ -304,38 +310,55 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
           ×
         </button>
       </div>
-      <Inventory host={host} />
-      <Kubernetes host={host} />
-      <ControlPlane host={host} />
-      <div className="section">
-        <h4>Lifecycle</h4>
-        <div className="actions">
-          {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
-          <button
-            onClick={() => run(() => op({ Drain: { host: host.id } }))}
-            disabled={busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
-            title="Cordon this host's Kubernetes node and evict its pods (kubectl drain)"
-          >
-            Drain
-          </button>
-          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
-          {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
-          {host.lifecycle !== 'Removed' && (
-            <button onClick={remove} disabled={busy}>
-              Remove
-            </button>
-          )}
+      <div className="inspector-summary">
+        <span><b>{host.profile.id}</b><small>{host.location}</small></span>
+        <span title={host.roles.join(', ')}><b>{host.roles.length ? `${host.roles.length} roles` : 'No roles'}</b><small>{host.roles.slice(0, 2).join(', ') || 'none assigned'}{host.roles.length > 2 ? '…' : ''}</small></span>
+        <span><b>{metric ? `${metric.cpu_pct.toFixed(0)}% CPU` : 'No sample'}</b><small>{metric ? `${metric.ram_pct.toFixed(0)}% RAM` : 'metrics pending'}</small></span>
+        <span><b>{podsOn(kube, host.id).length}</b><small>pods here</small></span>
+      </div>
+      <InspectorTabs tabs={HOST_TABS} value={tab} onChange={(next) => setTab(next)} label={`Host ${host.id} sections`} />
+      <div className="inspector-body">
+      {tab === 'Overview' && (
+        <>
+          <Inventory host={host} />
+          <Kubernetes host={host} />
+          <div className="section">
+            <h4>Lifecycle</h4>
+            <div className="actions">
+              {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
+              <button
+                onClick={() => run(() => op({ Drain: { host: host.id } }))}
+                disabled={busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
+                title="Cordon this host's Kubernetes node and evict its pods (kubectl drain)"
+              >
+                Drain
+              </button>
+              {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
+              {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
+              {host.lifecycle !== 'Removed' && (
+                <button onClick={remove} disabled={busy}>
+                  Remove
+                </button>
+              )}
+            </div>
+            {error && <div className="bad">{error}</div>}
+          </div>
+        </>
+      )}
+      {tab === 'Metrics' && (
+        <div className="section inspector-charts">
+          <Charts entity={`host:${host.id}`} title="Metrics" row />
         </div>
-        {error && <div className="bad">{error}</div>}
+      )}
+      {tab === 'Operate' && (
+        <>
+          <ControlPlane host={host} />
+          <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
+        </>
+      )}
+      {tab === 'Network' && <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />}
+      {tab === 'Debug' && <LabDebug host={host} />}
       </div>
-      <div className="section">
-        <Charts entity={`host:${host.id}`} title="Metrics" />
-      </div>
-      <LabDebug host={host} />
-      {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
-      <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
-      {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
-      <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
     </aside>
   )
 }

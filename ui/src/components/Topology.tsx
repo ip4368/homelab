@@ -99,8 +99,20 @@ export function Topology({ selectedSwitch, selectedHost, onSelectSwitch, onSelec
   const mismatches = layout.edges.filter((e) => e.state === 'mismatch').length
 
   return (
-    <section className="topology">
-      <div className="fleet-bar">
+    <section className="topology workspace-page">
+      <div className="page-heading compact-heading">
+        <div>
+          <span className="eyebrow">Fabric</span>
+          <h2>Topology</h2>
+          <p className="muted">Inspect a switch or host beside the fabric; link colour follows the busier direction.</p>
+        </div>
+        <div className="summary-pills">
+          <span><b>{Object.keys(switches).length}</b> switches</span>
+          <span><b>{Math.round(busiest * 100)}%</b> busiest link</span>
+          <span><b className={mismatches ? 'bad' : ''}>{mismatches}</b> mismatches</span>
+        </div>
+      </div>
+      <div className="fleet-bar toolbar-card">
         <Legend />
         <label>
           <input type="checkbox" checked={expand} onChange={(e) => setExpand(e.target.checked)} /> Expand large switches

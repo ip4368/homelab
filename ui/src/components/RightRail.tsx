@@ -8,7 +8,8 @@ import { formatClock } from '../clock'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
 
-type Tab = 'Alerts' | 'Events' | 'Pending joins'
+export type RightRailTab = 'Alerts' | 'Events' | 'Pending joins'
+type Tab = RightRailTab
 const TABS: Tab[] = ['Alerts', 'Events', 'Pending joins']
 const RESOLVED_SHOWN = 20
 const EVENTS_SHOWN = 200
@@ -194,8 +195,13 @@ function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
   )
 }
 
-export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void; showTruth: boolean }) {
-  const [tab, setTab] = useState<Tab>('Alerts')
+export function RightRail({ onSelect, showTruth, tab: controlledTab, onTabChange, onCollapse }: { onSelect(id: string): void; showTruth: boolean; tab?: Tab; onTabChange?(tab: Tab): void; onCollapse?(): void }) {
+  const [ownTab, setOwnTab] = useState<Tab>('Alerts')
+  const tab = controlledTab ?? ownTab
+  const setTab = (next: Tab) => {
+    setOwnTab(next)
+    onTabChange?.(next)
+  }
   const activeAlerts = useStore((s) => s.view.alerts)
   const hosts = useStore((s) => s.view.hosts)
   const counts = useMemo(
@@ -208,6 +214,14 @@ export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void;
   )
   return (
     <aside className="rail">
+      <div className="rail-head">
+        <strong>Activity</strong>
+        {onCollapse && (
+          <button className="icon-button" onClick={onCollapse} aria-label="Collapse activity dock" title="Collapse activity dock">
+            ›
+          </button>
+        )}
+      </div>
       <div className="tabs" role="tablist">
         {TABS.map((t) => (
           <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
