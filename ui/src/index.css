@@ -1043,3 +1043,33 @@ table.workload-table th {
 .kube-workloads table.workload-table td {
   padding: 2px 8px 2px 0;
 }
+
+.container-card {
+  border-left: 2px solid var(--border);
+  padding: 2px 0 6px 8px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.container-card .form-grid {
+  grid-template-columns: 110px 1fr;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+table.data.mounts {
+  margin-top: 4px;
+  width: 100%;
+  font-size: 12px;
+}
+
+table.data.mounts td {
+  padding: 2px 6px;
+  overflow-wrap: anywhere;
+}
+
+.pod-detail {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}

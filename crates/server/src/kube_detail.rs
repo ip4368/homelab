@@ -249,6 +249,10 @@ mod tests {
             detail: None,
             unschedulable: false,
             last_termination: None,
+            ips: vec![],
+            networks: vec![],
+            qos: None,
+            container_states: vec![],
         }
     }
 

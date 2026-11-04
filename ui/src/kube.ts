@@ -8,6 +8,8 @@ import type { KubeView } from './gen/KubeView'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornReplica } from './gen/LonghornReplica'
 import type { LonghornVolume } from './gen/LonghornVolume'
+import type { Mount } from './gen/Mount'
+import type { Pdb } from './gen/Pdb'
 
 /** Namespaces K3s and Longhorn run their own pods in. */
 export const SYSTEM_NAMESPACES = ['kube-system', 'longhorn-system']
@@ -238,4 +240,59 @@ export function podWhy(p: Pick<KubePod, 'detail' | 'last_termination' | 'restart
 /** A workload's key, as the drawer is opened with: `<namespace>/<kind>/<name>`. */
 export function workloadKey(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'name'>): string {
   return `${w.namespace}/${w.kind}/${w.name}`
+}
+
+/** An image digest cut short as `sha256:4f1c9a2b7d3e`, from a container's `imageID` (`docker.io/library/nginx@sha256:…`). */
+export function shortDigest(imageId: string): string {
+  const at = imageId.lastIndexOf('@')
+  const digest = at >= 0 ? imageId.slice(at + 1) : imageId
+  const colon = digest.indexOf(':')
+  return colon >= 0 ? `${digest.slice(0, colon)}:${digest.slice(colon + 1, colon + 13)}` : digest.slice(0, 12)
+}
+
+/** The digests each container of `w` runs, across its pods: more than one means a tag moved under it. */
+export function containerDigests(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'name'>, pods: KubePod[]): Map<string, string[]> {
+  const owner = `${w.kind}/${w.name}`
+  const out = new Map<string, string[]>()
+  for (const p of pods.filter((p) => p.namespace === w.namespace && p.owner === owner)) {
+    for (const s of p.container_states) {
+      if (!s.image_id) continue
+      const seen = out.get(s.name) ?? []
+      if (!seen.includes(s.image_id)) out.set(s.name, [...seen, s.image_id])
+    }
+  }
+  return out
+}
+
+/** A container's request and limit: `100m / 1.00 cores`, `64Mi / –` with no limit, nothing with neither. */
+export function requestLimit(request: number | null, limit: number | null, format: (n: number | null) => string): string {
+  if (request === null && limit === null) return ''
+  return `${format(request)} / ${format(limit)}`
+}
+
+/** Where a mount comes from, in a few words: `claim data-0`, `ConfigMap app (keys a)`, `host /dev/ttyUSB0`. */
+export function mountSource(m: Mount): string {
+  const kind: Record<Mount['kind'], string> = {
+    Claim: 'claim',
+    ConfigMap: 'ConfigMap',
+    Secret: 'Secret',
+    EmptyDir: 'emptyDir',
+    HostPath: 'host',
+    Projected: 'projected',
+    DownwardApi: 'downward API',
+    Other: 'volume',
+  }
+  const main = [kind[m.kind], m.source].filter(Boolean).join(' ')
+  return m.detail ? `${main} (${m.detail})` : main
+}
+
+/** The Longhorn volume behind claim `claim` in `namespace`, if it is one. */
+export function claimVolume(namespace: string, claim: string, volumes: LonghornVolume[]): LonghornVolume | undefined {
+  return volumes.find((v) => v.pvc === `${namespace}/${claim}`)
+}
+
+/** A disruption budget worth a warning: one that lets no pod be evicted now, so draining their hosts waits. */
+export function pdbWarning(pdb: Pdb | null): string | null {
+  if (!pdb || pdb.disruptions_allowed > 0) return null
+  return `PodDisruptionBudget ${pdb.name} allows no disruption now (${pdb.healthy}/${pdb.desired_healthy} healthy): draining its pods' hosts waits for it`
 }

@@ -4,6 +4,7 @@
 //! few seconds, the way `kubectl get` would.
 
 use crate::kube_detail;
+use crate::kube_spec::{self, ContainerSpec, ContainerState, Pdb, PodNetwork, Revision};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -104,6 +105,14 @@ pub struct KubeWorkload {
     pub endpoints: Vec<Endpoint>,
     /// Its controller's conditions that are not as they should be.
     pub conditions: Vec<KubeCondition>,
+    /// Its pod template's containers, init containers first.
+    pub containers: Vec<ContainerSpec>,
+    /// What its pods share of their host's: `host network`, `host PIDs`.
+    pub host_access: Vec<String>,
+    /// Its rollout history, newest first.
+    pub revisions: Vec<Revision>,
+    /// The PodDisruptionBudget over its pods, if any.
+    pub pdb: Option<Pdb>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -217,6 +226,13 @@ pub struct KubePod {
     pub unschedulable: bool,
     /// How a container that restarted last ended.
     pub last_termination: Option<Termination>,
+    pub ips: Vec<String>,
+    /// The networks Multus attached it to, the pod network included; none without Multus.
+    pub networks: Vec<PodNetwork>,
+    /// `Guaranteed`, `Burstable` or `BestEffort`.
+    pub qos: Option<String>,
+    /// Each container, init containers first.
+    pub container_states: Vec<ContainerState>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -268,6 +284,8 @@ pub struct Lists {
     pub services: Value,
     pub ingresses: Value,
     pub events: Value,
+    pub controllerrevisions: Value,
+    pub pdbs: Value,
     /// Pod usage from metrics-server, or why there is none.
     pub metrics: Result<Value, String>,
 }
@@ -275,7 +293,7 @@ pub struct Lists {
 impl Default for Lists {
     fn default() -> Self {
         let v = Value::Null;
-        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v, metrics: Ok(Value::Null) }
+        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v.clone(), controllerrevisions: v.clone(), pdbs: v, metrics: Ok(Value::Null) }
     }
 }
 
@@ -359,7 +377,7 @@ impl Access {
                 Err(e) => Err(format!("metrics-server: {e}")),
             }
         };
-        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, metrics) = tokio::join!(
+        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, controllerrevisions, pdbs, metrics) = tokio::join!(
             self.list("/api/v1/pods"),
             self.list("/apis/apps/v1/replicasets"),
             self.list("/apis/apps/v1/deployments"),
@@ -371,6 +389,8 @@ impl Access {
             self.list("/api/v1/services"),
             self.list("/apis/networking.k8s.io/v1/ingresses"),
             self.list("/api/v1/events?fieldSelector=type%3DWarning"),
+            self.list("/apis/apps/v1/controllerrevisions"),
+            self.list("/apis/policy/v1/poddisruptionbudgets"),
             metrics,
         );
         Ok(Lists {
@@ -385,6 +405,8 @@ impl Access {
             services: services?,
             ingresses: ingresses?,
             events: events?,
+            controllerrevisions: controllerrevisions?,
+            pdbs: pdbs?,
             metrics,
         })
     }
@@ -548,6 +570,10 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 detail,
                 unschedulable,
                 last_termination,
+                ips: kube_spec::pod_ips(p),
+                networks: kube_spec::pod_networks(p),
+                qos: text(&p["status"]["qosClass"]),
+                container_states: kube_spec::container_states(p),
                 namespace,
                 name,
             }
@@ -604,6 +630,10 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 images: template["spec"]["containers"].as_array().into_iter().flatten().filter_map(|c| text(&c["image"])).collect(),
                 endpoints: kube_detail::endpoints(&namespace, &template["metadata"]["labels"], &lists.services, &lists.ingresses, vip),
                 conditions,
+                containers: kube_spec::containers(&template["spec"], &kube_spec::claim_templates(w)),
+                host_access: kube_spec::host_access(&template["spec"]),
+                revisions: kube_spec::revisions(w, &kind.to_string(), &lists.replicasets, &lists.controllerrevisions, timestamp_ms),
+                pdb: kube_spec::pdb(&namespace, &template["metadata"]["labels"], &lists.pdbs),
                 namespace,
                 name,
             });
@@ -829,6 +859,8 @@ mod tests {
                 json!({ "involvedObject": { "kind": "Node", "name": "ms01-01" }, "reason": "InvalidDiskCapacity", "message": "x" }),
                 json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "web-6d4-x2" }, "reason": "Unhealthy", "message": "old", "lastTimestamp": "1970-01-01T00:00:01Z" }),
             ]),
+            controllerrevisions: list(vec![]),
+            pdbs: list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "selector": { "matchLabels": { "app": "web" } } }, "status": { "disruptionsAllowed": 0 } })]),
             metrics: Ok(json!({ "items": [{ "metadata": { "namespace": "demo", "name": "web-6d4-x2" }, "containers": [{ "usage": { "cpu": "12m", "memory": "30Mi" } }, { "usage": { "cpu": "3m", "memory": "2Mi" } }] }] })),
         }
     }
@@ -903,6 +935,24 @@ mod tests {
         let eps: Vec<_> = web.endpoints.iter().map(|e| (e.address.as_str(), e.link.is_some())).collect();
         assert_eq!(eps, [("http://10.0.3.253/", true), ("web.demo:80", false)]);
         assert_eq!(web.images, ["nginx:1.29"]);
+    }
+
+    #[test]
+    fn a_workload_carries_its_containers_history_and_budget_and_a_pod_its_networks() {
+        let mut lists = sample();
+        lists.deployments = list(vec![json!({ "metadata": { "namespace": "demo", "name": "web", "annotations": { "deployment.kubernetes.io/revision": "1" } },
+            "spec": { "replicas": 1, "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "hostNetwork": true, "containers": [{ "name": "nginx", "image": "nginx:1.29" }] } } }, "status": {} })]);
+        lists.replicasets["items"][0]["metadata"]["annotations"] = json!({ "deployment.kubernetes.io/revision": "1" });
+        lists.pods["items"][0]["status"]["podIP"] = json!("10.42.0.9");
+        lists.pods["items"][0]["status"]["qosClass"] = json!("BestEffort");
+        let v = view_of(&lists, NOW, VIP);
+        let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
+        assert_eq!(web.containers.iter().map(|c| c.image.as_str()).collect::<Vec<_>>(), ["nginx:1.29"]);
+        assert_eq!(web.host_access, ["host network"]);
+        assert_eq!(web.revisions.iter().map(|r| (r.number, r.current)).collect::<Vec<_>>(), [(1, true)]);
+        assert_eq!(web.pdb.as_ref().map(|p| (p.name.as_str(), p.disruptions_allowed)), Some(("web", 0)));
+        let pod = v.pods.iter().find(|p| p.name == "web-6d4-x2").unwrap();
+        assert_eq!((pod.ips.clone(), pod.qos.as_deref(), pod.container_states.len()), (vec!["10.42.0.9".to_string()], Some("BestEffort"), 2));
     }
 
     #[test]

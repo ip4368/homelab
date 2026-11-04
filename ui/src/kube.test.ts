@@ -4,7 +4,7 @@ import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, claimVolume, containerDigests, mountSource, pdbWarning, requestLimit, shortDigest, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return {
@@ -24,6 +24,10 @@ function pod(namespace: string, name: string, node: string | null, owner: string
     detail: null,
     unschedulable: false,
     last_termination: null,
+    ips: [],
+    networks: [],
+    qos: null,
+    container_states: [],
   }
 }
 
@@ -43,6 +47,10 @@ function workload(namespace: string, name: string, kind: KubeWorkload['kind'], d
     images: [],
     endpoints: [],
     conditions: [],
+    containers: [],
+    host_access: [],
+    revisions: [],
+    pdb: null,
   }
 }
 
@@ -197,5 +205,36 @@ describe('draining', () => {
     const restarted = { ...pod('demo', 'b', 'x', null), restarts: 3, last_termination: { reason: 'OOMKilled', exit_code: 137, at: null } }
     expect(podWhy(restarted)).toBe('last ended: OOMKilled (exit 137)')
     expect(podWhy(pod('demo', 'c', 'x', null))).toBeUndefined()
+  })
+})
+
+describe('containers', () => {
+  it('cuts digests short and finds containers running more than one', () => {
+    expect(shortDigest('docker.io/library/nginx@sha256:4f1c9a2b7d3e8f90aa')).toBe('sha256:4f1c9a2b7d3e')
+    expect(shortDigest('sha256:4f1c9a2b7d3e8f90aa')).toBe('sha256:4f1c9a2b7d3e')
+    const state = (image_id: string | null) => ({ name: 'nginx', role: 'App' as const, state: 'running', ready: true, restarts: 0, image_id })
+    const a = { ...pod('demo', 'web-a', 'x', 'Deployment/web'), container_states: [state('n@sha256:aaa')] }
+    const b = { ...pod('demo', 'web-b', 'x', 'Deployment/web'), container_states: [state('n@sha256:bbb'), { ...state(null), name: 'side' }] }
+    const c = { ...pod('demo', 'web-c', 'x', 'Deployment/web'), container_states: [state('n@sha256:aaa')] }
+    const other = { ...pod('demo', 'db-0', 'x', 'StatefulSet/db'), container_states: [state('n@sha256:ccc')] }
+    expect([...containerDigests(web, [a, b, c, other])]).toEqual([['nginx', ['n@sha256:aaa', 'n@sha256:bbb']]])
+  })
+
+  it('writes requests, limits and mounts in a few words', () => {
+    expect(requestLimit(100, 1000, cpu)).toBe('100m / 1.00 cores')
+    expect(requestLimit(null, 2 ** 28, mem)).toBe('– / 256Mi')
+    expect(requestLimit(null, null, mem)).toBe('')
+    const m = { path: '/x', volume: 'v', read_only: false, sub_path: null }
+    expect(mountSource({ ...m, kind: 'Claim', source: 'data-0', detail: null })).toBe('claim data-0')
+    expect(mountSource({ ...m, kind: 'EmptyDir', source: null, detail: 'in memory' })).toBe('emptyDir (in memory)')
+    expect(mountSource({ ...m, kind: 'HostPath', source: '/dev/ttyUSB0', detail: 'type CharDevice' })).toBe('host /dev/ttyUSB0 (type CharDevice)')
+    expect(claimVolume('demo', 'data-postgres-0', [volume])?.name).toBe('pvc-1')
+    expect(claimVolume('other', 'data-postgres-0', [volume])).toBeUndefined()
+  })
+
+  it('warns of a disruption budget that blocks a drain', () => {
+    expect(pdbWarning(null)).toBeNull()
+    expect(pdbWarning({ name: 'web', disruptions_allowed: 1, healthy: 3, desired_healthy: 2 })).toBeNull()
+    expect(pdbWarning({ name: 'web', disruptions_allowed: 0, healthy: 1, desired_healthy: 1 })).toContain('draining')
   })
 })

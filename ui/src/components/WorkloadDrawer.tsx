@@ -1,20 +1,25 @@
-import { age, cpu, gib, mem, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
+import { Fragment, useState } from 'react'
+import { age, containerDigests, cpu, gib, mem, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
+import { Containers, History, PodDetail } from './WorkloadContainers'
 
 /**
  * One workload in full, as Kubernetes reports it: health and why, usage,
- * endpoints, images, its pods, volumes and Warning events of the last hour.
+ * endpoints, containers, its pods, volumes, rollout history and Warning
+ * events of the last hour.
  */
 export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onClose(): void; onSelectHost(id: string): void }) {
   const kube = useStore((s) => s.kube)
   const now = useStore((s) => s.clock.now)
+  const [open, setOpen] = useState<string | null>(null)
   const w = kube.workloads.find((x) => workloadKey(x) === id)
   if (!w) return null
   const owner = `${w.kind}/${w.name}`
   const pods = kube.pods.filter((p) => p.namespace === w.namespace && p.owner === owner)
   const volumes = workloadVolumes(w, kube.pods, kube.volumes)
   const events = workloadEvents(w, kube.events)
+  const pdb = pdbWarning(w.pdb)
 
   return (
     <aside className="drawer workload-drawer" aria-label={`workload ${w.namespace}/${w.name}`}>
@@ -41,6 +46,8 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
           {c.message && <span className="muted"> {c.message}</span>}
         </div>
       ))}
+      {pdb && <div className="warn">{pdb}</div>}
+      {w.host_access.length > 0 && <div className="warn">Its pods use the {w.host_access.join(', ')}.</div>}
 
       <h4>Usage</h4>
       {kube.metrics_error ? (
@@ -67,14 +74,8 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
         </ul>
       )}
 
-      <h4>Images</h4>
-      <ul className="plain">
-        {w.images.map((i) => (
-          <li key={i}>
-            <code>{i}</code>
-          </li>
-        ))}
-      </ul>
+      <h4>Containers</h4>
+      <Containers namespace={w.namespace} containers={w.containers} digests={containerDigests(w, kube.pods)} volumes={kube.volumes} />
 
       <h4>Pods</h4>
       <table className="data">
@@ -90,21 +91,34 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
         </thead>
         <tbody>
           {pods.map((p) => (
-            <tr key={p.name}>
-              <td title={`created ${age(p.created, now)} ago`}>{p.name}</td>
-              <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">none</span>}</td>
-              <td className={podTone(p)} title={podWhy(p)}>
-                {p.status}
-                {podWhy(p) && <div className="muted pod-why">{podWhy(p)}</div>}
-              </td>
-              <td className={p.restarts > 0 ? 'warn' : 'muted'}>{p.restarts}</td>
-              <td className="num">
-                <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
-              </td>
-              <td className="num">
-                <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
-              </td>
-            </tr>
+            <Fragment key={p.name}>
+              <tr>
+                <td title={`created ${age(p.created, now)} ago`}>
+                  <button className="link" aria-expanded={open === p.name} onClick={() => setOpen(open === p.name ? null : p.name)}>
+                    {open === p.name ? '▾' : '▸'} {p.name}
+                  </button>
+                </td>
+                <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">none</span>}</td>
+                <td className={podTone(p)} title={podWhy(p)}>
+                  {p.status}
+                  {podWhy(p) && <div className="muted pod-why">{podWhy(p)}</div>}
+                </td>
+                <td className={p.restarts > 0 ? 'warn' : 'muted'}>{p.restarts}</td>
+                <td className="num">
+                  <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
+                </td>
+                <td className="num">
+                  <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
+                </td>
+              </tr>
+              {open === p.name && (
+                <tr>
+                  <td colSpan={6}>
+                    <PodDetail pod={p} />
+                  </td>
+                </tr>
+              )}
+            </Fragment>
           ))}
           {pods.length === 0 && (
             <tr>
@@ -130,6 +144,13 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
               </li>
             ))}
           </ul>
+        </>
+      )}
+
+      {w.revisions.length > 0 && (
+        <>
+          <h4>History</h4>
+          <History revisions={w.revisions} now={now} />
         </>
       )}
 

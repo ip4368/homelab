@@ -8,6 +8,7 @@ mod kube;
 mod kube_action;
 mod kube_apply;
 mod kube_detail;
+mod kube_spec;
 mod ws;
 
 use axum::Router;
