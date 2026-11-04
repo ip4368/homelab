@@ -3,6 +3,7 @@ import { kubeApply } from '../api'
 import type { ApplyReport } from '../gen/ApplyReport'
 import { outcomeLabel, previewVerdict } from '../kube'
 import { NewAppForm } from './NewAppForm'
+import { NewVmForm } from './NewVmForm'
 import { useAction } from './useAction'
 
 export interface ApplyDraft {
@@ -65,7 +66,7 @@ export function ApplyDialog({ draft, namespaces, onClose }: { draft: ApplyDraft;
   const [yaml, setYaml] = useState(draft.yaml)
   const [namespace, setNamespace] = useState(draft.namespace)
   const [force, setForce] = useState(draft.force ?? false)
-  const [tab, setTab] = useState<'yaml' | 'new'>('yaml')
+  const [tab, setTab] = useState<'yaml' | 'new' | 'vm'>('yaml')
   const [preview, setPreview] = useState<{ report: ApplyReport; yaml: string; namespace: string; force: boolean } | null>(null)
   const [applied, setApplied] = useState<ApplyReport | null>(null)
   const previewing = useAction()
@@ -106,7 +107,21 @@ export function ApplyDialog({ draft, namespaces, onClose }: { draft: ApplyDraft;
             <button role="tab" aria-selected={tab === 'new'} className={tab === 'new' ? 'active' : ''} onClick={() => setTab('new')} disabled={busy}>
               New from image
             </button>
+            <button role="tab" aria-selected={tab === 'vm'} className={tab === 'vm' ? 'active' : ''} onClick={() => setTab('vm')} disabled={busy}>
+              New VM
+            </button>
           </div>
+        )}
+        {tab === 'vm' && (
+          <NewVmForm
+            namespace={namespace}
+            namespaces={namespaces}
+            onWrite={(y, ns) => {
+              setYaml(y)
+              setNamespace(ns)
+              setTab('yaml')
+            }}
+          />
         )}
         {tab === 'new' && (
           <NewAppForm

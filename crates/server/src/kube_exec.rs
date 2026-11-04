@@ -1,5 +1,6 @@
-//! A shell in a container, for the UI's terminal: the browser's WebSocket
-//! bridged to Kubernetes' exec WebSocket (docs/plans/2026-11-04-workload-insight-logs-terminal-design.md §6).
+//! A shell in a container, or a VM's serial console, for the UI's terminal:
+//! the browser's WebSocket bridged to Kubernetes' exec WebSocket, or to
+//! KubeVirt's console (docs/plans/2026-11-04-workload-insight-logs-terminal-design.md §6, §9).
 //! The browser never sees Kubernetes' channels: it sends and gets terminal
 //! bytes in binary frames, and JSON in text frames for the rest, so a VM's
 //! serial console can use the same terminal.
@@ -16,6 +17,8 @@ use tokio_tungstenite::tungstenite::Message as KubeMsg;
 
 /// Exec's subprotocols, newest first: v5 adds closing stdin; K3s v1.36 speaks both.
 pub const EXEC_PROTOCOLS: [&str; 2] = ["v5.channel.k8s.io", "v4.channel.k8s.io"];
+/// KubeVirt's console subprotocol: binary frames are the serial port's bytes.
+pub const CONSOLE_PROTOCOLS: [&str; 1] = ["plain.kubevirt.io"];
 /// The most sessions (terminals and consoles) open at once.
 pub const MAX_SESSIONS: usize = 16;
 /// bash where the image has it, else sh.
@@ -52,6 +55,35 @@ impl ExecQuery {
 
     pub fn describe(&self) -> String {
         format!("{}/{}{}", self.namespace, self.pod, self.container.as_ref().map(|c| format!("/{c}")).unwrap_or_default())
+    }
+}
+
+/// `GET /api/kube/console`'s query: a VM.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ConsoleQuery {
+    pub namespace: String,
+    pub name: String,
+}
+
+impl ConsoleQuery {
+    /// As for a shell: a console is a way in.
+    pub fn refusal(&self) -> Option<String> {
+        if !valid_namespace(&self.namespace) || !valid_name(&self.name) {
+            return Some(format!("not a VM name: {}/{}", self.namespace, self.name));
+        }
+        if PROTECTED_NAMESPACES.contains(&self.namespace.as_str()) {
+            return Some(format!("{} is kept by homelabd: no console from here", self.namespace));
+        }
+        None
+    }
+
+    /// The serial console of the VM's running instance.
+    pub fn path(&self) -> String {
+        format!("/apis/subresources.kubevirt.io/v1/namespaces/{}/virtualmachineinstances/{}/console", self.namespace, self.name)
+    }
+
+    pub fn describe(&self) -> String {
+        format!("console of {}/{}", self.namespace, self.name)
     }
 }
 
@@ -162,6 +194,15 @@ pub struct Translate {
 }
 
 pub const EXEC: Translate = Translate { to_kube: |i| Some(exec_frame(i)), from_kube: from_exec };
+
+/// A serial port has no window size: typed bytes go as they are, resizes nowhere.
+pub const CONSOLE: Translate = Translate {
+    to_kube: |i| match i {
+        FromBrowser::Bytes(b) => Some(b.clone()),
+        FromBrowser::Resize { .. } => None,
+    },
+    from_kube: |f| (!f.is_empty()).then(|| ToBrowser::Bytes(f.to_vec())),
+};
 
 /// How long to wait for the browser's side of the close handshake.
 const CLOSE_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -297,6 +338,19 @@ mod tests {
         assert_eq!(ToBrowser::Exit(3).message(), BrowserMsg::Text(r#"{"exit":{"code":3}}"#.into()));
         assert_eq!(ToBrowser::Error("no".into()).message(), BrowserMsg::Text(r#"{"error":"no"}"#.into()));
         assert!(ToBrowser::Exit(0).ends() && !ToBrowser::Bytes(vec![]).ends());
+    }
+
+    #[test]
+    fn a_console_is_the_serial_port_as_it_is() {
+        let c = ConsoleQuery { namespace: "demo".into(), name: "deb".into() };
+        assert_eq!(c.path(), "/apis/subresources.kubevirt.io/v1/namespaces/demo/virtualmachineinstances/deb/console");
+        assert_eq!(c.refusal(), None);
+        assert!(ConsoleQuery { namespace: "kubevirt".into(), name: "x".into() }.refusal().is_some());
+        assert!(ConsoleQuery { namespace: "demo".into(), name: "a/b".into() }.refusal().is_some());
+        assert_eq!((CONSOLE.to_kube)(&FromBrowser::Bytes(b"root\r".to_vec())), Some(b"root\r".to_vec()));
+        assert_eq!((CONSOLE.to_kube)(&FromBrowser::Resize { cols: 80, rows: 24 }), None);
+        assert_eq!((CONSOLE.from_kube)(b"login: "), Some(ToBrowser::Bytes(b"login: ".to_vec())));
+        assert_eq!((CONSOLE.from_kube)(b""), None);
     }
 
     #[test]

@@ -18,6 +18,18 @@ export function execUrl(t: ExecTarget, page: { protocol: string; host: string })
   return `${page.protocol === 'https:' ? 'wss' : 'ws'}://${page.host}/api/kube/exec?${q}`
 }
 
+/** A VM, for its serial console. */
+export interface ConsoleTarget {
+  namespace: string
+  name: string
+}
+
+/** The WebSocket URL of `t`'s serial console. */
+export function consoleUrl(t: ConsoleTarget, page: { protocol: string; host: string }): string {
+  const q = new URLSearchParams({ namespace: t.namespace, name: t.name })
+  return `${page.protocol === 'https:' ? 'wss' : 'ws'}://${page.host}/api/kube/console?${q}`
+}
+
 export function resizeMessage(cols: number, rows: number): string {
   return JSON.stringify({ resize: { cols, rows } })
 }

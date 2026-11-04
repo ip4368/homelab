@@ -4,7 +4,7 @@
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
-use crate::kube_exec::{self, ExecQuery};
+use crate::kube_exec::{self, ConsoleQuery, ExecQuery};
 use crate::kube_logs::LogQuery;
 use crate::ws::ws_handler;
 use axum::extract::{Json, Query, State};
@@ -31,6 +31,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube/metrics", get(kube_metrics))
         .route("/api/kube/logs", get(kube_logs))
         .route("/api/kube/exec", get(kube_exec))
+        .route("/api/kube/console", get(kube_console))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -212,6 +213,21 @@ async fn kube_exec(State(driver): State<DriverHandle>, Query(q): Query<ExecQuery
         }
         match driver.kube_access().await {
             Ok(access) => kube_exec::run(socket, &access, &q.path(), &kube_exec::EXEC_PROTOCOLS, &kube_exec::EXEC, &q.describe()).await,
+            Err(e) => kube_exec::refuse(socket, &e.to_string()).await,
+        }
+    })
+}
+
+/// `?namespace=&name=`, a WebSocket: a VM's serial console, in the
+/// terminal protocol of [`kube_exec`] (resizes are dropped: a serial port
+/// has no window size).
+async fn kube_console(State(driver): State<DriverHandle>, Query(q): Query<ConsoleQuery>, ws: axum::extract::WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        if let Some(why) = q.refusal() {
+            return kube_exec::refuse(socket, &why).await;
+        }
+        match driver.kube_access().await {
+            Ok(access) => kube_exec::run(socket, &access, &q.path(), &kube_exec::CONSOLE_PROTOCOLS, &kube_exec::CONSOLE, &q.describe()).await,
             Err(e) => kube_exec::refuse(socket, &e.to_string()).await,
         }
     })

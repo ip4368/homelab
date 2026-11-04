@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 import { dock, useDock } from '../dock'
-import { execUrl } from '../terminal'
+import { consoleUrl, execUrl } from '../terminal'
 import { LogViewer } from './LogViewer'
 import { Terminal } from './Terminal'
 
@@ -50,8 +50,10 @@ export function Dock() {
         <div key={s.id} className="dock-body" style={{ height, display: s.id === active ? undefined : 'none' }}>
           {s.kind === 'logs' ? (
             <LogViewer target={s.target} />
-          ) : (
+          ) : s.kind === 'terminal' ? (
             <Terminal url={execUrl(s.target, location)} label={`shell in ${s.target.namespace}/${s.target.pod}${s.target.container ? ` (${s.target.container})` : ''}`} />
+          ) : (
+            <Terminal url={consoleUrl(s.target, location)} label={`serial console of ${s.target.namespace}/${s.target.name}`} />
           )}
         </div>
       ))}

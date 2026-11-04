@@ -5,9 +5,12 @@
 import { useSyncExternalStore } from 'react'
 import type { KubePod } from './gen/KubePod'
 import type { LogTarget } from './logs'
-import type { ExecTarget } from './terminal'
+import type { ConsoleTarget, ExecTarget } from './terminal'
 
-export type Session = { id: string; kind: 'logs'; title: string; target: LogTarget } | { id: string; kind: 'terminal'; title: string; target: ExecTarget }
+export type Session =
+  | { id: string; kind: 'logs'; title: string; target: LogTarget }
+  | { id: string; kind: 'terminal'; title: string; target: ExecTarget }
+  | { id: string; kind: 'console'; title: string; target: ConsoleTarget }
 
 export interface DockState {
   sessions: Session[]
@@ -55,6 +58,14 @@ export function terminalSession(p: Pick<KubePod, 'namespace' | 'name' | 'contain
   const title = `${p.name}${container && p.container_states.length > 1 ? `/${container}` : ''}`
   return { id: `terminal:${p.namespace}/${p.name}/${container ?? ''}#${terminals}`, kind: 'terminal', title, target: { namespace: p.namespace, pod: p.name, container } }
 }
+
+/** A VM's serial console: one tab per VM, as KubeVirt takes one connection at a time. */
+export function consoleSession(namespace: string, name: string): Session {
+  return { id: `console:${namespace}/${name}`, kind: 'console', title: `${name} console`, target: { namespace, name } }
+}
+
+/** The container of a VM's launcher pod that logs its serial console. */
+export const CONSOLE_LOG_CONTAINER = 'guest-console-log'
 
 let state = emptyDock
 const listeners = new Set<() => void>()

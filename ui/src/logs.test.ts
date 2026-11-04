@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
-import { closeSession, defaultContainer, emptyDock, logsSession, openSession, terminalSession } from './dock'
-import { endingLine, execUrl, parseEnding, resizeMessage } from './terminal'
+import { closeSession, consoleSession, defaultContainer, emptyDock, logsSession, openSession, terminalSession } from './dock'
+import { consoleUrl, endingLine, execUrl, parseEnding, resizeMessage } from './terminal'
 import { LineSplitter, appendLines, filterLines, logsUrl, parseLine } from './logs'
 
 describe('logs', () => {
@@ -76,6 +76,11 @@ describe('terminal', () => {
       'no shell',
       'connection closed',
     ])
+  })
+
+  it("opens a VM's console, one tab per VM", () => {
+    expect(consoleUrl({ namespace: 'demo', name: 'deb' }, { protocol: 'http:', host: 'lab' })).toBe('ws://lab/api/kube/console?namespace=demo&name=deb')
+    expect(consoleSession('demo', 'deb').id).toBe(consoleSession('demo', 'deb').id)
   })
 
   it('gives every shell its own tab', () => {

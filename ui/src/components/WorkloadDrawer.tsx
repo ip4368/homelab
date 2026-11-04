@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react'
 import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes, canShell } from '../kube'
-import { dock, logsSession, terminalSession } from '../dock'
+import { CONSOLE_LOG_CONTAINER, consoleSession, dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { Containers, History, PodDetail, VmGuest } from './WorkloadContainers'
@@ -90,6 +90,16 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
       {w.vm ? (
         <>
           <h4>Guest</h4>
+          <div className="actions-row">
+            <button disabled={w.ready === 0} onClick={() => dock.open(consoleSession(w.namespace, w.name))} title="its serial console, as virtctl console">
+              Console
+            </button>{' '}
+            {pods[0] && (
+              <button onClick={() => dock.open(logsSession(pods[0], CONSOLE_LOG_CONTAINER))} title="what its serial console printed, even with nobody attached">
+                Console log
+              </button>
+            )}
+          </div>
           <VmGuest vm={w.vm} namespace={w.namespace} volumes={kube.volumes} />
         </>
       ) : (

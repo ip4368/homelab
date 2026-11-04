@@ -8,7 +8,7 @@
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
 // health, usage, endpoints and events the tab shows; K12 logs and a shell, K13 network and
-// volume usage), checked against the cluster's Kubernetes API through the VIP with the
+// volume usage, K14 a KubeVirt VM), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -31,6 +31,7 @@ import type { ApplyReport } from '../ui/src/gen/ApplyReport.ts'
 import type { KubeAction } from '../ui/src/gen/KubeAction.ts'
 import type { KubeView } from '../ui/src/gen/KubeView.ts'
 import { Kube } from './kube.ts'
+import { BLANK_VM, newVmYaml } from '../ui/src/newvm.ts'
 
 const BASE = process.env.LAB_URL ?? 'http://127.0.0.1:8080'
 
@@ -1335,6 +1336,87 @@ spec:
     })
     await load
     note(`while ${Math.round(fetched / 2 ** 20)} MiB were fetched through the Ingress, store sent ${(rate.value / 1e6).toFixed(1)} Mb/s`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+/** A VM's serial console through `/api/kube/console`: what it printed so far, and a way to type. */
+function serialConsole(namespace: string, name: string) {
+  const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/api/kube/console?${new URLSearchParams({ namespace, name })}`)
+  ws.binaryType = 'arraybuffer'
+  const seen = { out: '', ending: null as unknown, closed: false }
+  ws.onmessage = (m) => {
+    if (m.data instanceof ArrayBuffer) seen.out += new TextDecoder().decode(m.data)
+    else seen.ending = JSON.parse(String(m.data))
+  }
+  ws.onclose = () => (seen.closed = true)
+  const opened = new Promise<void>((resolve, reject) => {
+    ws.onopen = () => resolve()
+    ws.onerror = () => reject(new Failed('the console did not open'))
+  })
+  return { seen, opened, type: (s: string) => ws.send(new TextEncoder().encode(s)), close: () => ws.close() }
+}
+
+await step('K14', 'A VM: homelabd installs KubeVirt on the vm hosts; a VM from the New VM form runs there, answers on its serial console, logs its console, stops and starts', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const kv = await waitFor('KubeVirt deployed', 15 * 60_000, () => watch.seen!.kube.kubevirt === 'Deployed')
+  const vmHosts = [...watch.seen!.hosts.values()].filter((h) => h.roles.includes('Vm')).map((h) => h.id)
+  const handlers = watch.seen!.kube.pods.filter((p) => p.namespace === 'kubevirt' && p.name.startsWith('virt-handler-')).map((p) => p.node)
+  if (handlers.length === 0 || handlers.some((n) => !n || !vmHosts.includes(n))) throw new Failed(`virt-handler on ${JSON.stringify(handlers)}; vm hosts: ${vmHosts}`)
+  note(`KubeVirt deployed (${secs(kv.ms)} to see it), virt-handler on ${[...new Set(handlers)].sort().join(', ')}: the vm hosts`)
+
+  const ns = 'e2e-vm'
+  await namespaceGone(ns)
+  const password = `k14-${Math.random().toString(36).slice(2, 8)}`
+  await apply(newVmYaml({ ...BLANK_VM, name: 'deb', namespace: ns, password }, true), ns)
+  try {
+    const vm = () => watch.seen!.kube.workloads.find((w) => w.namespace === ns && w.name === 'deb' && w.kind === 'VirtualMachine')
+    const running = await waitFor('the VM healthy', 15 * 60_000, () => (vm()?.health.state === 'Healthy' ? vm() : null))
+    const launcher = watch.seen!.kube.pods.find((p) => p.namespace === ns && p.owner === 'VirtualMachine/deb')
+    if (!launcher?.node || !vmHosts.includes(launcher.node)) throw new Failed(`its launcher pod: ${JSON.stringify(launcher)}`)
+    note(`deb healthy ${secs(running.ms)} after applying, on ${launcher.node}`)
+
+    const c = serialConsole(ns, 'deb')
+    await c.opened
+    const login = await waitAsync('a login prompt on the serial console', 10 * 60_000, async () => {
+      if (c.seen.closed) throw new Failed(`the console closed: ${JSON.stringify(c.seen.ending)}`)
+      if (/login: *$/.test(c.seen.out.trimEnd() + ' ')) return true
+      c.type('\r')
+      return `printed ${c.seen.out.length} bytes`
+    })
+    // cloud-init may set the password only after the first prompt shows: log in until it works.
+    const shell = await waitAsync('a shell on the serial console', 5 * 60_000, async () => {
+      const mark = c.seen.out.length
+      c.type('debian\r')
+      await sleep(1500)
+      c.type(`${password}\r`)
+      await sleep(4000)
+      c.type('echo k14-$((6*7))\r')
+      await sleep(1500)
+      return c.seen.out.slice(mark).includes('k14-42') || `got ${JSON.stringify(c.seen.out.slice(mark).slice(-120))}`
+    })
+    c.type('exit\r')
+    c.close()
+    note(`its serial console showed a login prompt (${secs(login.ms)}), and logging in ran a command (${secs(shell.ms)})`)
+
+    const log = await readLog({ namespace: ns, pod: launcher.name, container: 'guest-console-log', tail: '0', follow: 'false' }, 20_000)
+    if (log.status !== 200 || !log.body.includes('login:')) throw new Failed(`its console log: ${log.status} ${log.body.slice(-300)}`)
+    note(`its console log (guest-console-log) has ${log.lines.length} lines, the login prompt among them`)
+
+    const act = async (a: KubeAction) => {
+      const r = await fetch(`${BASE}/api/kube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(a) })
+      if (!r.ok) throw new Failed(`${JSON.stringify(a)}: ${r.status} ${await r.text()}`)
+    }
+    const workload = { namespace: ns, kind: 'VirtualMachine' as const, name: 'deb' }
+    await act({ Stop: { workload } })
+    const stopped = await waitFor('the VM idle, its launcher pod gone', 5 * 60_000, () =>
+      vm()?.health.state === 'Idle' && !watch.seen!.kube.pods.some((p) => p.namespace === ns && p.owner === 'VirtualMachine/deb'),
+    )
+    await act({ Start: { workload } })
+    const started = await waitFor('the VM healthy again', 10 * 60_000, () => vm()?.health.state === 'Healthy')
+    note(`Stop: idle and its pod gone in ${secs(stopped.ms)}; Start: healthy again in ${secs(started.ms)}`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }

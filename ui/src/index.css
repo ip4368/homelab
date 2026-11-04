@@ -1179,3 +1179,7 @@ table.data.mounts td {
   padding: 2px 4px;
   background: #0f1419;
 }
+
+.actions-row {
+  margin-bottom: 6px;
+}
