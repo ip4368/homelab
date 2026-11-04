@@ -91,3 +91,17 @@ export function formatBps(bps: number | null): string {
   }
   return `${Math.round(bps)} b/s`
 }
+
+/** A workload's last hour from `GET /api/kube/metrics`, summed over its pods, in the shape of host series. */
+export async function fetchWorkloadMetrics(namespace: string, kind: string, name: string): Promise<MetricsOutcome> {
+  const query = new URLSearchParams({ namespace, kind, name })
+  try {
+    const res = await fetch(`/api/kube/metrics?${query}`)
+    const json: unknown = await res.json().catch(() => null)
+    if (res.ok) return { ok: json as MetricsReply }
+    const error = (json as { error?: unknown } | null)?.error
+    return { error: typeof error === 'string' ? error : `HTTP ${res.status}` }
+  } catch (e) {
+    return { error: String(e) }
+  }
+}

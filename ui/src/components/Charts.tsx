@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { alignSeries, type Aligned, fetchMetrics, foldOutcome, formatBps, metricsSince, startPolling, type MetricsView } from '../metrics'
+import { alignSeries, type Aligned, fetchMetrics, foldOutcome, formatBps, metricsSince, startPolling, type MetricsOutcome, type MetricsView } from '../metrics'
+import { cpu, mem } from '../kube'
 import { formatClock } from '../clock'
 
 /** How often a visible chart asks for fresh series. */
@@ -16,16 +17,16 @@ const TIME_STEPS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600].map((s) => s * 1
 /** Rows in a chart's table view. */
 const TABLE_ROWS = 6
 
-type Unit = 'pct' | 'bps'
+type Unit = 'pct' | 'bps' | 'cpu' | 'bytes'
 
-interface ChartSpec {
+export interface ChartSpec {
   title: string
   unit: Unit
   series: { metric: string; label: string }[]
 }
 
 /** One host, or a rollup: average CPU and RAM, total port throughput. */
-const CHARTS: ChartSpec[] = [
+export const HOST_CHARTS: ChartSpec[] = [
   { title: 'CPU', unit: 'pct', series: [{ metric: 'cpu_pct', label: 'CPU' }] },
   { title: 'RAM', unit: 'pct', series: [{ metric: 'ram_pct', label: 'RAM' }] },
   {
@@ -37,22 +38,31 @@ const CHARTS: ChartSpec[] = [
     ],
   },
 ]
-const METRIC_NAMES = CHARTS.flatMap((c) => c.series.map((s) => s.metric))
+/** A workload, summed over its pods: CPU, memory and network, from the kubelets' stats. */
+export const WORKLOAD_CHARTS: ChartSpec[] = [
+  { title: 'CPU', unit: 'cpu', series: [{ metric: 'cpu_milli', label: 'CPU' }] },
+  { title: 'Memory', unit: 'bytes', series: [{ metric: 'memory_bytes', label: 'memory' }] },
+  {
+    title: 'Network',
+    unit: 'bps',
+    series: [
+      { metric: 'rx_bps', label: 'rx' },
+      { metric: 'tx_bps', label: 'tx' },
+    ],
+  },
+]
 
 const format = (unit: Unit, v: number | null | undefined) =>
-  v === null || v === undefined ? '–' : unit === 'pct' ? `${v.toFixed(0)}%` : formatBps(v)
+  v === null || v === undefined ? '–' : unit === 'pct' ? `${v.toFixed(0)}%` : unit === 'cpu' ? cpu(Math.round(v)) : unit === 'bytes' ? mem(v) : formatBps(v)
 
-/** Polls `entity`'s series every [`POLL_MS`] while mounted, keeping the last answer through pauses and errors. */
-function useMetrics(entity: string): MetricsView {
+/** Polls series with `fetchOnce` every `everyMs` while mounted (again when `key` changes), keeping the last answer through pauses and errors. */
+function useMetrics(key: string, fetchOnce: () => Promise<MetricsOutcome>, everyMs: number): MetricsView {
   const [view, setView] = useState<MetricsView>({ reply: null, note: null })
   useEffect(() => {
     setView({ reply: null, note: null })
-    return startPolling(
-      () => fetchMetrics(entity, METRIC_NAMES),
-      (outcome) => setView((prev) => foldOutcome(prev, outcome)),
-      POLL_MS,
-    )
-  }, [entity])
+    return startPolling(fetchOnce, (outcome) => setView((prev) => foldOutcome(prev, outcome)), everyMs)
+    // `key` names what `fetchOnce` fetches.
+  }, [key])
   return view
 }
 
@@ -65,8 +75,8 @@ function options(spec: ChartSpec, width: number): uPlot.Options {
     legend: { live: true },
     scales: {
       x: { time: false },
-      // Rates start at zero and end on a round tick.
-      y: spec.unit === 'pct' ? { range: [0, 100] } : { range: (_u, _min, max) => uPlot.rangeNum(0, Math.max(max, 1000), 0.1, true) },
+      // Rates and amounts start at zero and end on a round tick.
+      y: spec.unit === 'pct' ? { range: [0, 100] } : { range: (_u, _min, max) => uPlot.rangeNum(0, Math.max(max, spec.unit === 'cpu' ? 10 : 1000), 0.1, true) },
     },
     axes: [
       { ...axis, incrs: TIME_STEPS, values: (_u, ticks) => ticks.map(formatClock) },
@@ -142,14 +152,30 @@ function ChartTable({ spec, data }: { spec: ChartSpec; data: Aligned }) {
 }
 
 /**
- * CPU, RAM and port throughput of `entity` (`host:<id>` or `fleet`), from the
- * leader's metrics history, refreshed every [`POLL_MS`] while shown. While
- * the control plane does not answer, the last series stay on screen with a
- * note saying so.
+ * Charts of `entity`'s series. By default CPU, RAM and port throughput of
+ * `entity` (`host:<id>` or `fleet`), from the leader's metrics history,
+ * refreshed every [`POLL_MS`] while shown; `charts`, `fetchOnce` and
+ * `everyMs` chart something else (a workload). While the series do not come,
+ * the last ones stay on screen with a note saying so.
  */
-export function Charts({ entity, title, row = false }: { entity: string; title: string; row?: boolean }) {
-  const view = useMetrics(entity)
-  const data = useMemo(() => CHARTS.map((spec) => alignSeries(view.reply, spec.series.map((s) => s.metric))), [view.reply])
+export function Charts({
+  entity,
+  title,
+  row = false,
+  charts = HOST_CHARTS,
+  fetchOnce,
+  everyMs = POLL_MS,
+}: {
+  entity: string
+  title: string
+  row?: boolean
+  charts?: ChartSpec[]
+  fetchOnce?: () => Promise<MetricsOutcome>
+  everyMs?: number
+}) {
+  const metrics = charts.flatMap((c) => c.series.map((s) => s.metric))
+  const view = useMetrics(entity, fetchOnce ?? (() => fetchMetrics(entity, metrics)), everyMs)
+  const data = useMemo(() => charts.map((spec) => alignSeries(view.reply, spec.series.map((s) => s.metric))), [view.reply, charts])
   return (
     <div className="charts">
       <div className="charts-head">
@@ -162,7 +188,7 @@ export function Charts({ entity, title, row = false }: { entity: string; title: 
         )}
       </div>
       <div className={row ? 'charts-row' : 'charts-col'}>
-        {CHARTS.map((spec, i) => (
+        {charts.map((spec, i) => (
           <figure key={spec.title} className="chart">
             <figcaption>{spec.title}</figcaption>
             <LineChart spec={spec} data={data[i]} />

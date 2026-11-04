@@ -2,6 +2,7 @@
 import type { ContainerState } from "./ContainerState";
 import type { PodNetwork } from "./PodNetwork";
 import type { Termination } from "./Termination";
+import type { VolumeUse } from "./VolumeUse";
 
 export type KubePod = { namespace: string, name: string, 
 /**
@@ -44,4 +45,16 @@ qos: string | null,
 /**
  * Each container, init containers first.
  */
-container_states: Array<ContainerState>, };
+container_states: Array<ContainerState>, 
+/**
+ * Network receive and send rates (bits per second), from its kubelet.
+ */
+rx_bps: number | null, tx_bps: number | null, 
+/**
+ * What it uses of its node's disk: container layers, logs, emptyDirs.
+ */
+ephemeral_bytes: number | null, 
+/**
+ * How full each of its volumes is, from its kubelet.
+ */
+volume_use: Array<VolumeUse>, };

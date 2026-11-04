@@ -26,6 +26,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube", post(kube_action))
         .route("/api/kube/apply", post(kube_apply))
         .route("/api/kube/manifest", get(kube_manifest))
+        .route("/api/kube/metrics", get(kube_metrics))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -163,6 +164,13 @@ async fn kube_manifest(State(driver): State<DriverHandle>, Query(w): Query<Workl
         Ok(yaml) => ([("content-type", "application/yaml")], yaml).into_response(),
         Err(e) => action_error(e),
     }
+}
+
+/// `?namespace=&kind=&name=`: 200 with the workload's last hour, `{since,
+/// series: {cpu_milli, memory_bytes, rx_bps, tx_bps}}`, empty for a workload
+/// with no pods or none measured yet.
+async fn kube_metrics(State(driver): State<DriverHandle>, Query(w): Query<WorkloadRef>) -> Response {
+    Json(driver.kube_metrics(&w)).into_response()
 }
 
 #[cfg(test)]

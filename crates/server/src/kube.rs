@@ -5,6 +5,7 @@
 
 use crate::kube_detail;
 use crate::kube_spec::{self, ContainerSpec, ContainerState, Pdb, PodNetwork, Revision};
+use crate::kube_stats::{self, VolumeUse};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,6 +45,8 @@ pub struct KubeView {
     pub events: Vec<KubeEvent>,
     /// Why there is no CPU and memory usage: metrics-server did not answer.
     pub metrics_error: Option<String>,
+    /// The nodes whose kubelet gave no network and disk figures on the last read, and why.
+    pub stats_error: Option<String>,
 }
 
 /// The kinds of workload the Workloads tab shows.
@@ -99,6 +102,9 @@ pub struct KubeWorkload {
     pub cpu_limit_milli: Option<u64>,
     #[ts(type = "number | null")]
     pub memory_limit_bytes: Option<u64>,
+    /// Network receive and send rates (bits per second) summed over the pods measured.
+    pub rx_bps: Option<f64>,
+    pub tx_bps: Option<f64>,
     /// Its pod template's container images.
     pub images: Vec<String>,
     /// How to reach it, Ingresses first.
@@ -233,6 +239,14 @@ pub struct KubePod {
     pub qos: Option<String>,
     /// Each container, init containers first.
     pub container_states: Vec<ContainerState>,
+    /// Network receive and send rates (bits per second), from its kubelet.
+    pub rx_bps: Option<f64>,
+    pub tx_bps: Option<f64>,
+    /// What it uses of its node's disk: container layers, logs, emptyDirs.
+    #[ts(type = "number | null")]
+    pub ephemeral_bytes: Option<u64>,
+    /// How full each of its volumes is, from its kubelet.
+    pub volume_use: Vec<VolumeUse>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -252,6 +266,9 @@ pub struct LonghornVolume {
     pub robustness: String,
     /// The node it is attached to (where its engine runs).
     pub node: Option<String>,
+    /// What its filesystem holds, as the kubelet of a pod using it sees it.
+    #[ts(type = "number | null")]
+    pub used_bytes: Option<u64>,
     pub replicas: Vec<LonghornReplica>,
 }
 
@@ -298,6 +315,7 @@ impl Default for Lists {
 }
 
 /// How to reach the API: its URL and a client holding the kubeconfig's CA and client certificate.
+#[derive(Clone)]
 pub struct Access {
     server: String,
     client: reqwest::Client,
@@ -340,6 +358,15 @@ impl Access {
             s if !s.is_success() => Err(ReadError::Failed(format!("{path}: {s}"))),
             _ => res.json().await.map_err(|e| ReadError::Failed(format!("{path}: {e}"))),
         }
+    }
+
+    /// The kubelet's stats summary of `node`, through the API server.
+    pub async fn stats(&self, node: &str) -> Result<Value, String> {
+        let res = self.client.get(format!("{}/api/v1/nodes/{node}/proxy/stats/summary", self.server)).send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(res.status().to_string());
+        }
+        res.json().await.map_err(|e| e.to_string())
     }
 
     /// Everything the view is built from, fetched at once.
@@ -458,7 +485,7 @@ fn count(v: &Value) -> u32 {
 }
 
 /// Unix ms of a Kubernetes timestamp (RFC 3339 in UTC: `2026-10-27T14:00:45Z`).
-fn timestamp_ms(t: &str) -> Option<u64> {
+pub(crate) fn timestamp_ms(t: &str) -> Option<u64> {
     let b = t.as_bytes();
     if b.len() < 20 || b[4] != b'-' || b[10] != b'T' || !t.ends_with('Z') {
         return None;
@@ -524,8 +551,9 @@ fn key(meta: &Value) -> (String, String) {
     (text(&meta["namespace"]).unwrap_or_default(), text(&meta["name"]).unwrap_or_default())
 }
 
-/// The view `lists` describe, read at `at`; `vip` is the cluster's own address, for endpoints.
-pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
+/// The view `lists` describe, read at `at`; `vip` is the cluster's own address, for
+/// endpoints; `stats` the kubelets' network and disk figures.
+pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> KubeView {
     // A Deployment's pods belong to a ReplicaSet it owns.
     let rs_owner: BTreeMap<(String, String), (String, String)> =
         items(&lists.replicasets).iter().filter_map(|rs| Some((key(&rs["metadata"]), controller(&rs["metadata"])?))).collect();
@@ -554,6 +582,7 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 Some(Termination { reason: text(&t["reason"])?, exit_code: t["exitCode"].as_i64().unwrap_or(0) as i32, at: t["finishedAt"].as_str().and_then(timestamp_ms) })
             });
             let used = usage.get(&(namespace.clone(), name.clone()));
+            let now = stats.now(&namespace, &name).cloned().unwrap_or_default();
             let (cpu_limit_milli, memory_limit_bytes) = kube_detail::pod_limits(p);
             KubePod {
                 owner,
@@ -574,6 +603,10 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 networks: kube_spec::pod_networks(p),
                 qos: text(&p["status"]["qosClass"]),
                 container_states: kube_spec::container_states(p),
+                rx_bps: now.rx_bps,
+                tx_bps: now.tx_bps,
+                ephemeral_bytes: now.ephemeral_bytes,
+                volume_use: now.volumes,
                 namespace,
                 name,
             }
@@ -616,6 +649,7 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
             // Limits need every pod's (one without is unlimited); usage counts the pods measured so far.
             let sum = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { if mine.is_empty() { None } else { mine.iter().map(|p| f(p)).sum() } };
             let used = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { mine.iter().filter_map(|p| f(p)).reduce(|a, b| a + b) };
+            let rate = |f: fn(&KubePod) -> Option<f64>| -> Option<f64> { mine.iter().filter_map(|p| f(p)).reduce(|a, b| a + b) };
             let template = &w["spec"]["template"];
             workloads.push(KubeWorkload {
                 kind,
@@ -627,6 +661,8 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 memory_bytes: if metrics_ok { used(|p| p.memory_bytes) } else { None },
                 cpu_limit_milli: sum(|p| p.cpu_limit_milli),
                 memory_limit_bytes: sum(|p| p.memory_limit_bytes),
+                rx_bps: rate(|p| p.rx_bps),
+                tx_bps: rate(|p| p.tx_bps),
                 images: template["spec"]["containers"].as_array().into_iter().flatten().filter_map(|c| text(&c["image"])).collect(),
                 endpoints: kube_detail::endpoints(&namespace, &template["metadata"]["labels"], &lists.services, &lists.ingresses, vip),
                 conditions,
@@ -689,6 +725,8 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
             name,
         });
     }
+    // How full a claim is, as the kubelet of a pod using it sees it.
+    let claim_use: BTreeMap<String, u64> = pods.iter().flat_map(|p| p.volume_use.iter().filter_map(|v| Some((format!("{}/{}", p.namespace, v.claim.as_ref()?), v.used_bytes)))).collect();
     let mut volumes: Vec<LonghornVolume> = items(&lists.volumes)
         .iter()
         .map(|v| {
@@ -698,6 +736,7 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
             let mut reps = replicas.remove(&name).unwrap_or_default();
             reps.sort_by(|a, b| a.node.cmp(&b.node));
             LonghornVolume {
+                used_bytes: pvc.as_ref().and_then(|c| claim_use.get(c).copied()),
                 pvc,
                 pods: k8s["workloadsStatus"].as_array().into_iter().flatten().filter_map(|w| text(&w["podName"])).collect(),
                 size_bytes: v["spec"]["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0),
@@ -712,20 +751,28 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
         .collect();
     volumes.sort_by(|a, b| a.pvc.cmp(&b.pvc).then_with(|| a.name.cmp(&b.name)));
 
-    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned() }
+    let stats_error = (!stats.errors.is_empty()).then(|| {
+        let nodes: Vec<String> = stats.errors.iter().map(|(n, e)| format!("{n} ({e})")).collect();
+        format!("no network and disk figures from {}", nodes.join(", "))
+    });
+    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned(), stats_error }
 }
 
 /// Keeps `tx` up to date with what Kubernetes runs, reading it with the
 /// kubeconfig `kubeconfig` gives (asked again whenever the API refuses it
 /// or keeps failing). A failed read keeps the last lists and says why.
 /// `now` cuts the pause between reads short (after a change from the UI).
-pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>, now: Arc<Notify>)
+/// Every [`kube_stats::STATS_EVERY`] it also reads the kubelets' stats into
+/// `stats`, beside the reads, so a slow node does not hold the view back.
+pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>, now: Arc<Notify>, stats: kube_stats::SharedStore)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<String, String>>,
 {
     let mut access: Option<Access> = None;
     let mut failures = 0;
+    let mut stats_due = tokio::time::Instant::now();
+    let mut stats_read: Option<tokio::task::JoinHandle<()>> = None;
     loop {
         let Some(a) = &access else {
             match kubeconfig().await.and_then(|kc| Access::from_kubeconfig(&kc)) {
@@ -741,7 +788,14 @@ where
         match a.read().await {
             Ok(lists) => {
                 failures = 0;
-                tx.send_replace(Arc::new(view_of(&lists, node::runtime::wall_ms(), a.host())));
+                if stats_due <= tokio::time::Instant::now() && stats_read.as_ref().is_none_or(|r| r.is_finished()) {
+                    stats_due = tokio::time::Instant::now() + kube_stats::STATS_EVERY;
+                    let nodes = items(&lists.pods).iter().filter_map(|p| text(&p["spec"]["nodeName"])).collect();
+                    let (a, stats) = (a.clone(), stats.clone());
+                    stats_read = Some(tokio::spawn(async move { kube_stats::read(&a, nodes, &stats).await }));
+                }
+                let view = view_of(&lists, node::runtime::wall_ms(), a.host(), &stats.lock().expect("the stats store"));
+                tx.send_replace(Arc::new(view));
             }
             Err(e) => {
                 failures += 1;
@@ -870,7 +924,7 @@ mod tests {
 
     #[test]
     fn pods_belong_to_their_workload_and_node() {
-        let v = view_of(&sample(), 7, VIP);
+        let v = view_of(&sample(), 7, VIP, &kube_stats::Store::default());
         assert_eq!(v.at, 7);
         let names: Vec<_> = v.pods.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(names, ["postgres-0", "web-6d4-x2"]);
@@ -884,14 +938,14 @@ mod tests {
 
     #[test]
     fn workloads_count_their_ready_replicas() {
-        let v = view_of(&sample(), NOW, VIP);
+        let v = view_of(&sample(), NOW, VIP, &kube_stats::Store::default());
         let rows: Vec<_> = v.workloads.iter().map(|w| (w.kind, w.name.as_str(), w.ready, w.desired)).collect();
         assert_eq!(rows, [(WorkloadKind::StatefulSet, "postgres", 0, 1), (WorkloadKind::Deployment, "web", 2, 3), (WorkloadKind::DaemonSet, "longhorn-manager", 5, 6)]);
     }
 
     #[test]
     fn volumes_list_their_claim_pods_and_replicas() {
-        let v = view_of(&sample(), NOW, VIP);
+        let v = view_of(&sample(), NOW, VIP, &kube_stats::Store::default());
         let [vol] = v.volumes.as_slice() else { panic!("{:?}", v.volumes) };
         assert_eq!(vol.pvc.as_deref(), Some("demo/data-postgres-0"));
         assert_eq!(vol.pods, ["postgres-0"]);
@@ -903,7 +957,7 @@ mod tests {
 
     #[test]
     fn workloads_carry_health_usage_images_and_endpoints() {
-        let v = view_of(&sample(), NOW, VIP);
+        let v = view_of(&sample(), NOW, VIP, &kube_stats::Store::default());
         let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
         assert_eq!(web.health.state, HealthState::RollingOut, "0 of 3 updated: {:?}", web.health);
         assert_eq!((web.cpu_milli, web.memory_bytes, web.cpu_limit_milli), (Some(15), Some(32 << 20), None));
@@ -921,7 +975,7 @@ mod tests {
         let mut fresh = items(&lists.pods).iter().find(|p| p["metadata"]["name"] == "web-6d4-x2").unwrap().clone();
         fresh["metadata"]["name"] = json!("web-6d4-new");
         lists.pods["items"].as_array_mut().unwrap().push(fresh);
-        let v = view_of(&lists, NOW, VIP);
+        let v = view_of(&lists, NOW, VIP, &kube_stats::Store::default());
         let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
         assert_eq!((web.cpu_milli, web.memory_bytes), (Some(15), Some(32 << 20)), "web-6d4-new is not measured yet");
     }
@@ -930,7 +984,7 @@ mod tests {
     fn a_template_labelled_for_a_service_gets_its_endpoints() {
         let mut lists = sample();
         lists.deployments = list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "replicas": 1, "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "containers": [{ "image": "nginx:1.29" }] } } }, "status": {} })]);
-        let v = view_of(&lists, NOW, VIP);
+        let v = view_of(&lists, NOW, VIP, &kube_stats::Store::default());
         let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
         let eps: Vec<_> = web.endpoints.iter().map(|e| (e.address.as_str(), e.link.is_some())).collect();
         assert_eq!(eps, [("http://10.0.3.253/", true), ("web.demo:80", false)]);
@@ -945,7 +999,7 @@ mod tests {
         lists.replicasets["items"][0]["metadata"]["annotations"] = json!({ "deployment.kubernetes.io/revision": "1" });
         lists.pods["items"][0]["status"]["podIP"] = json!("10.42.0.9");
         lists.pods["items"][0]["status"]["qosClass"] = json!("BestEffort");
-        let v = view_of(&lists, NOW, VIP);
+        let v = view_of(&lists, NOW, VIP, &kube_stats::Store::default());
         let web = v.workloads.iter().find(|w| w.name == "web").unwrap();
         assert_eq!(web.containers.iter().map(|c| c.image.as_str()).collect::<Vec<_>>(), ["nginx:1.29"]);
         assert_eq!(web.host_access, ["host network"]);
@@ -957,7 +1011,7 @@ mod tests {
 
     #[test]
     fn warning_events_of_the_last_hour_are_matched_to_their_workload() {
-        let v = view_of(&sample(), NOW, VIP);
+        let v = view_of(&sample(), NOW, VIP, &kube_stats::Store::default());
         let rows: Vec<_> = v.events.iter().map(|e| (e.reason.as_str(), e.workload.as_deref(), e.count)).collect();
         assert_eq!(
             rows,
@@ -969,7 +1023,7 @@ mod tests {
     #[test]
     fn without_metrics_server_the_rest_still_shows() {
         let lists = Lists { metrics: Err("metrics-server: 503 Service Unavailable".into()), ..sample() };
-        let v = view_of(&lists, NOW, VIP);
+        let v = view_of(&lists, NOW, VIP, &kube_stats::Store::default());
         assert_eq!(v.metrics_error.as_deref(), Some("metrics-server: 503 Service Unavailable"));
         assert!(v.workloads.iter().all(|w| w.cpu_milli.is_none() && w.memory_bytes.is_none()));
         assert_eq!(v.workloads.len(), 3);
@@ -984,7 +1038,7 @@ mod tests {
 
     #[test]
     fn missing_lists_are_empty() {
-        let v = view_of(&Lists::default(), 1, VIP);
+        let v = view_of(&Lists::default(), 1, VIP, &kube_stats::Store::default());
         assert!(v.pods.is_empty() && v.workloads.is_empty() && v.volumes.is_empty());
     }
 }

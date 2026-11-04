@@ -9,6 +9,7 @@ use control::runtime::Svc;
 use crate::kube::{self, KubeView};
 use crate::kube_action::{self, ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::{self, ApplyReport, ApplyRequest};
+use crate::kube_stats;
 use lab::install::Role;
 use lab::manager::{Lab, LabFault, LabTruth, Power};
 use model::HostId;
@@ -88,6 +89,8 @@ pub struct DriverHandle {
     published: watch::Receiver<Arc<Published>>,
     /// Asks for a read of Kubernetes now, rather than at the next poll.
     kube_now: Arc<Notify>,
+    /// Each pod's network and disk figures and history, from the kubelets.
+    kube_stats: kube_stats::SharedStore,
 }
 
 fn empty_truth() -> LabTruth {
@@ -122,10 +125,10 @@ impl DriverHandle {
                 tokio::time::sleep(PUBLISH_EVERY).await;
             }
         });
-        let handle = Self { client, lab, published, kube_now: Arc::new(Notify::new()) };
+        let handle = Self { client, lab, published, kube_now: Arc::new(Notify::new()), kube_stats: Default::default() };
         // Reads Kubernetes with the admin kubeconfig the control plane hands out.
         let h = handle.clone();
-        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx, handle.kube_now.clone()));
+        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx, handle.kube_now.clone(), handle.kube_stats.clone()));
         handle
     }
 
@@ -209,6 +212,14 @@ impl DriverHandle {
     /// A live workload as YAML, to edit and apply again.
     pub async fn kube_manifest(&self, w: WorkloadRef) -> Result<String, ActionError> {
         kube_apply::manifest(&self.kube_access().await?, &w).await
+    }
+
+    /// An hour of `w`'s CPU, memory and network, summed over the pods it has
+    /// now, as `/api/metrics` answers host series.
+    pub fn kube_metrics(&self, w: &WorkloadRef) -> serde_json::Value {
+        let owner = format!("{}/{}", w.kind, w.name);
+        let pods: Vec<String> = self.published.borrow().kube.pods.iter().filter(|p| p.namespace == w.namespace && p.owner.as_deref() == Some(owner.as_str())).map(|p| p.name.clone()).collect();
+        self.kube_stats.lock().expect("the stats store").series(&w.namespace, &pods)
     }
 
     /// The Kubernetes API, with a fresh admin kubeconfig from the control plane.

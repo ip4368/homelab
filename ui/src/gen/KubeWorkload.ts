@@ -25,6 +25,10 @@ cpu_milli: number | null, memory_bytes: number | null,
  */
 cpu_limit_milli: number | null, memory_limit_bytes: number | null, 
 /**
+ * Network receive and send rates (bits per second) summed over the pods measured.
+ */
+rx_bps: number | null, tx_bps: number | null, 
+/**
  * Its pod template's container images.
  */
 images: Array<string>, 

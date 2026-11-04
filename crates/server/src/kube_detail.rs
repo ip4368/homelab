@@ -253,6 +253,10 @@ mod tests {
             networks: vec![],
             qos: None,
             container_states: vec![],
+            rx_bps: None,
+            tx_bps: None,
+            ephemeral_bytes: None,
+            volume_use: vec![],
         }
     }
 

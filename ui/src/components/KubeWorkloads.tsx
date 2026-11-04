@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, bytesUsed, cpu, deletePrompt, netRate, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
@@ -94,6 +94,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
         <td className="num">
           <Usage used={w.memory_bytes} limit={w.memory_limit_bytes} format={mem} />
         </td>
+        <td className="num muted">{netRate(w.rx_bps, w.tx_bps)}</td>
         <td>
           {w.endpoints.length > 0 ? <EndpointLink e={w.endpoints[0]} /> : <span className="muted">none</span>}
           {w.endpoints.length > 1 && (
@@ -130,7 +131,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
       </tr>
       {error && (
         <tr>
-          <td colSpan={9}>
+          <td colSpan={10}>
             <div className="bad refusal" role="alert">
               {error}
             </div>
@@ -185,6 +186,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
         </span>
       </div>
       {kube.metrics_error && kube.at > 0 && <p className="muted">No CPU and memory usage: {kube.metrics_error}</p>}
+      {kube.stats_error && kube.at > 0 && <p className="muted">{kube.stats_error}</p>}
       {kube.error && <p className={kube.at > 0 ? 'warn' : 'muted'}>{kube.at > 0 ? `Last read failed: ${kube.error}` : `Waiting for Kubernetes: ${kube.error}`}</p>}
 
       <h4>Workloads</h4>
@@ -197,6 +199,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
             <th>Health</th>
             <th>CPU</th>
             <th>Memory</th>
+            <th>Network</th>
             <th>Endpoints</th>
             <th>Hosts</th>
             <th />
@@ -208,7 +211,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           ))}
           {rows.workloads.length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 {kube.workloads.length === 0 ? 'None yet. Apply YAML adds some, or "Seed workloads" in the lab panel.' : 'Nothing matches the filters.'}
               </td>
             </tr>
@@ -279,6 +282,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
             <th>Claim</th>
             <th>Used by</th>
             <th>Size</th>
+            <th>Used</th>
             <th>Health</th>
             <th>Attached to</th>
             <th>Replicas</th>
@@ -292,6 +296,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
               </td>
               <td className="muted">{v.pods.join(', ') || 'nothing'}</td>
               <td>{gib(v.size_bytes)}</td>
+              <td className={`num ${usedTone(v.used_bytes, v.size_bytes)}`}>{bytesUsed(v.used_bytes, v.size_bytes)}</td>
               <td className={volumeTone(v)}>
                 {v.robustness === 'unknown' ? v.state : v.robustness}
               </td>
@@ -318,7 +323,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           ))}
           {rows.volumes.length === 0 && (
             <tr>
-              <td colSpan={6} className="muted">
+              <td colSpan={7} className="muted">
                 {kube.volumes.length === 0 ? 'No volumes yet.' : 'Nothing matches the filters.'}
               </td>
             </tr>

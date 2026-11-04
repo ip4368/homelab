@@ -7,7 +7,8 @@
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
-// health, usage, endpoints and events the tab shows), checked against the cluster's Kubernetes API through the VIP with the
+// health, usage, endpoints and events the tab shows; K13 network and
+// volume usage), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -1116,6 +1117,100 @@ spec:
       return es.length > 0 ? es : null
     })
     note(`broken: down (${broken.value.health.reason}); events: ${[...new Set(events.value.map((e) => e.reason))].join(', ')}`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+/** Waits until namespace `ns` is gone, so a step starts clean even right after its last run (deleting one takes a while). */
+async function namespaceGone(ns: string) {
+  const k = await kube()
+  await waitAsync(`namespace ${ns} gone`, 3 * 60_000, async () => {
+    const r = await k.get(`/api/v1/namespaces/${ns}`)
+    return r.status === 404 || `${r.status} ${r.body?.status?.phase ?? ''}`
+  })
+}
+
+/** Applies `yaml` through the server, as the Apply YAML dialog does. */
+async function apply(yaml: string, namespace: string) {
+  const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace, dry_run: false, force: false }) })
+  if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
+}
+
+await step('K13', 'Network and disk: a workload serving a file through its Ingress shows its send rate; writing to a Longhorn claim shows in its used bytes', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-usage'
+  await namespaceGone(ns)
+  // Prefix, not Exact: Traefik ranks rules by length, and the demo's PathPrefix(`/`) outranks Path(`/blob`).
+  await apply(
+    `apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: { name: store }
+spec:
+  replicas: 1
+  serviceName: store
+  selector: { matchLabels: { app: store } }
+  template:
+    metadata: { labels: { app: store } }
+    spec:
+      terminationGracePeriodSeconds: 1
+      nodeSelector: { homelab.io/storage-network: "true" }
+      containers:
+        - name: store
+          image: "busybox:1.37"
+          command: [sh, -c, "mkdir -p /www && dd if=/dev/zero of=/www/blob bs=1M count=100 && sync && exec httpd -f -p 8080 -h /www"]
+          ports: [{ containerPort: 8080 }]
+          volumeMounts: [{ name: data, mountPath: /www }]
+  volumeClaimTemplates:
+    - metadata: { name: data }
+      spec: { accessModes: [ReadWriteOnce], storageClassName: longhorn, resources: { requests: { storage: 1Gi } } }
+---
+apiVersion: v1
+kind: Service
+metadata: { name: store }
+spec:
+  selector: { app: store }
+  ports: [{ port: 80, targetPort: 8080 }]
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: { name: store }
+spec:
+  rules:
+    - http:
+        paths: [{ path: /blob, pathType: Prefix, backend: { service: { name: store, port: { number: 80 } } } }]
+`,
+    ns,
+  )
+  try {
+    const claim = `${ns}/data-store-0`
+    const used = await waitFor('the claim to hold about 100 MiB', 6 * 60_000, () => {
+      const v = watch.seen!.kube.volumes.find((x) => x.pvc === claim)
+      return v?.used_bytes !== null && v?.used_bytes !== undefined && v.used_bytes >= 100 * 2 ** 20 ? v : null
+    })
+    note(`${claim}: ${Math.round(used.value.used_bytes! / 2 ** 20)} MiB used of ${used.value.size_bytes / 2 ** 30} GiB, ${secs(used.ms)} after applying`)
+    const vip = new URL((await kube()).server).hostname
+    let fetched = 0
+    const load = (async () => {
+      const until = now() + 60_000
+      while (now() < until) {
+        const r = await fetch(`http://${vip}/blob`).catch(() => null)
+        if (r?.ok) fetched += (await r.arrayBuffer()).byteLength
+      }
+    })()
+    const rate = await waitAsync("store's send rate in /api/kube/metrics", 90_000, async () => {
+      const r = await fetch(`${BASE}/api/kube/metrics?namespace=${ns}&kind=StatefulSet&name=store`)
+      const series = (await r.json()).series as Record<string, [number, number][]>
+      const tx = series.tx_bps.at(-1)?.[1] ?? 0
+      return tx > 1e6 ? tx : `tx ${tx} b/s`
+    })
+    await load
+    note(`while ${Math.round(fetched / 2 ** 20)} MiB were fetched through the Ingress, store sent ${(rate.value / 1e6).toFixed(1)} Mb/s`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }

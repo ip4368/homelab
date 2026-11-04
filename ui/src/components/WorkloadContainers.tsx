@@ -2,7 +2,7 @@ import type { ContainerSpec } from '../gen/ContainerSpec'
 import type { KubePod } from '../gen/KubePod'
 import type { LonghornVolume } from '../gen/LonghornVolume'
 import type { Revision } from '../gen/Revision'
-import { age, claimVolume, cpu, gib, mem, mountSource, requestLimit, shortDigest } from '../kube'
+import { age, bytesUsed, claimVolume, cpu, gib, mem, mountSource, requestLimit, shortDigest, usedTone } from '../kube'
 
 const ROLE_LABELS: Record<ContainerSpec['role'], string | null> = { App: null, Init: 'init', Sidecar: 'sidecar' }
 
@@ -159,7 +159,17 @@ export function PodDetail({ pod }: { pod: KubePod }) {
       <div className="muted">
         {pod.ips.length > 0 ? `IP ${pod.ips.join(', ')}` : 'no IP yet'}
         {pod.qos && ` · QoS ${pod.qos}`}
+        {pod.ephemeral_bytes !== null && ` · ${mem(pod.ephemeral_bytes)} of its node's disk (layers, logs, emptyDirs)`}
       </div>
+      {pod.volume_use
+        .filter((v) => v.claim || !v.volume.startsWith('kube-api-access-'))
+        .map((v) => (
+          <div key={v.volume}>
+            {v.volume}
+            {v.claim && <span className="muted"> (claim {v.claim})</span>}:{' '}
+            <span className={usedTone(v.used_bytes, v.capacity_bytes)}>{bytesUsed(v.used_bytes, v.capacity_bytes)}</span>
+          </div>
+        ))}
       {pod.networks
         .filter((n) => !n.default)
         .map((n) => (

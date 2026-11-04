@@ -4,7 +4,7 @@ import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, claimVolume, containerDigests, mountSource, pdbWarning, requestLimit, shortDigest, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, bytesUsed, netRate, usedTone, claimVolume, containerDigests, mountSource, pdbWarning, requestLimit, shortDigest, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return {
@@ -28,6 +28,10 @@ function pod(namespace: string, name: string, node: string | null, owner: string
     networks: [],
     qos: null,
     container_states: [],
+    rx_bps: null,
+    tx_bps: null,
+    ephemeral_bytes: null,
+    volume_use: [],
   }
 }
 
@@ -44,6 +48,8 @@ function workload(namespace: string, name: string, kind: KubeWorkload['kind'], d
     memory_bytes: null,
     cpu_limit_milli: null,
     memory_limit_bytes: null,
+    rx_bps: null,
+    tx_bps: null,
     images: [],
     endpoints: [],
     conditions: [],
@@ -72,6 +78,7 @@ const volume: LonghornVolume = {
   state: 'attached',
   robustness: 'healthy',
   node: 'ms01-04',
+  used_bytes: null,
   replicas: [
     { name: 'r1', node: 'ms01-02', disk: '/mnt/nvme0', state: 'running', mode: 'RW', failed: false },
     { name: 'r2', node: 'ms01-04', disk: '/mnt/nvme0', state: 'running', mode: 'WO', failed: false },
@@ -236,5 +243,17 @@ describe('containers', () => {
     expect(pdbWarning(null)).toBeNull()
     expect(pdbWarning({ name: 'web', disruptions_allowed: 1, healthy: 3, desired_healthy: 2 })).toBeNull()
     expect(pdbWarning({ name: 'web', disruptions_allowed: 0, healthy: 1, desired_healthy: 1 })).toContain('draining')
+  })
+})
+
+describe('network and disk', () => {
+  it('writes rates and how full a volume is', () => {
+    expect(netRate(null, null)).toBe('–')
+    expect(netRate(1.2e6, 80e3)).toBe('↓ 1.2 Mb/s ↑ 80 kb/s')
+    expect(bytesUsed(null, 2 ** 31)).toBe('–')
+    expect(bytesUsed(7.2 * 2 ** 30, 10 * 2 ** 30)).toBe('7.2 / 10 GiB')
+    expect(bytesUsed(850 * 2 ** 20, 2 * 2 ** 30)).toBe('850Mi / 2 GiB')
+    expect(bytesUsed(4096, null)).toBe('0Mi')
+    expect([usedTone(50, 100), usedTone(90, 100), usedTone(96, 100), usedTone(null, 100)]).toEqual(['ok', 'warn', 'bad', 'muted'])
   })
 })

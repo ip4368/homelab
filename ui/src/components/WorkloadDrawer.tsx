@@ -1,8 +1,10 @@
 import { Fragment, useState } from 'react'
-import { age, containerDigests, cpu, gib, mem, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
+import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { Containers, History, PodDetail } from './WorkloadContainers'
+import { Charts, WORKLOAD_CHARTS } from './Charts'
+import { fetchWorkloadMetrics } from '../metrics'
 
 /**
  * One workload in full, as Kubernetes reports it: health and why, usage,
@@ -58,8 +60,18 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
           <Usage used={w.cpu_milli} limit={w.cpu_limit_milli} format={cpu} />
           <label>Memory</label>
           <Usage used={w.memory_bytes} limit={w.memory_limit_bytes} format={mem} />
+          <label>Network</label>
+          <span>{netRate(w.rx_bps, w.tx_bps)}</span>
         </div>
       )}
+      {kube.stats_error && <div className="muted">{kube.stats_error}</div>}
+      <Charts
+        entity={id}
+        title="Last hour"
+        charts={WORKLOAD_CHARTS}
+        fetchOnce={() => fetchWorkloadMetrics(w.namespace, w.kind, w.name)}
+        everyMs={15_000}
+      />
 
       <h4>Endpoints</h4>
       {w.endpoints.length === 0 ? (
@@ -87,6 +99,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
             <th>Restarts</th>
             <th>CPU</th>
             <th>Memory</th>
+            <th>Network</th>
           </tr>
         </thead>
         <tbody>
@@ -110,10 +123,11 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                 <td className="num">
                   <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
                 </td>
+                <td className="num muted">{netRate(p.rx_bps, p.tx_bps)}</td>
               </tr>
               {open === p.name && (
                 <tr>
-                  <td colSpan={6}>
+                  <td colSpan={7}>
                     <PodDetail pod={p} />
                   </td>
                 </tr>
@@ -122,7 +136,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
           ))}
           {pods.length === 0 && (
             <tr>
-              <td colSpan={6} className="muted">
+              <td colSpan={7} className="muted">
                 No pods.
               </td>
             </tr>
@@ -136,7 +150,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
           <ul className="plain">
             {volumes.map((v) => (
               <li key={v.name}>
-                {v.pvc ?? v.name} <span className="muted">{gib(v.size_bytes)}</span>{' '}
+                {v.pvc ?? v.name} <span className="muted">{v.used_bytes === null ? gib(v.size_bytes) : `${bytesUsed(v.used_bytes, v.size_bytes)} used`}</span>{' '}
                 <span className={volumeTone(v)}>{v.robustness === 'unknown' ? v.state : v.robustness}</span>{' '}
                 <span className="muted">
                   ({v.replicas.filter((r) => r.mode === 'RW').length}/{v.replicas_wanted} replicas in sync)

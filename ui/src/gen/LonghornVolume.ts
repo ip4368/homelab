@@ -21,4 +21,8 @@ robustness: string,
 /**
  * The node it is attached to (where its engine runs).
  */
-node: string | null, replicas: Array<LonghornReplica>, };
+node: string | null, 
+/**
+ * What its filesystem holds, as the kubelet of a pod using it sees it.
+ */
+used_bytes: number | null, replicas: Array<LonghornReplica>, };

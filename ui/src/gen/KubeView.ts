@@ -23,4 +23,8 @@ events: Array<KubeEvent>,
 /**
  * Why there is no CPU and memory usage: metrics-server did not answer.
  */
-metrics_error: string | null, };
+metrics_error: string | null, 
+/**
+ * The nodes whose kubelet gave no network and disk figures on the last read, and why.
+ */
+stats_error: string | null, };

@@ -10,6 +10,7 @@ import type { LonghornReplica } from './gen/LonghornReplica'
 import type { LonghornVolume } from './gen/LonghornVolume'
 import type { Mount } from './gen/Mount'
 import type { Pdb } from './gen/Pdb'
+import { formatBps } from './metrics'
 
 /** Namespaces K3s and Longhorn run their own pods in. */
 export const SYSTEM_NAMESPACES = ['kube-system', 'longhorn-system']
@@ -295,4 +296,23 @@ export function claimVolume(namespace: string, claim: string, volumes: LonghornV
 export function pdbWarning(pdb: Pdb | null): string | null {
   if (!pdb || pdb.disruptions_allowed > 0) return null
   return `PodDisruptionBudget ${pdb.name} allows no disruption now (${pdb.healthy}/${pdb.desired_healthy} healthy): draining its pods' hosts waits for it`
+}
+
+/** Network receive and send rates (bits per second): `↓ 1.2 Mb/s ↑ 80 kb/s`; a dash before there are any. */
+export function netRate(rx: number | null, tx: number | null): string {
+  if (rx === null && tx === null) return '–'
+  return `↓ ${formatBps(rx)} ↑ ${formatBps(tx)}`
+}
+
+/** What a volume's filesystem holds of its size: `7.2 / 10 GiB`, `850Mi / 2 GiB`; a dash when unknown. */
+export function bytesUsed(used: number | null, size: number | null): string {
+  if (used === null) return '–'
+  const size_ = size === null ? '' : ` / ${gib(size)}`
+  return used >= 2 ** 30 && size !== null ? `${(used / 2 ** 30).toFixed(1)}${size_}` : `${mem(used)}${size_}`
+}
+
+/** A volume nearly full is worth a look: from 85 %, and past 95 % it is about to fail writes. */
+export function usedTone(used: number | null, size: number | null): Tone {
+  if (used === null || size === null || size === 0) return 'muted'
+  return used >= size * 0.95 ? 'bad' : used >= size * 0.85 ? 'warn' : 'ok'
 }
