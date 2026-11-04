@@ -72,7 +72,8 @@ PORT=18080 ./lab.sh up   # listen on another port (8080 is often taken)
 ```
 
 The server listens on `BIND`:`PORT` (default `127.0.0.1:8080`) and serves the built UI from
-`ui/dist`. The API has no authentication and can power off the lab's VMs, so prefer an SSH tunnel
+`ui/dist`. The API has no authentication and can power off the lab's VMs and open shells in its
+containers and VMs, so prefer an SSH tunnel
 (`ssh -L 8080:localhost:8080 <host>`) to `BIND=0.0.0.0`.
 
 ## A tour of the UI
@@ -93,10 +94,15 @@ the **Ground truth** checkbox; the lab host's clock.
 - **Networks:** logical networks (VLAN, subnet, MTU), network templates (with staged rollouts) and
   auto-approve rules.
 - **Workloads:** what Kubernetes runs, read from the K3s API: workloads with their health and why,
-  CPU and memory (metrics-server) and endpoints, their pods and where they run, and Longhorn's
-  volumes with their replicas. A workload's drawer adds its pods' details and Warning events. Scale, restart, edit or delete a workload from
-  its row, and apply YAML after a dry-run preview, pasted or written by a small form for an app
-  from an image (not in the K3s and Longhorn namespaces).
+  CPU and memory (metrics-server), network rates and storage use (the kubelet's summary) and
+  endpoints, their pods and where they run, and Longhorn's volumes with their replicas. A
+  workload's drawer charts an hour of usage and opens a pod in full: its containers (requests,
+  limits, ports, probes), its mounts and devices resolved to their volumes and claims, its logs
+  (tail, follow, the previous instance), and a shell in each container — plus Warning events.
+  Scale, restart, edit or delete a workload from its row, and apply YAML after a dry-run preview,
+  pasted or written by a small form for an app from an image (not in the K3s and Longhorn
+  namespaces). A host's drawer likewise reads a lab VM's serial console and journal and opens
+  an SSH terminal to it. Design: [docs/plans/2026-11-04-workload-debug-design.md](docs/plans/2026-11-04-workload-debug-design.md).
 
 **Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
 
