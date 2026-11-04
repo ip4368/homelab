@@ -21,10 +21,9 @@ export interface MetricsView {
   note: string | null
 }
 
-export async function fetchMetrics(entity: string, metrics: string[]): Promise<MetricsOutcome> {
-  const query = new URLSearchParams({ entity, m: metrics.join(',') })
+async function fetchSeries(url: string): Promise<MetricsOutcome> {
   try {
-    const res = await fetch(`/api/metrics?${query}`)
+    const res = await fetch(url)
     const json: unknown = await res.json().catch(() => null)
     if (res.ok) return { ok: json as MetricsReply }
     const error = (json as { error?: unknown } | null)?.error
@@ -32,6 +31,19 @@ export async function fetchMetrics(entity: string, metrics: string[]): Promise<M
   } catch (e) {
     return { error: String(e) }
   }
+}
+
+export async function fetchMetrics(entity: string, metrics: string[]): Promise<MetricsOutcome> {
+  return fetchSeries(`/api/metrics?${new URLSearchParams({ entity, m: metrics.join(',') })}`)
+}
+
+/**
+ * A pod's (`ns/name` under `pod`) or workload's (`ns/Kind/name` under
+ * `workload`) series from the server's own Kubernetes history.
+ */
+export async function fetchKubeMetrics(entity: { pod: string } | { workload: string }, metrics: string[]): Promise<MetricsOutcome> {
+  const query = new URLSearchParams({ ...entity, m: metrics.join(',') })
+  return fetchSeries(`/api/kube/metrics?${query}`)
 }
 
 /**

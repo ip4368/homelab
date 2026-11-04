@@ -632,7 +632,7 @@ label.inline {
 }
 
 .workload-drawer {
-  width: 560px;
+  width: 720px;
   /* Everything in it wraps; the vertical scrollbar alone would add a horizontal one. */
   overflow-x: hidden;
 }
@@ -650,6 +650,64 @@ label.inline {
 
 .kube-events li {
   margin-bottom: 6px;
+}
+
+.selected-row {
+  background: #eef4fb;
+}
+
+.pod-detail {
+  border-top: 1px solid #e2e6ec;
+  margin-top: 8px;
+  padding-top: 4px;
+}
+
+.pod-detail h5 {
+  margin: 14px 0 6px;
+}
+
+.pod-meta label {
+  color: #667085;
+}
+
+.log-view {
+  background: #10141a;
+  color: #d7e0ea;
+  padding: 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.45;
+  max-height: 320px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.terminal-wrap {
+  margin-top: 10px;
+  border: 1px solid #2a323d;
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.terminal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: #1a212b;
+  color: #d7e0ea;
+  padding: 6px 8px;
+  font-size: 12px;
+}
+
+.terminal {
+  height: 320px;
+  background: #000;
+}
+
+.terminal .xterm {
+  height: 100%;
+  padding: 4px;
 }
 
 .apply-dialog {
@@ -1043,3 +1101,28 @@ table.workload-table th {
 .kube-workloads table.workload-table td {
   padding: 2px 8px 2px 0;
 }
+
+/* Pod detail cards and tables (workload debugging). */
+.pod-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.pod-heading h4 { margin: 2px 0 8px; overflow-wrap: anywhere; }
+.status-pill { padding: 3px 8px; border-radius: 999px; background: #eef2f8; font-size: 11px; font-weight: 700; }
+.fact-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin: 8px 0 10px; }
+.fact-chip { display: flex; flex-direction: column; gap: 2px; min-width: 0; padding: 8px 9px; border: 1px solid var(--border); border-radius: 9px; background: var(--panel); }
+.fact-chip small { color: var(--muted); }
+.fact-chip b { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pod-node-line { margin-bottom: 10px; }
+.table-scroll { overflow: auto; }
+.compact-scroll { max-height: 390px; }
+.inspector-section { margin-bottom: 12px; }
+.inspector-two-col { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.metric-card-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; margin-bottom: 14px; }
+.metric-card { display: flex; flex-direction: column; gap: 5px; padding: 12px; border-radius: 8px; background: #f7f9fc; border: 1px solid var(--border); }
+.metric-card > span { color: var(--muted); font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; }
+.metric-card strong { font-size: 18px; }
+.metric-card small { color: var(--muted); }
+.volume-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(300px, 100%), 1fr)); gap: 12px; }
+.volume-card { padding: 14px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.volume-card > div:first-child { display: flex; justify-content: space-between; gap: 12px; }
+.volume-card dl { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.volume-card dt { color: var(--muted); font-size: 11px; }
+.volume-card dd { margin: 0; font-weight: 600; }

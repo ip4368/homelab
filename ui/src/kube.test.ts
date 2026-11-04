@@ -4,7 +4,7 @@ import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, byteRate, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podClaims, podWhy, usage, usageTone, usedPct, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return {
@@ -21,9 +21,20 @@ function pod(namespace: string, name: string, node: string | null, owner: string
     memory_bytes: null,
     cpu_limit_milli: null,
     memory_limit_bytes: null,
+    cpu_request_milli: null,
+    memory_request_bytes: null,
+    net_rx_bps: null,
+    net_tx_bps: null,
+    fs_used_bytes: null,
     detail: null,
     unschedulable: false,
     last_termination: null,
+    uid: null,
+    pod_ip: null,
+    qos: null,
+    service_account: null,
+    container_details: [],
+    init_containers: [],
   }
 }
 
@@ -40,6 +51,10 @@ function workload(namespace: string, name: string, kind: KubeWorkload['kind'], d
     memory_bytes: null,
     cpu_limit_milli: null,
     memory_limit_bytes: null,
+    cpu_request_milli: null,
+    memory_request_bytes: null,
+    net_rx_bps: null,
+    net_tx_bps: null,
     images: [],
     endpoints: [],
     conditions: [],
@@ -197,5 +212,28 @@ describe('draining', () => {
     const restarted = { ...pod('demo', 'b', 'x', null), restarts: 3, last_termination: { reason: 'OOMKilled', exit_code: 137, at: null } }
     expect(podWhy(restarted)).toBe('last ended: OOMKilled (exit 137)')
     expect(podWhy(pod('demo', 'c', 'x', null))).toBeUndefined()
+  })
+
+  it('writes network byte rates and claim fullness', () => {
+    expect([byteRate(null), byteRate(950), byteRate(12_300), byteRate(2_500_000), byteRate(3_000_000_000)]).toEqual(['–', '950 B/s', '12.3 KB/s', '2.5 MB/s', '3 GB/s'])
+    expect([usedPct(1, 4), usedPct(2, 3), usedPct(null, 4), usedPct(1, 0), usedPct(1, null)]).toEqual([25, 67, null, null, null])
+    const claim = (namespace: string, name: string) => ({ namespace, name, phase: 'Bound', requested_bytes: 10, capacity_bytes: 10, used_bytes: 5, storage_class: 'longhorn', volume: 'pvc-1', access_modes: ['ReadWriteOnce'] })
+    const mounted = {
+      ...pod('demo', 'writer-1', 'ms01-02', 'Deployment/writer'),
+      container_details: [
+        {
+          name: 'writer', image: 'busybox', ready: true, restarts: 0, state: 'Running',
+          cpu_milli: null, memory_bytes: null, cpu_request_milli: null, memory_request_bytes: null, cpu_limit_milli: null, memory_limit_bytes: null,
+          extra_requests: {}, ports: [], probes: [], last_termination: null,
+          mounts: [
+            { path: '/data', volume: 'data', source: 'pvc writer', read_only: false, sub_path: null },
+            { path: '/etc/cfg', volume: 'cfg', source: 'configMap cfg', read_only: true, sub_path: null },
+          ],
+          devices: [{ path: '/dev/x', volume: 'raw', source: 'pvc raw', read_only: false, sub_path: null }],
+        },
+      ],
+    }
+    expect(podClaims(mounted, [claim('demo', 'writer'), claim('demo', 'raw'), claim('other', 'writer'), claim('demo', 'unmounted')]).map((c) => c.name)).toEqual(['writer', 'raw'])
+    expect(podClaims(pod('demo', 'bare', null, null), [claim('demo', 'writer')])).toEqual([])
   })
 })

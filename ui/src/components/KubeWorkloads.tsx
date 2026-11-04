@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { useStore } from '../store'
-import { age, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, byteRate, cpu, deletePrompt, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
@@ -94,6 +94,9 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
         <td className="num">
           <Usage used={w.memory_bytes} limit={w.memory_limit_bytes} format={mem} />
         </td>
+        <td className="num muted" title="bytes in ↓ out ↑ per second">
+          ↓{byteRate(w.net_rx_bps)} ↑{byteRate(w.net_tx_bps)}
+        </td>
         <td>
           {w.endpoints.length > 0 ? <EndpointLink e={w.endpoints[0]} /> : <span className="muted">none</span>}
           {w.endpoints.length > 1 && (
@@ -130,7 +133,7 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
       </tr>
       {error && (
         <tr>
-          <td colSpan={9}>
+          <td colSpan={10}>
             <div className="bad refusal" role="alert">
               {error}
             </div>
@@ -185,6 +188,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
         </span>
       </div>
       {kube.metrics_error && kube.at > 0 && <p className="muted">No CPU and memory usage: {kube.metrics_error}</p>}
+      {kube.stats_error && kube.at > 0 && <p className="muted">No network and storage usage: {kube.stats_error}</p>}
       {kube.error && <p className={kube.at > 0 ? 'warn' : 'muted'}>{kube.at > 0 ? `Last read failed: ${kube.error}` : `Waiting for Kubernetes: ${kube.error}`}</p>}
 
       <h4>Workloads</h4>
@@ -197,6 +201,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
             <th>Health</th>
             <th>CPU</th>
             <th>Memory</th>
+            <th>Network</th>
             <th>Endpoints</th>
             <th>Hosts</th>
             <th />
@@ -208,7 +213,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
           ))}
           {rows.workloads.length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 {kube.workloads.length === 0 ? 'None yet. Apply YAML adds some, or "Seed workloads" in the lab panel.' : 'Nothing matches the filters.'}
               </td>
             </tr>
@@ -227,6 +232,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
             <th>Restarts</th>
             <th>CPU</th>
             <th>Memory</th>
+            <th>Network</th>
             <th>Host</th>
             <th>Age</th>
           </tr>
@@ -253,13 +259,16 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
               <td className="num">
                 <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
               </td>
+              <td className="num muted" title={p.pod_ip ? `pod IP ${p.pod_ip}` : undefined}>
+                ↓{byteRate(p.net_rx_bps)} ↑{byteRate(p.net_tx_bps)}
+              </td>
               <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">unscheduled</span>}</td>
               <td className="muted">{age(p.created, now)}</td>
             </tr>
           ))}
           {rows.pods.length === 0 && (
             <tr>
-              <td colSpan={9} className="muted">
+              <td colSpan={10} className="muted">
                 {kube.pods.length === 0 ? 'No pods yet.' : 'Nothing matches the filters.'}
               </td>
             </tr>

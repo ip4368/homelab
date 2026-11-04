@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import uPlot from 'uplot'
 import 'uplot/dist/uPlot.min.css'
-import { alignSeries, type Aligned, fetchMetrics, foldOutcome, formatBps, metricsSince, startPolling, type MetricsView } from '../metrics'
+import { alignSeries, type Aligned, fetchKubeMetrics, fetchMetrics, foldOutcome, formatBps, metricsSince, startPolling, type MetricsOutcome, type MetricsView } from '../metrics'
+import { byteRate, cpu as cpuFmt, mem as memFmt } from '../kube'
 import { formatClock } from '../clock'
 
 /** How often a visible chart asks for fresh series. */
@@ -16,7 +17,7 @@ const TIME_STEPS = [10, 30, 60, 120, 300, 600, 900, 1800, 3600].map((s) => s * 1
 /** Rows in a chart's table view. */
 const TABLE_ROWS = 6
 
-type Unit = 'pct' | 'bps'
+type Unit = 'pct' | 'bps' | 'milli' | 'bytes' | 'bytesRate'
 
 interface ChartSpec {
   title: string
@@ -39,20 +40,37 @@ const CHARTS: ChartSpec[] = [
 ]
 const METRIC_NAMES = CHARTS.flatMap((c) => c.series.map((s) => s.metric))
 
-const format = (unit: Unit, v: number | null | undefined) =>
-  v === null || v === undefined ? '–' : unit === 'pct' ? `${v.toFixed(0)}%` : formatBps(v)
+/** A pod's or workload's usage: CPU, memory, and network from the kubelet's counters. */
+const KUBE_CHARTS: ChartSpec[] = [
+  { title: 'CPU', unit: 'milli', series: [{ metric: 'cpu_milli', label: 'CPU' }] },
+  { title: 'Memory', unit: 'bytes', series: [{ metric: 'memory_bytes', label: 'memory' }] },
+  {
+    title: 'Network',
+    unit: 'bytesRate',
+    series: [
+      { metric: 'net_rx_bps', label: 'rx' },
+      { metric: 'net_tx_bps', label: 'tx' },
+    ],
+  },
+]
+const KUBE_METRIC_NAMES = KUBE_CHARTS.flatMap((c) => c.series.map((s) => s.metric))
 
-/** Polls `entity`'s series every [`POLL_MS`] while mounted, keeping the last answer through pauses and errors. */
-function useMetrics(entity: string): MetricsView {
+const format = (unit: Unit, v: number | null | undefined) =>
+  v === null || v === undefined ? '–' : unit === 'pct' ? `${v.toFixed(0)}%` : unit === 'bps' ? formatBps(v) : unit === 'milli' ? cpuFmt(v) : unit === 'bytes' ? memFmt(v) : byteRate(v)
+
+/** Polls series every [`POLL_MS`] while mounted, keeping the last answer through pauses and errors. `key` restarts the poll; `load` is read fresh each tick. */
+function useSeries(key: string, load: () => Promise<MetricsOutcome>): MetricsView {
   const [view, setView] = useState<MetricsView>({ reply: null, note: null })
+  const latest = useRef(load)
+  latest.current = load
   useEffect(() => {
     setView({ reply: null, note: null })
     return startPolling(
-      () => fetchMetrics(entity, METRIC_NAMES),
+      () => latest.current(),
       (outcome) => setView((prev) => foldOutcome(prev, outcome)),
       POLL_MS,
     )
-  }, [entity])
+  }, [key])
   return view
 }
 
@@ -66,7 +84,7 @@ function options(spec: ChartSpec, width: number): uPlot.Options {
     scales: {
       x: { time: false },
       // Rates start at zero and end on a round tick.
-      y: spec.unit === 'pct' ? { range: [0, 100] } : { range: (_u, _min, max) => uPlot.rangeNum(0, Math.max(max, 1000), 0.1, true) },
+      y: spec.unit === 'pct' ? { range: [0, 100] } : { range: (_u, _min, max) => uPlot.rangeNum(0, Math.max(max, spec.unit === 'bps' ? 1000 : 1), 0.1, true) },
     },
     axes: [
       { ...axis, incrs: TIME_STEPS, values: (_u, ticks) => ticks.map(formatClock) },
@@ -141,20 +159,15 @@ function ChartTable({ spec, data }: { spec: ChartSpec; data: Aligned }) {
   )
 }
 
-/**
- * CPU, RAM and port throughput of `entity` (`host:<id>` or `fleet`), from the
- * leader's metrics history, refreshed every [`POLL_MS`] while shown. While
- * the control plane does not answer, the last series stay on screen with a
- * note saying so.
- */
-export function Charts({ entity, title, row = false }: { entity: string; title: string; row?: boolean }) {
-  const view = useMetrics(entity)
-  const data = useMemo(() => CHARTS.map((spec) => alignSeries(view.reply, spec.series.map((s) => s.metric))), [view.reply])
+/** The charts `specs` name, on series `load` fetches, refreshed every [`POLL_MS`] while shown. */
+function SeriesCharts({ title, specs, loadKey, load, row = false, sinceLabel }: { title: string; specs: ChartSpec[]; loadKey: string; load(): Promise<MetricsOutcome>; row?: boolean; sinceLabel(since: number): string }) {
+  const view = useSeries(loadKey, load)
+  const data = useMemo(() => specs.map((spec) => alignSeries(view.reply, spec.series.map((s) => s.metric))), [view.reply, specs])
   return (
     <div className="charts">
       <div className="charts-head">
         <h4>{title}</h4>
-        {view.reply && <span className="muted">{metricsSince(view.reply.since)}</span>}
+        {view.reply && <span className="muted">{sinceLabel(view.reply.since)}</span>}
         {view.note && (
           <span className="warn" role="status">
             {view.note}
@@ -162,7 +175,7 @@ export function Charts({ entity, title, row = false }: { entity: string; title: 
         )}
       </div>
       <div className={row ? 'charts-row' : 'charts-col'}>
-        {CHARTS.map((spec, i) => (
+        {specs.map((spec, i) => (
           <figure key={spec.title} className="chart">
             <figcaption>{spec.title}</figcaption>
             <LineChart spec={spec} data={data[i]} />
@@ -172,4 +185,23 @@ export function Charts({ entity, title, row = false }: { entity: string; title: 
       </div>
     </div>
   )
+}
+
+/**
+ * CPU, RAM and port throughput of `entity` (`host:<id>` or `fleet`), from the
+ * leader's metrics history. While the control plane does not answer, the
+ * last series stay on screen with a note saying so.
+ */
+export function Charts({ entity, title, row = false }: { entity: string; title: string; row?: boolean }) {
+  return <SeriesCharts title={title} specs={CHARTS} loadKey={entity} load={() => fetchMetrics(entity, METRIC_NAMES)} row={row} sinceLabel={metricsSince} />
+}
+
+/**
+ * A pod's or workload's CPU, memory and network, from the server's hour of
+ * Kubernetes samples (`/api/kube/metrics`). Until a series exists the note
+ * says why (the pod or workload is new, or its node gave no summary).
+ */
+export function KubeCharts({ entity, title, row = false }: { entity: { pod: string } | { workload: string }; title: string; row?: boolean }) {
+  const key = 'pod' in entity ? `pod:${entity.pod}` : `workload:${entity.workload}`
+  return <SeriesCharts title={title} specs={KUBE_CHARTS} loadKey={key} load={() => fetchKubeMetrics(entity, KUBE_METRIC_NAMES)} row={row} sinceLabel={metricsSince} />
 }

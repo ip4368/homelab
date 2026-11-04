@@ -228,7 +228,7 @@ describe('store', () => {
     const s = createStore()
     s.applyMessage(snapshot())
     expect(s.getState().kube).toBe(emptyKube)
-    const read = { ...emptyKube, at: 5, pods: [{ namespace: 'demo', name: 'web-1', owner: 'Deployment/web', node: 'a', status: 'Running', ready: 1, containers: 1, restarts: 0, created: 1, cpu_milli: null, memory_bytes: null, cpu_limit_milli: null, memory_limit_bytes: null, detail: null, unschedulable: false, last_termination: null }] }
+    const read = { ...emptyKube, at: 5, pods: [{ namespace: 'demo', name: 'web-1', owner: 'Deployment/web', node: 'a', status: 'Running', ready: 1, containers: 1, restarts: 0, created: 1, cpu_milli: null, memory_bytes: null, cpu_limit_milli: null, memory_limit_bytes: null, cpu_request_milli: null, memory_request_bytes: null, net_rx_bps: null, net_tx_bps: null, fs_used_bytes: null, detail: null, unschedulable: false, last_termination: null, uid: null, pod_ip: null, qos: null, service_account: null, container_details: [], init_containers: [] }] }
     s.applyMessage(delta({ kube: read }))
     expect(s.getState().kube).toBe(read)
     s.applyMessage(delta({ version: 3 }))

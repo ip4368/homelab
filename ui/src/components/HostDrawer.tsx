@@ -9,6 +9,7 @@ import type { Role } from '../gen/Role'
 import { podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
 import { store, useStore, type Store } from '../store'
 import { Charts } from './Charts'
+import { LabDebug } from './LabDebug'
 import { downVoters, HandoffDialog, handoffChoices, isDown } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
 import { ReplaceDialog, replaceChoices } from './ReplaceDialog'
@@ -330,6 +331,7 @@ export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
       <div className="section">
         <Charts entity={`host:${host.id}`} title="Metrics" />
       </div>
+      <LabDebug host={host} />
       {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
       <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
       {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}

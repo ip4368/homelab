@@ -2,6 +2,7 @@ import type { ApplyOutcome } from './gen/ApplyOutcome'
 import type { ApplyReport } from './gen/ApplyReport'
 import type { FieldConflict } from './gen/FieldConflict'
 import type { HealthState } from './gen/HealthState'
+import type { KubeClaim } from './gen/KubeClaim'
 import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeView } from './gen/KubeView'
@@ -197,6 +198,32 @@ export function mem(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined) return '–'
   if (bytes < 2 ** 30) return `${Math.round(bytes / 2 ** 20)}Mi`
   return `${(bytes / 2 ** 30).toFixed(1)}Gi`
+}
+
+/** A byte rate from the kubelet's counters: `950 B/s`, `12 KB/s`, `2.5 MB/s`; a dash for none. (Host port rates are bits — see `formatBps`.) */
+export function byteRate(perSecond: number | null | undefined): string {
+  if (perSecond === null || perSecond === undefined) return '–'
+  const units: [number, string][] = [
+    [1e9, 'GB/s'],
+    [1e6, 'MB/s'],
+    [1e3, 'KB/s'],
+  ]
+  for (const [scale, unit] of units) {
+    if (Math.abs(perSecond) >= scale) return `${parseFloat((perSecond / scale).toFixed(1))} ${unit}`
+  }
+  return `${Math.round(perSecond)} B/s`
+}
+
+/** `used` as a percentage of `capacity`, or null without both. */
+export function usedPct(used: number | null, capacity: number | null): number | null {
+  if (used === null || capacity === null || capacity === 0) return null
+  return Math.round((used / capacity) * 100)
+}
+
+/** The claims a pod mounts, by the `pvc <claim>` its mount sources name. */
+export function podClaims(p: Pick<KubePod, 'namespace' | 'container_details'>, claims: KubeClaim[]): KubeClaim[] {
+  const names = new Set(p.container_details.flatMap((c) => [...c.mounts, ...c.devices]).flatMap((m) => (m.source.startsWith('pvc ') ? [m.source.slice(4)] : [])))
+  return claims.filter((c) => c.namespace === p.namespace && names.has(c.name))
 }
 
 /** Usage against a limit, when there is one: `84Mi / 2Gi`. */

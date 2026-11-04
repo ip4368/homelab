@@ -4,6 +4,7 @@ import type { ApplyRequest } from './gen/ApplyRequest'
 import type { KubeAction } from './gen/KubeAction'
 import type { LabFault } from './gen/LabFault'
 import type { WorkloadRef } from './gen/WorkloadRef'
+import { consoleUrl, journalUrl, logParams, type LogRequest } from './debug'
 
 /**
  * POSTs `body` as JSON. A non-2xx answer (400 rejected, 503 control plane or
@@ -45,12 +46,32 @@ export async function kubeApply(req: ApplyRequest): Promise<ApplyReport> {
   return (await post('/api/kube/apply', req)) as ApplyReport
 }
 
-/** A live workload as YAML, to edit and apply again. */
-export async function kubeManifest(w: WorkloadRef): Promise<string> {
-  const res = await fetch(`/api/kube/manifest?${new URLSearchParams({ namespace: w.namespace, kind: w.kind, name: w.name })}`)
+/** GETs `path` as text; a refusal rejects with the server's error string, as `post` does. */
+async function getText(path: string): Promise<string> {
+  const res = await fetch(path)
   if (res.ok) return res.text()
   const error = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error
   throw typeof error === 'string' ? error : `HTTP ${res.status}`
+}
+
+/** A live workload as YAML, to edit and apply again. */
+export async function kubeManifest(w: WorkloadRef): Promise<string> {
+  return getText(`/api/kube/manifest?${new URLSearchParams({ namespace: w.namespace, kind: w.kind, name: w.name })}`)
+}
+
+/** A container's log tail, as `kubectl logs` prints it. */
+export async function kubeLogs(q: LogRequest): Promise<string> {
+  return getText(`/api/kube/logs?${logParams(q)}`)
+}
+
+/** A lab VM's serial console log. */
+export async function labConsole(vm: string): Promise<string> {
+  return getText(consoleUrl(vm))
+}
+
+/** A lab VM's journal for one unit (homelabd, k3s, k3s-agent). */
+export async function labJournal(vm: string, unit: string, lines?: number): Promise<string> {
+  return getText(journalUrl(vm, unit, lines))
 }
 
 /** Does something to the lab's hardware; resolves with the new machine's id for `AddVm`. */
