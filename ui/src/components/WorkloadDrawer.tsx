@@ -1,6 +1,6 @@
 import { Fragment, useState } from 'react'
-import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes } from '../kube'
-import { dock, logsSession } from '../dock'
+import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes, canShell } from '../kube'
+import { dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { Containers, History, PodDetail } from './WorkloadContainers'
@@ -128,6 +128,7 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
                 <td className="num muted">{netRate(p.rx_bps, p.tx_bps)}</td>
                 <td className="row-actions">
                   <button onClick={() => dock.open(logsSession(p))}>Logs</button>
+                  {canShell(p) && <button onClick={() => dock.open(terminalSession(p))}>Shell</button>}
                 </td>
               </tr>
               {open === p.name && (

@@ -5,8 +5,9 @@
 import { useSyncExternalStore } from 'react'
 import type { KubePod } from './gen/KubePod'
 import type { LogTarget } from './logs'
+import type { ExecTarget } from './terminal'
 
-export type Session = { id: string; kind: 'logs'; title: string; target: LogTarget }
+export type Session = { id: string; kind: 'logs'; title: string; target: LogTarget } | { id: string; kind: 'terminal'; title: string; target: ExecTarget }
 
 export interface DockState {
   sessions: Session[]
@@ -20,6 +21,8 @@ export const emptyDock: DockState = { sessions: [], active: null }
 export function sessionId(kind: Session['kind'], t: LogTarget): string {
   return `${kind}:${t.namespace}/${t.pod}/${t.container ?? ''}${t.previous ? ':previous' : ''}`
 }
+
+let terminals = 0
 
 export function openSession(s: DockState, session: Session): DockState {
   if (s.sessions.some((x) => x.id === session.id)) return { ...s, active: session.id }
@@ -44,6 +47,13 @@ export function logsSession(p: Pick<KubePod, 'namespace' | 'name' | 'container_s
   const target: LogTarget = { namespace: p.namespace, pod: p.name, container, previous }
   const title = `${p.name}${container && p.container_states.length > 1 ? `/${container}` : ''}${previous ? ' (previous)' : ''}`
   return { id: sessionId('logs', target), kind: 'logs', title, target }
+}
+
+/** A shell in `p`'s container: each opens its own tab, as two shells are two sessions. */
+export function terminalSession(p: Pick<KubePod, 'namespace' | 'name' | 'container_states'>, container = defaultContainer(p)): Session {
+  terminals += 1
+  const title = `${p.name}${container && p.container_states.length > 1 ? `/${container}` : ''}`
+  return { id: `terminal:${p.namespace}/${p.name}/${container ?? ''}#${terminals}`, kind: 'terminal', title, target: { namespace: p.namespace, pod: p.name, container } }
 }
 
 let state = emptyDock

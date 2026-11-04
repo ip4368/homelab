@@ -4,6 +4,7 @@
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
+use crate::kube_exec::{self, ExecQuery};
 use crate::kube_logs::LogQuery;
 use crate::ws::ws_handler;
 use axum::extract::{Json, Query, State};
@@ -29,6 +30,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube/manifest", get(kube_manifest))
         .route("/api/kube/metrics", get(kube_metrics))
         .route("/api/kube/logs", get(kube_logs))
+        .route("/api/kube/exec", get(kube_exec))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -198,6 +200,23 @@ async fn kube_logs(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>
     }
 }
 
+/// `?namespace=&pod=&container=`, a WebSocket: a shell in the container.
+/// Binary frames are terminal bytes both ways; the browser sends
+/// `{"resize":{"cols":…,"rows":…}}`, and is sent `{"exit":{"code":…}}` or
+/// `{"error":"…"}` before the server closes (refusals included, so the
+/// terminal can say why).
+async fn kube_exec(State(driver): State<DriverHandle>, Query(q): Query<ExecQuery>, ws: axum::extract::WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| async move {
+        if let Some(why) = q.refusal() {
+            return kube_exec::refuse(socket, &why).await;
+        }
+        match driver.kube_access().await {
+            Ok(access) => kube_exec::run(socket, &access, &q.path(), &kube_exec::EXEC_PROTOCOLS, &kube_exec::EXEC, &q.describe()).await,
+            Err(e) => kube_exec::refuse(socket, &e.to_string()).await,
+        }
+    })
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -326,6 +345,24 @@ pub mod tests {
         assert_eq!(msg["type"], "snapshot");
         assert_eq!(msg["view"]["leader"], "ms01-01");
         assert!(msg["clock"]["now"].as_u64().unwrap() > 1_700_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_says_why_it_cannot_open() {
+        let (driver, _host) = cluster();
+        wait_for_leader(&driver).await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app(driver)).await.unwrap() });
+        let said = |query: &'static str| async move {
+            let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/kube/exec?{query}")).await.unwrap();
+            let msg: Value = serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            msg["error"].as_str().unwrap().to_string()
+        };
+        assert!(said("namespace=kube-system&pod=coredns-1").await.contains("kubectl"), "a protected namespace");
+        assert!(said("namespace=demo&pod=a%2Fb").await.contains("not a pod"));
+        // This one-host cluster runs no K3s server, so it hands out no kubeconfig.
+        assert!(said("namespace=demo&pod=web-1").await.contains("kubeconfig"));
     }
 
     #[tokio::test]

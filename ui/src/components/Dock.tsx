@@ -1,11 +1,13 @@
 import { useRef, useState } from 'react'
 import { dock, useDock } from '../dock'
+import { execUrl } from '../terminal'
 import { LogViewer } from './LogViewer'
+import { Terminal } from './Terminal'
 
 const MIN_HEIGHT = 120
 
 /**
- * The dock at the bottom of the page: a tab per log (and terminal) session,
+ * The dock at the bottom of the page: a tab per log or terminal session,
  * with a draggable height. Hidden sessions keep running; closing a tab ends
  * its session. Minimised, it is just its tabs.
  */
@@ -46,7 +48,11 @@ export function Dock() {
       {/* Every session stays mounted, so a hidden log keeps following. */}
       {sessions.map((s) => (
         <div key={s.id} className="dock-body" style={{ height, display: s.id === active ? undefined : 'none' }}>
-          {s.kind === 'logs' && <LogViewer target={s.target} />}
+          {s.kind === 'logs' ? (
+            <LogViewer target={s.target} />
+          ) : (
+            <Terminal url={execUrl(s.target, location)} label={`shell in ${s.target.namespace}/${s.target.pod}${s.target.container ? ` (${s.target.container})` : ''}`} />
+          )}
         </div>
       ))}
     </section>

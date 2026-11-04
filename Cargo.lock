@@ -1364,6 +1364,7 @@ dependencies = [
  "model",
  "node",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml_ng",
@@ -1584,7 +1585,11 @@ checksum = "8f72a05e828585856dacd553fba484c242c46e391fb0e58917c942ee9202915c"
 dependencies = [
  "futures-util",
  "log",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-pki-types",
  "tokio",
+ "tokio-rustls",
  "tungstenite",
 ]
 
@@ -1716,6 +1721,8 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
+ "rustls",
+ "rustls-pki-types",
  "sha1",
  "thiserror",
 ]

@@ -321,12 +321,36 @@ pub struct Access {
     client: reqwest::Client,
     /// The same, without the timeout on whole requests: for streams that stay open (logs).
     streaming: reqwest::Client,
+    /// The same certificates, for WebSockets (exec, consoles).
+    ws_tls: Arc<rustls::ClientConfig>,
 }
 
 /// A base64 field of the kubeconfig (`homelabd kubeconfig` writes the one
 /// cluster and user K3s generates, with the certificates inline).
 fn field<'a>(kubeconfig: &'a str, key: &str) -> Option<&'a str> {
     kubeconfig.lines().find_map(|l| l.trim().strip_prefix(key)?.strip_prefix(':')).map(str::trim)
+}
+
+/// The host of a server URL: `https://10.0.3.253:6443` → `10.0.3.253`.
+fn host_of(server: &str) -> &str {
+    let rest = server.split_once("://").map_or(server, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or(rest);
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
+/// A TLS client trusting only the cluster's CA (PEM) and presenting the admin certificate and key (PEM).
+fn ws_tls(ca: &[u8], cert: &[u8], key: &[u8]) -> Result<rustls::ClientConfig, String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let mut roots = rustls::RootCertStore::empty();
+    for c in CertificateDer::pem_slice_iter(ca) {
+        roots.add(c.map_err(|e| format!("the kubeconfig's CA: {e}"))?).map_err(|e| format!("the kubeconfig's CA: {e}"))?;
+    }
+    let chain = CertificateDer::pem_slice_iter(cert).collect::<Result<Vec<_>, _>>().map_err(|e| format!("the kubeconfig's certificate: {e}"))?;
+    let key = PrivateKeyDer::from_pem_slice(key).map_err(|e| format!("the kubeconfig's key: {e}"))?;
+    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+        .with_safe_default_protocol_versions()
+        .and_then(|b| b.with_root_certificates(roots).with_client_auth_cert(chain, key))
+        .map_err(|e| e.to_string())
 }
 
 fn decoded(kubeconfig: &str, key: &str) -> Result<Vec<u8>, String> {
@@ -341,11 +365,12 @@ impl Access {
         let mut identity = decoded(kubeconfig, "client-certificate-data")?;
         identity.push(b'\n');
         identity.extend(decoded(kubeconfig, "client-key-data")?);
+        let ws_tls = Arc::new(ws_tls(&decoded(kubeconfig, "certificate-authority-data")?, &decoded(kubeconfig, "client-certificate-data")?, &decoded(kubeconfig, "client-key-data")?)?);
         let identity = reqwest::Identity::from_pem(&identity).map_err(|e| e.to_string())?;
         let builder = || reqwest::Client::builder().tls_certs_only([ca.clone()]).identity(identity.clone());
         let client = builder().timeout(REQUEST_TIMEOUT).build().map_err(|e| e.to_string())?;
         let streaming = builder().connect_timeout(REQUEST_TIMEOUT).build().map_err(|e| e.to_string())?;
-        Ok(Self { server, client, streaming })
+        Ok(Self { server, client, streaming, ws_tls })
     }
 
     /// The list at `path`; an empty one if the API does not have it (Longhorn not installed yet).
@@ -400,11 +425,32 @@ impl Access {
         Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
     }
 
+    /// Opens a WebSocket to `path` offering `protocols` (exec's channels, a
+    /// VM's console); Kubernetes' refusal in its words, as [`Access::send`].
+    pub async fn connect_ws(&self, path: &str, protocols: &[&str]) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, SendError> {
+        use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::HeaderValue, Error};
+        let url = format!("{}{path}", self.server.replacen("https://", "wss://", 1));
+        let mut req = url.into_client_request().map_err(|e| SendError::Unreachable(e.to_string()))?;
+        let offered = HeaderValue::from_str(&protocols.join(", ")).map_err(|e| SendError::Unreachable(e.to_string()))?;
+        req.headers_mut().insert("sec-websocket-protocol", offered);
+        let connector = tokio_tungstenite::Connector::Rustls(self.ws_tls.clone());
+        let connect = tokio_tungstenite::connect_async_tls_with_config(req, None, false, Some(connector));
+        match tokio::time::timeout(REQUEST_TIMEOUT, connect).await {
+            Err(_) => Err(SendError::Unreachable(format!("{path}: no answer in {} s", REQUEST_TIMEOUT.as_secs()))),
+            Ok(Ok((ws, _))) => Ok(ws),
+            Ok(Err(Error::Http(res))) => {
+                let status = res.status();
+                let answer: Value = res.body().as_deref().and_then(|b| serde_json::from_slice(b).ok()).unwrap_or(Value::Null);
+                let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
+                Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
+            }
+            Ok(Err(e)) => Err(SendError::Unreachable(e.to_string())),
+        }
+    }
+
     /// The cluster's own address, as the kubeconfig reaches it (the VIP): `10.0.3.253`.
     pub fn host(&self) -> &str {
-        let rest = self.server.split_once("://").map_or(self.server.as_str(), |(_, r)| r);
-        let authority = rest.split('/').next().unwrap_or(rest);
-        authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        host_of(&self.server)
     }
 
     pub async fn read(&self) -> Result<Lists, ReadError> {
@@ -1043,9 +1089,8 @@ mod tests {
 
     #[test]
     fn the_vip_is_the_kubeconfigs_server_host() {
-        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new(), streaming: reqwest::Client::new() }.host().to_string();
-        assert_eq!(host("https://10.0.3.253:6443"), "10.0.3.253");
-        assert_eq!(host("https://k3s.home"), "k3s.home");
+        assert_eq!(host_of("https://10.0.3.253:6443"), "10.0.3.253");
+        assert_eq!(host_of("https://k3s.home"), "k3s.home");
     }
 
     #[test]

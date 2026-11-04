@@ -7,7 +7,7 @@
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
-// health, usage, endpoints and events the tab shows; K12 logs, K13 network and
+// health, usage, endpoints and events the tab shows; K12 logs and a shell, K13 network and
 // volume usage), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
@@ -1162,7 +1162,31 @@ async function readLog(query: Record<string, string>, ms: number): Promise<{ sta
   return { status, lines, body }
 }
 
-await step('K12', 'Logs: the server streams a container\'s log, follows it, gives the run before a crash, and refuses names that are not names', async (note) => {
+/** Runs `input` in a shell in `namespace/pod` through `/api/kube/exec`: what it printed, and how it ended. */
+async function shell(namespace: string, pod: string, input: string): Promise<{ out: string; ending: unknown }> {
+  const ws = new WebSocket(`${BASE.replace(/^http/, 'ws')}/api/kube/exec?${new URLSearchParams({ namespace, pod })}`)
+  ws.binaryType = 'arraybuffer'
+  let out = ''
+  let ending: unknown = null
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Failed(`no end to the shell in 20 s; it printed ${JSON.stringify(out)}`)), 20_000)
+    ws.onopen = () => {
+      ws.send(JSON.stringify({ resize: { cols: 100, rows: 30 } }))
+      ws.send(new TextEncoder().encode(input))
+    }
+    ws.onmessage = (m) => {
+      if (m.data instanceof ArrayBuffer) out += new TextDecoder().decode(m.data)
+      else ending = JSON.parse(String(m.data))
+    }
+    ws.onclose = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+  })
+  return { out, ending }
+}
+
+await step('K12', 'Logs and a shell: the server streams a container\'s log, follows it, gives the run before a crash, opens a shell, and refuses names that are not names and the system namespaces', async (note) => {
   await kubeHealthy(5 * 60_000)
   const k = await kube()
   const ns = 'e2e-logs'
@@ -1187,6 +1211,18 @@ spec:
         - name: counter
           image: "busybox:1.37"
           command: [sh, -c, "i=0; while [ $i -lt 8 ]; do i=$((i+1)); echo line $i; sleep 1; done; exit 3"]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: sleeper }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: sleeper } }
+  template:
+    metadata: { labels: { app: sleeper } }
+    spec:
+      terminationGracePeriodSeconds: 1
+      containers: [{ name: sleeper, image: "busybox:1.37", command: [sleep, "3600"] }]
 `,
     ns,
   )
@@ -1214,6 +1250,12 @@ spec:
     if (sys.status !== 200) throw new Failed(`a kube-system pod's log: ${sys.status} ${sys.body}`)
     note(`a bad name is refused (400), a missing pod is Kubernetes' 404 (${JSON.parse(missing.body).error}), and ${system.name}'s log reads (logs are reads)`)
 
+    const sleeper = await waitFor('the sleeper running', 3 * 60_000, () => watch.seen!.kube.pods.find((p) => p.namespace === ns && p.owner === 'Deployment/sleeper' && p.status === 'Running'))
+    const ran = await shell(ns, sleeper.value.name, 'echo $((6*7)); stty size; exit 3\r')
+    if (!/\r\n42\r\n30 100\r\n/.test(ran.out) || JSON.stringify(ran.ending) !== '{"exit":{"code":3}}') throw new Failed(`the shell printed ${JSON.stringify(ran.out)} and ended ${JSON.stringify(ran.ending)}`)
+    const refused = await shell('kube-system', system.name, '\r')
+    if (!String((refused.ending as { error?: string } | null)?.error).includes('kubectl')) throw new Failed(`a shell in kube-system: ${JSON.stringify(refused)}`)
+    note(`a shell in ${sleeper.value.name} printed 42 at the 30x100 size sent, and ended with exit code 3; one in kube-system is refused`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }

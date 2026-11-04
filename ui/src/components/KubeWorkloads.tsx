@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
-import { dock, logsSession } from '../dock'
+import { dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
-import { age, bytesUsed, cpu, deletePrompt, netRate, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter } from '../kube'
+import { age, bytesUsed, cpu, deletePrompt, netRate, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter, canShell } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
@@ -262,6 +262,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
               <td className="muted">{age(p.created, now)}</td>
               <td className="row-actions">
                 <button onClick={() => dock.open(logsSession(p))}>Logs</button>
+                  {canShell(p) && <button onClick={() => dock.open(terminalSession(p))}>Shell</button>}
               </td>
             </tr>
           ))}

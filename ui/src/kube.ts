@@ -316,3 +316,8 @@ export function usedTone(used: number | null, size: number | null): Tone {
   if (used === null || size === null || size === 0) return 'muted'
   return used >= size * 0.95 ? 'bad' : used >= size * 0.85 ? 'warn' : 'ok'
 }
+
+/** Whether the Shell button shows: a running pod outside the protected namespaces (the server refuses those). */
+export function canShell(p: Pick<KubePod, 'namespace' | 'status'>): boolean {
+  return p.status === 'Running' && !PROTECTED_NAMESPACES.includes(p.namespace)
+}

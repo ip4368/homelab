@@ -232,7 +232,7 @@ impl DriverHandle {
     }
 
     /// The Kubernetes API, with a fresh admin kubeconfig from the control plane.
-    async fn kube_access(&self) -> Result<kube::Access, ActionError> {
+    pub async fn kube_access(&self) -> Result<kube::Access, ActionError> {
         let kubeconfig = self.kubeconfig().await.map_err(|e| ActionError::Unavailable(format!("no kubeconfig: {e}")))?;
         kube::Access::from_kubeconfig(&kubeconfig).map_err(|e| ActionError::Unavailable(format!("the kubeconfig: {e}")))
     }

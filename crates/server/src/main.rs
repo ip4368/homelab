@@ -8,6 +8,7 @@ mod kube;
 mod kube_action;
 mod kube_apply;
 mod kube_detail;
+mod kube_exec;
 mod kube_logs;
 mod kube_spec;
 mod kube_stats;
