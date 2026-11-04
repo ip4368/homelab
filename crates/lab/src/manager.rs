@@ -491,6 +491,40 @@ impl Lab {
         install::ssh_with_input(&self.cfg.state.join("id_ed25519"), self.mgmt_ip(id)?, script, input)
     }
 
+    /// The last bytes of `id`'s serial console log, at most `max`: what the
+    /// machine printed while booting, readable while it cannot be reached.
+    pub fn console_log(&self, id: &HostId, max: usize) -> io::Result<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let files = {
+            let vms = self.vms.lock().expect("vms lock");
+            let v = vms.get(id).ok_or_else(|| io::Error::other(format!("no VM {id}")))?;
+            v.files.clone()
+        };
+        let path = files.dir.join("console.log");
+        let mut f = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(String::new()),
+            Err(e) => return Err(e),
+        };
+        let len = f.metadata()?.len();
+        f.seek(SeekFrom::Start(len.saturating_sub(max as u64)))?;
+        let mut bytes = Vec::with_capacity(max.min(len as usize));
+        f.read_to_end(&mut bytes)?;
+        let text = String::from_utf8_lossy(&bytes);
+        // The cut usually lands mid-line: start at the next line.
+        let cut = len > max as u64;
+        Ok(match text.split_once('\n') {
+            Some((_, rest)) if cut => rest.to_string(),
+            _ => text.into_owned(),
+        })
+    }
+
+    /// Where an interactive SSH to `id` goes: the technician's key and the
+    /// machine's management address.
+    pub fn ssh_target(&self, id: &HostId) -> io::Result<(std::path::PathBuf, Ipv4Addr)> {
+        Ok((self.cfg.state.join("id_ed25519"), self.mgmt_ip(id)?))
+    }
+
     fn note_installer(&self, id: &HostId, what: String) {
         self.installer.lock().expect("installer lock").insert(id.clone(), what);
     }

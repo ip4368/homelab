@@ -8,7 +8,8 @@
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
 // health, usage, endpoints and events the tab shows; K12 the kubelet
-// network/volume metrics and their history; K13 logs and exec), checked against the cluster's Kubernetes API through the VIP with the
+// network/volume metrics and their history; K13 logs and exec; K14 a lab
+// VM's console, journal and SSH terminal), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -1325,6 +1326,32 @@ spec:
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }
+})
+
+await step('K14', 'VM debugging: a lab machine serial console, journal, and an SSH terminal through the server', async (note) => {
+  const vm = watch.seen?.truth.vms.find((v) => v.power === 'Running')?.id
+  if (!vm) throw new Failed('no running lab VM in ground truth')
+  const tag = Math.random().toString(36).slice(2, 8)
+
+  const bad = await fetch(`${BASE}/api/lab/journal?vm=${vm}&unit=ssh`)
+  if (bad.status !== 400) throw new Failed(`journal for unit ssh: ${bad.status}, not refused`)
+  const badVm = await fetch(`${BASE}/api/lab/console?vm=${encodeURIComponent('../etc')}`)
+  if (badVm.status !== 400) throw new Failed(`console for a bad VM name: ${badVm.status}, not refused`)
+
+  const consoleRes = await fetch(`${BASE}/api/lab/console?vm=${vm}`)
+  if (!consoleRes.ok) throw new Failed(`console: ${consoleRes.status} ${await consoleRes.text()}`)
+  const consoleText = await consoleRes.text()
+  note(`console of ${vm}: ${consoleText.length} bytes${consoleText ? `, last line "${consoleText.trim().split('\n').pop()?.slice(0, 80)}"` : ' (empty)'}`)
+
+  const journal = await waitAsync('homelabd journal over SSH', 2 * 60_000, async () => {
+    const r = await fetch(`${BASE}/api/lab/journal?vm=${vm}&unit=homelabd&lines=20`)
+    const body = await r.text()
+    return r.ok && body.length > 0 ? { body } : `${r.status} ${body.slice(0, 120)}`
+  })
+  note(`journal of ${vm}: ${journal.value.body.trim().split('\n').length} lines back`)
+
+  const term = await wsCollect(`${wsBase}/api/lab/terminal/ws?vm=${vm}`, `echo k14-${tag}-terminal; exit\n`, (t) => t.includes(`k14-${tag}-terminal`), 90_000)
+  note(`terminal: an SSH login to ${vm} echoed the marker (${term.length} bytes seen)`)
 })
 
 watch.close()

@@ -248,6 +248,34 @@ impl DriverHandle {
         crate::kube_exec::connect(&self.kube_access().await?, &q).await
     }
 
+    /// The tail of a lab VM's serial console log.
+    pub async fn lab_console(&self, vm: String) -> Result<String, LabError> {
+        let lab = self.lab.clone().ok_or(LabError::NoLab)?;
+        let id = HostId::from(vm.as_str());
+        tokio::task::spawn_blocking(move || lab.console_log(&id, crate::lab_debug::MAX_CONSOLE_BYTES))
+            .await
+            .map_err(|e| LabError::Panicked(e.to_string()))?
+            .map_err(|e| LabError::Failed(e.to_string()))
+    }
+
+    /// A lab VM's journal for `unit`, over the technician's SSH.
+    pub async fn lab_journal(&self, vm: String, unit: String, lines: Option<u32>) -> Result<String, LabError> {
+        let command = crate::lab_debug::journal_command(&unit, lines).map_err(LabError::Failed)?;
+        let lab = self.lab.clone().ok_or(LabError::NoLab)?;
+        let id = HostId::from(vm.as_str());
+        tokio::task::spawn_blocking(move || lab.ssh(&id, &command))
+            .await
+            .map_err(|e| LabError::Panicked(e.to_string()))?
+            .map_err(|e| LabError::Failed(e.to_string()))
+    }
+
+    /// Where an interactive SSH to a lab VM goes.
+    pub async fn lab_ssh_target(&self, vm: String) -> Result<(std::path::PathBuf, std::net::Ipv4Addr), LabError> {
+        let lab = self.lab.clone().ok_or(LabError::NoLab)?;
+        let id = HostId::from(vm.as_str());
+        tokio::task::spawn_blocking(move || lab.ssh_target(&id)).await.map_err(|e| LabError::Panicked(e.to_string()))?.map_err(|e| LabError::Failed(e.to_string()))
+    }
+
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an
     /// admin would with `kubectl apply` on a K3s server; kubectl's output.
     pub async fn seed_workloads(&self) -> Result<String, LabError> {
