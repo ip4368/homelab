@@ -310,7 +310,7 @@ pub async fn manifest(access: &Access, w: &WorkloadRef) -> Result<String, Action
     if !valid_namespace(&w.namespace) || !valid_name(&w.name) {
         return Err(ActionError::Refused(format!("{:?}/{:?} is not a Kubernetes namespace and name", w.namespace, w.name)));
     }
-    let obj = access.send(Method::GET, &format!("/apis/apps/v1/namespaces/{}/{}/{}", w.namespace, w.kind.resource(), w.name), None).await?;
+    let obj = access.send(Method::GET, &w.kind.path(&w.namespace, &w.name), None).await?;
     serde_yaml_ng::to_string(&cleaned(&obj)).map_err(|e| ActionError::Refused(format!("{} {}: {e}", w.kind, w.name)))
 }
 

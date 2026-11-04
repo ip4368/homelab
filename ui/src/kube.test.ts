@@ -4,7 +4,7 @@ import type { KubeEvent } from './gen/KubeEvent'
 import type { KubePod } from './gen/KubePod'
 import type { KubeWorkload } from './gen/KubeWorkload'
 import type { LonghornVolume } from './gen/LonghornVolume'
-import { age, bytesUsed, netRate, usedTone, claimVolume, containerDigests, mountSource, pdbWarning, requestLimit, shortDigest, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
+import { age, bytesUsed, netRate, usedTone, claimVolume, containerDigests, mountSource, pdbWarning, requestLimit, shortDigest, cpu, deletePrompt, editDraft, filterKube, healthTone, mem, podWhy, usage, usageTone, workloadEvents, workloadKey, workloadVolumes, outcomeLabel, previewVerdict, gib, podTone, podsToDrain, removeHostPrompt, replicaLabel, restartPrompt, stopPrompt, volumeHosts, workloadActions, workloadClaims, workloadHosts, workloadTone, type KubeFilter } from './kube'
 
 function pod(namespace: string, name: string, node: string | null, owner: string | null, status = 'Running'): KubePod {
   return {
@@ -57,6 +57,7 @@ function workload(namespace: string, name: string, kind: KubeWorkload['kind'], d
     host_access: [],
     revisions: [],
     pdb: null,
+    vm: null,
   }
 }
 
@@ -140,12 +141,22 @@ describe('draining', () => {
     expect(removeHostPrompt('a', pods.slice(1, 4))).toContain('No pods need moving off it.')
   })
 
-  it('offers no changes in the system namespaces, and no scaling of a DaemonSet', () => {
-    expect(workloadActions(web)).toEqual({ scale: true, restart: true, edit: true, remove: true })
-    expect(workloadActions({ namespace: 'demo', kind: 'DaemonSet' })).toEqual({ scale: false, restart: true, edit: true, remove: true })
-    for (const namespace of ['kube-system', 'longhorn-system', 'kube-public', 'kube-node-lease']) {
-      expect(workloadActions({ namespace, kind: 'Deployment' })).toEqual({ scale: false, restart: false, edit: false, remove: false })
+  it('offers no changes in the system namespaces, no scaling of a DaemonSet, and start or stop for a VM', () => {
+    const none = { scale: false, restart: false, edit: false, remove: false, start: false, stop: false }
+    expect(workloadActions(web)).toEqual({ ...none, scale: true, restart: true, edit: true, remove: true })
+    expect(workloadActions({ namespace: 'demo', kind: 'DaemonSet', desired: 2 })).toEqual({ ...none, restart: true, edit: true, remove: true })
+    expect(workloadActions({ namespace: 'demo', kind: 'VirtualMachine', desired: 1 })).toEqual({ ...none, restart: true, edit: true, remove: true, stop: true })
+    expect(workloadActions({ namespace: 'demo', kind: 'VirtualMachine', desired: 0 })).toEqual({ ...none, edit: true, remove: true, start: true })
+    for (const namespace of ['kube-system', 'longhorn-system', 'kube-public', 'kube-node-lease', 'kubevirt']) {
+      expect(workloadActions({ namespace, kind: 'Deployment', desired: 1 })).toEqual(none)
     }
+  })
+
+  it('a VM restarts, stops and is deleted in its own words', () => {
+    const deb = workload('demo', 'deb', 'VirtualMachine', 1, 1)
+    expect(restartPrompt(deb)).toContain('virtctl restart')
+    expect(stopPrompt(deb)).toContain('its disks stay')
+    expect(deletePrompt(deb, [])).toContain('dataVolumeTemplates')
   })
 
   it("deleting a StatefulSet says its claims stay, naming them", () => {

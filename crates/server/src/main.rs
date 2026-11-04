@@ -12,6 +12,7 @@ mod kube_exec;
 mod kube_logs;
 mod kube_spec;
 mod kube_stats;
+mod kube_vm;
 mod ws;
 
 use axum::Router;

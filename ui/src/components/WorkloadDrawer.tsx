@@ -3,7 +3,7 @@ import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, p
 import { dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
-import { Containers, History, PodDetail } from './WorkloadContainers'
+import { Containers, History, PodDetail, VmGuest } from './WorkloadContainers'
 import { Charts, WORKLOAD_CHARTS } from './Charts'
 import { fetchWorkloadMetrics } from '../metrics'
 
@@ -87,8 +87,17 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
         </ul>
       )}
 
-      <h4>Containers</h4>
-      <Containers namespace={w.namespace} containers={w.containers} digests={containerDigests(w, kube.pods)} volumes={kube.volumes} />
+      {w.vm ? (
+        <>
+          <h4>Guest</h4>
+          <VmGuest vm={w.vm} namespace={w.namespace} volumes={kube.volumes} />
+        </>
+      ) : (
+        <>
+          <h4>Containers</h4>
+          <Containers namespace={w.namespace} containers={w.containers} digests={containerDigests(w, kube.pods)} volumes={kube.volumes} />
+        </>
+      )}
 
       <h4>Pods</h4>
       <table className="data">

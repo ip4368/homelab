@@ -1,7 +1,9 @@
+import { Fragment } from 'react'
 import type { ContainerSpec } from '../gen/ContainerSpec'
 import type { KubePod } from '../gen/KubePod'
 import type { LonghornVolume } from '../gen/LonghornVolume'
 import type { Revision } from '../gen/Revision'
+import type { VmDetail } from '../gen/VmDetail'
 import { age, bytesUsed, claimVolume, cpu, gib, mem, mountSource, requestLimit, shortDigest, usedTone } from '../kube'
 
 const ROLE_LABELS: Record<ContainerSpec['role'], string | null> = { App: null, Init: 'init', Sidecar: 'sidecar' }
@@ -214,5 +216,63 @@ export function History({ revisions, now }: { revisions: Revision[]; now: number
         ))}
       </tbody>
     </table>
+  )
+}
+
+/** A VM's guest, as KubeVirt and the guest agent report it, and its disks. */
+export function VmGuest({ vm, namespace, volumes }: { vm: VmDetail; namespace: string; volumes: LonghornVolume[] }) {
+  return (
+    <>
+      <div className="form-grid">
+        <label>Status</label>
+        <span>
+          {vm.status} <span className="muted">(run strategy {vm.run_strategy})</span>
+        </span>
+        <label>Size</label>
+        <span>
+          {vm.cores ?? '?'} core{vm.cores === 1 ? '' : 's'}, {vm.memory ?? '?'} memory
+        </span>
+        {vm.node && (
+          <>
+            <label>Guest</label>
+            <span>
+              {vm.guest_os ?? <span className="muted">{vm.agent_connected ? 'unknown OS' : 'no guest agent'}</span>}
+              {vm.kernel && <span className="muted"> · {vm.kernel}</span>}
+            </span>
+            <label>Live migration</label>
+            <span className={vm.migratable ? 'ok' : 'muted'} title="needs disks every host can open at once (ReadWriteMany)">
+              {vm.migratable ? 'possible' : 'not possible: a drain restarts it elsewhere'}
+            </span>
+          </>
+        )}
+        {vm.interfaces.map((i) => (
+          <Fragment key={i.name}>
+            <label>{i.name}</label>
+            <span>
+              {i.ips.join(', ') || <span className="muted">no address yet</span>}
+              {i.guest_name && <span className="muted"> ({i.guest_name})</span>}
+            </span>
+          </Fragment>
+        ))}
+      </div>
+      <h4>Disks</h4>
+      <table className="data mounts">
+        <tbody>
+          {vm.disks.map((d) => {
+            const v = d.kind === 'claim' && d.source ? claimVolume(namespace, d.source, volumes) : undefined
+            return (
+              <tr key={d.name}>
+                <td>{d.name}</td>
+                <td>
+                  {d.kind} {d.source && <code>{d.source}</code>}
+                  {v && <span className="muted"> · Longhorn {v.used_bytes === null ? gib(v.size_bytes) : `${bytesUsed(v.used_bytes, v.size_bytes)} used`}</span>}
+                </td>
+                <td className="muted">{d.bus}</td>
+              </tr>
+            )
+          })}
+        </tbody>
+      </table>
+    </>
   )
 }

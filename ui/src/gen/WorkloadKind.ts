@@ -3,4 +3,4 @@
 /**
  * The kinds of workload the Workloads tab shows.
  */
-export type WorkloadKind = "Deployment" | "StatefulSet" | "DaemonSet";
+export type WorkloadKind = "Deployment" | "StatefulSet" | "DaemonSet" | "VirtualMachine";

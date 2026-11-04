@@ -3,7 +3,7 @@ import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
-import { age, bytesUsed, cpu, deletePrompt, netRate, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter, canShell } from '../kube'
+import { age, bytesUsed, cpu, deletePrompt, netRate, stopPrompt, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter, canShell } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
 import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
 import { useAction } from './useAction'
@@ -109,6 +109,16 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
           <Hosts hosts={hosts} onSelectHost={onSelectHost} />
         </td>
         <td className="row-actions">
+          {can.start && (
+            <button disabled={busy} onClick={() => run(() => kubeAction({ Start: { workload } }))}>
+              Start
+            </button>
+          )}
+          {can.stop && (
+            <button disabled={busy} onClick={() => window.confirm(stopPrompt(w)) && run(() => kubeAction({ Stop: { workload } }))}>
+              Stop
+            </button>
+          )}{' '}
           {can.restart && (
             <button disabled={busy} onClick={() => window.confirm(restartPrompt(w)) && run(() => kubeAction({ Restart: { workload } }))}>
               Restart

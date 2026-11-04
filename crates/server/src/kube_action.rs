@@ -30,17 +30,26 @@ pub struct WorkloadRef {
 pub enum KubeAction {
     /// Sets a Deployment's or StatefulSet's replicas, as `kubectl scale`.
     Scale { workload: WorkloadRef, replicas: u32 },
-    /// Replaces the workload's pods, a few at a time, as `kubectl rollout restart`.
+    /// Replaces the workload's pods, a few at a time, as `kubectl rollout
+    /// restart`; a VM's guest is restarted, as `virtctl restart`.
     Restart { workload: WorkloadRef },
     /// Deletes the workload and its pods. A StatefulSet's claims, and so its
-    /// Longhorn volumes, stay.
+    /// Longhorn volumes, stay, as do the claims a VM only refers to.
     Delete { workload: WorkloadRef },
+    /// Starts a stopped VM, as `virtctl start`.
+    Start { workload: WorkloadRef },
+    /// Stops a VM, as `virtctl stop`.
+    Stop { workload: WorkloadRef },
 }
 
 impl KubeAction {
     fn workload(&self) -> &WorkloadRef {
         match self {
-            KubeAction::Scale { workload, .. } | KubeAction::Restart { workload } | KubeAction::Delete { workload } => workload,
+            KubeAction::Scale { workload, .. }
+            | KubeAction::Restart { workload }
+            | KubeAction::Delete { workload }
+            | KubeAction::Start { workload }
+            | KubeAction::Stop { workload } => workload,
         }
     }
 }
@@ -112,10 +121,12 @@ pub fn refusal(action: &KubeAction) -> Option<String> {
     if PROTECTED_NAMESPACES.contains(&w.namespace.as_str()) {
         return Some(format!("{} belongs to K3s, Longhorn or KubeVirt, which homelabd installs: change it with kubectl", w.namespace));
     }
-    if matches!(action, KubeAction::Scale { .. }) && w.kind == WorkloadKind::DaemonSet {
-        return Some(format!("{} is a DaemonSet: it runs one pod on each node it may, so it has no replicas to scale", w.name));
+    match (action, w.kind) {
+        (KubeAction::Scale { .. }, WorkloadKind::DaemonSet) => Some(format!("{} is a DaemonSet: it runs one pod on each node it may, so it has no replicas to scale", w.name)),
+        (KubeAction::Scale { .. }, WorkloadKind::VirtualMachine) => Some(format!("{} is a VM: start or stop it instead", w.name)),
+        (KubeAction::Start { .. } | KubeAction::Stop { .. }, k) if k != WorkloadKind::VirtualMachine => Some(format!("{} is a {k}: only VMs start and stop; scale it instead", w.name)),
+        _ => None,
     }
-    None
 }
 
 /// One request to the Kubernetes API.
@@ -131,8 +142,17 @@ pub struct KubeRequest {
 /// The request that carries out `action` at Unix ms `now`, as kubectl sends it.
 pub fn request(action: &KubeAction, now: u64) -> KubeRequest {
     let w = action.workload();
-    let path = format!("/apis/apps/v1/namespaces/{}/{}/{}", w.namespace, w.kind.resource(), w.name);
+    let path = w.kind.path(&w.namespace, &w.name);
+    // KubeVirt's verbs are subresources of their own API group.
+    let vm_verb = |verb: &str| KubeRequest {
+        method: Method::PUT,
+        path: format!("/apis/subresources.kubevirt.io/v1/namespaces/{}/virtualmachines/{}/{verb}", w.namespace, w.name),
+        body: Some(("application/json", json!({}))),
+    };
     match action {
+        KubeAction::Restart { .. } if w.kind == WorkloadKind::VirtualMachine => vm_verb("restart"),
+        KubeAction::Start { .. } => vm_verb("start"),
+        KubeAction::Stop { .. } => vm_verb("stop"),
         KubeAction::Scale { replicas, .. } => KubeRequest {
             method: Method::PATCH,
             path: format!("{path}/scale?fieldManager={FIELD_MANAGER}"),
@@ -228,6 +248,21 @@ mod tests {
         let (content_type, body) = r.body.unwrap();
         assert_eq!(content_type, "application/merge-patch+json");
         assert_eq!(body["spec"]["template"]["metadata"]["annotations"]["kubectl.kubernetes.io/restartedAt"], "2026-10-27T14:00:45Z");
+    }
+
+    #[test]
+    fn vms_start_stop_and_restart_through_kubevirts_subresources() {
+        let vm = w("demo", WorkloadKind::VirtualMachine, "deb");
+        for (action, verb) in [(KubeAction::Start { workload: vm.clone() }, "start"), (KubeAction::Stop { workload: vm.clone() }, "stop"), (KubeAction::Restart { workload: vm.clone() }, "restart")] {
+            assert_eq!(refusal(&action), None);
+            let r = request(&action, 0);
+            assert_eq!((r.method, r.path), (Method::PUT, format!("/apis/subresources.kubevirt.io/v1/namespaces/demo/virtualmachines/deb/{verb}")));
+        }
+        let r = request(&KubeAction::Delete { workload: vm.clone() }, 0);
+        assert_eq!(r.path, "/apis/kubevirt.io/v1/namespaces/demo/virtualmachines/deb?propagationPolicy=Background");
+        assert!(refusal(&KubeAction::Scale { workload: vm, replicas: 2 }).unwrap().contains("start or stop"));
+        assert!(refusal(&KubeAction::Start { workload: w("demo", WorkloadKind::Deployment, "web") }).is_some());
+        assert!(refusal(&KubeAction::Stop { workload: w("kubevirt", WorkloadKind::VirtualMachine, "x") }).unwrap().contains("kubectl"));
     }
 
     #[test]

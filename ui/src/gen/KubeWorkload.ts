@@ -5,6 +5,7 @@ import type { Health } from "./Health";
 import type { KubeCondition } from "./KubeCondition";
 import type { Pdb } from "./Pdb";
 import type { Revision } from "./Revision";
+import type { VmDetail } from "./VmDetail";
 import type { WorkloadKind } from "./WorkloadKind";
 
 /**
@@ -55,4 +56,8 @@ revisions: Array<Revision>,
 /**
  * The PodDisruptionBudget over its pods, if any.
  */
-pdb: Pdb | null, };
+pdb: Pdb | null, 
+/**
+ * A VM's guest and disks.
+ */
+vm: VmDetail | null, };

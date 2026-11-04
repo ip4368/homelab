@@ -131,10 +131,15 @@ export function removeHostPrompt(host: string, pods: KubePod[]): string {
   return `Remove ${host}? ${what} It leaves the cluster for good; to bring it back, reinstall it with a new join token.`
 }
 
-/** What the Workloads tab offers to do to `w`: nothing in a protected namespace, and no scaling of a DaemonSet (one pod per node). */
-export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind'>): { scale: boolean; restart: boolean; edit: boolean; remove: boolean } {
-  if (PROTECTED_NAMESPACES.includes(w.namespace)) return { scale: false, restart: false, edit: false, remove: false }
-  return { scale: w.kind !== 'DaemonSet', restart: true, edit: true, remove: true }
+/**
+ * What the Workloads tab offers to do to `w`: nothing in a protected
+ * namespace, no scaling of a DaemonSet (one pod per node) or a VM, which
+ * starts and stops instead.
+ */
+export function workloadActions(w: Pick<KubeWorkload, 'namespace' | 'kind' | 'desired'>): { scale: boolean; restart: boolean; edit: boolean; remove: boolean; start: boolean; stop: boolean } {
+  if (PROTECTED_NAMESPACES.includes(w.namespace)) return { scale: false, restart: false, edit: false, remove: false, start: false, stop: false }
+  const vm = w.kind === 'VirtualMachine'
+  return { scale: !vm && w.kind !== 'DaemonSet', restart: !vm || w.desired > 0, edit: true, remove: true, start: vm && w.desired === 0, stop: vm && w.desired > 0 }
 }
 
 /** The claims of a StatefulSet's pods: the Longhorn volumes its pods use. */
@@ -143,10 +148,17 @@ export function workloadClaims(w: KubeWorkload, pods: KubePod[], volumes: Longho
 }
 
 export function restartPrompt(w: KubeWorkload): string {
+  if (w.kind === 'VirtualMachine') return `Restart VM ${w.namespace}/${w.name}? Its guest is stopped and started again, as virtctl restart does.`
   return `Restart ${w.kind} ${w.namespace}/${w.name}? Kubernetes replaces its pods a few at a time, as kubectl rollout restart does.`
 }
 
+export function stopPrompt(w: KubeWorkload): string {
+  return `Stop VM ${w.namespace}/${w.name}? Its guest is shut down; its disks stay, and Start brings it back.`
+}
+
 export function deletePrompt(w: KubeWorkload, claims: string[]): string {
+  if (w.kind === 'VirtualMachine')
+    return `Delete VM ${w.namespace}/${w.name}? Its guest stops; disks made from its dataVolumeTemplates go with it, claims it only refers to stay.`
   const ask = `Delete ${w.kind} ${w.namespace}/${w.name} and its pods?`
   if (w.kind !== 'StatefulSet') return ask
   const kept = claims.length === 0 ? 'Its volume claims stay' : `Its volume claims stay, with their data: ${claims.join(', ')}`

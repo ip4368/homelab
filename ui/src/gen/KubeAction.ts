@@ -4,4 +4,4 @@ import type { WorkloadRef } from "./WorkloadRef";
 /**
  * A change to a workload, as the UI asks for it.
  */
-export type KubeAction = { "Scale": { workload: WorkloadRef, replicas: number, } } | { "Restart": { workload: WorkloadRef, } } | { "Delete": { workload: WorkloadRef, } };
+export type KubeAction = { "Scale": { workload: WorkloadRef, replicas: number, } } | { "Restart": { workload: WorkloadRef, } } | { "Delete": { workload: WorkloadRef, } } | { "Start": { workload: WorkloadRef, } } | { "Stop": { workload: WorkloadRef, } };

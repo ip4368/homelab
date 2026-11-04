@@ -6,6 +6,7 @@
 use crate::kube_detail;
 use crate::kube_spec::{self, ContainerSpec, ContainerState, Pdb, PodNetwork, Revision};
 use crate::kube_stats::{self, VolumeUse};
+use crate::kube_vm::{self, VmDetail};
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -58,16 +59,25 @@ pub enum WorkloadKind {
     Deployment,
     StatefulSet,
     DaemonSet,
+    /// A KubeVirt VM.
+    VirtualMachine,
 }
 
 impl WorkloadKind {
-    /// Its resource in the `apps/v1` API.
-    pub fn resource(self) -> &'static str {
+    /// Its API group and version, and its resource there.
+    pub fn api(self) -> (&'static str, &'static str) {
         match self {
-            WorkloadKind::Deployment => "deployments",
-            WorkloadKind::StatefulSet => "statefulsets",
-            WorkloadKind::DaemonSet => "daemonsets",
+            WorkloadKind::Deployment => ("apps/v1", "deployments"),
+            WorkloadKind::StatefulSet => ("apps/v1", "statefulsets"),
+            WorkloadKind::DaemonSet => ("apps/v1", "daemonsets"),
+            WorkloadKind::VirtualMachine => ("kubevirt.io/v1", "virtualmachines"),
         }
+    }
+
+    /// The path of workload `namespace/name` of this kind in the Kubernetes API.
+    pub fn path(self, namespace: &str, name: &str) -> String {
+        let (api, resource) = self.api();
+        format!("/apis/{api}/namespaces/{namespace}/{resource}/{name}")
     }
 }
 
@@ -77,6 +87,7 @@ impl std::fmt::Display for WorkloadKind {
             WorkloadKind::Deployment => "Deployment",
             WorkloadKind::StatefulSet => "StatefulSet",
             WorkloadKind::DaemonSet => "DaemonSet",
+            WorkloadKind::VirtualMachine => "VirtualMachine",
         })
     }
 }
@@ -121,6 +132,8 @@ pub struct KubeWorkload {
     pub revisions: Vec<Revision>,
     /// The PodDisruptionBudget over its pods, if any.
     pub pdb: Option<Pdb>,
+    /// A VM's guest and disks.
+    pub vm: Option<VmDetail>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -306,6 +319,8 @@ pub struct Lists {
     pub controllerrevisions: Value,
     pub pdbs: Value,
     pub kubevirts: Value,
+    pub vms: Value,
+    pub vmis: Value,
     /// Pod usage from metrics-server, or why there is none.
     pub metrics: Result<Value, String>,
 }
@@ -313,7 +328,7 @@ pub struct Lists {
 impl Default for Lists {
     fn default() -> Self {
         let v = Value::Null;
-        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v.clone(), controllerrevisions: v.clone(), pdbs: v.clone(), kubevirts: v, metrics: Ok(Value::Null) }
+        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v.clone(), controllerrevisions: v.clone(), pdbs: v.clone(), kubevirts: v.clone(), vms: v.clone(), vmis: v, metrics: Ok(Value::Null) }
     }
 }
 
@@ -465,7 +480,7 @@ impl Access {
                 Err(e) => Err(format!("metrics-server: {e}")),
             }
         };
-        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, controllerrevisions, pdbs, kubevirts, metrics) = tokio::join!(
+        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, controllerrevisions, pdbs, kubevirts, vms, vmis, metrics) = tokio::join!(
             self.list("/api/v1/pods"),
             self.list("/apis/apps/v1/replicasets"),
             self.list("/apis/apps/v1/deployments"),
@@ -480,6 +495,8 @@ impl Access {
             self.list("/apis/apps/v1/controllerrevisions"),
             self.list("/apis/policy/v1/poddisruptionbudgets"),
             self.list("/apis/kubevirt.io/v1/kubevirts"),
+            self.list("/apis/kubevirt.io/v1/virtualmachines"),
+            self.list("/apis/kubevirt.io/v1/virtualmachineinstances"),
             metrics,
         );
         Ok(Lists {
@@ -497,6 +514,8 @@ impl Access {
             controllerrevisions: controllerrevisions?,
             pdbs: pdbs?,
             kubevirts: kubevirts?,
+            vms: vms?,
+            vmis: vmis?,
             metrics,
         })
     }
@@ -620,6 +639,9 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> 
     // A Deployment's pods belong to a ReplicaSet it owns.
     let rs_owner: BTreeMap<(String, String), (String, String)> =
         items(&lists.replicasets).iter().filter_map(|rs| Some((key(&rs["metadata"]), controller(&rs["metadata"])?))).collect();
+    // A VM's launcher pod belongs to its instance, which the VM owns.
+    let vmi_owner: BTreeMap<(String, String), (String, String)> =
+        items(&lists.vmis).iter().filter_map(|i| Some((key(&i["metadata"]), controller(&i["metadata"])?))).collect();
 
     let usage = lists.metrics.as_ref().map(kube_detail::pod_usage).unwrap_or_default();
     let mut pods: Vec<KubePod> = items(&lists.pods)
@@ -629,6 +651,10 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> 
             let (namespace, name) = key(meta);
             let owner = controller(meta).map(|(kind, owner)| match kind.as_str() {
                 "ReplicaSet" => match rs_owner.get(&(namespace.clone(), owner.clone())) {
+                    Some((k, n)) => format!("{k}/{n}"),
+                    None => format!("{kind}/{owner}"),
+                },
+                "VirtualMachineInstance" => match vmi_owner.get(&(namespace.clone(), owner.clone())) {
                     Some((k, n)) => format!("{k}/{n}"),
                     None => format!("{kind}/{owner}"),
                 },
@@ -733,10 +759,44 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> 
                 host_access: kube_spec::host_access(&template["spec"]),
                 revisions: kube_spec::revisions(w, &kind.to_string(), &lists.replicasets, &lists.controllerrevisions, timestamp_ms),
                 pdb: kube_spec::pdb(&namespace, &template["metadata"]["labels"], &lists.pdbs),
+                vm: None,
                 namespace,
                 name,
             });
         }
+    }
+    for vm in items(&lists.vms) {
+        let (namespace, name) = key(&vm["metadata"]);
+        let vmi = items(&lists.vmis).iter().find(|i| key(&i["metadata"]) == (namespace.clone(), name.clone()));
+        let (desired, ready, updated) = kube_vm::replicas(vm, vmi);
+        let owner = format!("{}/{name}", WorkloadKind::VirtualMachine);
+        let mine: Vec<&KubePod> = pods.iter().filter(|p| p.namespace == namespace && p.owner.as_deref() == Some(owner.as_str())).collect();
+        let used = |f: fn(&KubePod) -> Option<u64>| -> Option<u64> { mine.iter().filter_map(|p| f(p)).reduce(|a, b| a + b) };
+        let rate = |f: fn(&KubePod) -> Option<f64>| -> Option<f64> { mine.iter().filter_map(|p| f(p)).reduce(|a, b| a + b) };
+        let labels = &vm["spec"]["template"]["metadata"]["labels"];
+        workloads.push(KubeWorkload {
+            kind: WorkloadKind::VirtualMachine,
+            desired,
+            ready,
+            updated,
+            health: kube_vm::health(vm, vmi),
+            cpu_milli: if metrics_ok { used(|p| p.cpu_milli) } else { None },
+            memory_bytes: if metrics_ok { used(|p| p.memory_bytes) } else { None },
+            cpu_limit_milli: mine.iter().map(|p| p.cpu_limit_milli).sum::<Option<u64>>().filter(|_| !mine.is_empty()),
+            memory_limit_bytes: mine.iter().map(|p| p.memory_limit_bytes).sum::<Option<u64>>().filter(|_| !mine.is_empty()),
+            rx_bps: rate(|p| p.rx_bps),
+            tx_bps: rate(|p| p.tx_bps),
+            images: kube_vm::images(vm),
+            endpoints: kube_detail::endpoints(&namespace, labels, &lists.services, &lists.ingresses, vip),
+            conditions: kube_vm::conditions(vm),
+            containers: vec![],
+            host_access: vec![],
+            revisions: vec![],
+            pdb: kube_spec::pdb(&namespace, labels, &lists.pdbs),
+            vm: Some(kube_vm::detail(vm, vmi)),
+            namespace,
+            name,
+        });
     }
     workloads.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
 
@@ -750,7 +810,8 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str, stats: &kube_stats::Store) -> 
             let workload = match kind.as_str() {
                 "Pod" => pod_owner.get(&(namespace.as_str(), name.as_str())).map(|o| o.to_string()),
                 "ReplicaSet" => rs_owner.get(&(namespace.clone(), name.clone())).map(|(k, n)| format!("{k}/{n}")),
-                "Deployment" | "StatefulSet" | "DaemonSet" => Some(format!("{kind}/{name}")),
+                "Deployment" | "StatefulSet" | "DaemonSet" | "VirtualMachine" => Some(format!("{kind}/{name}")),
+                "VirtualMachineInstance" => vmi_owner.get(&(namespace.clone(), name.clone())).map(|(k, n)| format!("{k}/{n}")),
                 _ => None,
             };
             let last = [&e["lastTimestamp"], &e["series"]["lastObservedTime"], &e["eventTime"], &e["metadata"]["creationTimestamp"]].into_iter().find_map(|t| t.as_str().and_then(timestamp_ms));
@@ -979,6 +1040,8 @@ mod tests {
             ]),
             controllerrevisions: list(vec![]),
             kubevirts: list(vec![json!({ "metadata": { "namespace": "kubevirt", "name": "kubevirt" }, "status": { "phase": "Deployed" } })]),
+            vms: list(vec![]),
+            vmis: list(vec![]),
             pdbs: list(vec![json!({ "metadata": { "namespace": "demo", "name": "web" }, "spec": { "selector": { "matchLabels": { "app": "web" } } }, "status": { "disruptionsAllowed": 0 } })]),
             metrics: Ok(json!({ "items": [{ "metadata": { "namespace": "demo", "name": "web-6d4-x2" }, "containers": [{ "usage": { "cpu": "12m", "memory": "30Mi" } }, { "usage": { "cpu": "3m", "memory": "2Mi" } }] }] })),
         }
@@ -1072,6 +1135,32 @@ mod tests {
         assert_eq!(web.pdb.as_ref().map(|p| (p.name.as_str(), p.disruptions_allowed)), Some(("web", 0)));
         let pod = v.pods.iter().find(|p| p.name == "web-6d4-x2").unwrap();
         assert_eq!((pod.ips.clone(), pod.qos.as_deref(), pod.container_states.len()), (vec!["10.42.0.9".to_string()], Some("BestEffort"), 2));
+    }
+
+    #[test]
+    fn a_vm_is_a_workload_with_its_launcher_pod_guest_and_events() {
+        let mut lists = sample();
+        lists.vms = list(vec![json!({ "metadata": { "namespace": "demo", "name": "deb" },
+            "spec": { "runStrategy": "Always", "template": { "metadata": { "labels": { "app": "web" } }, "spec": { "domain": { "cpu": { "cores": 1 } },
+                "volumes": [{ "name": "root", "containerDisk": { "image": "quay.io/containerdisks/debian:13" } }] } } },
+            "status": { "printableStatus": "Running" } })]);
+        lists.vmis = list(vec![json!({ "metadata": { "namespace": "demo", "name": "deb", "ownerReferences": [{ "kind": "VirtualMachine", "name": "deb", "controller": true }] },
+            "status": { "nodeName": "ms01-03", "conditions": [{ "type": "Ready", "status": "True" }] } })]);
+        lists.pods["items"].as_array_mut().unwrap().push(json!({
+            "metadata": { "namespace": "demo", "name": "virt-launcher-deb-x7k", "ownerReferences": [{ "kind": "VirtualMachineInstance", "name": "deb", "controller": true }] },
+            "spec": { "nodeName": "ms01-03", "containers": [{ "resources": { "limits": { "cpu": "1100m", "memory": "1300Mi" } } }] },
+            "status": { "phase": "Running", "containerStatuses": [{ "ready": true, "state": { "running": {} } }] } }));
+        lists.events["items"].as_array_mut().unwrap().push(json!({ "involvedObject": { "namespace": "demo", "kind": "VirtualMachineInstance", "name": "deb" }, "reason": "Migrated", "message": "x", "lastTimestamp": "1970-01-01T01:20:00Z" }));
+        let v = view_of(&lists, NOW, VIP, &kube_stats::Store::default());
+        let deb = v.workloads.iter().find(|w| w.kind == WorkloadKind::VirtualMachine).unwrap();
+        assert_eq!((deb.name.as_str(), deb.desired, deb.ready, deb.health.state), ("deb", 1, 1, HealthState::Healthy));
+        assert_eq!((deb.cpu_limit_milli, deb.images.as_slice()), (Some(1100), ["quay.io/containerdisks/debian:13".to_string()].as_slice()));
+        assert_eq!(deb.vm.as_ref().and_then(|d| d.node.as_deref()), Some("ms01-03"));
+        assert_eq!(deb.endpoints.iter().map(|e| e.address.as_str()).collect::<Vec<_>>(), ["http://10.0.3.253/", "web.demo:80"], "Services select its template's labels");
+        let launcher = v.pods.iter().find(|p| p.name.starts_with("virt-launcher")).unwrap();
+        assert_eq!(launcher.owner.as_deref(), Some("VirtualMachine/deb"), "through its instance");
+        assert!(v.events.iter().any(|e| e.reason == "Migrated" && e.workload.as_deref() == Some("VirtualMachine/deb")));
+        assert_eq!(WorkloadKind::VirtualMachine.path("demo", "deb"), "/apis/kubevirt.io/v1/namespaces/demo/virtualmachines/deb");
     }
 
     #[test]
