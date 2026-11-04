@@ -2,7 +2,7 @@ import { Fragment, useState } from 'react'
 import { age, bytesUsed, containerDigests, cpu, gib, mem, netRate, pdbWarning, podTone, podWhy, volumeTone, workloadEvents, workloadKey, workloadVolumes, canShell } from '../kube'
 import { CONSOLE_LOG_CONTAINER, consoleSession, dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
-import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
+import { EndpointLink, HealthBadge, Hosts, NetRate, Usage } from './KubeBits'
 import { Containers, History, PodDetail, VmGuest } from './WorkloadContainers'
 import { Charts, WORKLOAD_CHARTS } from './Charts'
 import { fetchWorkloadMetrics } from '../metrics'
@@ -110,64 +110,68 @@ export function WorkloadDrawer({ id, onClose, onSelectHost }: { id: string; onCl
       )}
 
       <h4>Pods</h4>
-      <table className="data">
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Host</th>
-            <th>Status</th>
-            <th>Restarts</th>
-            <th>CPU</th>
-            <th>Memory</th>
-            <th>Network</th>
-            <th />
-          </tr>
-        </thead>
-        <tbody>
-          {pods.map((p) => (
-            <Fragment key={p.name}>
-              <tr>
-                <td title={`created ${age(p.created, now)} ago`}>
-                  <button className="link" aria-expanded={open === p.name} onClick={() => setOpen(open === p.name ? null : p.name)}>
-                    {open === p.name ? '▾' : '▸'} {p.name}
-                  </button>
-                </td>
-                <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">none</span>}</td>
-                <td className={podTone(p)} title={podWhy(p)}>
-                  {p.status}
-                  {podWhy(p) && <div className="muted pod-why">{podWhy(p)}</div>}
-                </td>
-                <td className={p.restarts > 0 ? 'warn' : 'muted'}>{p.restarts}</td>
-                <td className="num">
-                  <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
-                </td>
-                <td className="num">
-                  <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
-                </td>
-                <td className="num muted">{netRate(p.rx_bps, p.tx_bps)}</td>
-                <td className="row-actions">
-                  <button onClick={() => dock.open(logsSession(p))}>Logs</button>
-                  {canShell(p) && <button onClick={() => dock.open(terminalSession(p))}>Shell</button>}
-                </td>
-              </tr>
-              {open === p.name && (
+      <div className="table-scroll">
+        <table className="data pod-table">
+          <thead>
+            <tr>
+              <th>Pod</th>
+              <th>Status</th>
+              <th>Usage</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {pods.map((p) => (
+              <Fragment key={p.name}>
                 <tr>
-                  <td colSpan={8}>
-                    <PodDetail pod={p} />
+                  <td title={`created ${age(p.created, now)} ago`}>
+                    <button className="link pod-name" aria-expanded={open === p.name} onClick={() => setOpen(open === p.name ? null : p.name)}>
+                      {open === p.name ? '▾' : '▸'} {p.name}
+                    </button>
+                    <div className="muted">on {p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : 'no host yet'}</div>
+                  </td>
+                  <td className={podTone(p)} title={podWhy(p)}>
+                    {p.status}
+                    {p.restarts > 0 && <div className="warn">{p.restarts} restart{p.restarts === 1 ? '' : 's'}</div>}
+                    {podWhy(p) && <div className="muted pod-why">{podWhy(p)}</div>}
+                  </td>
+                  <td className="num pod-usage">
+                    <div>
+                      <span className="muted">CPU </span>
+                      <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
+                    </div>
+                    <div>
+                      <span className="muted">mem </span>
+                      <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
+                    </div>
+                    <div className="muted">
+                      <NetRate rx={p.rx_bps} tx={p.tx_bps} />
+                    </div>
+                  </td>
+                  <td className="pod-actions">
+                    <button onClick={() => dock.open(logsSession(p))}>Logs</button>
+                    {canShell(p) && <button onClick={() => dock.open(terminalSession(p))}>Shell</button>}
                   </td>
                 </tr>
-              )}
-            </Fragment>
-          ))}
-          {pods.length === 0 && (
-            <tr>
-              <td colSpan={8} className="muted">
-                No pods.
-              </td>
-            </tr>
-          )}
-        </tbody>
-      </table>
+                {open === p.name && (
+                  <tr>
+                    <td colSpan={4}>
+                      <PodDetail pod={p} />
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
+            ))}
+            {pods.length === 0 && (
+              <tr>
+                <td colSpan={4} className="muted">
+                  No pods.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
 
       {volumes.length > 0 && (
         <>

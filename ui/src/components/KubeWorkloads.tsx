@@ -3,9 +3,9 @@ import { kubeAction, kubeManifest } from '../api'
 import type { KubeWorkload } from '../gen/KubeWorkload'
 import { dock, logsSession, terminalSession } from '../dock'
 import { useStore } from '../store'
-import { age, bytesUsed, cpu, deletePrompt, netRate, stopPrompt, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter, canShell } from '../kube'
+import { age, bytesUsed, cpu, deletePrompt, stopPrompt, usedTone, editDraft, filterKube, mem, podWhy, workloadKey, gib, podTone, replicaLabel, restartPrompt, volumeTone, workloadActions, workloadClaims, workloadTone, type KubeFilter, canShell } from '../kube'
 import { ApplyDialog, type ApplyDraft } from './ApplyDialog'
-import { EndpointLink, HealthBadge, Hosts, Usage } from './KubeBits'
+import { EndpointLink, HealthBadge, Hosts, NetRate, Usage } from './KubeBits'
 import { useAction } from './useAction'
 
 /** Pod tables can be long; the filters narrow them. */
@@ -95,7 +95,9 @@ function WorkloadRow({ w, hosts, onSelectHost, onSelect, onEdit }: { w: KubeWork
         <td className="num">
           <Usage used={w.memory_bytes} limit={w.memory_limit_bytes} format={mem} />
         </td>
-        <td className="num muted">{netRate(w.rx_bps, w.tx_bps)}</td>
+        <td className="num muted">
+          <NetRate rx={w.rx_bps} tx={w.tx_bps} />
+        </td>
         <td>
           {w.endpoints.length > 0 ? <EndpointLink e={w.endpoints[0]} /> : <span className="muted">none</span>}
           {w.endpoints.length > 1 && (
@@ -276,7 +278,7 @@ export function KubeWorkloads({ onSelectHost, onSelectWorkload }: { onSelectHost
               </td>
               <td>{p.node ? <Hosts hosts={[p.node]} onSelectHost={onSelectHost} /> : <span className="muted">unscheduled</span>}</td>
               <td className="muted">{age(p.created, now)}</td>
-              <td className="row-actions">
+              <td className="pod-actions">
                 <button onClick={() => dock.open(logsSession(p))}>Logs</button>
                   {canShell(p) && <button onClick={() => dock.open(terminalSession(p))}>Shell</button>}
               </td>

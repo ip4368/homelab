@@ -1,6 +1,7 @@
 import type { Endpoint } from '../gen/Endpoint'
 import type { Health } from '../gen/Health'
 import { HEALTH_LABELS, healthTone, usage, usageTone } from '../kube'
+import { formatBps } from '../metrics'
 
 /** Host names as links that open the host drawer. */
 export function Hosts({ hosts, onSelectHost }: { hosts: string[]; onSelectHost(id: string): void }) {
@@ -46,6 +47,16 @@ export function EndpointLink({ e }: { e: Endpoint }) {
   return (
     <span className={e.kind === 'Cluster' ? 'muted' : undefined} title={e.kind === 'Cluster' ? `${e.via}: only from inside the cluster` : e.via}>
       {e.address}
+    </span>
+  )
+}
+
+/** Receive and send rates on two lines, so a narrow column holds them; a dash before there are any. */
+export function NetRate({ rx, tx }: { rx: number | null; tx: number | null }) {
+  if (rx === null && tx === null) return <span>–</span>
+  return (
+    <span className="net-rate">
+      <span>↓ {formatBps(rx)}</span> <span>↑ {formatBps(tx)}</span>
     </span>
   )
 }

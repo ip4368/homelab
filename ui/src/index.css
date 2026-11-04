@@ -1183,3 +1183,47 @@ table.data.mounts td {
 .actions-row {
   margin-bottom: 6px;
 }
+
+.table-scroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+table.pod-table {
+  width: 100%;
+}
+
+table.pod-table td {
+  padding: 5px 6px;
+  vertical-align: top;
+}
+
+.pod-name {
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+
+.pod-usage {
+  font-size: 12px;
+}
+
+.pod-actions {
+  white-space: nowrap;
+}
+
+.pod-actions button {
+  display: block;
+  width: 100%;
+  margin-bottom: 3px;
+  padding: 2px 8px;
+}
+
+/* ↓ and ↑ on their own lines when the column is narrow. */
+.net-rate span {
+  display: inline-block;
+  white-space: nowrap;
+}
+
+table.workload-table .net-rate span {
+  display: block;
+}
