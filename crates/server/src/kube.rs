@@ -39,10 +39,16 @@ pub struct KubeView {
     pub workloads: Vec<KubeWorkload>,
     pub pods: Vec<KubePod>,
     pub volumes: Vec<LonghornVolume>,
+    /// Volume claims, with how much of each the kubelet reports used.
+    pub claims: Vec<KubeClaim>,
+    /// The nodes, for a workload's share of the host it runs on.
+    pub nodes: Vec<KubeNode>,
     /// Warning events of the last hour on workloads and their pods, newest first.
     pub events: Vec<KubeEvent>,
     /// Why there is no CPU and memory usage: metrics-server did not answer.
     pub metrics_error: Option<String>,
+    /// Why there is no network and storage usage: no kubelet summary answered.
+    pub stats_error: Option<String>,
 }
 
 /// The kinds of workload the Workloads tab shows.
@@ -98,6 +104,16 @@ pub struct KubeWorkload {
     pub cpu_limit_milli: Option<u64>,
     #[ts(type = "number | null")]
     pub memory_limit_bytes: Option<u64>,
+    /// Requests summed over its pods; none if a pod has none.
+    #[ts(type = "number | null")]
+    pub cpu_request_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_request_bytes: Option<u64>,
+    /// Network bytes in and out per second, summed over its pods measured.
+    #[ts(type = "number | null")]
+    pub net_rx_bps: Option<u64>,
+    #[ts(type = "number | null")]
+    pub net_tx_bps: Option<u64>,
     /// Its pod template's container images.
     pub images: Vec<String>,
     /// How to reach it, Ingresses first.
@@ -211,12 +227,129 @@ pub struct KubePod {
     pub cpu_limit_milli: Option<u64>,
     #[ts(type = "number | null")]
     pub memory_limit_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub cpu_request_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_request_bytes: Option<u64>,
+    /// Network bytes in and out per second, from the kubelet's counters.
+    #[ts(type = "number | null")]
+    pub net_rx_bps: Option<u64>,
+    #[ts(type = "number | null")]
+    pub net_tx_bps: Option<u64>,
+    /// Ephemeral storage in use (its logs and containers' writable layers).
+    #[ts(type = "number | null")]
+    pub fs_used_bytes: Option<u64>,
     /// Why it is as it is, in Kubernetes' words: the scheduler's message, or a waiting container's.
     pub detail: Option<String>,
     /// The scheduler cannot place it.
     pub unschedulable: bool,
     /// How a container that restarted last ended.
     pub last_termination: Option<Termination>,
+    /// Its Kubernetes UID: how the kubelet's stats name it.
+    pub uid: Option<String>,
+    pub pod_ip: Option<String>,
+    /// `Guaranteed`, `Burstable` or `BestEffort`.
+    pub qos: Option<String>,
+    pub service_account: Option<String>,
+    /// Its (non-init) containers in full.
+    pub container_details: Vec<KubeContainer>,
+    /// Its init containers' names.
+    pub init_containers: Vec<String>,
+}
+
+/// One container of a pod.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct KubeContainer {
+    pub name: String,
+    pub image: String,
+    pub ready: bool,
+    pub restarts: u32,
+    /// `Running`, or why not (`CrashLoopBackOff`, `Completed`…).
+    pub state: String,
+    #[ts(type = "number | null")]
+    pub cpu_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub cpu_request_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_request_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub cpu_limit_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_limit_bytes: Option<u64>,
+    /// Requests beyond CPU and memory (a GPU, say), by resource name, as written.
+    pub extra_requests: std::collections::BTreeMap<String, String>,
+    pub ports: Vec<ContainerPort>,
+    pub mounts: Vec<PodMount>,
+    /// Raw block devices (`volumeDevices`).
+    pub devices: Vec<PodMount>,
+    /// The probes it has: some of `readiness`, `liveness`, `startup`.
+    pub probes: Vec<String>,
+    pub last_termination: Option<Termination>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct ContainerPort {
+    pub name: Option<String>,
+    pub port: u32,
+    /// `TCP`, `UDP` or `SCTP`.
+    pub protocol: String,
+    /// Also opened on the host.
+    #[ts(type = "number | null")]
+    pub host_port: Option<u32>,
+}
+
+/// A volume mounted (or, in `devices`, attached as a block device) in a container.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct PodMount {
+    /// Where it appears in the container.
+    pub path: String,
+    /// The volume's name in the pod.
+    pub volume: String,
+    /// What the volume is: `pvc data-x`, `configMap cfg`, `secret tls`, `emptyDir`, `hostPath /dev/x`…
+    pub source: String,
+    pub read_only: bool,
+    pub sub_path: Option<String>,
+}
+
+/// A PersistentVolumeClaim.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct KubeClaim {
+    pub namespace: String,
+    pub name: String,
+    /// `Bound`, `Pending`, `Lost`.
+    pub phase: String,
+    #[ts(type = "number | null")]
+    pub requested_bytes: Option<u64>,
+    #[ts(type = "number | null")]
+    pub capacity_bytes: Option<u64>,
+    /// What the kubelet reports written on it.
+    #[ts(type = "number | null")]
+    pub used_bytes: Option<u64>,
+    pub storage_class: Option<String>,
+    /// The PersistentVolume it is bound to.
+    pub volume: Option<String>,
+    pub access_modes: Vec<String>,
+}
+
+/// A node, for what a workload may use of its host.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[ts(export)]
+pub struct KubeNode {
+    pub name: String,
+    pub ready: bool,
+    #[ts(type = "number | null")]
+    pub cpu_allocatable_milli: Option<u64>,
+    #[ts(type = "number | null")]
+    pub memory_allocatable_bytes: Option<u64>,
+    /// True pressure conditions: `MemoryPressure`, `DiskPressure`, `PIDPressure`.
+    pub pressures: Vec<String>,
+    pub kubelet_version: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, TS)]
@@ -268,21 +401,32 @@ pub struct Lists {
     pub services: Value,
     pub ingresses: Value,
     pub events: Value,
+    pub pvcs: Value,
+    pub nodes: Value,
     /// Pod usage from metrics-server, or why there is none.
     pub metrics: Result<Value, String>,
+    /// Each node's kubelet summary that answered, by node name.
+    pub summaries: Vec<(String, Value)>,
+    /// Why no summary answered, when there are nodes to ask.
+    pub stats_error: Option<String>,
 }
 
 impl Default for Lists {
     fn default() -> Self {
         let v = Value::Null;
-        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), events: v, metrics: Ok(Value::Null) }
+        Self { pods: v.clone(), replicasets: v.clone(), deployments: v.clone(), statefulsets: v.clone(), daemonsets: v.clone(), volumes: v.clone(), replicas: v.clone(), engines: v.clone(), services: v.clone(), ingresses: v.clone(), pvcs: v.clone(), nodes: v.clone(), events: v, metrics: Ok(Value::Null), summaries: vec![], stats_error: None }
     }
 }
 
 /// How to reach the API: its URL and a client holding the kubeconfig's CA and client certificate.
+/// The PEMs are kept so a WebSocket client (exec) can authenticate the same way.
 pub struct Access {
     server: String,
     client: reqwest::Client,
+    /// Without the overall timeout, for `follow` log streams.
+    stream_client: reqwest::Client,
+    ca_pem: Vec<u8>,
+    identity_pem: Vec<u8>,
 }
 
 /// A base64 field of the kubeconfig (`homelabd kubeconfig` writes the one
@@ -299,18 +443,48 @@ fn decoded(kubeconfig: &str, key: &str) -> Result<Vec<u8>, String> {
 impl Access {
     pub fn from_kubeconfig(kubeconfig: &str) -> Result<Self, String> {
         let server = field(kubeconfig, "server").ok_or("the kubeconfig has no server")?.trim_end_matches('/').to_string();
-        let ca = reqwest::Certificate::from_pem(&decoded(kubeconfig, "certificate-authority-data")?).map_err(|e| e.to_string())?;
-        let mut identity = decoded(kubeconfig, "client-certificate-data")?;
-        identity.push(b'\n');
-        identity.extend(decoded(kubeconfig, "client-key-data")?);
-        let identity = reqwest::Identity::from_pem(&identity).map_err(|e| e.to_string())?;
-        let client = reqwest::Client::builder()
-            .tls_certs_only([ca])
-            .identity(identity)
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|e| e.to_string())?;
-        Ok(Self { server, client })
+        let ca_pem = decoded(kubeconfig, "certificate-authority-data")?;
+        let mut identity_pem = decoded(kubeconfig, "client-certificate-data")?;
+        identity_pem.push(b'\n');
+        identity_pem.extend(decoded(kubeconfig, "client-key-data")?);
+        let build = |timeout: Option<Duration>| -> Result<reqwest::Client, String> {
+            let ca = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| e.to_string())?;
+            let identity = reqwest::Identity::from_pem(&identity_pem).map_err(|e| e.to_string())?;
+            let mut b = reqwest::Client::builder().tls_certs_only([ca]).identity(identity);
+            if let Some(t) = timeout {
+                b = b.timeout(t);
+            }
+            b.build().map_err(|e| e.to_string())
+        };
+        Ok(Self { client: build(Some(REQUEST_TIMEOUT))?, stream_client: build(None)?, server, ca_pem, identity_pem })
+    }
+
+    /// The API server's base URL (`https://<vip>:6443`).
+    pub fn server(&self) -> &str {
+        &self.server
+    }
+
+    pub fn ca_pem(&self) -> &[u8] {
+        &self.ca_pem
+    }
+
+    /// Client certificate and key, concatenated PEM.
+    pub fn identity_pem(&self) -> &[u8] {
+        &self.identity_pem
+    }
+
+    /// A GET of `path` as a live response, for streaming endpoints (logs).
+    /// No overall timeout is applied by the caller; the client timeout
+    /// bounds the connect and read of one call site that awaits the body.
+    pub async fn get(&self, path: &str) -> Result<reqwest::Response, SendError> {
+        let res = self.stream_client.get(format!("{}{path}", self.server)).send().await.map_err(|e| SendError::Unreachable(e.to_string()))?;
+        let status = res.status();
+        if status.is_success() {
+            return Ok(res);
+        }
+        let answer: Value = res.json().await.unwrap_or(Value::Null);
+        let message = text(&answer["message"]).unwrap_or_else(|| status.to_string());
+        Err(if status.is_server_error() { SendError::Unreachable(message) } else { SendError::Refused { status: status.as_u16(), message, status_body: answer } })
     }
 
     /// The list at `path`; an empty one if the API does not have it (Longhorn not installed yet).
@@ -359,7 +533,7 @@ impl Access {
                 Err(e) => Err(format!("metrics-server: {e}")),
             }
         };
-        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, metrics) = tokio::join!(
+        let (pods, replicasets, deployments, statefulsets, daemonsets, volumes, replicas, engines, services, ingresses, events, pvcs, nodes, metrics) = tokio::join!(
             self.list("/api/v1/pods"),
             self.list("/apis/apps/v1/replicasets"),
             self.list("/apis/apps/v1/deployments"),
@@ -371,8 +545,37 @@ impl Access {
             self.list("/api/v1/services"),
             self.list("/apis/networking.k8s.io/v1/ingresses"),
             self.list("/api/v1/events?fieldSelector=type%3DWarning"),
+            self.list("/api/v1/persistentvolumeclaims"),
+            self.list("/api/v1/nodes"),
             metrics,
         );
+        let nodes = nodes?;
+        // Kubelet summaries are best-effort, like metrics-server: ask every
+        // node at once, keep those that answer, say why if none did.
+        let node_names: Vec<String> = items(&nodes).iter().filter_map(|n| text(&n["metadata"]["name"])).collect();
+        let fetches = node_names.iter().map(|name| {
+            let name = name.clone();
+            async move {
+                let path = format!("/api/v1/nodes/{name}/proxy/stats/summary?only_cpu_and_memory=false");
+                match self.client.get(format!("{}{path}", self.server)).send().await {
+                    Ok(r) if r.status().is_success() => match r.json::<Value>().await {
+                        Ok(v) => Ok((name.clone(), v)),
+                        Err(e) => Err(format!("{name}: {e}")),
+                    },
+                    Ok(r) => Err(format!("{name}: {}", r.status())),
+                    Err(e) => Err(format!("{name}: {e}")),
+                }
+            }
+        });
+        let mut summaries = vec![];
+        let mut stats_error = None;
+        for outcome in futures_util::future::join_all(fetches).await {
+            match outcome {
+                Ok(pair) => summaries.push(pair),
+                Err(e) => stats_error = Some(e),
+            }
+        }
+        let stats_error = if summaries.is_empty() { stats_error.or_else(|| (!node_names.is_empty()).then(|| "no kubelet summary answered".to_string())) } else { None };
         Ok(Lists {
             pods: pods?,
             replicasets: replicasets?,
@@ -385,7 +588,11 @@ impl Access {
             services: services?,
             ingresses: ingresses?,
             events: events?,
+            pvcs: pvcs?,
+            nodes,
             metrics,
+            summaries,
+            stats_error,
         })
     }
 }
@@ -509,6 +716,7 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
         items(&lists.replicasets).iter().filter_map(|rs| Some((key(&rs["metadata"]), controller(&rs["metadata"])?))).collect();
 
     let usage = lists.metrics.as_ref().map(kube_detail::pod_usage).unwrap_or_default();
+    let stats = crate::kube_stats::pod_stats(&lists.summaries);
     let mut pods: Vec<KubePod> = items(&lists.pods)
         .iter()
         .map(|p| {
@@ -533,6 +741,9 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
             });
             let used = usage.get(&(namespace.clone(), name.clone()));
             let (cpu_limit_milli, memory_limit_bytes) = kube_detail::pod_limits(p);
+            let (cpu_request_milli, memory_request_bytes) = kube_detail::pod_requests(p);
+            let uid = text(&meta["uid"]);
+            let fs_used_bytes = uid.as_ref().and_then(|u| stats.get(u)).and_then(|s| s.fs_used_bytes);
             KubePod {
                 owner,
                 node: text(&p["spec"]["nodeName"]),
@@ -545,9 +756,20 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 memory_bytes: used.map(|u| u.1),
                 cpu_limit_milli,
                 memory_limit_bytes,
+                cpu_request_milli,
+                memory_request_bytes,
+                net_rx_bps: None,
+                net_tx_bps: None,
+                fs_used_bytes,
                 detail,
                 unschedulable,
                 last_termination,
+                uid,
+                pod_ip: text(&p["status"]["podIP"]),
+                qos: text(&p["status"]["qosClass"]),
+                service_account: text(&p["spec"]["serviceAccountName"]),
+                container_details: kube_detail::container_details(p, lists.metrics.as_ref().unwrap_or(&Value::Null)),
+                init_containers: p["spec"]["initContainers"].as_array().into_iter().flatten().filter_map(|c| text(&c["name"])).collect(),
                 namespace,
                 name,
             }
@@ -601,6 +823,10 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
                 memory_bytes: if metrics_ok { used(|p| p.memory_bytes) } else { None },
                 cpu_limit_milli: sum(|p| p.cpu_limit_milli),
                 memory_limit_bytes: sum(|p| p.memory_limit_bytes),
+                cpu_request_milli: sum(|p| p.cpu_request_milli),
+                memory_request_bytes: sum(|p| p.memory_request_bytes),
+                net_rx_bps: None,
+                net_tx_bps: None,
                 images: template["spec"]["containers"].as_array().into_iter().flatten().filter_map(|c| text(&c["image"])).collect(),
                 endpoints: kube_detail::endpoints(&namespace, &template["metadata"]["labels"], &lists.services, &lists.ingresses, vip),
                 conditions,
@@ -682,20 +908,62 @@ pub fn view_of(lists: &Lists, at: u64, vip: &str) -> KubeView {
         .collect();
     volumes.sort_by(|a, b| a.pvc.cmp(&b.pvc).then_with(|| a.name.cmp(&b.name)));
 
-    KubeView { at, error: None, workloads, pods, volumes, events, metrics_error: lists.metrics.as_ref().err().cloned() }
+    let claim_used = crate::kube_stats::claim_used(&stats);
+    let mut claims: Vec<KubeClaim> = items(&lists.pvcs)
+        .iter()
+        .map(|c| {
+            let (namespace, name) = key(&c["metadata"]);
+            KubeClaim {
+                used_bytes: claim_used.get(&(namespace.clone(), name.clone())).copied(),
+                phase: text(&c["status"]["phase"]).unwrap_or_else(|| "unknown".into()),
+                requested_bytes: kube_detail::bytes(&c["spec"]["resources"]["requests"]["storage"]),
+                capacity_bytes: kube_detail::bytes(&c["status"]["capacity"]["storage"]),
+                storage_class: text(&c["spec"]["storageClassName"]),
+                volume: text(&c["spec"]["volumeName"]),
+                access_modes: c["spec"]["accessModes"].as_array().into_iter().flatten().filter_map(|m| text(m)).collect(),
+                namespace,
+                name,
+            }
+        })
+        .collect();
+    claims.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+
+    let mut nodes: Vec<KubeNode> = items(&lists.nodes)
+        .iter()
+        .map(|n| {
+            let conds = n["status"]["conditions"].as_array().map_or(&[][..], Vec::as_slice);
+            KubeNode {
+                name: text(&n["metadata"]["name"]).unwrap_or_default(),
+                ready: conds.iter().any(|c| c["type"] == "Ready" && c["status"] == "True"),
+                cpu_allocatable_milli: kube_detail::millicores(&n["status"]["allocatable"]["cpu"]),
+                memory_allocatable_bytes: kube_detail::bytes(&n["status"]["allocatable"]["memory"]),
+                pressures: conds
+                    .iter()
+                    .filter(|c| c["status"] == "True")
+                    .filter_map(|c| text(&c["type"]))
+                    .filter(|t| t.ends_with("Pressure"))
+                    .collect(),
+                kubelet_version: text(&n["status"]["nodeInfo"]["kubeletVersion"]),
+            }
+        })
+        .collect();
+    nodes.sort_by(|a, b| a.name.cmp(&b.name));
+
+    KubeView { at, error: None, workloads, pods, volumes, claims, nodes, events, metrics_error: lists.metrics.as_ref().err().cloned(), stats_error: lists.stats_error.clone() }
 }
 
 /// Keeps `tx` up to date with what Kubernetes runs, reading it with the
 /// kubeconfig `kubeconfig` gives (asked again whenever the API refuses it
 /// or keeps failing). A failed read keeps the last lists and says why.
 /// `now` cuts the pause between reads short (after a change from the UI).
-pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>, now: Arc<Notify>)
+pub async fn watch<F, Fut>(kubeconfig: F, tx: watch::Sender<Arc<KubeView>>, now: Arc<Notify>, history: Arc<crate::kube_history::KubeHistory>)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = Result<String, String>>,
 {
     let mut access: Option<Access> = None;
     let mut failures = 0;
+    let mut rates = crate::kube_stats::RateState::default();
     loop {
         let Some(a) = &access else {
             match kubeconfig().await.and_then(|kc| Access::from_kubeconfig(&kc)) {
@@ -711,7 +979,12 @@ where
         match a.read().await {
             Ok(lists) => {
                 failures = 0;
-                tx.send_replace(Arc::new(view_of(&lists, node::runtime::wall_ms(), a.host())));
+                let at = node::runtime::wall_ms();
+                let stats = crate::kube_stats::pod_stats(&lists.summaries);
+                let mut view = view_of(&lists, at, a.host());
+                rates.apply(&mut view, &stats, at);
+                history.record(&view);
+                tx.send_replace(Arc::new(view));
             }
             Err(e) => {
                 failures += 1;
@@ -830,6 +1103,18 @@ mod tests {
                 json!({ "involvedObject": { "namespace": "demo", "kind": "Pod", "name": "web-6d4-x2" }, "reason": "Unhealthy", "message": "old", "lastTimestamp": "1970-01-01T00:00:01Z" }),
             ]),
             metrics: Ok(json!({ "items": [{ "metadata": { "namespace": "demo", "name": "web-6d4-x2" }, "containers": [{ "usage": { "cpu": "12m", "memory": "30Mi" } }, { "usage": { "cpu": "3m", "memory": "2Mi" } }] }] })),
+            pvcs: list(vec![json!({
+                "metadata": { "namespace": "demo", "name": "data-postgres-0" },
+                "spec": { "storageClassName": "longhorn", "volumeName": "pvc-1", "accessModes": ["ReadWriteOnce"], "resources": { "requests": { "storage": "2Gi" } } },
+                "status": { "phase": "Bound", "capacity": { "storage": "2Gi" } }
+            })]),
+            nodes: list(vec![json!({
+                "metadata": { "name": "ms01-02" },
+                "status": { "allocatable": { "cpu": "8", "memory": "16Gi" }, "nodeInfo": { "kubeletVersion": "v1.31.0" },
+                    "conditions": [{ "type": "Ready", "status": "True" }, { "type": "DiskPressure", "status": "True" }, { "type": "MemoryPressure", "status": "False" }] }
+            })]),
+            summaries: vec![],
+            stats_error: None,
         }
     }
 
@@ -927,7 +1212,7 @@ mod tests {
 
     #[test]
     fn the_vip_is_the_kubeconfigs_server_host() {
-        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new() }.host().to_string();
+        let host = |server: &str| Access { server: server.into(), client: reqwest::Client::new(), stream_client: reqwest::Client::new(), ca_pem: vec![], identity_pem: vec![] }.host().to_string();
         assert_eq!(host("https://10.0.3.253:6443"), "10.0.3.253");
         assert_eq!(host("https://k3s.home"), "k3s.home");
     }
@@ -935,6 +1220,62 @@ mod tests {
     #[test]
     fn missing_lists_are_empty() {
         let v = view_of(&Lists::default(), 1, VIP);
-        assert!(v.pods.is_empty() && v.workloads.is_empty() && v.volumes.is_empty());
+        assert!(v.pods.is_empty() && v.workloads.is_empty() && v.volumes.is_empty() && v.claims.is_empty() && v.nodes.is_empty());
+    }
+
+    #[test]
+    fn claims_nodes_requests_and_container_detail_are_read() {
+        let mut lists = sample();
+        lists.pods = list(vec![json!({
+            "metadata": { "namespace": "demo", "name": "writer-1", "uid": "uid-w", "ownerReferences": [{ "kind": "Deployment", "name": "writer", "controller": true }] },
+            "spec": { "nodeName": "ms01-02", "serviceAccountName": "writer",
+                "initContainers": [{ "name": "setup" }],
+                "volumes": [
+                    { "name": "data", "persistentVolumeClaim": { "claimName": "writer" } },
+                    { "name": "cfg", "configMap": { "name": "writer-cfg" } },
+                    { "name": "tls", "secret": { "secretName": "writer-tls" } },
+                    { "name": "scratch", "emptyDir": {} },
+                    { "name": "dev", "hostPath": { "path": "/dev/dri" } }
+                ],
+                "containers": [{
+                    "name": "writer", "image": "busybox:1.37",
+                    "ports": [{ "name": "http", "containerPort": 8080, "protocol": "TCP" }, { "containerPort": 53, "protocol": "UDP", "hostPort": 5353 }],
+                    "resources": { "requests": { "cpu": "100m", "memory": "64Mi", "nvidia.com/gpu": "1" }, "limits": { "cpu": "500m", "memory": "256Mi" } },
+                    "readinessProbe": { "httpGet": { "path": "/", "port": 8080 } },
+                    "volumeMounts": [{ "name": "data", "mountPath": "/data" }, { "name": "cfg", "mountPath": "/etc/cfg", "readOnly": true }, { "name": "tls", "mountPath": "/etc/tls", "subPath": "cert" }, { "name": "scratch", "mountPath": "/tmp" }, { "name": "dev", "mountPath": "/dev/dri" }],
+                    "volumeDevices": [{ "name": "data", "devicePath": "/dev/xvda" }]
+                }] },
+            "status": { "phase": "Running", "podIP": "10.42.1.7", "qosClass": "Burstable",
+                "containerStatuses": [{ "name": "writer", "ready": true, "restartCount": 1, "state": { "running": {} }, "lastState": { "terminated": { "reason": "Error", "exitCode": 3 } } }] }
+        })]);
+        lists.deployments = list(vec![json!({ "metadata": { "namespace": "demo", "name": "writer" }, "spec": { "replicas": 1 }, "status": { "readyReplicas": 1, "updatedReplicas": 1 } })]);
+        lists.summaries = vec![("ms01-02".into(), json!({ "pods": [{
+            "podRef": { "name": "writer-1", "namespace": "demo", "uid": "uid-w" },
+            "containers": [{ "rootfs": { "usedBytes": 10 }, "logs": { "usedBytes": 5 } }],
+            "volume": [{ "pvcRef": { "name": "data-postgres-0", "namespace": "demo" }, "usedBytes": 777 }]
+        }] }))];
+        let v = view_of(&lists, NOW, VIP);
+        let p = &v.pods[0];
+        assert_eq!((p.uid.as_deref(), p.pod_ip.as_deref(), p.qos.as_deref(), p.service_account.as_deref()), (Some("uid-w"), Some("10.42.1.7"), Some("Burstable"), Some("writer")));
+        assert_eq!((p.cpu_request_milli, p.memory_request_bytes, p.fs_used_bytes), (Some(100), Some(64 << 20), Some(15)));
+        assert_eq!(p.init_containers, ["setup"]);
+        let c = &p.container_details[0];
+        assert_eq!((c.name.as_str(), c.image.as_str(), c.ready, c.restarts, c.state.as_str()), ("writer", "busybox:1.37", true, 1, "Running"));
+        assert_eq!(c.extra_requests.get("nvidia.com/gpu").map(String::as_str), Some("1"));
+        assert_eq!(c.probes, ["readiness"]);
+        let ports: Vec<_> = c.ports.iter().map(|x| (x.port, x.protocol.as_str(), x.host_port)).collect();
+        assert_eq!(ports, [(8080, "TCP", None), (53, "UDP", Some(5353))]);
+        let mounts: Vec<_> = c.mounts.iter().map(|m| (m.path.as_str(), m.source.as_str(), m.read_only)).collect();
+        assert_eq!(mounts, [("/data", "pvc writer", false), ("/etc/cfg", "configMap writer-cfg", true), ("/etc/tls", "secret writer-tls", false), ("/tmp", "emptyDir", false), ("/dev/dri", "hostPath /dev/dri", false)]);
+        assert_eq!(c.mounts[2].sub_path.as_deref(), Some("cert"));
+        assert_eq!(c.devices[0].path, "/dev/xvda");
+        assert_eq!(c.last_termination.as_ref().map(|t| (t.reason.as_str(), t.exit_code)), Some(("Error", 3)));
+        let w = v.workloads.iter().find(|w| w.name == "writer").unwrap();
+        assert_eq!((w.cpu_request_milli, w.memory_request_bytes), (Some(100), Some(64 << 20)));
+        let claim = &v.claims[0];
+        assert_eq!((claim.phase.as_str(), claim.capacity_bytes, claim.used_bytes, claim.storage_class.as_deref()), ("Bound", Some(2 << 30), Some(777), Some("longhorn")));
+        let node = &v.nodes[0];
+        assert_eq!((node.ready, node.cpu_allocatable_milli, node.memory_allocatable_bytes), (true, Some(8000), Some(16 << 30)));
+        assert_eq!(node.pressures, ["DiskPressure"]);
     }
 }

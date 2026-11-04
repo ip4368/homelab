@@ -88,6 +88,8 @@ pub struct DriverHandle {
     published: watch::Receiver<Arc<Published>>,
     /// Asks for a read of Kubernetes now, rather than at the next poll.
     kube_now: Arc<Notify>,
+    /// An hour of pod and workload usage, sampled by the watcher.
+    kube_history: Arc<crate::kube_history::KubeHistory>,
 }
 
 fn empty_truth() -> LabTruth {
@@ -122,10 +124,15 @@ impl DriverHandle {
                 tokio::time::sleep(PUBLISH_EVERY).await;
             }
         });
-        let handle = Self { client, lab, published, kube_now: Arc::new(Notify::new()) };
+        let handle = Self { client, lab, published, kube_now: Arc::new(Notify::new()), kube_history: Arc::new(crate::kube_history::KubeHistory::default()) };
         // Reads Kubernetes with the admin kubeconfig the control plane hands out.
         let h = handle.clone();
-        tokio::spawn(kube::watch(move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } }, kube_tx, handle.kube_now.clone()));
+        tokio::spawn(kube::watch(
+            move || { let h = h.clone(); async move { h.kubeconfig().await.map_err(|e| e.to_string()) } },
+            kube_tx,
+            handle.kube_now.clone(),
+            handle.kube_history.clone(),
+        ));
         handle
     }
 
@@ -215,6 +222,11 @@ impl DriverHandle {
     async fn kube_access(&self) -> Result<kube::Access, ActionError> {
         let kubeconfig = self.kubeconfig().await.map_err(|e| ActionError::Unavailable(format!("no kubeconfig: {e}")))?;
         kube::Access::from_kubeconfig(&kubeconfig).map_err(|e| ActionError::Unavailable(format!("the kubeconfig: {e}")))
+    }
+
+    /// A pod's or workload's usage series, from this server's own history.
+    pub fn kube_series(&self, entity: &str, metrics: &[String]) -> Result<serde_json::Value, String> {
+        self.kube_history.query(entity, metrics)
     }
 
     /// Applies the demo workloads (`deploy/demo-workloads.yaml`), as an

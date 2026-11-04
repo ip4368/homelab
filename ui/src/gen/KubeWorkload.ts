@@ -22,6 +22,14 @@ cpu_milli: number | null, memory_bytes: number | null,
  */
 cpu_limit_milli: number | null, memory_limit_bytes: number | null, 
 /**
+ * Requests summed over its pods; none if a pod has none.
+ */
+cpu_request_milli: number | null, memory_request_bytes: number | null, 
+/**
+ * Network bytes in and out per second, summed over its pods measured.
+ */
+net_rx_bps: number | null, net_tx_bps: number | null, 
+/**
  * Its pod template's container images.
  */
 images: Array<string>, 

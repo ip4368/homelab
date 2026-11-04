@@ -8,6 +8,8 @@ mod kube;
 mod kube_action;
 mod kube_apply;
 mod kube_detail;
+mod kube_history;
+mod kube_stats;
 mod ws;
 
 use axum::Router;

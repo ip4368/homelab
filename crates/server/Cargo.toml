@@ -14,12 +14,12 @@ tower-http = { version = "0.6", features = ["fs"] }
 serde.workspace = true
 serde_json.workspace = true
 ts-rs.workspace = true
-reqwest = { version = "0.13", default-features = false, features = ["rustls", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "stream"] }
 base64 = "0.22"
 serde_yaml_ng = "0.10"
+futures-util = "0.3"
 
 [dev-dependencies]
-futures-util = "0.3"
 tokio-tungstenite = "0.29"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

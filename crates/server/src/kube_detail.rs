@@ -2,7 +2,7 @@
 //! health and why, its CPU and memory, and how to reach it. Worked out from
 //! the lists the server reads (docs/plans/2026-11-02-workload-details-design.md).
 
-use crate::kube::{Endpoint, EndpointKind, Health, HealthState, KubePod};
+use crate::kube::{ContainerPort, Endpoint, EndpointKind, Health, HealthState, KubeContainer, KubePod, PodMount, Termination};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -52,6 +52,15 @@ pub fn pod_usage(metrics: &Value) -> BTreeMap<(String, String), (u64, u64)> {
 
 /// A pod's limits (millicores, bytes): each the sum over its containers, none if one container has none.
 pub fn pod_limits(pod: &Value) -> (Option<u64>, Option<u64>) {
+    pod_resources(pod, "limits")
+}
+
+/// A pod's requests, summed as its limits are.
+pub fn pod_requests(pod: &Value) -> (Option<u64>, Option<u64>) {
+    pod_resources(pod, "requests")
+}
+
+fn pod_resources(pod: &Value, kind: &str) -> (Option<u64>, Option<u64>) {
     let containers = pod["spec"]["containers"].as_array().map_or(&[][..], Vec::as_slice);
     let sum = |f: &dyn Fn(&Value) -> Option<u64>| -> Option<u64> {
         if containers.is_empty() {
@@ -59,7 +68,139 @@ pub fn pod_limits(pod: &Value) -> (Option<u64>, Option<u64>) {
         }
         containers.iter().map(f).sum()
     };
-    (sum(&|c| millicores(&c["resources"]["limits"]["cpu"])), sum(&|c| bytes(&c["resources"]["limits"]["memory"])))
+    (sum(&|c| millicores(&c["resources"][kind]["cpu"])), sum(&|c| bytes(&c["resources"][kind]["memory"])))
+}
+
+fn txt(v: &Value) -> Option<String> {
+    v.as_str().filter(|s| !s.is_empty()).map(String::from)
+}
+
+/// What the volume named `name` in `pod` is, in a few words (its claim, map or secret by name only).
+pub fn volume_source(pod: &Value, name: &str) -> String {
+    let volumes = pod["spec"]["volumes"].as_array().map_or(&[][..], Vec::as_slice);
+    let Some(v) = volumes.iter().find(|v| v["name"].as_str() == Some(name)) else { return "volume".into() };
+    if let Some(c) = txt(&v["persistentVolumeClaim"]["claimName"]) {
+        return format!("pvc {c}");
+    }
+    if let Some(c) = txt(&v["configMap"]["name"]) {
+        return format!("configMap {c}");
+    }
+    if let Some(c) = txt(&v["secret"]["secretName"]) {
+        return format!("secret {c}");
+    }
+    if let Some(p) = txt(&v["hostPath"]["path"]) {
+        return format!("hostPath {p}");
+    }
+    if let Some(d) = txt(&v["csi"]["driver"]) {
+        return format!("csi {d}");
+    }
+    for kind in ["emptyDir", "projected", "downwardAPI", "ephemeral", "nfs", "iscsi"] {
+        if !v[kind].is_null() {
+            return kind.into();
+        }
+    }
+    v.as_object().and_then(|o| o.keys().find(|k| *k != "name").cloned()).unwrap_or_else(|| "volume".into())
+}
+
+fn mounts_of(pod: &Value, c: &Value, list: &str, path_field: &str) -> Vec<PodMount> {
+    c[list]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| {
+            let volume = txt(&m["name"]).unwrap_or_default();
+            PodMount {
+                path: txt(&m[path_field]).unwrap_or_default(),
+                source: volume_source(pod, &volume),
+                volume,
+                read_only: m["readOnly"].as_bool().unwrap_or(false),
+                sub_path: txt(&m["subPath"]),
+            }
+        })
+        .collect()
+}
+
+fn container_state(st: &Value) -> String {
+    let s = &st["state"];
+    if !s["running"].is_null() {
+        return "Running".into();
+    }
+    if let Some(r) = txt(&s["waiting"]["reason"]) {
+        return r;
+    }
+    if let Some(r) = txt(&s["terminated"]["reason"]) {
+        return r;
+    }
+    "Waiting".into()
+}
+
+fn termination_of(t: &Value) -> Option<Termination> {
+    Some(Termination { reason: txt(&t["reason"])?, exit_code: t["exitCode"].as_i64().unwrap_or(0) as i32, at: None })
+}
+
+/// A pod's containers in full: spec joined with status by name, and with
+/// metrics-server's per-container usage (`metrics` as in [`pod_usage`]'s source).
+pub fn container_details(pod: &Value, metrics: &Value) -> Vec<KubeContainer> {
+    let (ns, pname) = (txt(&pod["metadata"]["namespace"]).unwrap_or_default(), txt(&pod["metadata"]["name"]).unwrap_or_default());
+    let mine = metrics["items"].as_array().into_iter().flatten().find(|m| m["metadata"]["namespace"].as_str() == Some(&ns) && m["metadata"]["name"].as_str() == Some(&pname));
+    let usage_of = |name: &str| -> (Option<u64>, Option<u64>) {
+        let c = mine.and_then(|m| m["containers"].as_array()?.iter().find(|c| c["name"].as_str() == Some(name)).cloned());
+        match c {
+            Some(c) => (millicores(&c["usage"]["cpu"]), bytes(&c["usage"]["memory"])),
+            None => (None, None),
+        }
+    };
+    let statuses = pod["status"]["containerStatuses"].as_array().map_or(&[][..], Vec::as_slice);
+    pod["spec"]["containers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|c| {
+            let name = txt(&c["name"]).unwrap_or_default();
+            let st = statuses.iter().find(|s| s["name"].as_str() == Some(name.as_str()));
+            let extra_requests = c["resources"]["requests"]
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter(|(k, _)| *k != "cpu" && *k != "memory")
+                .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), String::from)))
+                .collect();
+            let (cpu_milli, memory_bytes) = usage_of(&name);
+            KubeContainer {
+                image: txt(&c["image"]).unwrap_or_default(),
+                ready: st.is_some_and(|s| s["ready"].as_bool() == Some(true)),
+                restarts: st.map_or(0, |s| s["restartCount"].as_u64().unwrap_or(0) as u32),
+                state: st.map_or_else(|| "Waiting".into(), container_state),
+                cpu_milli,
+                memory_bytes,
+                cpu_request_milli: millicores(&c["resources"]["requests"]["cpu"]),
+                memory_request_bytes: bytes(&c["resources"]["requests"]["memory"]),
+                cpu_limit_milli: millicores(&c["resources"]["limits"]["cpu"]),
+                memory_limit_bytes: bytes(&c["resources"]["limits"]["memory"]),
+                extra_requests,
+                ports: c["ports"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .map(|p| ContainerPort {
+                        name: txt(&p["name"]),
+                        port: p["containerPort"].as_u64().unwrap_or(0) as u32,
+                        protocol: txt(&p["protocol"]).unwrap_or_else(|| "TCP".into()),
+                        host_port: p["hostPort"].as_u64().map(|n| n as u32),
+                    })
+                    .collect(),
+                mounts: mounts_of(pod, c, "volumeMounts", "mountPath"),
+                devices: mounts_of(pod, c, "volumeDevices", "devicePath"),
+                probes: [("readiness", "readinessProbe"), ("liveness", "livenessProbe"), ("startup", "startupProbe")]
+                    .into_iter()
+                    .filter(|(_, f)| !c[*f].is_null())
+                    .map(|(label, _)| label.to_string())
+                    .collect(),
+                last_termination: st.and_then(|s| termination_of(&s["lastState"]["terminated"])),
+                name,
+            }
+        })
+        .collect()
 }
 
 /// Container waiting reasons that will not clear by themselves.
@@ -246,9 +387,20 @@ mod tests {
             memory_bytes: None,
             cpu_limit_milli: None,
             memory_limit_bytes: None,
+            cpu_request_milli: None,
+            memory_request_bytes: None,
+            net_rx_bps: None,
+            net_tx_bps: None,
+            fs_used_bytes: None,
             detail: None,
             unschedulable: false,
             last_termination: None,
+            uid: None,
+            pod_ip: None,
+            qos: None,
+            service_account: None,
+            container_details: vec![],
+            init_containers: vec![],
         }
     }
 

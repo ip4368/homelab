@@ -26,6 +26,7 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api/kube", post(kube_action))
         .route("/api/kube/apply", post(kube_apply))
         .route("/api/kube/manifest", get(kube_manifest))
+        .route("/api/kube/metrics", get(kube_metrics))
         .route("/api/ws", get(ws_handler))
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
@@ -162,6 +163,31 @@ async fn kube_manifest(State(driver): State<DriverHandle>, Query(w): Query<Workl
     match driver.kube_manifest(w).await {
         Ok(yaml) => ([("content-type", "application/yaml")], yaml).into_response(),
         Err(e) => action_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct KubeMetricsQuery {
+    /// A pod as `<namespace>/<name>`.
+    pod: Option<String>,
+    /// A workload as `<namespace>/<Kind>/<name>`.
+    workload: Option<String>,
+    m: Option<String>,
+}
+
+/// `?pod=ns/name|workload=ns/Kind/name&m=cpu_milli,net_rx_bps`: 200 with
+/// `{since, series}` from this server's sampled history; 400 for an unknown
+/// entity or metric, or with neither or both of them.
+async fn kube_metrics(State(driver): State<DriverHandle>, Query(q): Query<KubeMetricsQuery>) -> Response {
+    let entity = match (q.pod, q.workload) {
+        (Some(p), None) => p,
+        (None, Some(w)) => w,
+        _ => return error(StatusCode::BAD_REQUEST, "exactly one of pod and workload is required"),
+    };
+    let metrics: Vec<String> = q.m.unwrap_or_default().split(',').filter(|m| !m.is_empty()).map(String::from).collect();
+    match driver.kube_series(&entity, &metrics) {
+        Ok(value) => Json(value).into_response(),
+        Err(message) => error(StatusCode::BAD_REQUEST, &message),
     }
 }
 
@@ -322,5 +348,18 @@ pub mod tests {
         let app = app(driver);
         assert_eq!(get_json(&app, "/api/sim/speed").await.0, StatusCode::NOT_FOUND);
         assert_eq!(get_json(&app, "/api").await.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn kube_metrics_are_validated() {
+        let (driver, _host) = cluster();
+        wait_for_leader(&driver).await;
+        let app = app(driver);
+        assert_eq!(get_json(&app, "/api/kube/metrics?m=cpu_milli").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get_json(&app, "/api/kube/metrics?pod=demo/web-1&workload=demo/Deployment/web&m=cpu_milli").await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(get_json(&app, "/api/kube/metrics?pod=demo/web-1&m=bogus").await.0, StatusCode::BAD_REQUEST);
+        let (status, body) = get_json(&app, "/api/kube/metrics?pod=demo/web-1&m=cpu_milli").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("no history"), "{body}");
     }
 }

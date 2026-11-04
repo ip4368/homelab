@@ -7,7 +7,8 @@
 // Kubernetes criteria K1–K8 of docs/plans/2026-10-27-k3s-longhorn-lab-design.md
 // §5 (K9 drains a host; K10 applies, scales, restarts, edits and deletes a
 // workload through `/api/kube`, as the Workloads tab does; K11 checks the
-// health, usage, endpoints and events the tab shows), checked against the cluster's Kubernetes API through the VIP with the
+// health, usage, endpoints and events the tab shows; K12 the kubelet
+// network/volume metrics and their history), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
 // get it with `sudo homelabd kubeconfig`).
 //
@@ -1116,6 +1117,126 @@ spec:
       return es.length > 0 ? es : null
     })
     note(`broken: down (${broken.value.health.reason}); events: ${[...new Set(events.value.map((e) => e.reason))].join(', ')}`)
+  } finally {
+    await k.delete(`/api/v1/namespaces/${ns}`)
+  }
+})
+
+/** Opens a WebSocket, sends `send` once open, and collects decoded text until `until` holds (or the deadline). */
+async function wsCollect(url: string, send: string | null, until: (text: string) => boolean, timeoutMs: number): Promise<string> {
+  const ws = new WebSocket(url)
+  ws.binaryType = 'arraybuffer'
+  let text = ''
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Failed(`timed out after ${timeoutMs / 1000} s on ${url}; got: ${text.slice(-300)}`)), timeoutMs)
+      // A shell may not be reading yet when the socket opens; type it again
+      // every few seconds (an echo repeated is harmless) until it answers.
+      const resend = send === null ? undefined : setInterval(() => {
+        if (ws.readyState === WebSocket.OPEN) ws.send(new TextEncoder().encode(send))
+      }, 3000)
+      const done = (fn: () => void) => () => {
+        clearTimeout(timer)
+        clearInterval(resend)
+        fn()
+      }
+      ws.onopen = () => {
+        if (send !== null) ws.send(new TextEncoder().encode(send))
+      }
+      ws.onmessage = (e) => {
+        text += typeof e.data === 'string' ? e.data : new TextDecoder().decode(e.data as ArrayBuffer)
+        if (until(text)) done(resolve)()
+      }
+      ws.onerror = done(() => reject(new Failed(`websocket error on ${url}; got: ${text.slice(-300)}`)))
+      ws.onclose = done(() => {
+        if (!until(text)) reject(new Failed(`websocket closed on ${url}; got: ${text.slice(-300)}`))
+      })
+    })
+  } finally {
+    ws.close()
+  }
+  return text
+}
+
+const wsBase = BASE.replace(/^http/, 'ws')
+
+async function applyYaml(yaml: string, ns: string) {
+  const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run: false, force: false }) })
+  if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
+}
+
+await step('K12', 'Workload metrics: network rates and volume use from the kubelet, container detail, and an hour of history through /api/kube/metrics', async (note) => {
+  await kubeHealthy(5 * 60_000)
+  const k = await kube()
+  const ns = 'e2e-metrics'
+  const manifests = `apiVersion: v1
+kind: Namespace
+metadata: { name: ${ns} }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: load }
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: longhorn
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: { name: load }
+spec:
+  replicas: 1
+  strategy: { type: Recreate }
+  selector: { matchLabels: { app: load } }
+  template:
+    metadata: { labels: { app: load } }
+    spec:
+      terminationGracePeriodSeconds: 2
+      containers:
+        - name: load
+          image: "busybox:1.37"
+          command: [sh, -c, "dd if=/dev/urandom of=/data/blob bs=1M count=8 conv=fsync 2>/dev/null; httpd -p 8080 -h /data; i=0; while true; do i=$((i+1)); echo tick-$i; wget -q -O /dev/null http://load/blob || echo miss; sleep 2; done"]
+          ports: [{ containerPort: 8080 }]
+          resources: { requests: { cpu: 50m, memory: 32Mi }, limits: { cpu: 500m, memory: 128Mi } }
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes: [{ name: data, persistentVolumeClaim: { claimName: load } }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: load }
+spec:
+  selector: { app: load }
+  ports: [{ port: 80, targetPort: 8080 }]
+`
+  await applyYaml(manifests, ns)
+  try {
+    const pod = await waitFor('load pod with a network rate', 5 * 60_000, () => {
+      const p = watch.seen!.kube.pods.find((x) => x.namespace === ns && x.owner === 'Deployment/load')
+      return p && p.status === 'Running' && (p.net_rx_bps ?? 0) > 1000 ? p : null
+    })
+    const p = pod.value
+    const c = p.container_details[0]
+    if (!c) throw new Failed('no container detail on the load pod')
+    if (c.cpu_request_milli !== 50 || c.memory_request_bytes !== 32 * 2 ** 20) throw new Failed(`requests: ${c.cpu_request_milli}m and ${c.memory_request_bytes} bytes, not 50m and 32Mi`)
+    if (!c.mounts.some((m) => m.path === '/data' && m.source === 'pvc load')) throw new Failed(`mounts: ${JSON.stringify(c.mounts)}`)
+    if (!p.pod_ip) throw new Failed('the load pod shows no pod IP')
+    note(`load: ↓${p.net_rx_bps} B/s ↑${p.net_tx_bps} B/s on ${p.node} (${p.pod_ip}), /data from pvc load, in ${secs(pod.ms)}`)
+
+    const claim = await waitFor('claim use from the kubelet', 5 * 60_000, () => {
+      const cl = watch.seen!.kube.claims.find((x) => x.namespace === ns && x.name === 'load')
+      return cl && (cl.used_bytes ?? 0) >= 8 * 2 ** 20 ? cl : null
+    })
+    note(`claim load: ${claim.value.used_bytes} of ${claim.value.capacity_bytes} bytes used (${claim.value.phase})`)
+
+    const series = await waitAsync('pod history with a network point', 2 * 60_000, async () => {
+      const r = await fetch(`${BASE}/api/kube/metrics?pod=${ns}/${p.name}&m=cpu_milli,net_rx_bps`)
+      if (!r.ok) return `${r.status} ${await r.text()}`
+      const j = (await r.json()) as { since: number; series: Record<string, [number, number][]> }
+      return j.series.net_rx_bps?.some(([, v]) => v > 1000) ? j : `net points so far: ${JSON.stringify(j.series.net_rx_bps)}`
+    })
+    const wl = await fetch(`${BASE}/api/kube/metrics?workload=${ns}/Deployment/load&m=net_tx_bps`)
+    if (!wl.ok) throw new Failed(`workload history: ${wl.status} ${await wl.text()}`)
+    note(`history since ${series.value.since}: ${series.value.series.net_rx_bps.length} rx points for the pod, and the workload answers too`)
   } finally {
     await k.delete(`/api/v1/namespaces/${ns}`)
   }
