@@ -38,7 +38,7 @@ everything K3s stands on, and supervises K3s; K3s owns everything that runs on i
 | Starting cordon and drain | Evicting the pods |
 | Host metrics; K3s's health: alerts and safe repairs | |
 
-The Workloads tab's changes (applying YAML, scale, restart, delete, starting and stopping VMs) and its
+The Workloads page's changes (applying YAML, scale, restart, delete, starting and stopping VMs) and its
 shells and consoles come from the UI's server on the user's behalf, as kubectl and virtctl would with
 the admin kubeconfig. homelabd itself still never writes a workload.
 
@@ -77,41 +77,71 @@ The server listens on `BIND`:`PORT` (default `127.0.0.1:8080`) and serves the bu
 
 ## A tour of the UI
 
-**Top bar:** hosts ready, not ready and pending; the control-plane leader and quorum; open alerts;
-the **Ground truth** checkbox; the lab host's clock.
+The UI is a workspace rather than a long page: **navigation down the left**, a **header** with the
+cluster's health, the page's **list**, and a **detail pane** beside it for whatever is open. Every
+page, list, open item and pane tab is in the URL (`#/workloads/pods?open=host:ms01-02&tab=pods`), so
+links and the browser's Back work; the old `#topology`-style links still open their page.
 
-**Views** (tabs; the URL hash opens one directly, e.g. `#topology`)
+**Navigation:** Overview, Hosts, Workloads, Topology, Networks and Lab, each with a count of its
+problems (hosts down or waiting, workloads not healthy, switch alerts, lab faults). At its foot: the
+**Ground truth** overlay, the connection and the lab host's clock. It folds to icons (it starts
+folded below 1100 px wide) and slides in from the left on a narrow screen.
 
-- **Fleet:** every host as a tile, coloured by health, with CPU/RAM and role badges, grouped by
-  rack, switch, role or profile. Click a tile to open the host drawer: inventory, what it runs of
-  Kubernetes (and its pods), control-plane membership (hand-off, replacing a down voter, moving the
-  VIP), lifecycle (Cordon, Drain, Uncordon, Cancel drain, Remove), live charts, the roles editor and
-  the per-host network editor.
-- **Topology:** switches, uplinks and host connections, with ports coloured by state and
-  utilisation, and VLAN/MTU mismatches highlighted. Click a switch for its port table, port config
-  editor and suggested fixes.
+**Header:** hosts ready, quorum, the leader and workloads healthy as chips (each opens what it
+counts), **Search** (Ctrl+K or `/`: jump to any host, workload, switch or page, or open a pod's
+logs) and the bell for the activity panel, with the count of open alerts.
+
+**Pages**
+
+- **Overview:** the cluster in five numbers (hosts, control plane, workloads, pods, Longhorn
+  volumes), **Needs attention** (open alerts with their suggested fix, hosts down or waiting to
+  join, workloads and volumes not healthy, each opening its detail), the hosts at a glance, the
+  fleet's CPU, RAM and throughput charts, and the latest events.
+- **Hosts:** every host as a tile (state, roles, CPU and RAM, its K3s role and pods), grouped by
+  rack, switch, role or profile, or as a sortable table; filter by name, rack or role, or show only
+  hosts that are not Ready.
+- **Workloads:** what Kubernetes runs, read from the K3s API, one list at a time under one set of
+  filters (namespace, host, name, problems only, system namespaces): **Workloads** (KubeVirt VMs
+  among them) with health and why, usage, endpoints and hosts; **Pods** with their status, usage and
+  host; **Volumes** (Longhorn) with how full they are and their replicas. Each row has **Logs**; a
+  workload's **⋯** has Start, Stop, Restart, Edit YAML and Delete, and **−**/**+** beside its ready
+  count scale it. **New / Apply YAML** applies manifests after a dry-run preview, pasted or written
+  by a small form for an app from an image or a VM (not in the K3s, Longhorn and KubeVirt
+  namespaces).
+- **Topology:** switches, uplinks and host connections, with links coloured by utilisation and
+  VLAN/MTU mismatches highlighted.
 - **Networks:** logical networks (VLAN, subnet, MTU), network templates (with staged rollouts) and
   auto-approve rules.
-- **Workloads:** what Kubernetes runs, read from the K3s API: workloads (KubeVirt VMs among them)
-  with their health and why, CPU, memory and network, and endpoints; their pods and where they run;
-  and Longhorn's volumes with their replicas and how full they are. A workload's drawer adds its
-  containers (resources, ports, probes, environment names, mounts, devices), an hour of charts, its
-  rollout history, its pods' details and Warning events; a VM's adds its guest and disks. Scale,
-  restart, edit or delete a workload from its row, start or stop a VM, and apply YAML after a
-  dry-run preview, pasted or written by a small form for an app from an image or a VM (not in the
-  K3s, Longhorn and KubeVirt namespaces). A dock at the bottom follows pods' logs and holds shells
-  in containers and VMs' serial consoles.
+- **Lab:** the lab's machines as a table, seen from outside (power, cables and disks, clock,
+  what the technician did): power one on or off, shut it down, reset, freeze or thaw it from its
+  row; expand it to unplug, replug or degrade a NIC and pull or restore a data disk; tick machines
+  to partition them as a group (with a switch or not) and heal partitions; kill, restore or
+  partition a switch; rack a new machine (optionally with a switch-port mistake: VLAN 20 missing,
+  MTU too small, a bond without LACP); seed the demo workloads.
 
-**Right rail:** alerts (with a button for the fix one suggests, such as replacing a dead voter), the event log, and the *Pending joins* queue (approve with roles).
+**Detail pane:** opens beside the list (drag its edge to resize it; Esc closes it) with a header
+saying how the thing is, its actions, and tabs:
+
+- a **host**: Overview (hardware, Kubernetes, control plane with hand-off, replacing a down voter
+  and moving the VIP, and its charts), Pods (with logs and shells), Network (the per-host network
+  editor), Roles, and in the lab, Lab machine (its power, cables and disks). Cordon, Drain,
+  Uncordon, Cancel drain and Remove are in its header.
+- a **workload**: Overview (health and why, usage now and over the last hour, endpoints,
+  volumes), Pods (expand one for its containers' states, IPs and disk use), Containers (resources,
+  ports, probes, environment names, mounts, devices) or a VM's Guest, its rollout History and its
+  Warning Events. Logs, Shell (Console and Console log for a VM), Restart and Edit YAML are in its
+  header.
+- a **switch**: its ports beside the port editor, and the fixes the control plane suggests.
+
+**Activity panel** (the bell): alerts (with a button for the fix one suggests, such as replacing a
+dead voter), the event log, and hosts waiting to join (approve with roles; create a join token).
+
+**Dock:** along the bottom, it follows pods' logs and holds shells in containers and VMs' serial
+consoles, a tab each; it stays while you move around.
 
 **Ground-truth overlay:** what the lab sees from outside the machines but the control plane does
 not, for example a host the control plane still believes Ready while it is powered off, partitions,
 or the VIP held by two machines. Add `?truth` to the URL to open the UI with the overlay on.
-
-**Lab panel:** power a machine on or off, shut it down, reset, freeze or thaw it; partition it;
-unplug, replug or degrade a NIC; pull or restore a data disk; kill, restore or partition a switch;
-rack a new machine (optionally with a switch-port mistake: VLAN 20 missing, MTU too small, a bond
-without LACP); seed the demo workloads.
 
 ## Tests
 
