@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { ActivityPanel } from './components/ActivityPanel'
+import { CommandPalette } from './components/CommandPalette'
 import { Dock } from './components/Dock'
 import { HostDetail } from './components/HostDetail'
 import { HostsPage } from './components/HostsPage'
@@ -23,7 +24,7 @@ const NARROW = 1100
 /** Keys typed into a field, or with a dialog open, are not shortcuts. */
 function typing(e: KeyboardEvent): boolean {
   const t = e.target as HTMLElement | null
-  return !!t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || !!t.closest('.xterm, .modal'))
+  return !!t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || !!t.closest('.xterm, .modal, .palette'))
 }
 
 /**
@@ -36,6 +37,7 @@ export default function App() {
   const [collapsed, setCollapsed] = usePref('navCollapsed', window.innerWidth < NARROW)
   const [activity, setActivity] = usePref('activityOpen', false)
   const [navOpen, setNavOpen] = useState(false)
+  const [palette, setPalette] = useState(false)
   // `?truth` in the URL opens with the overlay on, so a link can show it.
   const [showTruth, setShowTruth] = useState(() => new URLSearchParams(location.search).has('truth'))
   const open = route.open
@@ -48,17 +50,25 @@ export default function App() {
     if (open && synced && !exists) nav.close()
   }, [open, exists, synced])
   useEffect(() => setNavOpen(false), [route.page])
+  // Going somewhere (a link, Back) closes the palette.
+  useEffect(() => setPalette(false), [route])
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (typing(e)) return
-      if (e.key === 'Escape' && document.querySelector('.menu, .modal-backdrop') === null) {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
+        e.preventDefault()
+        setPalette((p) => !p)
+      } else if (typing(e) || palette) return
+      else if (e.key === '/') {
+        e.preventDefault()
+        setPalette(true)
+      } else if (e.key === 'Escape' && document.querySelector('.menu, .modal-backdrop') === null) {
         if (route.open) nav.close()
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [route.open])
+  }, [palette, route.open])
 
   const page =
     route.page === 'hosts' ? (
@@ -95,7 +105,7 @@ export default function App() {
       <Sidebar page={route.page} collapsed={collapsed} onCollapse={setCollapsed} showTruth={showTruth} onShowTruth={setShowTruth} />
       {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
       <div className="main">
-        <TopBar page={route.page} onMenu={() => setNavOpen(!navOpen)} activityOpen={activity} onActivity={() => setActivity(!activity)} />
+        <TopBar page={route.page} onMenu={() => setNavOpen(!navOpen)} onSearch={() => setPalette(true)} activityOpen={activity} onActivity={() => setActivity(!activity)} />
         <div className={`content${pane ? ' with-pane' : ''}`}>
           <main className={`page page-${route.page}`}>{page}</main>
           {pane}
@@ -103,6 +113,7 @@ export default function App() {
       </div>
       {activity && <ActivityPanel showTruth={showTruth} onClose={() => setActivity(false)} />}
       <Dock />
+      {palette && <CommandPalette onClose={() => setPalette(false)} />}
     </div>
   )
 }

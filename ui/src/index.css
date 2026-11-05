@@ -500,6 +500,14 @@ td.num {
   .chips .chip:nth-child(n + 4) {
     display: none;
   }
+
+  .search-button kbd {
+    display: none;
+  }
+
+  .search-button {
+    min-width: 0;
+  }
 }
 
 @container (max-width: 860px) {
@@ -510,6 +518,10 @@ td.num {
 
 @container (max-width: 640px) {
   .chips {
+    display: none;
+  }
+
+  .search-button span {
     display: none;
   }
 }
@@ -540,6 +552,17 @@ button.chip:hover:not(:disabled) {
   font-variant-numeric: tabular-nums;
 }
 
+.search-button {
+  color: var(--muted);
+  background: var(--panel-2);
+  min-width: 190px;
+  justify-content: flex-start;
+}
+
+.search-button span {
+  flex: 1;
+  text-align: left;
+}
 
 .activity-toggle {
   position: relative;
@@ -1661,7 +1684,7 @@ ul.event-list li > div:first-child {
   }
 }
 
-/* Menus */
+/* Menus and the command palette */
 
 .menu {
   position: fixed;
@@ -1688,6 +1711,84 @@ ul.event-list li > div:first-child {
 .menu button:focus-visible {
   background: var(--accent-soft);
   outline: none;
+}
+
+.palette-backdrop {
+  padding-top: 12vh;
+  z-index: 40;
+}
+
+.palette {
+  width: min(640px, 94vw);
+  background: var(--panel);
+  border-radius: 12px;
+  box-shadow: 0 24px 60px rgba(16, 24, 40, 0.3);
+  overflow: hidden;
+}
+
+.palette input:not([type='checkbox']) {
+  width: 100%;
+  height: 52px;
+  padding: 0 18px;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  font-size: 16px;
+  outline: none;
+}
+
+.palette ul {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  max-height: 52vh;
+  overflow: auto;
+}
+
+.palette-group {
+  padding: 8px 10px 4px;
+  font-size: 11px;
+  font-weight: 650;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+}
+
+.palette li button {
+  width: 100%;
+  border: none;
+  background: none;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
+.palette li button.active {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+.palette-label {
+  font-weight: 600;
+}
+
+.palette-hint {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.palette-empty {
+  padding: 12px;
+}
+
+.palette-foot {
+  padding: 8px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
 }
 
 /* Forms and dialogs */

@@ -35,9 +35,9 @@ function Chip({ label, value, tone, title, onClick }: { label: string; value: st
 
 /**
  * The header over every page: where you are, the cluster's health in a few
- * chips (each opens what it counts), and the activity panel's toggle.
+ * chips (each opens what it counts), search, and the activity panel's toggle.
  */
-export function TopBar({ page, onMenu, activityOpen, onActivity }: { page: Page; onMenu(): void; activityOpen: boolean; onActivity(): void }) {
+export function TopBar({ page, onMenu, onSearch, activityOpen, onActivity }: { page: Page; onMenu(): void; onSearch(): void; activityOpen: boolean; onActivity(): void }) {
   const hosts = useStore((s) => s.view.hosts)
   const alerts = useStore((s) => s.view.alerts)
   const cp = useStore((s) => s.view.cp)
@@ -92,6 +92,11 @@ export function TopBar({ page, onMenu, activityOpen, onActivity }: { page: Page;
         <Chip label="Leader" value={leader ? `${leader} · term ${term}` : 'none'} tone={leader ? 'ok' : 'bad'} title="Holds the VIP and answers the API" onClick={leader ? () => nav.host(leader) : undefined} />
       </div>
       <div className="spacer" />
+      <button className="search-button" onClick={onSearch} title="Find a host, workload, switch or page (Ctrl+K)">
+        <Icon name="search" />
+        <span>Search</span>
+        <kbd>Ctrl K</kbd>
+      </button>
       <button
         className={`icon-button activity-toggle${activityOpen ? ' pressed' : ''}`}
         onClick={onActivity}
