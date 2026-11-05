@@ -2537,6 +2537,23 @@ table.data.mounts td {
     padding: 8px 12px;
   }
 
+  .nav-collapsed .brand {
+    padding: 14px 18px 18px;
+    justify-content: flex-start;
+  }
+
+  .nav-collapsed .sidebar li a .badge-count {
+    position: static;
+    min-width: 18px;
+    line-height: 18px;
+    font-size: 11px;
+  }
+
+  .nav-collapsed .sidebar-foot {
+    padding: 12px 18px 14px;
+    align-items: stretch;
+  }
+
   .sidebar .collapse {
     display: none;
   }
