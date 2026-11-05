@@ -4,7 +4,7 @@ import type { HostObj } from '../gen/HostObj'
 import type { ServerMsg } from '../gen/ServerMsg'
 import type { ViewSnapshot } from '../gen/ViewSnapshot'
 import { createStore, emptyKube } from '../store'
-import { kubeSummary, leadership, linkPorts, MOVE_VIP_WAIT_MS, nicState, untilLeads } from './HostDrawer'
+import { kubeSummary, leadership, linkPorts, MOVE_VIP_WAIT_MS, nicState, untilLeads } from './HostDetail'
 
 const cfg: HostNetworkConfig = {
   links: [

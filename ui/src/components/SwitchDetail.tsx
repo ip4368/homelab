@@ -5,6 +5,8 @@ import type { SwitchPortCfg } from '../gen/SwitchPortCfg'
 import { formatBps, portPeers, suggestedFixes } from '../topology'
 import { useStore } from '../store'
 import { useAction } from './useAction'
+import { Card, DetailPane, type PaneTab } from './DetailPane'
+import { nav } from '../nav'
 
 export interface PortForm {
   mode: 'Access' | 'Trunk'
@@ -81,10 +83,7 @@ function PortEditor({ switchId, port, cfg }: { switchId: string; port: string; c
     })
   }
   return (
-    <div className="section port-editor">
-      <h4>
-        Edit {switchId} {port}
-      </h4>
+    <Card title={`Edit ${port}`} className="port-editor">
       <div className="form-grid">
         <label>Mode</label>
         <select value={form.mode} onChange={(e) => set({ mode: e.target.value as PortForm['mode'] })}>
@@ -120,18 +119,21 @@ function PortEditor({ switchId, port, cfg }: { switchId: string; port: string; c
         {sent && <span className="muted">Applied. The control plane sees it at the next switch poll.</span>}
         {(invalid ?? error) && <span className="bad">{invalid ?? error}</span>}
       </div>
-    </div>
+    </Card>
   )
 }
 
-interface DrawerProps {
+interface DetailProps {
   id: string
+  tab: string | null
+  onTab(t: string): void
   onClose(): void
-  onSelectHost(id: string): void
-  onSelectSwitch(id: string): void
 }
 
-export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: DrawerProps) {
+/** One switch in the detail pane: its ports (pick one to edit its config) and the fixes the control plane suggests. */
+export function SwitchDetail({ id, tab, onTab, onClose }: DetailProps) {
+  const onSelectHost = (h: string) => nav.host(h)
+  const onSelectSwitch = (s: string) => nav.switch(s)
   const sw = useStore((s) => s.view.switches[id])
   const hostMap = useStore((s) => s.view.hosts)
   const alerts = useStore((s) => s.view.alerts)
@@ -158,107 +160,129 @@ export function SwitchDrawer({ id, onClose, onSelectHost, onSelectSwitch }: Draw
     return peers.has(p.port) || p.neighbor ? { text: 'down', cls: 'bad' } : { text: '-', cls: '' }
   }
 
+  const unreachable = Object.values(alerts).some((a) => a.kind === 'SwitchUnreachable' && a.resolved_at === null && a.entity.id === id)
+  const cabled = sw.ports.filter((p) => peers.has(p.port) || p.neighbor).length
+  const tabs: PaneTab[] = [
+    { id: 'ports', label: 'Ports', count: rows.length },
+    { id: 'fixes', label: 'Suggested fixes', count: fixes.length, tone: fixes.length > 0 ? 'warn' : undefined },
+  ]
+  const pick = (p: string) => {
+    setPort(p)
+    onTab('ports')
+  }
+
   return (
-    <aside className="drawer switch-drawer" aria-label={`switch ${id}`}>
-      <div className="drawer-head">
-        <h3>{id}</h3>
-        <span className="muted">{sw.model}</span>
-        <div className="spacer" />
-        <button onClick={onClose} aria-label="close">
-          ×
-        </button>
-      </div>
-      <p className="muted">
-        {sw.mlag_peer ? `MLAG peer ${sw.mlag_peer}. ` : ''}Last seen at {formatClock(sw.last_seen)}. Ports show the last poll.
-      </p>
-      {fixes.length > 0 && (
-        <div className="section">
-          <h4>Suggested fixes</h4>
-          <ul className="fixes">
-            {fixes.map((f) => (
-              <li key={`${f.host}:${f.text}`}>
-                {f.port ? (
-                  <button className="link" onClick={() => setPort(f.port)} title="Edit this port">
-                    {f.text}
-                  </button>
-                ) : (
-                  f.text
-                )}{' '}
-                <span className="muted">({f.host})</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      )}
-      <div className="section">
-        <h4>
-          Ports{' '}
-          <label className="inline">
-            <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> show all {sw.ports.length}
-          </label>
-        </h4>
-        <table className="ports">
-          <thead>
-            <tr>
-              <th>Port</th>
-              <th>Config</th>
-              <th>Link</th>
-              <th>Rx / Tx</th>
-              <th>Host</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.map((p) => {
-              const link = linkOf(p)
-              const l = load.get(p.port)
-              const peer = peers.get(p.port)
-              return (
-                <tr key={p.port} className={p.port === port ? 'selected' : ''}>
-                  <td>
-                    <button className="link" onClick={() => setPort(p.port)} title="Edit this port">
-                      {p.port}
+    <DetailPane
+      label={`switch ${id}`}
+      title={id}
+      status={<span className={`pill ${unreachable ? 'bad' : 'ok'}`}>{unreachable ? 'not answering' : 'answering'}</span>}
+      subtitle={
+        <>
+          {sw.model} · {cabled} of {sw.ports.length} ports cabled
+          {sw.mlag_peer ? ` · MLAG peer ${sw.mlag_peer}` : ''} · last seen {formatClock(sw.last_seen)}
+        </>
+      }
+      tabs={tabs}
+      tab={tab}
+      onTab={onTab}
+      onClose={onClose}
+    >
+      {(t) =>
+        t === 'fixes' ? (
+          fixes.length === 0 ? (
+            <p className="muted">Nothing to fix: the hosts cabled here agree with their ports.</p>
+          ) : (
+            <ul className="fixes">
+              {fixes.map((f) => (
+                <li key={`${f.host}:${f.text}`}>
+                  {f.port ? (
+                    <button className="link" onClick={() => pick(f.port!)} title="Edit this port">
+                      {f.text}
                     </button>
-                  </td>
-                  <td>
-                    {describeMode(p.cfg.mode)}, mtu {p.cfg.mtu}
-                    {p.cfg.lacp_group ? `, lacp ${p.cfg.lacp_group}` : ''}
-                  </td>
-                  <td className={`num ${link.cls}`}>{link.text}</td>
-                  <td className="num">{l ? `${formatBps(l.rx_bps)} / ${formatBps(l.tx_bps)}` : '-'}</td>
-                  <td>
-                    {peer ? (
-                      <button className="link" onClick={() => onSelectHost(peer.host.id)}>
-                        {peer.host.id}
-                      </button>
-                    ) : p.neighbor ? (
-                      <button className="link" onClick={() => onSelectSwitch(p.neighbor!.switch)}>
-                        {p.neighbor.switch}
-                      </button>
-                    ) : (
-                      ''
+                  ) : (
+                    f.text
+                  )}{' '}
+                  <span className="muted">({f.host})</span>
+                </li>
+              ))}
+            </ul>
+          )
+        ) : (
+          <div className="split">
+            <div>
+              <div className="toolbar">
+                <label className="inline">
+                  <input type="checkbox" checked={showAll} onChange={(e) => setShowAll(e.target.checked)} /> show all {sw.ports.length} ports
+                </label>
+                <span className="muted">Ports show the last poll.</span>
+              </div>
+              <div className="table-wrap">
+                <table className="grid-table compact">
+                  <thead>
+                    <tr>
+                      <th>Port</th>
+                      <th>Config</th>
+                      <th>Link</th>
+                      <th className="num">Rx / Tx</th>
+                      <th>Peer</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((p) => {
+                      const link = linkOf(p)
+                      const l = load.get(p.port)
+                      const peer = peers.get(p.port)
+                      return (
+                        <tr key={p.port} className={`clickable${p.port === port ? ' selected' : ''}`} onClick={() => setPort(p.port)} title="Edit this port">
+                          <td>
+                            <strong>{p.port}</strong>
+                          </td>
+                          <td>
+                            {describeMode(p.cfg.mode)}, mtu {p.cfg.mtu}
+                            {p.cfg.lacp_group ? `, lacp ${p.cfg.lacp_group}` : ''}
+                          </td>
+                          <td className={`num ${link.cls}`}>{link.text}</td>
+                          <td className="num">{l ? `${formatBps(l.rx_bps)} / ${formatBps(l.tx_bps)}` : '-'}</td>
+                          <td onClick={(e) => e.stopPropagation()}>
+                            {peer ? (
+                              <button className="link" onClick={() => onSelectHost(peer.host.id)}>
+                                {peer.host.id}
+                              </button>
+                            ) : p.neighbor ? (
+                              <button className="link" onClick={() => onSelectSwitch(p.neighbor!.switch)}>
+                                {p.neighbor.switch}
+                              </button>
+                            ) : (
+                              ''
+                            )}
+                            {peer && <span className="muted"> {peer.nic}</span>}
+                            {p.neighbor && <span className="muted"> {p.neighbor.port}</span>}
+                          </td>
+                        </tr>
+                      )
+                    })}
+                    {rows.length === 0 && (
+                      <tr>
+                        <td colSpan={5} className="muted">
+                          No cabled or busy ports.
+                        </td>
+                      </tr>
                     )}
-                    {peer && <span className="muted"> {peer.nic}</span>}
-                    {p.neighbor && <span className="muted"> {p.neighbor.port}</span>}
-                  </td>
-                </tr>
-              )
-            })}
-            {rows.length === 0 && (
-              <tr>
-                <td colSpan={5} className="muted">
-                  No cabled or busy ports.
-                </td>
-              </tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+            {editing ? (
+              // Re-mount when the switch reports a different config for the port.
+              <PortEditor key={`${id}:${editing.port}:${JSON.stringify(editing.cfg)}`} switchId={id} port={editing.port} cfg={editing.cfg} />
+            ) : (
+              <Card title="Edit a port">
+                <p className="muted">Pick a port to edit its config. The change is made on the switch as a technician would; the control plane sees it at its next poll.</p>
+              </Card>
             )}
-          </tbody>
-        </table>
-      </div>
-      {editing ? (
-        // Re-mount when the switch reports a different config for the port.
-        <PortEditor key={`${id}:${editing.port}:${JSON.stringify(editing.cfg)}`} switchId={id} port={editing.port} cfg={editing.cfg} />
-      ) : (
-        <p className="muted">Pick a port to edit its config.</p>
-      )}
-    </aside>
+          </div>
+        )
+      }
+    </DetailPane>
   )
 }

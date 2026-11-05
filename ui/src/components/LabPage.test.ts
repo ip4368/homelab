@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { MISTAKES, mistakeOf, partitionOf } from './LabPanel'
+import { MISTAKES, mistakeOf, partitionOf } from './LabPage'
 
 describe('lab panel forms', () => {
   it('maps each technician mistake choice to the AddVm shape', () => {

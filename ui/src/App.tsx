@@ -1,106 +1,118 @@
 import { useEffect, useState } from 'react'
+import { ActivityPanel } from './components/ActivityPanel'
 import { Dock } from './components/Dock'
-import { LabPanel } from './components/LabPanel'
-import { FleetGrid } from './components/FleetGrid'
-import { HostDrawer } from './components/HostDrawer'
-import { KubeWorkloads } from './components/KubeWorkloads'
+import { HostDetail } from './components/HostDetail'
+import { HostsPage } from './components/HostsPage'
+import { LabPage } from './components/LabPage'
 import { NetworksPage } from './components/NetworksPage'
-import { RightRail } from './components/RightRail'
-import { SwitchDrawer } from './components/SwitchDrawer'
-import { WorkloadDrawer } from './components/WorkloadDrawer'
-import { workloadKey } from './kube'
+import { OverviewPage } from './components/OverviewPage'
+import { Sidebar } from './components/Sidebar'
+import { SwitchDetail } from './components/SwitchDetail'
 import { TopBar } from './components/TopBar'
 import { Topology } from './components/Topology'
+import { WorkloadDetail } from './components/WorkloadDetail'
+import { WorkloadsPage } from './components/WorkloadsPage'
+import { workloadKey } from './kube'
+import { nav, useRoute } from './nav'
+import { usePref } from './prefs'
 import { useStore } from './store'
 
-const VIEWS = ['fleet', 'topology', 'networks', 'workloads'] as const
-type ViewName = (typeof VIEWS)[number]
-const LABELS: Record<ViewName, string> = { fleet: 'Fleet', topology: 'Topology', networks: 'Networks', workloads: 'Workloads' }
+/** Under this width the navigation starts as icons. */
+const NARROW = 1100
 
-/** The view named by the URL hash (`#topology`), so a link can open it directly. */
-function viewFromHash(hash: string): ViewName {
-  return VIEWS.find((v) => `#${v}` === hash) ?? 'fleet'
+/** Keys typed into a field, or with a dialog open, are not shortcuts. */
+function typing(e: KeyboardEvent): boolean {
+  const t = e.target as HTMLElement | null
+  return !!t && (t.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(t.tagName) || !!t.closest('.xterm, .modal'))
 }
 
+/**
+ * The page: navigation on the left, a header with the cluster's health, the
+ * page's list with the detail pane beside it, the activity panel on the
+ * right, and the dock of logs and terminals along the bottom.
+ */
 export default function App() {
-  const [view, setView] = useState<ViewName>(() => viewFromHash(location.hash))
-  const [host, setHost] = useState<string | null>(null)
-  const [sw, setSwitch] = useState<string | null>(null)
-  const [workload, setWorkload] = useState<string | null>(null)
+  const route = useRoute()
+  const [collapsed, setCollapsed] = usePref('navCollapsed', window.innerWidth < NARROW)
+  const [activity, setActivity] = usePref('activityOpen', false)
+  const [navOpen, setNavOpen] = useState(false)
   // `?truth` in the URL opens with the overlay on, so a link can show it.
   const [showTruth, setShowTruth] = useState(() => new URLSearchParams(location.search).has('truth'))
-  const hostExists = useStore((s) => host !== null && host in s.view.hosts)
-  const switchExists = useStore((s) => sw !== null && sw in s.view.switches)
-  const workloadExists = useStore((s) => workload !== null && s.kube.workloads.some((w) => workloadKey(w) === workload))
-  // A removed host, switch or workload must not stay selected.
+  const open = route.open
+  const exists = useStore((s) =>
+    open === null ? true : open.kind === 'host' ? open.id in s.view.hosts : open.kind === 'switch' ? open.id in s.view.switches : s.kube.at === 0 || s.kube.workloads.some((w) => workloadKey(w) === open.id),
+  )
+  const synced = useStore((s) => s.view.version > 0)
+  // A removed host, switch or workload must not stay open.
   useEffect(() => {
-    if (host !== null && !hostExists) setHost(null)
-  }, [host, hostExists])
-  useEffect(() => {
-    if (sw !== null && !switchExists) setSwitch(null)
-  }, [sw, switchExists])
-  useEffect(() => {
-    if (workload !== null && !workloadExists) setWorkload(null)
-  }, [workload, workloadExists])
-  // The switch drawer belongs to the topology view, the workload drawer to the workloads view.
-  useEffect(() => {
-    if (view !== 'topology') setSwitch(null)
-    if (view !== 'workloads') setWorkload(null)
-  }, [view])
-  useEffect(() => {
-    const onHash = () => setView(viewFromHash(location.hash))
-    window.addEventListener('hashchange', onHash)
-    return () => window.removeEventListener('hashchange', onHash)
-  }, [])
+    if (open && synced && !exists) nav.close()
+  }, [open, exists, synced])
+  useEffect(() => setNavOpen(false), [route.page])
 
-  // One drawer at a time.
-  const selectHost = (id: string) => {
-    setHost(id)
-    setSwitch(null)
-    setWorkload(null)
-  }
-  const selectSwitch = (id: string) => {
-    setSwitch(id)
-    setHost(null)
-  }
-  const selectWorkload = (key: string) => {
-    setWorkload(key)
-    setHost(null)
-  }
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (typing(e)) return
+      if (e.key === 'Escape' && document.querySelector('.menu, .modal-backdrop') === null) {
+        if (route.open) nav.close()
+      }
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [route.open])
+
+  const page =
+    route.page === 'hosts' ? (
+      <HostsPage selected={open?.kind === 'host' ? open.id : null} showTruth={showTruth} />
+    ) : route.page === 'workloads' ? (
+      <WorkloadsPage list={route.list} selected={open?.kind === 'workload' ? open.id : null} />
+    ) : route.page === 'topology' ? (
+      <Topology
+        selectedSwitch={open?.kind === 'switch' ? open.id : null}
+        selectedHost={open?.kind === 'host' ? open.id : null}
+        onSelectSwitch={(id) => nav.switch(id)}
+        onSelectHost={(id) => nav.host(id)}
+      />
+    ) : route.page === 'networks' ? (
+      <NetworksPage list={route.list} />
+    ) : route.page === 'lab' ? (
+      <LabPage />
+    ) : (
+      <OverviewPage />
+    )
+
+  const pane =
+    open?.kind === 'host' ? (
+      <HostDetail key={open.id} id={open.id} tab={route.tab} onTab={nav.tab} onClose={nav.close} showTruth={showTruth} />
+    ) : open?.kind === 'workload' ? (
+      <WorkloadDetail key={open.id} id={open.id} tab={route.tab} onTab={nav.tab} onClose={nav.close} />
+    ) : open?.kind === 'switch' ? (
+      <SwitchDetail key={open.id} id={open.id} tab={route.tab} onTab={nav.tab} onClose={nav.close} />
+    ) : null
 
   return (
-    <div className="app">
-      <TopBar showTruth={showTruth} onShowTruth={setShowTruth} />
-      <div className="workspace">
-        <div className="center">
-          <nav className="view-switch" aria-label="view">
-            {VIEWS.map((v) => (
-              <button key={v} className={v === view ? 'active' : ''} onClick={() => (location.hash = v)}>
-                {LABELS[v]}
-              </button>
-            ))}
-          </nav>
-          <div className="grid-wrap">
-            <main className="grid-area">
-              {view === 'fleet' ? (
-                <FleetGrid selected={host} showTruth={showTruth} onSelect={selectHost} />
-              ) : view === 'networks' ? (
-                <NetworksPage />
-              ) : view === 'workloads' ? (
-                <KubeWorkloads onSelectHost={selectHost} onSelectWorkload={selectWorkload} />
-              ) : (
-                <Topology selectedSwitch={sw} selectedHost={host} onSelectSwitch={selectSwitch} onSelectHost={selectHost} />
-              )}
-            </main>
-            {host && <HostDrawer key={host} id={host} onClose={() => setHost(null)} />}
-            {view === 'workloads' && workload && <WorkloadDrawer key={workload} id={workload} onClose={() => setWorkload(null)} onSelectHost={selectHost} />}
-            {view === 'topology' && sw && <SwitchDrawer key={sw} id={sw} onClose={() => setSwitch(null)} onSelectHost={selectHost} onSelectSwitch={selectSwitch} />}
-          </div>
-          <LabPanel selected={host} />
+    <div className={`app${collapsed ? ' nav-collapsed' : ''}${navOpen ? ' nav-open' : ''}${activity ? ' activity-open' : ''}`}>
+      <Banner />
+      <Sidebar page={route.page} collapsed={collapsed} onCollapse={setCollapsed} showTruth={showTruth} onShowTruth={setShowTruth} />
+      {navOpen && <div className="scrim" onClick={() => setNavOpen(false)} />}
+      <div className="main">
+        <TopBar page={route.page} onMenu={() => setNavOpen(!navOpen)} activityOpen={activity} onActivity={() => setActivity(!activity)} />
+        <div className={`content${pane ? ' with-pane' : ''}`}>
+          <main className={`page page-${route.page}`}>{page}</main>
+          {pane}
         </div>
-        <RightRail onSelect={selectHost} showTruth={showTruth} />
       </div>
+      {activity && <ActivityPanel showTruth={showTruth} onClose={() => setActivity(false)} />}
       <Dock />
+    </div>
+  )
+}
+
+function Banner() {
+  const connection = useStore((s) => s.connection)
+  if (connection !== 'cp-unavailable') return null
+  return (
+    <div className="banner" role="alert">
+      control plane unavailable — reconnecting
     </div>
   )
 }

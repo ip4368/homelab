@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { SwitchPortCfg } from '../gen/SwitchPortCfg'
-import { cfgFromForm, describeMode, formFromCfg } from './SwitchDrawer'
+import { cfgFromForm, describeMode, formFromCfg } from './SwitchDetail'
 
 const trunk: SwitchPortCfg = { mode: { Trunk: { native: 1, allowed: [1, 20] } }, mtu: 9000, lacp_group: 'g1', admin_up: true }
 

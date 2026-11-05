@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { alertAction } from './RightRail'
+import { alertAction } from './ActivityPanel'
 
 describe('alert actions', () => {
   it('names the replacement an alert suggests', () => {

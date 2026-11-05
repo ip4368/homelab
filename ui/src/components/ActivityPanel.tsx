@@ -7,6 +7,8 @@ import { useStore } from '../store'
 import { formatClock } from '../clock'
 import { RolePicker } from './RolePicker'
 import { useAction } from './useAction'
+import { Icon } from './Icons'
+import { nav } from '../nav'
 
 type Tab = 'Alerts' | 'Events' | 'Pending joins'
 const TABS: Tab[] = ['Alerts', 'Events', 'Pending joins']
@@ -26,7 +28,7 @@ export function alertAction(action: ApiOp): { label: string; confirm: string } {
 }
 
 /** The button for an open alert's suggested op, with its error beside it. */
-function AlertAction({ action }: { action: ApiOp }) {
+export function AlertAction({ action }: { action: ApiOp }) {
   const { error, busy, run } = useAction()
   const { label, confirm } = alertAction(action)
   return (
@@ -97,9 +99,9 @@ function SplitBrain() {
   )
 }
 
-function Events() {
+export function Events({ limit = EVENTS_SHOWN }: { limit?: number }) {
   const events = useStore((s) => s.view.events)
-  const shown = useMemo(() => events.slice(-EVENTS_SHOWN).reverse(), [events])
+  const shown = useMemo(() => events.slice(-limit).reverse(), [events, limit])
   if (shown.length === 0) return <p className="muted">No events.</p>
   return (
     <ul className="rail-list">
@@ -194,7 +196,11 @@ function PendingJoins({ onSelect }: { onSelect(id: string): void }) {
   )
 }
 
-export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void; showTruth: boolean }) {
+/**
+ * The activity panel at the right, opened from the header's bell: alerts
+ * (with the fix one suggests), the event log, and hosts waiting to join.
+ */
+export function ActivityPanel({ showTruth, onClose }: { showTruth: boolean; onClose(): void }) {
   const [tab, setTab] = useState<Tab>('Alerts')
   const activeAlerts = useStore((s) => s.view.alerts)
   const hosts = useStore((s) => s.view.hosts)
@@ -206,17 +212,24 @@ export function RightRail({ onSelect, showTruth }: { onSelect(id: string): void;
     }),
     [activeAlerts, hosts],
   )
+  const onSelect = (id: string) => nav.host(id)
   return (
-    <aside className="rail">
-      <div className="tabs" role="tablist">
-        {TABS.map((t) => (
-          <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
-            {t}
-            {counts[t] > 0 && ` (${counts[t]})`}
-          </button>
-        ))}
+    <aside className="activity" aria-label="activity">
+      <div className="activity-head">
+        <div className="seg" role="tablist">
+          {TABS.map((t) => (
+            <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
+              {t === 'Pending joins' ? 'Joins' : t}
+              {counts[t] > 0 && <span className="count">{counts[t]}</span>}
+            </button>
+          ))}
+        </div>
+        <div className="spacer" />
+        <button className="icon-button" onClick={onClose} aria-label="close activity">
+          <Icon name="close" />
+        </button>
       </div>
-      <div className="rail-body">
+      <div className="activity-body">
         {tab === 'Alerts' && showTruth && <SplitBrain />}
         {tab === 'Alerts' && <Alerts onSelect={onSelect} />}
         {tab === 'Events' && <Events />}

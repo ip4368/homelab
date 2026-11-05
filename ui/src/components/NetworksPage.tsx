@@ -13,6 +13,7 @@ import { useStore } from '../store'
 import { ConfigForm } from './NetworkEditor'
 import { RolloutDialog } from './RolloutDialog'
 import { useAction } from './useAction'
+import { nav } from '../nav'
 
 const TABS = ['Networks', 'Templates', 'Auto-approve rules'] as const
 type Tab = (typeof TABS)[number]
@@ -130,7 +131,8 @@ function NetworksTab({ onRollout }: { onRollout(c: Change): void }) {
   const ids = Object.keys(networks).sort()
   return (
     <div>
-      <table className="ports data">
+      <div className="table-wrap card flush">
+      <table className="grid-table">
         <thead>
           <tr>
             <th>Network</th>
@@ -154,6 +156,7 @@ function NetworksTab({ onRollout }: { onRollout(c: Change): void }) {
           )}
         </tbody>
       </table>
+      </div>
       <div className="actions">
         <button onClick={() => setEditing('new')}>New network</button>
       </div>
@@ -290,7 +293,8 @@ function TemplatesTab({ onRollout }: { onRollout(c: Change): void }) {
   }
   return (
     <div>
-      <table className="ports data">
+      <div className="table-wrap card flush">
+      <table className="grid-table">
         <thead>
           <tr>
             <th>Template</th>
@@ -314,6 +318,7 @@ function TemplatesTab({ onRollout }: { onRollout(c: Change): void }) {
           )}
         </tbody>
       </table>
+      </div>
       <div className="actions">
         <button
           onClick={() => {
@@ -418,7 +423,8 @@ function RulesTab() {
   const rows = Object.values(rules).sort((a, b) => a.id.localeCompare(b.id))
   return (
     <div>
-      <table className="ports data">
+      <div className="table-wrap card flush">
+      <table className="grid-table">
         <thead>
           <tr>
             <th>Rule</th>
@@ -441,6 +447,7 @@ function RulesTab() {
           )}
         </tbody>
       </table>
+      </div>
       <div className="actions">
         <button onClick={() => setEditing({ existing: false, draft: { id: '', profile: 'Ms01', roles: ['Compute'], template: '' } })}>New rule</button>
       </div>
@@ -449,18 +456,21 @@ function RulesTab() {
   )
 }
 
-export function NetworksPage() {
-  const [tab, setTab] = useState<Tab>('Networks')
+const LIST: Record<Tab, string | null> = { Networks: null, Templates: 'templates', 'Auto-approve rules': 'rules' }
+
+/** Logical networks, network templates and auto-approve rules, one at a time; `list` (from the URL) picks which. */
+export function NetworksPage({ list }: { list: string | null }) {
+  const tab: Tab = TABS.find((t) => LIST[t] === list) ?? 'Networks'
   const [change, setChange] = useState<Change | null>(null)
   const [showRollouts, setShowRollouts] = useState(false)
   const rollouts = useStore((s) => s.view.rollouts)
   const active = Object.values(rollouts).filter((r) => r.state !== 'Done' && r.state !== 'Aborted').length
   return (
     <section className="networks-page">
-      <div className="fleet-bar">
-        <div className="tabs inline-tabs" role="tablist">
+      <div className="toolbar">
+        <div className="seg" role="tablist">
           {TABS.map((t) => (
-            <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => setTab(t)}>
+            <button key={t} role="tab" aria-selected={t === tab} className={t === tab ? 'active' : ''} onClick={() => nav.list(LIST[t])}>
               {t}
             </button>
           ))}

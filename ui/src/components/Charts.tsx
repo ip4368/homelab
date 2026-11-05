@@ -179,7 +179,7 @@ export function Charts({
   return (
     <div className="charts">
       <div className="charts-head">
-        <h4>{title}</h4>
+        {title && <h4>{title}</h4>}
         {view.reply && <span className="muted">{metricsSince(view.reply.since)}</span>}
         {view.note && (
           <span className="warn" role="status">
@@ -187,7 +187,7 @@ export function Charts({
           </span>
         )}
       </div>
-      <div className={row ? 'charts-row' : 'charts-col'}>
+      <div className={row ? 'charts-row' : 'charts-grid'}>
         {charts.map((spec, i) => (
           <figure key={spec.title} className="chart">
             <figcaption>{spec.title}</figcaption>

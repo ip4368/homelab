@@ -9,11 +9,11 @@ export function Hosts({ hosts, onSelectHost }: { hosts: string[]; onSelectHost(i
   return (
     <>
       {hosts.map((h, n) => (
-        <span key={h}>
-          {n > 0 && ', '}
+        <span key={h} className="host-link">
           <button className="link" onClick={() => onSelectHost(h)}>
             {h}
           </button>
+          {n < hosts.length - 1 && ','}
         </span>
       ))}
     </>

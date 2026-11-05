@@ -6,9 +6,16 @@ import type { HostObj } from '../gen/HostObj'
 import type { KubeRole } from '../gen/KubeRole'
 import type { NicState } from '../gen/NicState'
 import type { Role } from '../gen/Role'
-import { podTone, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
+import type { KubePod } from '../gen/KubePod'
+import { age, cpu, mem, podTone, podWhy, podsOn, podsToDrain, removeHostPrompt, SYSTEM_NAMESPACES } from '../kube'
+import { nav } from '../nav'
 import { store, useStore, type Store } from '../store'
 import { Charts } from './Charts'
+import { Card, DetailPane, type PaneTab } from './DetailPane'
+import { Usage } from './KubeBits'
+import { MachineControls } from './LabPage'
+import { Menu } from './Menu'
+import { PodButtons } from './PodButtons'
 import { downVoters, HandoffDialog, handoffChoices, isDown } from './HandoffDialog'
 import { NetworkEditor } from './NetworkEditor'
 import { ReplaceDialog, replaceChoices } from './ReplaceDialog'
@@ -84,7 +91,6 @@ function Inventory({ host }: { host: HostObj }) {
   )
 }
 
-const MAX_LISTED = 12
 
 /** One line on the host's Kubernetes node, from what its agent reports. */
 export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'warn' | 'bad' | 'muted' } {
@@ -107,17 +113,15 @@ export function kubeSummary(k: HostObj['kube']): { text: string; tone: 'ok' | 'w
   return { text: `${role} ${k.version}, node ${k.node_ready ? 'Ready' : 'not Ready'}${disks}${etcd}`, tone: k.node_ready && !etcd ? 'ok' : 'warn' }
 }
 
-function Kubernetes({ host }: { host: HostObj }) {
+function Kubernetes({ host, pods, onPods }: { host: HostObj; pods: KubePod[]; onPods(): void }) {
   const { text, tone } = kubeSummary(host.kube)
-  const kube = useStore((s) => s.kube)
-  const pods = useMemo(() => podsOn(kube, host.id), [kube, host.id])
   // Your workloads first; K3s's and Longhorn's own pods are summed up.
   const apps = pods.filter((p) => !SYSTEM_NAMESPACES.includes(p.namespace))
   const system = pods.length - apps.length
   const left = podsToDrain(pods).length
+  const troubled = pods.filter((p) => podTone(p) === 'bad' || podTone(p) === 'warn').length
   return (
-    <div className="section">
-      <h4>Kubernetes</h4>
+    <Card title="Kubernetes">
       <p className={tone}>{text}</p>
       {host.lifecycle === 'Draining' && (
         <p className="drain-progress" role="status">
@@ -126,24 +130,109 @@ function Kubernetes({ host }: { host: HostObj }) {
       )}
       {host.lifecycle === 'Drained' && <p className="ok">Drained: node cordoned, only DaemonSet pods run here.</p>}
       {host.lifecycle === 'Cordoned' && <p className="muted">Cordoned: no new pods are scheduled here.</p>}
-      {pods.length > 0 && (
-        <p>
-          {apps.slice(0, MAX_LISTED).map((p, n) => (
-            <span key={`${p.namespace}/${p.name}`} title={`${p.namespace}/${p.name}: ${p.status}`}>
-              {n > 0 && ', '}
-              <span className={podTone(p)}>{p.name}</span>
-            </span>
-          ))}
-          {apps.length > MAX_LISTED && <span className="muted"> and {apps.length - MAX_LISTED} more</span>}
-          {system > 0 && (
-            <span className="muted">
-              {apps.length > 0 ? ', and ' : ''}
-              {system} K3s and Longhorn pod{system === 1 ? '' : 's'}
-            </span>
-          )}
-        </p>
-      )}
-    </div>
+      <div className="kpis">
+        <button className="kpi" onClick={onPods}>
+          <span className="kpi-value">{apps.length}</span>
+          <span className="kpi-label">your pods</span>
+        </button>
+        <button className="kpi" onClick={onPods}>
+          <span className="kpi-value muted">{system}</span>
+          <span className="kpi-label">K3s and Longhorn pods</span>
+        </button>
+        <button className="kpi" onClick={onPods}>
+          <span className={`kpi-value ${troubled ? 'warn' : 'muted'}`}>{troubled}</span>
+          <span className="kpi-label">not running well</span>
+        </button>
+      </div>
+    </Card>
+  )
+}
+
+/** The pods on a host, yours first, with their logs and shells. */
+function HostPods({ pods }: { pods: KubePod[] }) {
+  const now = useStore((s) => s.clock.now)
+  const [system, setSystem] = useState(false)
+  const shown = useMemo(
+    () =>
+      pods
+        .filter((p) => system || !SYSTEM_NAMESPACES.includes(p.namespace))
+        .sort((a, b) => Number(SYSTEM_NAMESPACES.includes(a.namespace)) - Number(SYSTEM_NAMESPACES.includes(b.namespace)) || a.namespace.localeCompare(b.namespace) || a.name.localeCompare(b.name)),
+    [pods, system],
+  )
+  const hidden = pods.length - pods.filter((p) => !SYSTEM_NAMESPACES.includes(p.namespace)).length
+  return (
+    <>
+      <div className="toolbar">
+        <label className="inline">
+          <input type="checkbox" checked={system} onChange={(e) => setSystem(e.target.checked)} /> show K3s, Longhorn and KubeVirt ({hidden})
+        </label>
+      </div>
+      <div className="table-wrap">
+        <table className="grid-table">
+          <thead>
+            <tr>
+              <th>Pod</th>
+              <th>Status</th>
+              <th className="num">CPU</th>
+              <th className="num">Memory</th>
+              <th className="num hide-narrow">Age</th>
+              <th />
+            </tr>
+          </thead>
+          <tbody>
+            {shown.map((p) => {
+              const owner = p.owner ? `${p.namespace}/${p.owner}` : null
+              return (
+                <tr key={`${p.namespace}/${p.name}`}>
+                  <td>
+                    <div className="cell-title">{p.name}</div>
+                    <div className="cell-sub">
+                      {p.namespace}
+                      {owner && (
+                        <>
+                          {' · '}
+                          <button className="link" onClick={() => nav.workload(owner)}>
+                            {p.owner}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </td>
+                  <td>
+                    <span className={`pill ${podTone(p)}`} title={podWhy(p)}>
+                      {p.status}
+                    </span>
+                    {p.restarts > 0 && (
+                      <span className="warn">
+                        {' '}
+                        {p.restarts} restart{p.restarts === 1 ? '' : 's'}
+                      </span>
+                    )}
+                  </td>
+                  <td className="num">
+                    <Usage used={p.cpu_milli} limit={p.cpu_limit_milli} format={cpu} />
+                  </td>
+                  <td className="num">
+                    <Usage used={p.memory_bytes} limit={p.memory_limit_bytes} format={mem} />
+                  </td>
+                  <td className="num muted hide-narrow">{age(p.created, now)}</td>
+                  <td className="row-actions">
+                    <PodButtons pod={p} />
+                  </td>
+                </tr>
+              )
+            })}
+            {shown.length === 0 && (
+              <tr>
+                <td colSpan={6} className="muted">
+                  No pods{hidden > 0 && !system ? ' of yours' : ''} here.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </>
   )
 }
 
@@ -199,8 +288,7 @@ function ControlPlane({ host }: { host: HostObj }) {
   const replaceable = useMemo(() => replaceChoices(host, cp, hosts), [host, cp, hosts])
   const down = downVoters(cp, hosts)
   return (
-    <div className="section">
-      <h4>Control plane</h4>
+    <Card title="Control plane">
       <p className={voter ? 'ok' : 'muted'}>
         {voter ? 'Voter: runs a control-plane replica and a K3s server (API + etcd).' : reason ? `Cannot join: ${reason}.` : 'Not a voter.'}
       </p>
@@ -248,7 +336,7 @@ function ControlPlane({ host }: { host: HostObj }) {
       )}
       {open === 'handoff' && <HandoffDialog host={host} onClose={() => setOpen(null)} />}
       {open === 'replace' && <ReplaceDialog host={host} onClose={() => setOpen(null)} />}
-    </div>
+    </Card>
   )
 }
 
@@ -260,8 +348,8 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
   const submit = () =>
     run(() => op(pending ? { ApproveHost: { id: host.id, roles } } : { SetRoles: { id: host.id, roles } }))
   return (
-    <div className="section">
-      <h4>Roles</h4>
+    <Card title="Roles">
+      <p className="muted">What the host runs: control plane, Longhorn storage, workloads, VMs, transcoding. The server refuses roles the hardware cannot take.</p>
       <RolePicker profile={host.profile} value={roles} onChange={setRoles} />
       <div className="actions">
         <button onClick={submit} disabled={disabled || busy || (!pending && sameRoles(roles, host.roles))}>
@@ -269,71 +357,143 @@ function RolesEditor({ host, disabled = false }: { host: HostObj; disabled?: boo
         </button>
         {error && <span className="bad">{error}</span>}
       </div>
-    </div>
+    </Card>
   )
 }
 
-export function HostDrawer({ id, onClose }: { id: string; onClose(): void }) {
-  const host = useStore((s) => s.view.hosts[id])
-  const kube = useStore((s) => s.kube)
-  const { error, busy, run } = useAction()
-  if (!host) return null
+const LIFECYCLE_TONE: Record<HostObj['lifecycle'], string> = {
+  Ready: 'ok',
+  NotReady: 'bad',
+  Pending: 'warn',
+  Approved: 'warn',
+  Provisioning: 'warn',
+  Cordoned: 'purple',
+  Draining: 'purple',
+  Drained: 'purple',
+  Removed: 'muted',
+}
 
+export function lifecycleTone(l: HostObj['lifecycle']): string {
+  return LIFECYCLE_TONE[l]
+}
+
+/** Cordon, Drain, Uncordon, Cancel drain and Remove, as the host's lifecycle allows. */
+function LifecycleActions({ host, pods }: { host: HostObj; pods: KubePod[] }) {
+  const { error, busy, run } = useAction()
   const remove = () => {
     // Removal is permanent: say what still runs here.
-    if (window.confirm(removeHostPrompt(host.id, podsOn(kube, host.id)))) {
-      run(() => op({ RemoveHost: { id: host.id } }))
-    }
+    if (window.confirm(removeHostPrompt(host.id, pods))) run(() => op({ RemoveHost: { id: host.id } }))
   }
-
-  const lifecycleButton = (label: string, show: boolean, o: Parameters<typeof op>[0]) =>
-    show && (
-      <button onClick={() => run(() => op(o))} disabled={busy}>
-        {label}
-      </button>
-    )
-
+  const l = host.lifecycle
   return (
-    <aside className="drawer host-drawer" aria-label={`host ${host.id}`}>
-      <div className="drawer-head">
-        <h3>{host.id}</h3>
-        <span className={`lifecycle lc-${host.lifecycle}`}>{host.lifecycle}</span>
-        <div className="spacer" />
-        <button onClick={onClose} aria-label="close">
-          ×
+    <>
+      {l === 'Ready' && (
+        <button onClick={() => run(() => op({ Cordon: { id: host.id } }))} disabled={busy} title="No new pods are scheduled here">
+          Cordon
         </button>
-      </div>
-      <Inventory host={host} />
-      <Kubernetes host={host} />
-      <ControlPlane host={host} />
-      <div className="section">
-        <h4>Lifecycle</h4>
-        <div className="actions">
-          {lifecycleButton('Cordon', host.lifecycle === 'Ready', { Cordon: { id: host.id } })}
-          <button
-            onClick={() => run(() => op({ Drain: { host: host.id } }))}
-            disabled={busy || (host.lifecycle !== 'Ready' && host.lifecycle !== 'Cordoned')}
-            title="Cordon this host's Kubernetes node and evict its pods (kubectl drain)"
-          >
-            Drain
-          </button>
-          {lifecycleButton('Uncordon', host.lifecycle === 'Cordoned' || host.lifecycle === 'Drained', { Uncordon: { id: host.id } })}
-          {lifecycleButton('Cancel drain', host.lifecycle === 'Draining', { Uncordon: { id: host.id } })}
-          {host.lifecycle !== 'Removed' && (
-            <button onClick={remove} disabled={busy}>
-              Remove
-            </button>
+      )}
+      {(l === 'Ready' || l === 'Cordoned') && (
+        <button onClick={() => run(() => op({ Drain: { host: host.id } }))} disabled={busy} title="Cordon this host's Kubernetes node and evict its pods (kubectl drain)">
+          Drain
+        </button>
+      )}
+      {(l === 'Cordoned' || l === 'Drained') && (
+        <button onClick={() => run(() => op({ Uncordon: { id: host.id } }))} disabled={busy}>
+          Uncordon
+        </button>
+      )}
+      {l === 'Draining' && (
+        <button onClick={() => run(() => op({ Uncordon: { id: host.id } }))} disabled={busy}>
+          Cancel drain
+        </button>
+      )}
+      {l !== 'Removed' && (
+        <Menu
+          label={`more actions for ${host.id}`}
+          items={[{ label: 'Remove from the cluster…', onClick: remove, danger: true, disabled: busy, title: 'Permanent: the host must join again to come back' }]}
+        />
+      )}
+      {error && <span className="bad">{error}</span>}
+    </>
+  )
+}
+
+/**
+ * One host in the detail pane: what it is and runs (hardware, Kubernetes,
+ * control plane, charts), its pods, network, roles and, in the lab, its
+ * machine's power, cables and disks.
+ */
+export function HostDetail({ id, tab, onTab, onClose, showTruth }: { id: string; tab: string | null; onTab(t: string): void; onClose(): void; showTruth: boolean }) {
+  const host = useStore((s) => s.view.hosts[id])
+  const kube = useStore((s) => s.kube)
+  const leader = useStore((s) => s.view.leader)
+  const voters = useStore((s) => s.view.cp.voters)
+  const inLab = useStore((s) => s.truth.vms.some((v) => v.id === id))
+  const metric = useStore((s) => s.view.metrics[id])
+  const pods = useMemo(() => podsOn(kube, id), [kube, id])
+  if (!host) return null
+  const apps = pods.filter((p) => !SYSTEM_NAMESPACES.includes(p.namespace)).length
+  const tabs: PaneTab[] = [
+    { id: 'overview', label: 'Overview' },
+    { id: 'pods', label: 'Pods', count: apps },
+    { id: 'network', label: 'Network', tone: host.net.state === 'Failed' ? 'bad' : undefined },
+    { id: 'roles', label: 'Roles' },
+    ...(inLab ? [{ id: 'lab', label: 'Lab machine' }] : []),
+  ]
+  return (
+    <DetailPane
+      label={`host ${host.id}`}
+      title={host.id}
+      status={<span className={`pill ${lifecycleTone(host.lifecycle)}`}>{host.lifecycle}</span>}
+      subtitle={
+        <>
+          {host.profile.id} · {host.location}
+          {leader === host.id ? ' · leader, holds the VIP' : voters.includes(host.id) ? ' · control-plane voter' : ''}
+          {metric && (
+            <span className="muted">
+              {' '}
+              · CPU {metric.cpu_pct.toFixed(0)}% · RAM {metric.ram_pct.toFixed(0)}%
+            </span>
           )}
-        </div>
-        {error && <div className="bad">{error}</div>}
-      </div>
-      <div className="section">
-        <Charts entity={`host:${host.id}`} title="Metrics" />
-      </div>
-      {/* Re-mount the editor when the server changes the roles or lifecycle under it. */}
-      <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
-      {/* Re-mount the form when the server changes the config under it, so it does not show a stale draft. */}
-      <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
-    </aside>
+          <span className="role-badges">
+            {host.roles.map((r) => (
+              <span key={r} className="badge">
+                {r}
+              </span>
+            ))}
+          </span>
+        </>
+      }
+      actions={<LifecycleActions host={host} pods={pods} />}
+      tabs={tabs}
+      tab={tab}
+      onTab={onTab}
+      onClose={onClose}
+    >
+      {(t) =>
+        t === 'pods' ? (
+          <HostPods pods={pods} />
+        ) : t === 'network' ? (
+          // Re-mount the form when the server changes the config under it, so it does not show a stale draft.
+          <NetworkEditor key={`${host.id}:${host.net.desired_generation}:${host.override_ !== null}`} host={host} />
+        ) : t === 'roles' ? (
+          // Re-mount the editor when the server changes the roles or lifecycle under it.
+          <RolesEditor key={`${host.id}:${host.lifecycle}:${host.roles.join()}`} host={host} />
+        ) : t === 'lab' ? (
+          <MachineControls vm={host.id} showTruth={showTruth} />
+        ) : (
+          <div className="card-grid">
+            <Card title="Hardware">
+              <Inventory host={host} />
+            </Card>
+            <Kubernetes host={host} pods={pods} onPods={() => onTab('pods')} />
+            <ControlPlane host={host} />
+            <Card title="Metrics" className="span-all">
+              <Charts entity={`host:${host.id}`} title="" />
+            </Card>
+          </div>
+        )
+      }
+    </DetailPane>
   )
 }
