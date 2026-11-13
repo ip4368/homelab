@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { Terminal as XTerm } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
+import { SESSION_ENDED } from '../auth'
 import { resizeFrame, terminalNotice } from '../debug'
 
 /**
@@ -45,7 +46,7 @@ export function Terminal({ url, title, onClose }: { url: string; title: string; 
         term.write(new Uint8Array(e.data))
       }
     }
-    socket.onclose = () => setNotice((prev) => prev ?? 'session closed')
+    socket.onclose = (e) => setNotice((prev) => prev ?? (e.code === SESSION_ENDED ? 'logged out: log in again to reopen it' : 'session closed'))
     socket.onerror = () => setNotice((prev) => prev ?? 'the connection failed')
     const dataSub = term.onData((data) => {
       if (socket.readyState === WebSocket.OPEN) socket.send(new TextEncoder().encode(data))

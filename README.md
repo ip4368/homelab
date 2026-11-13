@@ -39,8 +39,8 @@ everything K3s stands on, and supervises K3s; K3s owns everything that runs on i
 | Host metrics; K3s's health: alerts and safe repairs | |
 
 The Workloads tab's changes (applying YAML, scale, restart, delete) come from the UI's server on the user's
-behalf, as kubectl would make them with the admin kubeconfig. homelabd itself still never writes a
-workload.
+behalf, as kubectl would make them with the admin kubeconfig, and only for a logged-in user (each
+change is logged with who made it). homelabd itself still never writes a workload.
 
 The full split, the two kinds of "down" (host NotReady, node not Ready) and how homelabd supervises
 K3s: [docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md](docs/plans/2026-10-29-homelabd-k3s-responsibilities-design.md).
@@ -72,14 +72,34 @@ PORT=18080 ./lab.sh up   # listen on another port (8080 is often taken)
 ```
 
 The server listens on `BIND`:`PORT` (default `127.0.0.1:8080`) and serves the built UI from
-`ui/dist`. The API has no authentication and can power off the lab's VMs and open shells in its
-containers and VMs, so prefer an SSH tunnel
-(`ssh -L 8080:localhost:8080 <host>`) to `BIND=0.0.0.0`.
+`ui/dist`.
+
+**Logging in.** The UI and its API need a login. The first `up` creates the users file
+(`/var/lib/homelab-lab/users.yml`, in the shape of Authelia's file users database, Argon2id
+hashes) with one user, `admin`, and a generated password:
+
+```sh
+./lab.sh password             # the generated admin password
+./lab.sh user passwd admin    # set your own (or add a user); it takes effect without a restart
+./lab.sh user delete alice    # remove a user and end their sessions
+./lab.sh user list
+```
+
+Sessions are an `HttpOnly`, `SameSite=Strict` cookie, last 12 h unused (7 days at most) and end
+when their user's password changes. Wrong passwords are throttled; changes and WebSockets from
+another origin are refused. The server still speaks plain HTTP, and its API can power off the
+lab's VMs and open shells in its containers and VMs, so prefer an SSH tunnel
+(`ssh -L 8080:localhost:8080 <host>`) to `BIND=0.0.0.0`, or put a TLS reverse proxy in front
+(`ALLOWED_ORIGINS=https://homelab.example` if it rewrites `Host`). Design, and the plan for OIDC
+with Authelia: [docs/plans/2026-11-12-login-design.md](docs/plans/2026-11-12-login-design.md).
 
 ## A tour of the UI
 
+**Login:** a user name and password first. If the session ends while the UI is open, a login
+dialog covers it and nothing on screen is lost.
+
 **Top bar:** hosts ready, not ready and pending; the control-plane leader and quorum; open alerts;
-the **Ground truth** checkbox; the lab host's clock.
+the **Ground truth** checkbox; the lab host's clock; who is logged in, and **Log out**.
 
 **Views** (tabs; the URL hash opens one directly, e.g. `#topology`)
 
@@ -121,7 +141,7 @@ without LACP); seed the demo workloads.
 cargo test --workspace                       # all Rust tests
 cd ui && npm test                            # UI unit tests (vitest)
 cd ui && npx tsc -b && npm run build         # type check and production build
-node e2e/lab.e2e.ts [--only K4,K9]           # end to end, against a running lab
+node e2e/lab.e2e.ts [--only K4,K9]           # end to end, against a running lab (logs in as admin; LAB_USER/LAB_PASSWORD)
 ```
 
 ## Repository layout
@@ -143,4 +163,6 @@ node e2e/lab.e2e.ts [--only K4,K9]           # end to end, against a running lab
   when K3s breaks and does not restart a hung K3s (the design above).
 - **Metrics history resets on leader failover.** The UI shows "metrics since …".
 - **Removing a host does not delete its Kubernetes node.** Drain it first.
-- **No real-system concerns.** There is no authentication or multi-user support.
+- **One kind of user.** Everyone who can log in can do everything; there are no roles yet, and
+  no OIDC (planned: Authelia). Sessions live in the server's memory, so restarting it logs
+  everyone out.

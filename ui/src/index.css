@@ -2374,3 +2374,106 @@ textarea {
 
 
 
+
+/* Login */
+.login-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: min(380px, 94vw);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 22px 24px 24px;
+  box-shadow: 0 12px 32px rgba(16, 24, 40, 0.08);
+}
+
+.login-card .nav-brand {
+  margin-bottom: 8px;
+}
+
+/* The brand is styled for the dark sidebar; on the light card it needs the text colours. */
+.login-card .brand-copy strong {
+  color: var(--text);
+}
+
+.login-card .brand-copy small {
+  color: var(--muted);
+}
+
+.login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.login-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.login-form input {
+  font: inherit;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+}
+
+.login-form input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.login-form button[type='submit'] {
+  padding: 7px 10px;
+}
+
+.login-form button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.login-error {
+  color: var(--bad);
+  font-size: 13px;
+}
+
+.login-backdrop {
+  z-index: 100;
+  align-items: center;
+  padding-top: 0;
+}
+
+.login-dialog {
+  width: min(420px, 94vw);
+}
+
+.login-switch {
+  margin-top: 10px;
+  border: none;
+  background: none;
+  color: var(--accent);
+  padding: 0;
+}
+
+.user-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 10px;
+  font-size: 13px;
+}
+
+.user-chip .user-name {
+  font-weight: 600;
+}

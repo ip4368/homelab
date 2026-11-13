@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import type { CpInfo } from '../gen/CpInfo'
 import type { HostObj } from '../gen/HostObj'
+import { auth, useAuth } from '../auth'
 import { formatClock } from '../clock'
 import { useStore } from '../store'
 import { Charts } from './Charts'
@@ -30,6 +31,8 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
   const clock = useStore((s) => s.clock)
   const connection = useStore((s) => s.connection)
   const [monitoring, setMonitoring] = useState(false)
+  const login = useAuth()
+  const user = login.phase === 'in' ? login.session.user : login.phase === 'lost' ? login.user : null
 
   const counts = useMemo(() => {
     const c = { Ready: 0, NotReady: 0, Pending: 0 }
@@ -70,6 +73,12 @@ export function TopBar({ showTruth, onShowTruth }: { showTruth: boolean; onShowT
         <span className="clock" title="lab host time">
           {clock.now === 0 ? '--:--:--' : formatClock(clock.now)}
         </span>
+        {user && (
+          <span className="user-chip" title={`logged in as ${user}`}>
+            <span className="user-name">{user}</span>
+            <button onClick={() => void auth.logout()}>Log out</button>
+          </span>
+        )}
       </div>
       {monitoring && (
         <div className="monitoring">

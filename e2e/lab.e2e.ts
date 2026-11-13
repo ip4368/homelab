@@ -11,9 +11,14 @@
 // network/volume metrics and their history; K13 logs and exec; K14 a lab
 // VM's console, journal and SSH terminal), checked against the cluster's Kubernetes API through the VIP with the
 // admin kubeconfig `GET /api/lab/kubeconfig` hands out (as an admin would
-// get it with `sudo homelabd kubeconfig`).
+// get it with `sudo homelabd kubeconfig`). K15 checks the login in front of
+// all of it.
 //
 //   node e2e/lab.e2e.ts [--only 3a,4]     (LAB_URL defaults to http://127.0.0.1:8080)
+//
+// It logs in as LAB_USER (default admin) with LAB_PASSWORD (default: the
+// generated admin password, read with sudo from
+// $LAB_STATE/initial-admin-password).
 //
 // Criterion 2 racks two new MS-01s each time it runs, and the lab keeps
 // them; `./lab.sh reset` starts over from the first four.
@@ -31,9 +36,44 @@ import type { SwitchPortCfg } from '../ui/src/gen/SwitchPortCfg.ts'
 import type { ApplyReport } from '../ui/src/gen/ApplyReport.ts'
 import type { KubeAction } from '../ui/src/gen/KubeAction.ts'
 import type { KubeView } from '../ui/src/gen/KubeView.ts'
+import type { AuthStatus } from '../ui/src/gen/AuthStatus.ts'
+import { execFileSync } from 'node:child_process'
 import { Kube } from './kube.ts'
 
 const BASE = process.env.LAB_URL ?? 'http://127.0.0.1:8080'
+const USER = process.env.LAB_USER ?? 'admin'
+
+function labPassword(): string {
+  if (process.env.LAB_PASSWORD) return process.env.LAB_PASSWORD
+  const file = `${process.env.LAB_STATE ?? '/var/lib/homelab-lab'}/initial-admin-password`
+  return execFileSync('sudo', ['cat', file], { encoding: 'utf8' }).trim()
+}
+
+/** Logs in: the `Cookie` header value for the new session, or why not. */
+async function login(user: string, password: string): Promise<{ cookie: string } | { status: number; body: string }> {
+  const res = await fetch(`${BASE}/api/auth/login`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ username: user, password }) })
+  const body = await res.text()
+  const set = res.headers.get('set-cookie')
+  if (!res.ok || !set) return { status: res.status, body }
+  return { cookie: set.split(';')[0] }
+}
+
+const session = await login(USER, labPassword())
+if (!('cookie' in session)) throw new Error(`cannot log in to ${BASE} as ${USER}: ${session.status} ${session.body}`)
+const COOKIE = session.cookie
+
+/** `fetch` on the server's API, as the logged-in user. */
+function api(path: string, init: RequestInit = {}, cookie: string | null = COOKIE): Promise<Response> {
+  const headers = new Headers(init.headers)
+  if (cookie) headers.set('cookie', cookie)
+  return fetch(`${BASE}${path}`, { ...init, headers })
+}
+
+/** A WebSocket to the server as the logged-in user (Node's WebSocket takes headers). */
+function socket(url: string, cookie: string | null = COOKIE): WebSocket {
+  const Ctor = WebSocket as unknown as new (url: string, init: { headers: Record<string, string> }) => WebSocket
+  return new Ctor(url, { headers: cookie ? { cookie } : {} })
+}
 
 /** What the e2e run follows of the server's stream. */
 interface Seen {
@@ -56,7 +96,7 @@ class Watcher {
   ready: Promise<void>
 
   constructor() {
-    this.ws = new WebSocket(BASE.replace(/^http/, 'ws') + '/api/ws')
+    this.ws = socket(BASE.replace(/^http/, 'ws') + '/api/ws')
     this.ready = new Promise((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error(`no message from ${BASE}/api/ws in 15 s`)), 15_000)
       this.ws.onerror = () => reject(new Error(`cannot open ${BASE}/api/ws`))
@@ -116,7 +156,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /** Does `f` to the lab's hardware; the machine `AddVm` racked, if that was it. */
 async function fault(f: LabFault): Promise<string | undefined> {
-  const res = await fetch(`${BASE}/api/lab/fault`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(f) })
+  const res = await api(`/api/lab/fault`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(f) })
   if (!res.ok) throw new Error(`fault ${JSON.stringify(f)}: ${res.status} ${await res.text()}`)
   return ((await res.json()) as { vm?: string }).vm
 }
@@ -199,7 +239,7 @@ async function kube(): Promise<Kube> {
   if (kubeClient) return kubeClient
   const deadline = now() + 10 * 60_000
   for (;;) {
-    const res = await fetch(`${BASE}/api/lab/kubeconfig`)
+    const res = await api(`/api/lab/kubeconfig`)
     if (res.ok) return (kubeClient = new Kube(await res.text()))
     if (now() > deadline) throw new Failed(`no kubeconfig: ${res.status} ${await res.text()}`)
     await sleep(5000)
@@ -460,7 +500,7 @@ await step('3c', 'Move the VIP: hand the leadership to a chosen voter', async (n
   const [old, term] = [s0.leader!, s0.term]
   const to = s0.cp.voters.find((v) => v !== old)!
   const nonVoter = [...s0.hosts.keys()].find((h) => !s0.cp.voters.includes(h))
-  const op = (body: unknown) => fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+  const op = (body: unknown) => api(`/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
   if (nonVoter) {
     const refused = await op({ TransferCpLeadership: { to: nonVoter } })
     if (refused.status !== 400) throw new Failed(`moving the VIP to non-voter ${nonVoter}: ${refused.status} ${await refused.text()}`)
@@ -824,12 +864,12 @@ await step('K8', 'Replace a K3s server: power one off, replace it; etcd lists ex
   const off = now()
   await waitFor(`${victim} NotReady`, 90_000, (s) => s.hosts.get(victim)?.lifecycle === 'NotReady')
   // A dead voter is replaced, not handed off (the UI offers only Replace then).
-  const handoff = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ HandOffCp: { from: s0.leader, to: spare } }) })
+  const handoff = await api(`/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ HandOffCp: { from: s0.leader, to: spare } }) })
   const refusal = await handoff.text()
   if (handoff.status !== 400 || !refusal.includes('replace it first')) throw new Failed(`a hand-off while ${victim} is down: ${handoff.status} ${refusal}`)
   note(`a hand-off while ${victim} is down is refused: ${JSON.parse(refusal).error}`)
   // As the CpReplacementSuggested alert and the UI's Replace button offer it; asked for at once here.
-  const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ReplaceCpMember: { dead: victim, with: spare } }) })
+  const res = await api(`/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ReplaceCpMember: { dead: victim, with: spare } }) })
   if (!res.ok) throw new Failed(`ReplaceCpMember: ${res.status} ${await res.text()}`)
   const asked = now()
   note(`${victim} NotReady ${secs(asked - off)} after the power-off; replacing it with ${spare}`)
@@ -871,7 +911,7 @@ await step('K9', 'Drain: a drained host\'s node is cordoned and its pods move of
   const app = `web-${Math.random().toString(36).slice(2, 8)}`
   await k.create('/api/v1/namespaces', { metadata: { name: ns } })
   const op = async (body: unknown) => {
-    const res = await fetch(`${BASE}/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+    const res = await api(`/api/ops`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
     if (!res.ok) throw new Failed(`${JSON.stringify(body)}: ${res.status} ${await res.text()}`)
   }
   let victim: string | null = null
@@ -929,7 +969,7 @@ await step('K10', 'Workload changes: the server applies YAML (preview first), sc
   const workload = { namespace: ns, kind: 'Deployment' as const, name: app }
   /** `POST /api/kube`: the status and the server's error, if any. */
   const act = async (a: KubeAction) => {
-    const res = await fetch(`${BASE}/api/kube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(a) })
+    const res = await api(`/api/kube`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(a) })
     return { status: res.status, error: res.ok ? null : ((await res.json().catch(() => ({}))) as { error?: string }).error ?? res.statusText }
   }
   const must = async (a: KubeAction) => {
@@ -938,7 +978,7 @@ await step('K10', 'Workload changes: the server applies YAML (preview first), sc
   }
   /** `POST /api/kube/apply` that must answer 200: each object's outcome, as `<kind>/<name>=<outcome>`. */
   const apply = async (yaml: string, dry_run: boolean, force = false) => {
-    const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run, force }) })
+    const res = await api(`/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run, force }) })
     if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
     const report = (await res.json()) as ApplyReport
     return report.objects.map((o) => `${o.kind}/${o.name}=${typeof o.outcome === 'string' ? o.outcome : Object.keys(o.outcome)[0]}`).join(' ')
@@ -1001,7 +1041,7 @@ metadata: { name: ${ns} }
     note(`refused: kube-system (${refused.error}); scaling a DaemonSet; a missing workload is Kubernetes' 404 (${missing.error})`)
 
     // Edit YAML: the live Deployment as a manifest, changed and applied again.
-    const res = await fetch(`${BASE}/api/kube/manifest?namespace=${ns}&kind=Deployment&name=${app}`)
+    const res = await api(`/api/kube/manifest?namespace=${ns}&kind=Deployment&name=${app}`)
     const live = await res.text()
     if (!res.ok || !live.includes('replicas: 2') || live.includes('resourceVersion') || live.includes('status:')) throw new Failed(`the manifest to edit: ${res.status} ${live.slice(0, 300)}`)
     // The UI's Scale set replicas through the scale subresource: an edit takes it over, as the Edit YAML dialog does.
@@ -1019,7 +1059,7 @@ metadata: { name: ${ns} }
     expect('taking it over', await apply(settings, false, true), 'ConfigMap/settings=Configured')
     const mode = (await k.must(`/api/v1/namespaces/${ns}/configmaps/settings`)).data.mode
     if (mode !== 'b') throw new Failed(`taken over, but mode is ${mode}`)
-    const intoSystem = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: settings, namespace: 'kube-system', dry_run: true, force: false }) })
+    const intoSystem = await api(`/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: settings, namespace: 'kube-system', dry_run: true, force: false }) })
     if (intoSystem.status !== 400) throw new Failed(`applying into kube-system: ${intoSystem.status}, not refused`)
     note('a field another manager set conflicts until taken over; applying into kube-system is refused')
 
@@ -1089,7 +1129,7 @@ spec:
     spec:
       containers: [{ name: broken, image: "registry.invalid/none:1" }]
 `
-  const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: manifests, namespace: ns, dry_run: false, force: false }) })
+  const res = await api(`/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml: manifests, namespace: ns, dry_run: false, force: false }) })
   if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
   try {
     const workload = (name: string) => watch.seen!.kube.workloads.find((w) => w.namespace === ns && w.name === name)
@@ -1125,7 +1165,7 @@ spec:
 
 /** Opens a WebSocket, sends `send` once open, and collects decoded text until `until` holds (or the deadline). */
 async function wsCollect(url: string, send: string | null, until: (text: string) => boolean, timeoutMs: number): Promise<string> {
-  const ws = new WebSocket(url)
+  const ws = socket(url)
   ws.binaryType = 'arraybuffer'
   let text = ''
   try {
@@ -1162,7 +1202,7 @@ async function wsCollect(url: string, send: string | null, until: (text: string)
 const wsBase = BASE.replace(/^http/, 'ws')
 
 async function applyYaml(yaml: string, ns: string) {
-  const res = await fetch(`${BASE}/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run: false, force: false }) })
+  const res = await api(`/api/kube/apply`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ yaml, namespace: ns, dry_run: false, force: false }) })
   if (!res.ok) throw new Failed(`apply: ${res.status} ${await res.text()}`)
 }
 
@@ -1230,12 +1270,12 @@ spec:
     note(`claim load: ${claim.value.used_bytes} of ${claim.value.capacity_bytes} bytes used (${claim.value.phase})`)
 
     const series = await waitAsync('pod history with a network point', 2 * 60_000, async () => {
-      const r = await fetch(`${BASE}/api/kube/metrics?pod=${ns}/${p.name}&m=cpu_milli,net_rx_bps`)
+      const r = await api(`/api/kube/metrics?pod=${ns}/${p.name}&m=cpu_milli,net_rx_bps`)
       if (!r.ok) return `${r.status} ${await r.text()}`
       const j = (await r.json()) as { since: number; series: Record<string, [number, number][]> }
       return j.series.net_rx_bps?.some(([, v]) => v > 1000) ? j : `net points so far: ${JSON.stringify(j.series.net_rx_bps)}`
     })
-    const wl = await fetch(`${BASE}/api/kube/metrics?workload=${ns}/Deployment/load&m=net_tx_bps`)
+    const wl = await api(`/api/kube/metrics?workload=${ns}/Deployment/load&m=net_tx_bps`)
     if (!wl.ok) throw new Failed(`workload history: ${wl.status} ${await wl.text()}`)
     note(`history since ${series.value.since}: ${series.value.series.net_rx_bps.length} rx points for the pod, and the workload answers too`)
   } finally {
@@ -1290,7 +1330,7 @@ spec:
     const pod = chatty.value.name
 
     const tail = await waitAsync('a log tail with its lines', 60_000, async () => {
-      const r = await fetch(`${BASE}/api/kube/logs?namespace=${ns}&pod=${pod}&container=chatty&tail=50`)
+      const r = await api(`/api/kube/logs?namespace=${ns}&pod=${pod}&container=chatty&tail=50`)
       const body = await r.text()
       return r.ok && body.includes(`k13-${tag}-line-`) ? { body } : `${r.status} ${body.slice(0, 120)}`
     })
@@ -1308,7 +1348,7 @@ spec:
     if (!refused.includes('kubectl')) throw new Failed(`exec into kube-system was not refused as a system namespace: ${refused}`)
     const corePod = watch.seen!.kube.pods.find((x) => x.namespace === 'kube-system' && x.status === 'Running')
     if (corePod) {
-      const lr = await fetch(`${BASE}/api/kube/logs?namespace=kube-system&pod=${corePod.name}&tail=5`)
+      const lr = await api(`/api/kube/logs?namespace=kube-system&pod=${corePod.name}&tail=5`)
       if (!lr.ok) throw new Failed(`logs in kube-system (read-only, allowed): ${lr.status} ${await lr.text()}`)
       note('exec into kube-system refused; its logs still read')
     }
@@ -1318,7 +1358,7 @@ spec:
       return p && p.restarts >= 1 ? p : null
     })
     const prev = await waitAsync('previous-instance logs', 60_000, async () => {
-      const r = await fetch(`${BASE}/api/kube/logs?namespace=${ns}&pod=${crashed.value.name}&container=crasher&previous=true&tail=50`)
+      const r = await api(`/api/kube/logs?namespace=${ns}&pod=${crashed.value.name}&container=crasher&previous=true&tail=50`)
       const body = await r.text()
       return r.ok && body.includes(`k13-${tag}-before-crash`) ? { body } : `${r.status} ${body.slice(0, 120)}`
     })
@@ -1333,18 +1373,18 @@ await step('K14', 'VM debugging: a lab machine serial console, journal, and an S
   if (!vm) throw new Failed('no running lab VM in ground truth')
   const tag = Math.random().toString(36).slice(2, 8)
 
-  const bad = await fetch(`${BASE}/api/lab/journal?vm=${vm}&unit=ssh`)
+  const bad = await api(`/api/lab/journal?vm=${vm}&unit=ssh`)
   if (bad.status !== 400) throw new Failed(`journal for unit ssh: ${bad.status}, not refused`)
-  const badVm = await fetch(`${BASE}/api/lab/console?vm=${encodeURIComponent('../etc')}`)
+  const badVm = await api(`/api/lab/console?vm=${encodeURIComponent('../etc')}`)
   if (badVm.status !== 400) throw new Failed(`console for a bad VM name: ${badVm.status}, not refused`)
 
-  const consoleRes = await fetch(`${BASE}/api/lab/console?vm=${vm}`)
+  const consoleRes = await api(`/api/lab/console?vm=${vm}`)
   if (!consoleRes.ok) throw new Failed(`console: ${consoleRes.status} ${await consoleRes.text()}`)
   const consoleText = await consoleRes.text()
   note(`console of ${vm}: ${consoleText.length} bytes${consoleText ? `, last line "${consoleText.trim().split('\n').pop()?.slice(0, 80)}"` : ' (empty)'}`)
 
   const journal = await waitAsync('homelabd journal over SSH', 2 * 60_000, async () => {
-    const r = await fetch(`${BASE}/api/lab/journal?vm=${vm}&unit=homelabd&lines=20`)
+    const r = await api(`/api/lab/journal?vm=${vm}&unit=homelabd&lines=20`)
     const body = await r.text()
     return r.ok && body.length > 0 ? { body } : `${r.status} ${body.slice(0, 120)}`
   })
@@ -1352,6 +1392,115 @@ await step('K14', 'VM debugging: a lab machine serial console, journal, and an S
 
   const term = await wsCollect(`${wsBase}/api/lab/terminal/ws?vm=${vm}`, `echo k14-${tag}-terminal; exit\n`, (t) => t.includes(`k14-${tag}-terminal`), 90_000)
   note(`terminal: an SSH login to ${vm} echoed the marker (${term.length} bytes seen)`)
+})
+
+await step('K15', 'Login: the API, its sockets and the lab need a session; wrong passwords, other sites and ended sessions are refused; failures are throttled', async (note) => {
+  const tag = Math.random().toString(36).slice(2, 8)
+  const post = (body: unknown, headers: Record<string, string> = {}): RequestInit => ({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, body: JSON.stringify(body) })
+
+  const page = await fetch(`${BASE}/`)
+  if (!page.ok || !(await page.text()).includes('id="root"')) throw new Failed(`the UI page itself should load without a session (it shows the login): ${page.status}`)
+  const anon = (await (await api('/api/auth/session', {}, null)).json()) as AuthStatus
+  if (anon.session !== null || !anon.methods.some((m) => m.kind === 'password')) throw new Failed(`session without a cookie: ${JSON.stringify(anon)}`)
+
+  const vm = watch.seen?.truth.vms.find((v) => v.power === 'Running')?.id
+  if (!vm) throw new Failed('no running lab VM in ground truth')
+  const refusals: [string, Response][] = [
+    ['GET /api/metrics', await api('/api/metrics?entity=fleet&m=cpu_pct', {}, null)],
+    ['GET /api/lab/kubeconfig', await api('/api/lab/kubeconfig', {}, null)],
+    [`POST /api/lab/fault Freeze ${vm}`, await api('/api/lab/fault', post({ Freeze: { vm } }), null)],
+    ['POST /api/kube', await api('/api/kube', post({ Restart: { workload: { namespace: 'demo', kind: 'Deployment', name: 'web' } } }), null)],
+    ['POST /api/ops', await api('/api/ops', post('CreateJoinToken'), null)],
+    ['GET /api/lab/console', await api(`/api/lab/console?vm=${vm}`, {}, null)],
+    ['a forged cookie', await api('/api/metrics?entity=fleet&m=cpu_pct', {}, 'homelab_session=forged-token')],
+  ]
+  const bad = refusals.filter(([, r]) => r.status !== 401).map(([w, r]) => `${w}: ${r.status}`)
+  if (bad.length) throw new Failed(`not refused without a session: ${bad.join('; ')}`)
+  await sleep(1500)
+  if (watch.seen!.truth.vms.find((v) => v.id === vm)?.power !== 'Running') throw new Failed(`${vm} changed power state after a refused Freeze`)
+  note(`without a session: ${refusals.length} API calls answered 401 (${vm} still running); the UI page loads to show its login`)
+
+  const opened = await new Promise<string>((resolve) => {
+    const ws = socket(`${wsBase}/api/ws`, null)
+    const timer = setTimeout(() => resolve('neither opened nor refused in 10 s'), 10_000)
+    ws.onopen = () => {
+      clearTimeout(timer)
+      ws.close()
+      resolve('opened')
+    }
+    ws.onerror = () => {
+      clearTimeout(timer)
+      resolve('refused')
+    }
+  })
+  if (opened !== 'refused') throw new Failed(`the live view's WebSocket without a session: ${opened}`)
+
+  const wrong = await login(USER, `not-the-password-${tag}`)
+  if ('cookie' in wrong || wrong.status !== 401) throw new Failed(`a wrong password: ${JSON.stringify(wrong)}`)
+
+  // A page on another site (or another port) cannot use the browser's cookie to change anything or open a socket.
+  const evil = await api('/api/kube', post({ Restart: { workload: { namespace: 'demo', kind: 'Deployment', name: 'web' } } }, { origin: 'http://evil.example' }))
+  if (evil.status !== 403) throw new Failed(`a cross-site change with a valid cookie: ${evil.status}`)
+  const http = await import('node:http')
+  const evilWs = await new Promise<number | string>((resolve) => {
+    const u = new URL(`${BASE}/api/ws`)
+    const req = http.request({
+      host: u.hostname,
+      port: u.port,
+      path: u.pathname,
+      headers: { connection: 'Upgrade', upgrade: 'websocket', 'sec-websocket-version': '13', 'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==', origin: 'http://127.0.0.1:9', cookie: COOKIE },
+    })
+    req.on('response', (res) => resolve(res.statusCode ?? 0))
+    req.on('upgrade', (_res, sock) => {
+      sock.destroy()
+      resolve('upgraded')
+    })
+    req.on('error', (e) => resolve(String(e)))
+    req.end()
+  })
+  if (evilWs !== 403) throw new Failed(`a cross-site WebSocket with a valid cookie: ${evilWs}`)
+  note('a wrong password is 401; a valid cookie from another origin is 403, for a change and for a WebSocket')
+
+  // A second session: its socket closes with 4401 the moment it logs out, and its cookie stops working.
+  const second = await login(USER, labPassword())
+  if (!('cookie' in second)) throw new Failed(`second login: ${JSON.stringify(second)}`)
+  const me = (await (await api('/api/auth/session', {}, second.cookie)).json()) as AuthStatus
+  if (me.session?.user !== USER) throw new Failed(`session of the second login: ${JSON.stringify(me)}`)
+  const closed = await new Promise<number | string>((resolve) => {
+    const ws = socket(`${wsBase}/api/ws`, second.cookie)
+    const timer = setTimeout(() => resolve('still open 30 s after logging out'), 30_000)
+    let first = true
+    ws.onmessage = () => {
+      if (!first) return
+      first = false
+      void api('/api/auth/logout', { method: 'POST' }, second.cookie)
+    }
+    ws.onclose = (e) => {
+      clearTimeout(timer)
+      resolve(first ? `closed before any message (${e.code})` : e.code)
+    }
+  })
+  if (closed !== 4401) throw new Failed(`the live view after logging out: ${closed}`)
+  const after = await api('/api/metrics?entity=fleet&m=cpu_pct', {}, second.cookie)
+  if (after.status !== 401) throw new Failed(`a logged-out cookie: ${after.status}`)
+  const still = await api('/api/metrics?entity=fleet&m=cpu_pct')
+  if (!still.ok) throw new Failed(`the run's own session after another logged out: ${still.status}`)
+  note(`a second session's live view closed with ${closed} on logout and its cookie is refused; the first session is untouched`)
+
+  // Guessing is throttled: after 5 failures for one user name, the next try waits.
+  const nobody = `e2e-nobody-${tag}`
+  for (let i = 0; i < 5; i++) {
+    const r = await login(nobody, 'guess')
+    if ('cookie' in r || r.status !== 401) throw new Failed(`guess ${i + 1}: ${JSON.stringify(r)}`)
+  }
+  const sixth = await fetch(`${BASE}/api/auth/login`, post({ username: nobody, password: 'guess' }))
+  const retry = Number(sixth.headers.get('retry-after'))
+  if (sixth.status !== 429 || !(retry >= 1)) throw new Failed(`the 6th guess: ${sixth.status}, Retry-After ${sixth.headers.get('retry-after')}`)
+  await sleep(retry * 1000 + 300)
+  const again = await login(USER, labPassword())
+  if (!('cookie' in again)) throw new Failed(`the right password after the wait: ${JSON.stringify(again)}`)
+  await api('/api/auth/logout', { method: 'POST' }, again.cookie)
+  note(`the 6th guess was 429 (Retry-After ${retry} s); after waiting, the right password logs in`)
 })
 
 watch.close()

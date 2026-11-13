@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { kubeLogs } from '../api'
+import { SESSION_ENDED } from '../auth'
 import { appendLog, filterLog, logFollowUrl, terminalNotice } from '../debug'
 
 const TAILS = [100, 200, 500, 2000]
@@ -75,7 +76,10 @@ export function LogPanel({ namespace, pod, containers, restarts }: { namespace: 
         return next
       })
     }
-    ws.onclose = () => setFollowing(false)
+    ws.onclose = (e) => {
+      setFollowing(false)
+      if (e.code === SESSION_ENDED) setError('logged out: log in again to follow')
+    }
     ws.onerror = () => setFollowing(false)
   }, [namespace, pod, container, tail, stopFollow])
 

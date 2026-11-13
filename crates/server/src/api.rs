@@ -1,6 +1,7 @@
 //! The HTTP API: user operations (through the control plane), the lab's
 //! hardware faults, and the WebSocket.
 
+use crate::auth::{self, Auth, SessionGuard};
 use crate::driver::{DriverHandle, LabError};
 use crate::kube_action::{ActionError, KubeAction, WorkloadRef};
 use crate::kube_apply::ApplyRequest;
@@ -8,7 +9,7 @@ use crate::kube_exec::ExecQuery;
 use crate::kube_log::LogQuery;
 use crate::ws::ws_handler;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Json, Query, State};
+use axum::extract::{Extension, Json, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, get, post};
@@ -19,7 +20,13 @@ use lab::manager::LabFault;
 use serde::Deserialize;
 use serde_json::json;
 
-pub fn app(driver: DriverHandle) -> Router {
+/// The API behind [`auth::guard`]: every path but `/api/auth/{session,login,logout}` needs a session.
+pub fn app(driver: DriverHandle, auth: Auth) -> Router {
+    let login = Router::new()
+        .route("/api/auth/session", get(auth::session))
+        .route("/api/auth/login", post(auth::login))
+        .route("/api/auth/logout", post(auth::logout))
+        .with_state(auth.clone());
     Router::new()
         .route("/api/ops", post(submit_op))
         .route("/api/metrics", get(get_metrics))
@@ -40,6 +47,8 @@ pub fn app(driver: DriverHandle) -> Router {
         .route("/api", any(unknown_api))
         .route("/api/{*path}", any(unknown_api))
         .with_state(driver)
+        .merge(login)
+        .layer(axum::middleware::from_fn_with_state(auth, auth::guard))
 }
 
 fn error(status: StatusCode, message: &str) -> Response {
@@ -212,11 +221,11 @@ async fn kube_logs(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>
 }
 
 /// The follow stream: text frames as log chunks arrive, an hour at most.
-async fn kube_logs_ws(State(driver): State<DriverHandle>, Query(q): Query<LogQuery>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve_log_follow(socket, driver, q))
+async fn kube_logs_ws(State(driver): State<DriverHandle>, Extension(session): Extension<SessionGuard>, Query(q): Query<LogQuery>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve_log_follow(socket, driver, q, session))
 }
 
-async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQuery) {
+async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQuery, mut session: SessionGuard) {
     let mut res = match driver.kube_log_follow(q).await {
         Ok(r) => r,
         Err(e) => {
@@ -240,6 +249,10 @@ async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQue
                 Some(Ok(_)) => {}
             },
             () = tokio::time::sleep_until(deadline) => return,
+            () = session.ended() => {
+                let _ = socket.send(SessionGuard::close_frame()).await;
+                return;
+            }
         }
     }
 }
@@ -247,11 +260,11 @@ async fn serve_log_follow(mut socket: WebSocket, driver: DriverHandle, q: LogQue
 /// A shell in a container: binary frames are keystrokes (browser → server)
 /// and terminal output (server → browser); text frames carry
 /// `{"resize":{width,height}}` in and `{"status":…}` / `{"error":…}` out.
-async fn kube_exec_ws(State(driver): State<DriverHandle>, Query(q): Query<ExecQuery>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve_exec(socket, driver, q))
+async fn kube_exec_ws(State(driver): State<DriverHandle>, Extension(session): Extension<SessionGuard>, Query(q): Query<ExecQuery>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve_exec(socket, driver, q, session))
 }
 
-async fn serve_exec(mut socket: WebSocket, driver: DriverHandle, q: ExecQuery) {
+async fn serve_exec(mut socket: WebSocket, driver: DriverHandle, q: ExecQuery, mut session: SessionGuard) {
     use futures_util::{SinkExt, StreamExt};
     let upstream = match driver.kube_exec(q).await {
         Ok(s) => s,
@@ -303,6 +316,10 @@ async fn serve_exec(mut socket: WebSocket, driver: DriverHandle, q: ExecQuery) {
                 let _ = socket.send(Message::Text(json!({ "status": "session ended: 15 minutes is the most one shell may run" }).to_string().into())).await;
                 return;
             }
+            () = session.ended() => {
+                let _ = socket.send(SessionGuard::close_frame()).await;
+                return;
+            }
         }
     }
 }
@@ -351,11 +368,11 @@ async fn lab_journal(State(driver): State<DriverHandle>, Query(q): Query<Journal
 
 /// An interactive SSH login to a lab VM: binary frames both ways, text
 /// frames carry `{"resize":{width,height}}` in and `{"error":…}` out.
-async fn lab_terminal_ws(State(driver): State<DriverHandle>, Query(q): Query<VmQuery>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve_lab_terminal(socket, driver, q.vm))
+async fn lab_terminal_ws(State(driver): State<DriverHandle>, Extension(session): Extension<SessionGuard>, Query(q): Query<VmQuery>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve_lab_terminal(socket, driver, q.vm, session))
 }
 
-async fn serve_lab_terminal(mut socket: WebSocket, driver: DriverHandle, vm: String) {
+async fn serve_lab_terminal(mut socket: WebSocket, driver: DriverHandle, vm: String, mut session: SessionGuard) {
     use portable_pty::{native_pty_system, CommandBuilder, PtySize};
     use std::io::{Read, Write};
     use std::sync::{Arc, Mutex};
@@ -374,7 +391,7 @@ async fn serve_lab_terminal(mut socket: WebSocket, driver: DriverHandle, vm: Str
             fail!(e.to_string());
         }
     };
-    eprintln!("lab terminal: ssh to {vm} at {ip}");
+    eprintln!("lab terminal: {} opened ssh to {vm} at {ip}", session.identity.user);
     let pair = match native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }) {
         Ok(p) => p,
         Err(e) => {
@@ -445,6 +462,10 @@ async fn serve_lab_terminal(mut socket: WebSocket, driver: DriverHandle, vm: Str
                 None => break,
             },
             () = tokio::time::sleep_until(deadline) => break,
+            () = session.ended() => {
+                let _ = socket.send(SessionGuard::close_frame()).await;
+                break;
+            }
         }
     }
     let _ = child.lock().expect("ssh child").kill();
@@ -503,6 +524,20 @@ pub mod tests {
         })
         .await
         .expect("a leader within 10 s")
+    }
+
+    /// The API as a logged-in browser on the server's own origin sees it:
+    /// every request carries a live session's cookie.
+    fn app(driver: DriverHandle) -> Router {
+        let (auth, token) = crate::auth::tests::logged_in();
+        let cookie = axum::http::HeaderValue::from_str(&format!("{}={token}", crate::auth::COOKIE)).unwrap();
+        super::app(driver, auth).layer(axum::middleware::map_request(move |mut req: Request<Body>| {
+            let cookie = cookie.clone();
+            async move {
+                req.headers_mut().insert(axum::http::header::COOKIE, cookie);
+                req
+            }
+        }))
     }
 
     async fn post_json(app: &Router, path: &str, body: Value) -> (StatusCode, Value) {

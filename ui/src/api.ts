@@ -4,14 +4,15 @@ import type { ApplyRequest } from './gen/ApplyRequest'
 import type { KubeAction } from './gen/KubeAction'
 import type { LabFault } from './gen/LabFault'
 import type { WorkloadRef } from './gen/WorkloadRef'
+import { apiFetch } from './auth'
 import { consoleUrl, journalUrl, logParams, type LogRequest } from './debug'
 
 /**
- * POSTs `body` as JSON. A non-2xx answer (400 rejected, 503 control plane or
- * lab unavailable) rejects with the server's `{"error": ...}` string.
+ * POSTs `body` as JSON. A non-2xx answer (400 rejected, 401 logged out, 503
+ * control plane or lab unavailable) rejects with the server's `{"error": ...}` string.
  */
 async function post(path: string, body: unknown): Promise<unknown> {
-  const res = await fetch(path, {
+  const res = await apiFetch(path, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(body),
@@ -48,7 +49,7 @@ export async function kubeApply(req: ApplyRequest): Promise<ApplyReport> {
 
 /** GETs `path` as text; a refusal rejects with the server's error string, as `post` does. */
 async function getText(path: string): Promise<string> {
-  const res = await fetch(path)
+  const res = await apiFetch(path)
   if (res.ok) return res.text()
   const error = ((await res.json().catch(() => null)) as { error?: unknown } | null)?.error
   throw typeof error === 'string' ? error : `HTTP ${res.status}`

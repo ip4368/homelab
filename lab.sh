@@ -12,10 +12,16 @@
 #   ./lab.sh ssh VM    log into a VM (by its lab name, e.g. ms01-02)
 #   ./lab.sh kubectl ARGS...   kubectl on a K3s server, e.g. ./lab.sh kubectl get pods -A -o wide
 #   ./lab.sh seed      apply deploy/demo-workloads.yaml (a database, a writer, a web app, a CPU burner)
+#   ./lab.sh user passwd NAME | delete NAME | list
+#                      manage who may log in to the UI (the first up creates admin, with its
+#                      password in $LAB_STATE/initial-admin-password); passwd reads the new
+#                      password from the terminal, or one line of stdin
+#   ./lab.sh password  print the generated admin password
 #
 # PORT sets the UI's port (default 8080). BIND sets the address it listens on
-# (default 127.0.0.1; e.g. BIND=0.0.0.0 to reach it from other machines, but
-# note the API has no authentication and can power off the VMs).
+# (default 127.0.0.1; e.g. BIND=0.0.0.0 to reach it from other machines: the UI
+# needs a login, but the server speaks plain HTTP, so put TLS in front of it).
+# HOMELAB_USERS moves the users file (default $LAB_STATE/users.yml).
 set -euo pipefail
 cd "$(dirname "$0")"
 export PATH="$HOME/.cargo/bin:$PATH"
@@ -70,8 +76,16 @@ case "${1:-}" in
   seed)
     "$0" kubectl apply -f - < deploy/demo-workloads.yaml
     ;;
+  user)
+    shift
+    cargo build --release -p server
+    exec sudo -E ./target/release/server user "$@"
+    ;;
+  password)
+    exec sudo cat "$STATE/initial-admin-password"
+    ;;
   *)
-    sed -n '2,18p' "$0"
+    sed -n '2,24p' "$0"
     exit 2
     ;;
 esac

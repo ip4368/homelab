@@ -5,7 +5,8 @@
 
 use crate::driver::{ClockInfo, DriverHandle, Published};
 use crate::kube::KubeView;
-use axum::extract::State;
+use crate::auth::SessionGuard;
+use axum::extract::{Extension, State};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::response::Response;
 use control::proto::MetricSample;
@@ -155,8 +156,8 @@ impl Connection {
     }
 }
 
-pub async fn ws_handler(State(driver): State<DriverHandle>, upgrade: WebSocketUpgrade) -> Response {
-    upgrade.on_upgrade(move |socket| serve(socket, driver))
+pub async fn ws_handler(State(driver): State<DriverHandle>, Extension(session): Extension<SessionGuard>, upgrade: WebSocketUpgrade) -> Response {
+    upgrade.on_upgrade(move |socket| serve(socket, driver, session))
 }
 
 async fn send(socket: &mut WebSocket, msg: &ServerMsg) -> bool {
@@ -164,7 +165,7 @@ async fn send(socket: &mut WebSocket, msg: &ServerMsg) -> bool {
     socket.send(Message::Text(json.into())).await.is_ok()
 }
 
-async fn serve(mut socket: WebSocket, driver: DriverHandle) {
+async fn serve(mut socket: WebSocket, driver: DriverHandle, mut session: SessionGuard) {
     let mut published = driver.subscribe();
     let first = published.borrow_and_update().clone();
     let (mut conn, msg) = Connection::open(&first);
@@ -187,6 +188,11 @@ async fn serve(mut socket: WebSocket, driver: DriverHandle) {
                 None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
                 Some(Ok(_)) => {}
             },
+            // Logged out, expired or re-passworded: the UI shows its login.
+            () = session.ended() => {
+                let _ = socket.send(SessionGuard::close_frame()).await;
+                return;
+            }
         }
     }
 }

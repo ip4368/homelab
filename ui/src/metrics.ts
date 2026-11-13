@@ -3,6 +3,7 @@
  * history: a new leader starts empty (`since` says from when it has data).
  * The UI keeps showing the last series it got while a fetch fails.
  */
+import { apiFetch } from './auth'
 import { formatClock } from './clock'
 
 export interface MetricsReply {
@@ -23,7 +24,7 @@ export interface MetricsView {
 
 async function fetchSeries(url: string): Promise<MetricsOutcome> {
   try {
-    const res = await fetch(url)
+    const res = await apiFetch(url)
     const json: unknown = await res.json().catch(() => null)
     if (res.ok) return { ok: json as MetricsReply }
     const error = (json as { error?: unknown } | null)?.error

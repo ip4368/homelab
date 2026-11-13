@@ -1,8 +1,11 @@
 //! The homelab cluster manager's server: the UI's client to the control
 //! plane of the real VM lab, the lab itself, the HTTP API and WebSocket, and
 //! the built UI. Runs as root (the lab needs it).
+//!
+//! `server user passwd|delete|list` manages who may log in instead (see [`auth`]).
 
 mod api;
+mod auth;
 mod driver;
 mod kube;
 mod kube_action;
@@ -26,8 +29,8 @@ use tower_http::services::{ServeDir, ServeFile};
 const DEFAULT_PORT: u16 = 8080;
 
 /// Where to listen: `$BIND` (an IP address, default loopback) and `$PORT`
-/// (default 8080). Loopback by default because the API is unauthenticated
-/// and can power off the lab's VMs.
+/// (default 8080). Loopback by default: even behind a login, the API can
+/// power off the lab's VMs and the server speaks plain HTTP.
 fn listen_addr(bind: Option<&str>, port: Option<&str>) -> Result<SocketAddr, String> {
     let ip = match bind {
         None => IpAddr::V4(Ipv4Addr::LOCALHOST),
@@ -56,9 +59,42 @@ fn with_ui(router: Router, dist: &Path) -> Router {
     router.route("/", get(move || async move { hint }))
 }
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::process::ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("user") {
+        return match auth::cli(&args[1..]) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("server user: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+    if !args.is_empty() {
+        eprintln!("usage: server            run the server and the lab\n       server user passwd <name> | delete <name> | list");
+        return std::process::ExitCode::from(2);
+    }
+    let runtime = tokio::runtime::Runtime::new().expect("a tokio runtime");
+    match runtime.block_on(serve()) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("server: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn serve() -> std::io::Result<()> {
     let lab = Lab::start(LabConfig::from_env()).await?;
+    let auth = auth::Auth::new(auth::AuthConfig::from_env());
+    if let Some(note) = auth.bootstrap()? {
+        eprintln!(
+            "auth: created {} with the user admin; its password is in {} (change it with `./lab.sh user passwd admin`)",
+            auth.users_file().display(),
+            note.display()
+        );
+    }
+    auth.spawn_sweeper();
     let client = lab::client::spawn()?;
     let driver = DriverHandle::start(client, Some(lab.clone()));
     let up = driver.clone();
@@ -78,15 +114,15 @@ async fn main() -> std::io::Result<()> {
         stop.stop_services();
         std::process::exit(0);
     });
-    let app = with_ui(api::app(driver), &dist_dir());
+    let app = with_ui(api::app(driver, auth), &dist_dir());
     let addr = listen_addr(std::env::var("BIND").ok().as_deref(), std::env::var("PORT").ok().as_deref())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     println!("homelab cluster manager on http://{}", listener.local_addr()?);
     if !addr.ip().is_loopback() {
-        eprintln!("warning: listening beyond loopback; anyone who can reach {addr} can control the lab (there is no authentication)");
+        eprintln!("warning: listening beyond loopback over plain HTTP: passwords and session cookies cross the network unencrypted (put a TLS reverse proxy in front)");
     }
-    axum::serve(listener, app).await
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await
 }
 
 #[cfg(test)]
