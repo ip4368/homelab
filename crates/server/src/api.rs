@@ -636,6 +636,75 @@ pub mod tests {
         assert_eq!(get_json(&app, "/api/kube/manifest?namespace=demo&kind=Pod&name=web").await.0, StatusCode::BAD_REQUEST, "not a workload kind");
     }
 
+    /// Every route of the real router, as the method the UI uses: without a
+    /// session each must be refused before its handler runs. Keep it in step
+    /// with [`super::app`].
+    const PROTECTED: [(&str, &str); 19] = [
+        ("POST", "/api/ops"),
+        ("GET", "/api/metrics?entity=host:ms01-01&m=cpu_pct"),
+        ("POST", "/api/lab/fault"),
+        ("GET", "/api/lab/kubeconfig"),
+        ("POST", "/api/lab/seed"),
+        ("POST", "/api/kube"),
+        ("POST", "/api/kube/apply"),
+        ("GET", "/api/kube/manifest?namespace=demo&kind=Deployment&name=web"),
+        ("GET", "/api/kube/metrics?pod=demo/web-1&m=cpu_milli"),
+        ("GET", "/api/kube/logs?namespace=demo&pod=web-1"),
+        ("WS", "/api/kube/logs/ws?namespace=demo&pod=web-1"),
+        ("WS", "/api/kube/exec/ws?namespace=demo&pod=web-1"),
+        ("GET", "/api/lab/console?vm=ms01-01"),
+        ("GET", "/api/lab/journal?vm=ms01-01&unit=homelabd"),
+        ("WS", "/api/lab/terminal/ws?vm=ms01-01"),
+        ("WS", "/api/ws"),
+        ("GET", "/api"),
+        ("GET", "/api/sim/speed"),
+        ("DELETE", "/api/ops"),
+    ];
+
+    async fn status_for(app: &Router, method: &str, path: &str, cookie: Option<&str>) -> StatusCode {
+        let mut req = Request::builder().uri(path).header("host", "127.0.0.1:8080");
+        req = match method {
+            "WS" => req
+                .method("GET")
+                .header("origin", "http://127.0.0.1:8080")
+                .header("connection", "upgrade")
+                .header("upgrade", "websocket")
+                .header("sec-websocket-version", "13")
+                .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            m => req.method(m).header("content-type", "application/json"),
+        };
+        if let Some(c) = cookie {
+            req = req.header("cookie", c);
+        }
+        let body = if method == "POST" { Body::from("{}") } else { Body::empty() };
+        app.clone().oneshot(req.body(body).unwrap()).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn the_real_router_refuses_every_route_without_a_session() {
+        // No control plane: a request that got past the guard would be
+        // answered by its handler (400, 422, 503…), never 401.
+        let client = lab::client::spawn_at(Ipv4Addr::LOCALHOST, 1).unwrap();
+        let auth = crate::auth::tests::auth_with("router", &[("alice", "wonderland1")]);
+        let app = super::app(DriverHandle::start(client, None), auth.clone());
+        for (method, path) in PROTECTED {
+            assert_eq!(status_for(&app, method, path, None).await, StatusCode::UNAUTHORIZED, "{method} {path} without a session");
+            assert_eq!(status_for(&app, method, path, Some("homelab_session=forged")).await, StatusCode::UNAUTHORIZED, "{method} {path} with a forged cookie");
+        }
+        // The three public paths stay open, and a real login gets past the guard.
+        assert_eq!(status_for(&app, "GET", "/api/auth/session", None).await, StatusCode::OK);
+        assert_eq!(status_for(&app, "POST", "/api/auth/logout", None).await, StatusCode::OK);
+        let (token, _) = auth.login("alice", "wonderland1", None).await.unwrap();
+        let cookie = format!("{}={token}", crate::auth::COOKIE);
+        assert_eq!(status_for(&app, "GET", "/api/lab/console?vm=..", Some(&cookie)).await, StatusCode::BAD_REQUEST, "the handler's own check");
+        assert_eq!(status_for(&app, "GET", "/api/sim/speed", Some(&cookie)).await, StatusCode::NOT_FOUND);
+        // After logout the same cookie is refused everywhere again.
+        auth.logout(&token);
+        for (method, path) in PROTECTED {
+            assert_eq!(status_for(&app, method, path, Some(&cookie)).await, StatusCode::UNAUTHORIZED, "{method} {path} after logout");
+        }
+    }
+
     #[tokio::test]
     async fn unknown_api_paths_are_404_not_the_ui() {
         let (driver, _host) = cluster();

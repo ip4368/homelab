@@ -9,6 +9,8 @@ export const SESSION_ENDED = 4401
 /**
  * Where the login stands:
  * - `checking`: asking the server on first load;
+ * - `unreachable`: that first question got no answer (server down or
+ *   restarting, a proxy error): say so and keep asking, rather than wait forever;
  * - `anonymous`: nobody logged in (first visit, or after signing out): the login page;
  * - `in`: logged in; `epoch` counts logins, so a new one reconnects the live view;
  * - `lost`: the session ended under a running UI (expired, password changed,
@@ -17,6 +19,7 @@ export const SESSION_ENDED = 4401
  */
 export type AuthState =
   | { phase: 'checking' }
+  | { phase: 'unreachable'; reason: string }
   | { phase: 'anonymous'; methods: AuthMethod[] }
   | { phase: 'in'; session: AuthSession; methods: AuthMethod[]; epoch: number }
   | { phase: 'lost'; user: string; methods: AuthMethod[]; epoch: number }
@@ -26,11 +29,12 @@ export type AuthEvent =
   | { type: 'logged-in'; status: AuthStatus }
   | { type: 'expired' }
   | { type: 'logged-out' }
+  | { type: 'unreachable'; reason: string }
 
 const DEFAULT_METHODS: AuthMethod[] = [{ kind: 'password' }]
 
 function methodsOf(s: AuthState): AuthMethod[] {
-  return s.phase === 'checking' ? DEFAULT_METHODS : s.methods
+  return s.phase === 'checking' || s.phase === 'unreachable' ? DEFAULT_METHODS : s.methods
 }
 
 function epochOf(s: AuthState): number {
@@ -55,6 +59,12 @@ export function authReducer(s: AuthState, e: AuthEvent): AuthState {
       return s.phase === 'in' ? { phase: 'lost', user: s.session.user, methods: s.methods, epoch: s.epoch } : s
     case 'logged-out':
       return { phase: 'anonymous', methods: methodsOf(s) }
+    case 'unreachable':
+      // Only before we know who is logged in: a running workspace keeps
+      // going, and its live view shows that the server is away.
+      if (s.phase === 'checking') return { phase: 'unreachable', reason: e.reason }
+      if (s.phase === 'unreachable' && s.reason !== e.reason) return { ...s, reason: e.reason }
+      return s
   }
 }
 
@@ -87,17 +97,25 @@ class AuthStore {
     for (const fn of this.listeners) fn()
   }
 
-  /** Asks the server who we are. A server that cannot be reached leaves the state as it is. */
+  /**
+   * Asks the server who we are. A server that cannot be reached leaves a
+   * running workspace as it is; on first load it shows as `unreachable`.
+   */
   async refresh(): Promise<AuthStatus | null> {
+    let res: Response
     try {
-      const res = await fetch('/api/auth/session')
-      if (!res.ok) return null
-      const status = (await res.json()) as AuthStatus
-      this.dispatch({ type: 'status', status })
-      return status
+      res = await fetch('/api/auth/session')
     } catch {
+      this.dispatch({ type: 'unreachable', reason: 'cannot reach the server' })
       return null
     }
+    const status = res.ok ? ((await res.json().catch(() => null)) as AuthStatus | null) : null
+    if (status === null) {
+      this.dispatch({ type: 'unreachable', reason: `the server answered HTTP ${res.status}` })
+      return null
+    }
+    this.dispatch({ type: 'status', status })
+    return status
   }
 
   /** Logs in; rejects with what to tell the user. */

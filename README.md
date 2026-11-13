@@ -79,7 +79,7 @@ The server listens on `BIND`:`PORT` (default `127.0.0.1:8080`) and serves the bu
 hashes) with one user, `admin`, and a generated password:
 
 ```sh
-./lab.sh password             # the generated admin password
+./lab.sh password             # the generated admin password (gone once admin gets a new one)
 ./lab.sh user passwd admin    # set your own (or add a user); it takes effect without a restart
 ./lab.sh user delete alice    # remove a user and end their sessions
 ./lab.sh user list

@@ -35,6 +35,25 @@ describe('authReducer', () => {
   })
 })
 
+describe('an unreachable server', () => {
+  it('shows on first load instead of waiting forever, and clears with the first answer', () => {
+    const off = authReducer({ phase: 'checking' }, { type: 'unreachable', reason: 'cannot reach the server' })
+    expect(off).toEqual({ phase: 'unreachable', reason: 'cannot reach the server' })
+    expect(authReducer(off, { type: 'unreachable', reason: 'cannot reach the server' })).toBe(off)
+    expect(authReducer(off, { type: 'unreachable', reason: 'the server answered HTTP 502' })).toEqual({ phase: 'unreachable', reason: 'the server answered HTTP 502' })
+    expect(authReducer(off, { type: 'status', status: as(null) })).toEqual({ phase: 'anonymous', methods })
+    expect(authReducer(off, { type: 'status', status: as('alice') })).toMatchObject({ phase: 'in', epoch: 1 })
+  })
+
+  it('leaves a running workspace, the login page and the login dialog as they are', () => {
+    const down = { type: 'unreachable', reason: 'cannot reach the server' } as const
+    const inside: AuthState = { phase: 'in', session: as('alice').session!, methods, epoch: 1 }
+    const lost: AuthState = { phase: 'lost', user: 'alice', methods, epoch: 1 }
+    const anonymous: AuthState = { phase: 'anonymous', methods }
+    for (const s of [inside, lost, anonymous]) expect(authReducer(s, down)).toBe(s)
+  })
+})
+
 describe('loginError', () => {
   it("prefers the server's words", () => {
     expect(loginError(429, { error: 'too many failed logins: try again in 4 s' })).toBe('too many failed logins: try again in 4 s')

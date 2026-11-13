@@ -16,7 +16,7 @@
 #                      manage who may log in to the UI (the first up creates admin, with its
 #                      password in $LAB_STATE/initial-admin-password); passwd reads the new
 #                      password from the terminal, or one line of stdin
-#   ./lab.sh password  print the generated admin password
+#   ./lab.sh password  print the generated admin password (until admin gets a new one)
 #
 # PORT sets the UI's port (default 8080). BIND sets the address it listens on
 # (default 127.0.0.1; e.g. BIND=0.0.0.0 to reach it from other machines: the UI
@@ -82,6 +82,11 @@ case "${1:-}" in
     exec sudo -E ./target/release/server user "$@"
     ;;
   password)
+    if ! sudo test -f "$STATE/initial-admin-password"; then
+      echo "lab.sh: no generated admin password: admin's password was changed (./lab.sh user passwd admin)," >&2
+      echo "or the server has not started yet. Set a new one with: ./lab.sh user passwd admin" >&2
+      exit 1
+    fi
     exec sudo cat "$STATE/initial-admin-password"
     ;;
   *)

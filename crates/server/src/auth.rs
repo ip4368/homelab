@@ -9,7 +9,8 @@
 //! disables or gives a new password.
 //!
 //! **Sessions** are random tokens in an `HttpOnly`, `SameSite=Strict` cookie,
-//! held in this process's memory (a restart logs everyone out). A session
+//! held in this process's memory (a restart logs everyone out) under a hash
+//! of the token, never the token itself ([`session_key`]). A session
 //! records *how* its user proved who they are ([`Identity`]), so an OIDC
 //! login can later make the same kind of session as a password does.
 //!
@@ -191,6 +192,15 @@ fn new_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// What the session table is keyed by: a BLAKE2s hash of the cookie's token,
+/// so the table (a core dump, a debug print) holds nothing a browser could
+/// present, and looking a token up compares hashes, not the secret itself.
+fn session_key(token: &str) -> String {
+    use base64::Engine;
+    use blake2::{Blake2s256, Digest};
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Blake2s256::digest(token.as_bytes()))
+}
+
 type Users = Arc<BTreeMap<String, UserEntry>>;
 
 /// The users file, re-read whenever its modification time or size changes.
@@ -341,6 +351,7 @@ pub struct Auth {
 struct Inner {
     cfg: AuthConfig,
     users: UserDb,
+    /// Live sessions by [`session_key`] of their token.
     sessions: Mutex<HashMap<String, Session>>,
     throttle: Mutex<Throttle>,
     checks: Semaphore,
@@ -383,7 +394,7 @@ impl Auth {
         let mut file = UsersFile::default();
         file.users.insert("admin".into(), UserEntry { displayname: "Administrator".into(), password: hash_password(&password), disabled: false, extra: BTreeMap::new() });
         file.write(path)?;
-        let note = path.with_file_name("initial-admin-password");
+        let note = initial_password_note(path);
         write_private(&note, &format!("{password}\n"))?;
         Ok(Some(note))
     }
@@ -448,23 +459,24 @@ impl Auth {
         let (end, _) = watch::channel(());
         let session = Session { identity, credential, created: now, last_seen: now, end };
         let status = status_of(&session, now);
-        self.inner.sessions.lock().expect("sessions lock").insert(token.clone(), session);
+        self.inner.sessions.lock().expect("sessions lock").insert(session_key(&token), session);
         (token, status)
     }
 
     /// Ends the session `token` names, if any; whose it was.
     pub fn logout(&self, token: &str) -> Option<String> {
-        self.inner.sessions.lock().expect("sessions lock").remove(token).map(|s| s.identity.user)
+        self.inner.sessions.lock().expect("sessions lock").remove(&session_key(token)).map(|s| s.identity.user)
     }
 
     /// The live session `token` names, refreshed as used just now.
     fn touch(&self, token: &str) -> Option<(SessionGuard, AuthSession)> {
         let users = self.inner.users.current();
         let now = Instant::now();
+        let key = session_key(token);
         let mut sessions = self.inner.sessions.lock().expect("sessions lock");
-        let s = sessions.get_mut(token)?;
+        let s = sessions.get_mut(&key)?;
         if s.deadline() <= now || !still_valid(&users, s) {
-            sessions.remove(token);
+            sessions.remove(&key);
             return None;
         }
         s.last_seen = now;
@@ -496,6 +508,26 @@ impl Auth {
         let https = self.inner.cfg.secure_cookie || headers.get("x-forwarded-proto").is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"https"));
         let secure = if https { "; Secure" } else { "" };
         HeaderValue::from_str(&format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{secure}", max_age.as_secs())).expect("a cookie of token characters")
+    }
+}
+
+/// Where [`Auth::bootstrap`] writes the generated `admin` password: beside the users file.
+pub fn initial_password_note(users: &Path) -> PathBuf {
+    users.with_file_name("initial-admin-password")
+}
+
+/// Deletes the generated-password note once `user`'s password is no longer
+/// the generated one (`admin` re-passworded or deleted), so that nothing
+/// (`./lab.sh password`) hands out a password that no longer works. Whether
+/// there was one to delete.
+pub fn forget_initial_password(users: &Path, user: &str) -> io::Result<bool> {
+    if user != "admin" {
+        return Ok(false);
+    }
+    match std::fs::remove_file(initial_password_note(users)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
 }
 
@@ -641,6 +673,9 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             let created = entry.password.is_empty();
             entry.password = hash_password(&password);
             file.write(path).map_err(|e| e.to_string())?;
+            if forget_initial_password(path, name).map_err(|e| e.to_string())? {
+                println!("removed {}: it no longer holds {name}'s password", initial_password_note(path).display());
+            }
             println!("{} {name} in {}{}", if created { "created" } else { "new password for" }, path.display(), if created { "" } else { " (their sessions end)" });
             Ok(())
         }
@@ -650,6 +685,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
                 return Err(format!("no user {name:?} in {}", path.display()));
             }
             file.write(path).map_err(|e| e.to_string())?;
+            forget_initial_password(path, name).map_err(|e| e.to_string())?;
             println!("deleted {name} (their sessions end)");
             Ok(())
         }
@@ -794,6 +830,13 @@ pub mod tests {
         let file = UsersFile::read(auth.users_file()).unwrap().unwrap();
         assert!(verify_password(&file.users["admin"].password, &password));
         assert_eq!(auth.bootstrap().unwrap(), None, "only the first time");
+        assert_eq!(note, initial_password_note(auth.users_file()));
+        // Once admin has another password the note would lie, so it goes.
+        assert!(!forget_initial_password(auth.users_file(), "alice").unwrap(), "another user's password is not in it");
+        assert!(note.exists());
+        assert!(forget_initial_password(auth.users_file(), "admin").unwrap());
+        assert!(!note.exists());
+        assert!(!forget_initial_password(auth.users_file(), "admin").unwrap(), "already gone");
     }
 
     #[test]
@@ -939,5 +982,17 @@ pub mod tests {
         assert!(auth.touch(&token).is_some());
         auth.sweep(now + SESSION_IDLE + Duration::from_secs(1));
         assert!(auth.touch(&token).is_none(), "idle too long");
+    }
+
+    #[test]
+    fn the_session_table_holds_hashes_not_tokens() {
+        let (auth, token) = logged_in();
+        let sessions = auth.inner.sessions.lock().unwrap();
+        assert!(!sessions.contains_key(&token));
+        assert!(sessions.contains_key(&session_key(&token)));
+        assert_ne!(session_key(&token), session_key(&format!("{token}x")));
+        drop(sessions);
+        assert!(auth.touch(&token).is_some(), "the token still finds its session");
+        assert!(auth.touch(&session_key(&token)).is_none(), "the stored key is not a token");
     }
 }

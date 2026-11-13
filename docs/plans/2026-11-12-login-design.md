@@ -40,7 +40,8 @@ works here, and this file can seed Authelia's own when the cluster moves to OIDC
 
 - **First start:** with no file, the server creates it with one user, `admin`, and a generated
   24-character password written to `$LAB_STATE/initial-admin-password` (0600). The path is
-  logged, the password is not. `./lab.sh password` prints it.
+  logged, the password is not. `./lab.sh password` prints it. Giving `admin` a new password
+  (or deleting it) with `./lab.sh user` removes that file, so it never hands out a stale one.
 - **Managing users:** `./lab.sh user passwd <name>` (create, or set a new password: read twice
   from the terminal, or one line of stdin for scripts), `./lab.sh user delete <name>`,
   `./lab.sh user list`. They rewrite the file atomically, so a running server needs no restart.
@@ -55,6 +56,7 @@ works here, and this file can seed Authelia's own when the cluster moves to OIDC
 `POST /api/auth/login {username, password}` checks the password and sets
 `homelab_session=<32 random bytes, base64url>; Path=/; HttpOnly; SameSite=Strict; Max-Age=7d`,
 plus `Secure` behind a proxy that says `X-Forwarded-Proto: https` (or with `COOKIE_SECURE=1`).
+The server keeps its sessions under a BLAKE2s hash of the token, never the token itself.
 
 - A session ends after **12 h unused** or **7 days** however busy, on logout
   (`POST /api/auth/logout`), or when its user changes (§2).
@@ -97,7 +99,9 @@ the host's SSH process are torn down as on any other close.
 ## 5. The UI
 
 - `Root` asks `GET /api/auth/session` first: the login page if nobody is logged in, else the
-  workspace and its live view.
+  workspace and its live view. If that first request gets no answer (server down or
+  restarting, a proxy error), it says the server is not answering and asks again every 5 s,
+  with a "Try now" button, instead of staying on "connecting…".
 - **A session that ends under a running UI** (a 401 from any API call, a 4401 close, or a drop
   after which `/api/auth/session` says nobody) does not throw the page away: a login dialog covers
   the workspace, with the user name filled in, so a half-written YAML or an open drawer survives.

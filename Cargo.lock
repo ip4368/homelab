@@ -1575,6 +1575,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64 0.22.1",
+ "blake2",
  "control",
  "futures-util",
  "http-body-util",
